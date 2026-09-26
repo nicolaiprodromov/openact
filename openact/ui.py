@@ -8,6 +8,7 @@ Drawing plans and writes nothing: Blender refuses changes to nodes and data whil
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 
@@ -15,7 +16,7 @@ import bpy
 
 from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
 from . import prefs as P
-from .specs.base import SOURCES, UNSURE_BELOW
+from .specs.base import UNSURE_BELOW, table_of
 from .watch import WATCH
 
 _ICONS = {
@@ -44,7 +45,7 @@ SERVER_BANNERS = ("install", "runtime", "port")  # shown in the Model box, above
 IMPORT_CSV_NOTE = ("Import CSV '{}' reads the same file; Blender won't re-read it after edits in this session. Use "
                    "this node's payload outputs, or restart Blender")
 LEGACY = []  # callables giving the old Jev nodes banner as (text, operator idname), or None (§12.3)
-_NOTES = [None, {}]  # the pass the Import CSV notes were worked out after, and the notes
+EMPTY_SLOT = "(empty slot)"  # a row without a name: an empty material slot, never offered
 
 
 def wrap(layout, text, width=46, icon='NONE'):
@@ -62,8 +63,8 @@ def wrap(layout, text, width=46, icon='NONE'):
 # ---------------------------------------------------------------------------------------------- data
 
 def status_rows(status) -> list[tuple[str, str]]:
-    """(icon, text) lines of a node's status record (§17.1): the status line, the row counts, the ETA, then every
-    problem, errors first."""
+    """(icon, text) lines of a node's status record (§17.1): the status line (its ETA included), the row counts, then
+    every other problem, errors first."""
     if status is None:
         return [('SORTTIME', "Waiting...")]
     rows = [(status.icon, status.text)]
@@ -74,29 +75,26 @@ def status_rows(status) -> list[tuple[str, str]]:
             ("in error", status.errors)) if n)
         total = f"{status.rows} row{'s' if status.rows != 1 else ''}"
         rows.append(('BLANK1', f"{total}: {counts}" if counts else total))
-    if status.eta_s is not None:
-        rows.append(('BLANK1', f"Done in {engine.eta_text(status.eta_s)}"))
-    return rows + [(PROBLEM_ICONS.get(problem.severity, 'INFO'), problem.message) for problem in status.problems]
+    return rows + [(PROBLEM_ICONS.get(problem.severity, 'INFO'), problem.message) for problem in status.problems
+                   if problem.message != status.text]  # an error's line is its first problem
 
 
 def table_rows(spec, job, entry=None) -> list[tuple]:
     """(name, answer, confidence or None, source) of each row of a context's table: from the entry it shows once it is
-    answered, else from its plan, whose pending rows have no answer yet."""
-    kinds = {src: source for source, src in SOURCES.items()}
-    if entry is not None and len(entry.rows.name) == len(job.rows):
-        table = [(kinds.get(entry.rows.src[i], "model"), {column: v[i] for column, v in entry.rows.v.items()})
-                 for i in range(len(job.rows))]
-    else:
-        table = [(row.source, dict(row.values)) for row in job.rows]
+    answered, else from its plan, whose pending rows have no answer yet. An empty material slot has neither."""
     rows = []
-    for i, (source, values) in enumerate(table):
+    for i, (source, values) in enumerate(table_of(job, entry)):
+        name = job.rows[i].name
+        if not name:  # never offered, so nothing was decided
+            rows.append((EMPTY_SLOT, "", None, source))
+            continue
         if not values or source == "error":
             answer = ""
         elif "prob" in values:  # Pick: how well each item fits
             answer = f"{values['prob'] * 100:.0f}%"
         else:
             answer = spec.answer_text(job, i, values)  # as the Overrides CSV writes it
-        rows.append((job.rows[i].name, answer, values.get("c"), source))
+        rows.append((name, answer, values.get("c"), source))
     return rows
 
 
@@ -146,12 +144,11 @@ def import_csv_notes() -> dict:
     """§7.1: csvfmt.identity() -> note, for each file an OpenAct node reads that one of the artist's own Import CSV
     nodes reads too. Blender keeps its first read of a path for the session, so after an edit that node shows old
     rows. Worked out once per pass, when drawn."""
-    if _NOTES[0] != engine.passes:
-        _NOTES[:] = [engine.passes, _import_csv_notes()]
-    return _NOTES[1]
+    return _import_csv_notes(engine.passes)
 
 
-def _import_csv_notes():
+@functools.lru_cache(maxsize=1)  # keyed by the pass
+def _import_csv_notes(_pass):
     notes, uses = {}, None
     if not WATCH.files:
         return notes
@@ -217,7 +214,7 @@ def draw_server(layout, banner=None):
         box.label(text=_TITLES.get(state, state), icon=_ICONS.get(state, 'QUESTION'))
         if message:
             wrap(box, message, icon='BLANK1')
-    if server.STATE.install_warning:
+    if server.STATE.install_warning and server.STATE.install_warning not in message:  # "Runtime installed. <it>"
         wrap(box, server.STATE.install_warning, icon='ERROR')
     health = server.STATE.health
     if state == "ready" and health:
@@ -270,13 +267,12 @@ def draw_preferences(prefs, context, layout):
     note.label(text="Qwen3.5-4B by Alibaba Qwen, Apache-2.0. Not affiliated with TypeSafe or Jev", icon='BLANK1')
 
 
-def draw_table(layout, context, node, uses):
-    """The selected context's table (§17.2), PAGE_ROWS rows a page: name, answer, confidence bar, source icon, and
+def draw_table(layout, context, node, uses, index):
+    """The table of context `index` (§17.2), PAGE_ROWS rows a page: name, answer, confidence bar, source icon, and
     Show Question."""
-    wm = context.window_manager
-    index = min(wm.openact_context, len(uses) - 1)
     label, job, entry = uses[index]
-    lines, page, pages = table_page(table_rows(engine.SPECS[node.bl_idname], job, entry), wm.openact_page)
+    lines, page, pages = table_page(table_rows(engine.SPECS[node.bl_idname], job, entry),
+                                    context.window_manager.openact_page)
     box = layout.box()
     head = box.row(align=True)
     head.label(text=f"Table: {label}" if len(uses) > 1 else "Table", icon='SPREADSHEET')

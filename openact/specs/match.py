@@ -155,11 +155,6 @@ class MatchSpec(PerItemSpec):
             return f"{len(values)} items · mean {mean:.2f} · {self.unsure(entry)} unsure"
         return f"{sum(p >= 0.5 for p in values)} of {len(values)} yes · {self.unsure(entry)} unsure"
 
-    def preview(self, entry):
-        """(item, answer) rows for the sidebar."""
-        amount = entry.answer_type == 'AMOUNT'
-        return [(name, f"{p:.2f}" if amount else f"{p * 100:.0f}% yes") for name, p in self.offered(entry, "p")]
-
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy
 

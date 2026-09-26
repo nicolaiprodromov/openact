@@ -138,11 +138,5 @@ class ClassifySpec(PerItemSpec):
         used = len({label for _name, label in rows if label >= 0})
         return f"{len(rows)} items · {used} label{'' if used == 1 else 's'} used · {self.unsure(entry)} unsure"
 
-    def preview(self, entry):
-        """(item, label name) rows for the sidebar."""
-        names = entry.shape.get("labels", [])
-        return [(name, names[label] if 0 <= label < len(names) else str(label))
-                for name, label in self.offered(entry, "label")]
-
     def build(self, b, gi, go, entries):
         b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])  # every output is a per-element column

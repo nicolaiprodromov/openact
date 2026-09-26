@@ -46,7 +46,6 @@ CLASH = ("'{}' and '{}' share every word but not their list (a collection, objec
 OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
 ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
          "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
-MS_PER_ROW = 21.0  # the ETA's rate until the server has measured one: a two-option row on an RTX 3090 (§5.4)
 
 STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
@@ -249,6 +248,7 @@ def run_pass(everything=True):
     _has_nodes = bool(nodes)
     _group_count = -1 if nodes else len(bpy.data.node_groups)
     if not nodes:
+        STATUS.clear()
         PLANS.clear()
         LAST_SHOWN.clear()
         LIVE.clear()
@@ -278,8 +278,9 @@ def run_pass(everything=True):
     for cache in (PLANS, LAST_SHOWN):  # contexts that disappeared, and nodes that did
         for key in [key for key in cache if key[1] not in contexts.get(key[0], ())]:
             del cache[key]
-    for uid in [uid for uid in LIVE if uid not in contexts]:
-        del LIVE[uid]
+    for cache in (LIVE, STATUS):  # nodes that disappeared: undo and deleting a node group call no node's free()
+        for uid in [uid for uid in cache if uid not in contexts]:
+            del cache[uid]
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
     redraw()
 
@@ -477,8 +478,8 @@ def _filling(uid):
     found = progress(uid) if progress is not None else None
     if not found or not found[1]:
         return "Asking...", None
-    done, total, ms_per_row = found
-    eta = max(total - done, 0) * (ms_per_row or server.STATE.health.get("ms_per_row") or MS_PER_ROW) / 1000
+    done, total, ms_per_row = found  # ms_per_row: per remaining cell, /health's rate and the §5.4 default folded in
+    eta = (total - done) * ms_per_row / 1000
     return f"Filling {done}/{total} · {eta_text(eta)}", eta
 
 
@@ -515,12 +516,18 @@ def answers_for(node):
     return status.uses if status is not None else []
 
 
+def ask_key_now(spec, debias):
+    """The ask key a row would be answered with now: templates, Balance Option Order and backend. "" until the model
+    server has reported its backend."""
+    model = pipeline.provenance(server.STATE.health)
+    return spec.ask_key(debias, model) if model else ""
+
+
 def older_settings(node, entry):
     """True when a row of the entry was asked with other templates, order balancing or backend than the node would
     use now. Unknown, so False, until the model server has reported its backend."""
-    model = pipeline.provenance(server.STATE.health)
-    current = SPECS[node.bl_idname].ask_key(node.balance_order, model)
-    return bool(model) and any(ask and ask != current for ask in entry.asks)  # "": code rows, no model asked
+    current = ask_key_now(SPECS[node.bl_idname], node.balance_order)
+    return bool(current) and any(ask and ask != current for ask in entry.asks)  # "": code rows, no model asked
 
 
 def reask(node):

@@ -19,6 +19,7 @@ KEY = ('INPUT', "Key", 'NodeSocketString',
        "Tells apart objects that share every other word, e.g. typed per object on the modifier. Compared, never "
        "sent to the model", "word", True)  # the last word of every node (§6.0), hidden until Ctrl H
 SOURCES = {"lock": "l", "code": "c", "model": "m", "pending": "p", "stale": "s", "error": "e"}  # Row.source -> src
+KINDS = {src: source for source, src in SOURCES.items()}  # src -> Row.source
 OVERRIDES = ("Optional Overrides CSV (.csv path). Rows with lock = 1 replace the model's answer and are never asked. "
              "Write Overrides CSV (sidebar) starts one from the current answers")
 UNSURE_BELOW = 0.30  # 4.e: the exported unsure column
@@ -132,10 +133,19 @@ def orphaned(jobs) -> list[str]:
 
 def stored_rows(entry) -> list[pipeline.Row]:
     """The answered rows of a stored entry: model and code rows (locks come from the Overrides CSV every time)."""
-    rows, kinds = entry.rows, {src: source for source, src in SOURCES.items()}
-    return [pipeline.Row(rows.name[i], wkey, kinds[rows.src[i]], {column: v[i] for column, v in rows.v.items()},
+    rows = entry.rows
+    return [pipeline.Row(rows.name[i], wkey, KINDS[rows.src[i]], {column: v[i] for column, v in rows.v.items()},
                          entry.asks[rows.ask[i]])
             for i, wkey in enumerate(rows.wkey) if wkey and rows.src[i] in "mc"]
+
+
+def table_of(job, entry=None) -> list[tuple[str, dict]]:
+    """(source, values) of each row of a context's table, as the table view, Show Question and the Overrides CSV show
+    it: from the entry it shows once it is answered, else from its plan, whose pending rows have no values yet."""
+    if entry is not None and len(entry.rows.name) == len(job.rows):
+        return [(KINDS.get(entry.rows.src[i], "model"), {column: v[i] for column, v in entry.rows.v.items()})
+                for i in range(len(job.rows))]
+    return [(row.source, dict(row.values)) for row in job.rows]
 
 
 class Spec:

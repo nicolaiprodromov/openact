@@ -121,7 +121,7 @@ class _OpenActNode:
         selected = min(context.window_manager.openact_context, len(uses) - 1) if uses else 0
         if uses:
             self.draw_answers(layout, uses, selected)
-            ui.draw_table(layout, context, self, uses)
+            ui.draw_table(layout, context, self, uses, selected)
         row = layout.row()
         row.enabled = self.id_data.library is None  # a linked node's answers come from its library file
         row.operator("openact.reask", icon='FILE_REFRESH').uid = self.uid

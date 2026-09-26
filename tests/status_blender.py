@@ -3,11 +3,13 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 - a fill: waiting -> filling -> complete; n/N and an ETA only when pipeline.progress() exists, else "Asking...";
 - the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to and an outcome never
   offered, more than 16 live word sets;
-- table_page(): rows, icons and paging; table_rows() of answered and pending tables;
-- the banner conditions, and live: a blocked read in an untrusted file, an Import CSV node on a file a node reads,
+- table_page(): rows, icons and paging; table_rows() of answered and pending tables and of an empty material slot;
+- the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
+  trust button lets every node make and a deleted node stops counting in, an Import CSV node on a file a node reads,
   the old Jev nodes hook, over-cap, and jev_nodes enabled (in stand-in preferences);
 - show_question returns exactly the state, instructions and options that the --record log shows for that row, and
-  asks nothing;
+  asks nothing; a row answered with older settings says so;
+- the pass drops the status records of nodes that are gone;
 - drawing the node body, the sidebar panels, the popup and the preferences into a stand-in layout: valid icons,
   operators and properties, paging, the install's VRAM warning, and nothing planned or written while drawing;
 - Open File opens CSV files only.
@@ -37,7 +39,7 @@ TMP = tempfile.mkdtemp(prefix="openact_status_")
 OUTSIDE = tempfile.mkdtemp(prefix="openact_status_outside_")  # outside the folder the .blend is saved in
 os.environ.setdefault("OPENACT_STATE_DIR", os.path.join(TMP, "state"))  # where the server writes its log
 
-from openact import csvfmt, engine, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
+from openact import csvfmt, engine, lists, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402
 from openact.specs.classify import ClassifySpec  # noqa: E402
@@ -211,9 +213,8 @@ def phase_eta():
                                 ("Asking...", None), ("Asking...", None)], got)
     rows = ui.status_rows(engine.NodeStatus("filling", "Filling 12/50 · ~2 s", rows=50, answered=12, pending=38,
                                             eta_s=1.52))
-    check("status_rows: the filling line, the row counts, and the ETA",
-          rows == [('SORTTIME', "Filling 12/50 · ~2 s"), ('BLANK1', "50 rows: 12 answered, 38 pending"),
-                   ('BLANK1', "Done in ~2 s")], rows)
+    check("status_rows: the filling line with its ETA, then the row counts",
+          rows == [('SORTTIME', "Filling 12/50 · ~2 s"), ('BLANK1', "50 rows: 12 answered, 38 pending")], rows)
 
 
 # --------------------------------------------------------------------------------------- Show Question
@@ -251,6 +252,17 @@ def phase_question(pick, ask):
           result == {'FINISHED'} and len(recorded()) == before and not pipeline.PENDING
           and f"State: {found['state']}" in text and "Question (noul): Is it soft?" in text
           and "Answered with ask key" in text, (result, len(recorded()) - before, text))
+
+    ask.balance_order = False  # words keys hold no Balance Option Order: the answer asked with it on is kept
+    settle(lambda: state(ask) == "complete" and not status(ask).uses[0][1].debias, 30)
+    found = ops.row_question(ask, 0, 0)
+    text = ops.question_text(found)
+    check("show_question: a row answered with Balance Option Order on, shown once it is off, says it was answered "
+          "with older settings and that this is what would be sent now; nothing is asked",
+          len(recorded()) == before and found["older"] and not found["debias"] and "Balance Option Order: off" in text
+          and "Answered with older settings" in text and "Answered with ask key" not in text, text)
+    ask.balance_order = True
+    settle(lambda: state(ask) == "complete" and status(ask).uses[0][1].debias, 30)
 
     solo = pick.id_data.nodes.new(engine.PICK_ID)
     solo.inputs["Prompt"].default_value = "something to hold"
@@ -306,6 +318,15 @@ def phase_table(pick, ask):
     check("table_rows: an answered Ask lists its question, yes or no, and its confidence",
           got == [("Is it soft?", "yes" if entry.single["Answer"] >= 0.5 else "no", entry.rows.v["c"][0], "model")],
           got)
+    spec = engine.SPECS[engine.PICK_ID]
+    slots = spec.job(("Something shiny", ""), [lists.Item("Steel"), lists.Item("", offered=False),
+                                                lists.Item("Gold")], True)
+    got, text = ui.table_rows(spec, slots)[1], ops.question_text({"name": "", "source": "code", "state": None})
+    check("table: an empty material slot is listed as one, with no answer or confidence; Show Question says it is "
+          "never offered", got == (ui.EMPTY_SLOT, "", None, "code")
+          and text == f"Row: {ui.EMPTY_SLOT}\n{ops.NEVER_OFFERED}", (got, text))
+    kept = [each.label for each in engine.SPECS.values() if hasattr(each, "preview")]
+    check("table: it replaced the Match and Classify previews, so no spec keeps a preview()", not kept, kept)
 
 
 # --------------------------------------------------------------------------------- warning and error lines
@@ -342,9 +363,10 @@ def phase_lines():
     check("warning line: status_rows lists the warning with the triangle", ('ERROR', warning) in ui.status_rows(got),
           ui.status_rows(got))
     got = status(broken)
-    check("error line: a missing CSV is an error with the CANCEL icon, which status_rows lists",
+    check("error line: a missing CSV is an error with the CANCEL icon, which status_rows lists once",
           got.state == "error" and got.icon == 'CANCEL' and got.text.startswith("Can't find ")
-          and got.text.endswith("missing.csv") and ('CANCEL', got.text) in ui.status_rows(got), got)
+          and got.text.endswith("missing.csv") and ui.status_rows(got).count(('CANCEL', got.text)) == 1,
+          ui.status_rows(got))
     got, entry = status(rules), S.load(rules).entries[0]
     check("Rules: cells no outcome applies to give the error line, and the rest of the table still shows",
           got.state == "error" and got.text == "No outcome applies to state=alive, neighbours=0; state=alive, "
@@ -464,37 +486,76 @@ def phase_import_csv(tree, answers):
 
 
 def phase_trust():
-    """An untrusted .blend whose node reads a CSV outside its folder (§16.1)."""
+    """An untrusted .blend whose Ask and Rules nodes read CSVs outside its folder (§16.1). The banner counts the
+    blocked reads of the nodes that exist, and either button lets every node read its CSVs: the trust state is in
+    every plan's fingerprint, so the pass plans them again, the Rules node too."""
     far = write(OUTSIDE, "far.csv", "answer,when\nyes,It is far.\nno,It is near.\n")
     tree = new_tree("Trust")
     reader = tree.nodes.new(engine.ASK_ID)
     reader.inputs["Question"].default_value = "Is it far?"
     reader.inputs["Answers"].default_value = far
+    rules = tree.nodes.new(RulesSpec.idname)
+    rules.inputs["Question"].default_value = "Which one?"
+    rules.inputs["Factors"].default_value = write(OUTSIDE, "far_factors.csv", "factor,kind,level,when\n"
+                                                  "heat,amount,cold,Cold.\nheat,amount,hot,Hot.\n")
+    rules.inputs["Outcomes"].default_value = write(TMP, "near_outcomes.csv", "answer,when\nA,The first.\n"
+                                                   "B,The second.\n")
     user("Truster", tree)
+    gone = new_tree("Gone")  # a second tree, deleted while its read is blocked
+    stale = gone.nodes.new(engine.ASK_ID)
+    stale.inputs["Question"].default_value = "Is it gone?"
+    stale.inputs["Answers"].default_value = write(OUTSIDE, "gone.csv", "answer,when\nyes,It is gone.\nno,It stays.\n")
     blend = os.path.join(TMP, "status.blend")
     bpy.ops.wm.save_as_mainfile(filepath=blend)
-    trust.TRUST["opened"] = blend  # as if opened from disk, without Auto Run: not trusted
+    trust.TRUST["opened"] = blend  # as if opened from disk: not trusted
     engine.schedule(immediate=True)
-    settle(lambda: state(reader) == "error", 30)
+    blocked = (reader, rules, stale)
+    settle(lambda: all(status(node) and status(node).text.startswith(trust.BLOCKED) for node in blocked), 30)
+
+    def trust_banner(count):
+        return [("trust", 'ERROR', f"This file is not trusted, so {count} reads outside its folder were blocked",
+                 ("openact.allow_file", "openact.trust_folder"))]
+
     found = [banner for banner in ui.live_banners(bpy.context) if banner[0] == "trust"]
-    check("trust banner: a read blocked in an untrusted file shows it, with Allow This File and Trust This Folder",
-          not trust.is_trusted() and status(reader).text.startswith(trust.BLOCKED) and found == [
-              ("trust", 'ERROR', "This file is not trusted, so 1 read outside its folder was blocked",
-               ("openact.allow_file", "openact.trust_folder"))], (found, status(reader)))
+    check("trust banner: reads blocked in an untrusted file show it, with Allow This File and Trust This Folder",
+          not trust.is_trusted() and all(state(node) == "error" for node in blocked) and found == trust_banner(3),
+          (found, [status(node) for node in blocked]))
+    uid = stale.uid
+    bpy.data.node_groups.remove(gone)  # frees no node, as an undo that takes a node away
+    engine.run_pass()
+    found = [banner for banner in ui.live_banners(bpy.context) if banner[0] == "trust"]
+    check("trust banner: a deleted node's blocked read no longer counts: the pass drops its status record",
+          uid not in engine.STATUS and found == trust_banner(2), (found, uid in engine.STATUS))
+
     bpy.ops.openact.allow_file()
     check("trust banner: gone once the file is allowed", trust.is_trusted() and "trust" not in banner_kinds(),
           banner_kinds())
+    engine.schedule(immediate=True)
+    settle(lambda: state(reader) == state(rules) == "complete", 30)
+    check("Allow This File: the pass plans the blocked nodes again, and each reads its CSV, the Rules node's Factors "
+          "CSV too", state(reader) == state(rules) == "complete" and bool(S.load(rules).entries),
+          (status(reader), status(rules)))
     P._Defaults.trusted_files.clear()
+    engine.schedule(immediate=True)
+    settle(lambda: status(rules).text.startswith(trust.BLOCKED), 30)
+    check("trust: no longer allowed, the reads are blocked again",
+          all(status(node).text.startswith(trust.BLOCKED) for node in (reader, rules)), (status(reader), status(rules)))
     result = bpy.ops.openact.trust_folder()
     check("Trust This Folder: trusts the .blend's folder, and the banner goes",
           result == {'FINISHED'} and P._Defaults.trusted_folders == [os.path.dirname(os.path.normpath(blend))]
           and trust.is_trusted() and "trust" not in banner_kinds(), P._Defaults.trusted_folders)
     engine.schedule(immediate=True)
-    settle(lambda: state(reader) == "complete", 30)
-    check("trust: once trusted, the far CSV is read and the node is answered", state(reader) == "complete",
-          status(reader))
+    settle(lambda: state(reader) == state(rules) == "complete", 30)
+    check("Trust This Folder: the pass plans them again too, and each reads its CSV, the Rules node's too",
+          state(reader) == state(rules) == "complete", (status(reader), status(rules)))
     P._Defaults.trusted_folders.clear()
     trust.TRUST["opened"] = ""  # created in this session again
+
+    for group in list(bpy.data.node_groups):
+        bpy.data.node_groups.remove(group)
+    engine.run_pass()
+    check("status: with no OpenAct node left, the pass keeps no status record", not engine.STATUS,
+          list(engine.STATUS))
 
 
 # ------------------------------------------------------------------------------------------ drawing
@@ -608,12 +669,18 @@ def phase_draw(pick, warned):
     check("draw: the preferences, and the Model box with the not-installed banner and its buttons",
           "Model ready" in log and "[openact.install_runtime]" in log and "[openact.locate_runtime]" in log, log)
     server.STATE.install_warning = "Warning: the GPU has 8 GB of VRAM"
+    status_of = server.status
     try:
         log = drawn(lambda layout: ui.draw_server(layout))
+        server.status = lambda: ("stopped", "Runtime installed. Warning: the GPU has 8 GB of VRAM")  # auto start off
+        installed = drawn(lambda layout: ui.draw_server(layout))
     finally:
+        server.status = status_of
         server.STATE.install_warning = ""
     check("draw: the Model box keeps the install's VRAM warning after the status moved on",
           "Warning: the GPU has 8 GB of VRAM" in log and "Model ready" in log, log)
+    check("draw: ...and shows it once while the status message still holds it",
+          "Model stopped" in installed and sum("8 GB" in str(entry) for entry in installed) == 1, installed)
 
     ctx.space_data.edit_tree = tree
     tree.nodes.active = match

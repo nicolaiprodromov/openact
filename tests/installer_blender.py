@@ -375,9 +375,11 @@ def phase_hashes():
               len(FAKE.uv_envs) == 4 and all(env.get("UV_NO_CONFIG") == "1" and "UV_LINK_MODE" not in env
                                              for env in FAKE.uv_envs),
               [(env.get("UV_NO_CONFIG"), env.get("UV_LINK_MODE")) for env in FAKE.uv_envs])
-        check("install: an 8 GB GPU's warning stays in the final status",
+        check("install: an 8 GB GPU's warning stays in the final status, and in STATE.install_warning, which the "
+              "Model box keeps after the status moves on",
               state[0] == "stopped" and state[1].startswith("Runtime installed. Warning: the GPU has 8 GB of VRAM")
-              and P.runtime_installed(root), state)
+              and server.STATE.install_warning.startswith("Warning: the GPU has 8 GB of VRAM")
+              and P.runtime_installed(root), (state, server.STATE.install_warning))
 
         FAKE.reset()
         FAKE.files[uv_url] = archive

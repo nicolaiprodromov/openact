@@ -13,13 +13,14 @@ import bpy
 from . import csvfmt, engine, lists, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Hint, Pending, Unresolvable
-from .specs.base import SOURCES, UNSURE_BELOW
+from .specs.base import UNSURE_BELOW, table_of
 
 PERMISSION = "Close the file in the other program (e.g. Excel) and try again."
 EXPORTED = ("answer", "lock", "model_answer", "confidence", "unsure", "source")  # after the key columns (§7.6)
 NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
               "code": "Decided by code (one option applies): never sent to the model",
               "error": "No outcome applies to this cell: never sent to the model"}
+NEVER_OFFERED = "An empty material slot: never offered or sent"  # a code row without a name
 
 
 class OverridesError(Exception):
@@ -168,7 +169,7 @@ class OPENACT_OT_allow_file(bpy.types.Operator):
 
     def execute(self, context):
         trust.allow(bpy.data.filepath)
-        engine.schedule(immediate=True)  # the reads that were blocked
+        engine.schedule(immediate=True)  # trust is in every plan's fingerprint: the pass plans blocked reads again
         return {'FINISHED'}
 
 
@@ -184,7 +185,7 @@ class OPENACT_OT_trust_folder(bpy.types.Operator):
 
     def execute(self, context):
         trust.allow(bpy.data.filepath, folder=True)
-        engine.schedule(immediate=True)  # the reads that were blocked
+        engine.schedule(immediate=True)  # as Allow This File: the pass plans blocked reads again
         return {'FINISHED'}
 
 
@@ -212,30 +213,31 @@ class OPENACT_OT_open_file(bpy.types.Operator):
 def row_question(node, context=0, row=0) -> dict:
     """What row `row` of the node's context `context` asks the model, from the plan its last pass cached: its source
     ("lock", "code" and "error" rows are never sent), the state, question type, instructions, options in the order
-    sent and debias, as sent or as they would be sent, the cell key, and the ask key it was answered with ("" when not
-    answered). Asks nothing. Raises ValueError when there is no such row."""
+    sent and debias, as sent or as they would be sent now, the cell key, the ask key it was answered with ("" when not
+    answered), and whether that ask key is older than the one it would be answered with now. Asks nothing. Raises
+    ValueError when there is no such row."""
     uses = engine.answers_for(node)
     if not 0 <= context < len(uses):
         raise ValueError("This context has no table yet")
     _label, job, entry = uses[context]
     if not 0 <= row < len(job.rows):
         raise ValueError(f"The table has no row {row + 1}")
-    planned, source, ask = job.rows[row], job.rows[row].source, ""
-    if entry is not None and len(entry.rows.name) == len(job.rows):
-        source = {src: name for name, src in SOURCES.items()}.get(entry.rows.src[row], source)
-        ask = entry.asks[entry.rows.ask[row]] if source == "model" else ""
-    cell = planned.cell
+    planned, source = job.rows[row], table_of(job, entry)[row][0]
+    ask = entry.asks[entry.rows.ask[row]] if source == "model" and entry is not None else ""
+    now, cell = engine.ask_key_now(engine.SPECS[node.bl_idname], job.debias), planned.cell
     return {"name": planned.name, "source": source, "debias": job.debias, "ask": ask,
-            "state": cell and cell.state, "type": cell and cell.question["type"],
-            "instructions": cell and cell.question["instructions"], "options": cell and cell.question.get("criteria"),
-            "key": cell and cell.key}
+            "older": bool(ask and now and ask != now), "state": cell and cell.state,
+            "type": cell and cell.question["type"], "instructions": cell and cell.question["instructions"],
+            "options": cell and cell.question.get("criteria"), "key": cell and cell.key}
 
 
 def question_text(found) -> str:
-    """row_question() as the Show Question popup writes it: every text exactly as sent."""
-    lines = [f"Row: {found['name']}"]
+    """row_question() as the Show Question popup writes it: every text exactly as sent, or as it would be sent now for
+    a row not answered yet or answered with older settings."""
+    lines = [f"Row: {found['name'] or ui.EMPTY_SLOT}"]
     if found["state"] is None:
-        return "\n".join([*lines, NEVER_SENT.get(found["source"], "Never sent to the model")])
+        reason = NEVER_SENT.get(found["source"], "Never sent to the model") if found["name"] else NEVER_OFFERED
+        return "\n".join([*lines, reason])
     lines += [f"State: {found['state']}", f"Question ({found['type']}): {found['instructions']}"]
     options = found["options"]
     if options is None:  # a Yes/No question without whens: the server offers these
@@ -244,8 +246,12 @@ def question_text(found) -> str:
         pairs = options.items() if isinstance(options, dict) else enumerate(options)
         lines += ["Options, in the order sent:", *(f"  {key}: {text}" for key, text in pairs)]
     lines.append("Balance Option Order: " + ("on (asked in both option orders)" if found["debias"] else "off"))
-    lines.append(f"Answered with ask key {found['ask'][:12]}" if found["ask"] else
-                 "Not answered yet: this is what would be sent")
+    if found["older"]:  # the templates, Balance Option Order or backend changed since it was answered
+        lines.append(f"Answered with older settings (templates, Balance Option Order or backend; ask key "
+                     f"{found['ask'][:12]}): this is what would be sent now. Ask Again re-asks it")
+    else:
+        lines.append(f"Answered with ask key {found['ask'][:12]}" if found["ask"] else
+                     "Not answered yet: this is what would be sent")
     return "\n".join(lines)
 
 
@@ -360,12 +366,7 @@ def merged_rows(spec, job, entry, path, delimiter):
         for row in doc.rows:
             cells = {column.casefold(): cell for column, cell in zip(doc.header, row)}
             old.setdefault(csvfmt.KEY_SEP.join(cells.get(k.casefold(), "").casefold() for k in keys), cells)
-    kinds = {src: source for source, src in SOURCES.items()}
-    if entry is not None and len(entry.rows.name) == len(job.rows):
-        table = [(kinds.get(entry.rows.src[i], "model"), {column: v[i] for column, v in entry.rows.v.items()})
-                 for i in range(len(job.rows))]
-    else:  # not answered yet: lock and code rows have their values, the others are pending
-        table = [(row.source, dict(row.values)) for row in job.rows]
+    table = table_of(job, entry)
 
     def locked(cells):
         return cells.get("lock", "").casefold() in csvfmt.LOCKED
