@@ -170,9 +170,13 @@ class Spec:
         return None
 
     def fingerprint(self, node, ctx) -> str:
-        """Everything plan() reads, hashed: while it is unchanged, the Job planned from it still holds (§5.3)."""
+        """Everything plan() reads, hashed: while it is unchanged, the Job planned from it still holds (§5.3). The
+        trust state is part of it, as it decides which files plan() may read (§16.1)."""
+        from .. import trust  # imports bpy
+
         return pipeline.digest(self.name, self.PROMPT_VERSION, self.gn(node, ctx), getattr(node, "answer_type", ""),
-                               node.balance_order, self.listed(node, ctx), self.overrides_stamp(node, ctx))
+                               node.balance_order, self.listed(node, ctx), self.overrides_stamp(node, ctx),
+                               trust.is_trusted())
 
     def plan(self, node, ctx) -> pipeline.Job:
         """The node's Job in ctx. Raises Hint, Pending or Unresolvable."""

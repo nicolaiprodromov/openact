@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-import os
 
 from .. import csvfmt, pipeline, rules_core
 from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, named, number_text, overrides_inputs, warnings
@@ -133,18 +132,18 @@ class RulesSpec(Spec):
     # ------------------------------------------------------------------ planning
 
     def listed(self, node, ctx):
-        """The CSV files plan() reads, by path and stamp, so an edit plans again (§5.3)."""
+        """The CSV files plan() reads, by path and stamp as read, so an edit plans again (§5.3), and so does a file
+        that becomes readable or is no longer blocked."""
         from .. import lists
         from ..evaluator import Hint, Pending, Unresolvable
 
         seen = []
-        for name in ("Factors", "Outcomes"):
+        for name, schema in (("Factors", "factors"), ("Outcomes", "answer_set")):
             try:
                 source = lists.csv_source(node, name, ctx)
-                path = lists.resolve_path(source.path, node) if source is not None else ""
-                stat = os.stat(path) if path else None
-                seen.append([path, source and source.delimiter, stat and stat.st_mtime_ns, stat and stat.st_size])
-            except (Hint, Pending, Unresolvable, OSError) as error:
+                doc = lists.load_csv(node, source, schema) if source is not None else None
+                seen.append(doc and [doc.path, source.delimiter, list(doc.stamp)])
+            except (Hint, Pending, Unresolvable) as error:
                 seen.append(str(error))
         return seen
 
