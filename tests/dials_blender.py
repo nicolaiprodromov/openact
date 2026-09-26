@@ -3,7 +3,8 @@
 Without arguments no model is needed: fake answers stand in for it. The weather settings plan into one request; the
 one-row-per-entry table object gives each output its setting's answer, Amount mapped into min-max; a min/max edit is
 a values-only update with 0 requests; two contexts with different ranges each get their own values; different setting
-names give the shape-agreement error; an output drives Grid's Vertices X through a valid link; renaming a setting warns.
+names give the shape-agreement error; an output drives Grid's Vertices X through a valid link; renaming a setting warns
+(in the CSV or inline), and renaming it back brings its output back.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -132,16 +133,15 @@ def asking(calls):
 
 
 @contextlib.contextmanager
-def values_first(rebuilt):
-    """The pass wiring of §8.8: update_values() first, build() only when it refuses (rebuilt nodes are listed)."""
+def rebuilds(rebuilt):
+    """Lists the nodes the passes inside rebuild: they call build() only when update_values() refuses (§8.8)."""
     build = inner.build
 
-    def wired(node_, store_, live=None, default=None):
-        if not inner.update_values(node_, store_, live, default):
-            rebuilt.append(node_.name)
-            build(node_, store_, live, default)
+    def recorded(node_, store_, live=None, default=None):
+        rebuilt.append(node_.name)
+        build(node_, store_, live, default)
 
-    inner.build = wired
+    inner.build = recorded
     try:
         yield
     finally:
@@ -196,12 +196,19 @@ def phase_nomodel():
           names)
     check("status: the node sums up its settings", engine.STATUS[node.uid] == (
         'CHECKMARK', "5 settings · lowest confidence 0.50"), engine.STATUS.get(node.uid))
+    weather("a.csv", ("\nFog,", "\n\nFog,"))  # a blank line between rows: a warning, the settings still usable
+    with asking(calls):
+        settle()
+    icon, text = engine.STATUS[node.uid]
+    check("status: a Settings CSV warning shows before the summary, and nothing is asked",
+          icon == 'ERROR' and text.startswith("a.csv line 6: Line 6 is blank")
+          and text.endswith("(5 settings · lowest confidence 0.50)") and not calls, (icon, text, len(calls)))
 
     # a min/max edit: the rows carry over (their wkeys hold no min/max), the shape changes, the graph doesn't
     before, rebuilt = pointers(node), []
     weather("a.csv", (",0,30", ",10,50"))
     calls.clear()
-    with asking(calls), values_first(rebuilt):
+    with asking(calls), rebuilds(rebuilt):
         settle()
     ranges = [(s["name"], s["min"], s["max"]) for s in S.load(node).entries[0].shape["settings"]][1]
     check("min/max edit: 0 requests, a values-only update (no rebuild), stored as the entry's shape.settings",
@@ -238,6 +245,17 @@ def phase_nomodel():
           engine.STATUS[node.uid][0] == 'CHECKMARK' and not calls and read(users["B"])["Wind speed"] == 75.0,
           (engine.STATUS[node.uid], len(calls)))
 
+    # with two entries too: the pass replaces the entry in place, so the graph's entry order holds
+    before, rebuilt = pointers(node), []
+    weather("a.csv", (",0,30", ",20,60"))
+    calls.clear()
+    with asking(calls), rebuilds(rebuilt):
+        settle()
+    got = read(users["A"])
+    check("min/max edit, two entries: still values only (20 + 0.75 x 40)",
+          not calls and not rebuilt and pointers(node) == before and got["Wind speed"] == 50.0,
+          (len(calls), rebuilt, got))
+
     phase_grid(csv_a)
 
     # renaming a linked setting replaces its socket, drops the link and warns
@@ -249,6 +267,32 @@ def phase_nomodel():
     check("rename: the node warns once, and the renamed setting gets a new socket",
           dials.WARNINGS.get(node.uid) == "Setting 'Fog' renamed or retyped: reconnect its output"
           and "Mist" in names and "Fog" not in names and not calls, (dials.WARNINGS.get(node.uid), names, len(calls)))
+    phase_inline()
+
+
+def phase_inline():
+    """An inline rename changes the words: the new entry is appended while the old one stays, just left. Both get the
+    pass's t stamp, so the outputs must follow the one that shows (a tie once picked the old one)."""
+    inline = "Rain (yes/no): Is it raining?; {} (amount): How foggy is it?"
+    tree, node, users = scene("DialsInline", [("I", STORM, inline.format("Fog"))])
+    calls = []
+    with asking(calls):
+        settle()  # the cells are the CSV's: cached
+    wire(tree, node)
+    words(users["I"], Settings=inline.format("Mist"))
+    with asking(calls):
+        settle()
+    names = [s.name for s in node.outputs]
+    check("inline rename: the outputs follow the entry that shows, and the node warns",
+          names == ["Rain", "Mist", "Confidence"] and len(S.load(node).entries) == 2 and not calls
+          and dials.WARNINGS.get(node.uid) == "Setting 'Fog' renamed or retyped: reconnect its output",
+          (names, dials.WARNINGS.get(node.uid), len(calls)))
+    words(users["I"], Settings=inline.format("Fog"))  # back to the stored entry: the store itself doesn't change
+    with asking(calls):
+        settle()
+    names = [s.name for s in node.outputs]
+    check("inline rename back: the stored entry's outputs return, with 0 requests",
+          names == ["Rain", "Fog", "Confidence"] and not calls, (names, len(calls)))
 
 
 def phase_grid(csv):

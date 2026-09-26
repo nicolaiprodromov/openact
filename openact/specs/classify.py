@@ -6,7 +6,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline, store
-from .base import KEY, confidence
+from .base import KEY, confidence, warnings
 from .match import PerItemSpec
 
 
@@ -74,7 +74,9 @@ class ClassifySpec(PerItemSpec):
             # the payload outputs follow the Labels CSV; the rebuild lays their columns out at once
             inner.sync_interface(node, self.interface(node, payload))
             inner.build(node, store.load(node))
-        return self.job(gn, items, labels, node.balance_order, node.uid)
+        job = self.job(gn, items, labels, node.balance_order, node.uid)
+        job.problems = warnings(items.problems + labels.problems)  # the pass shows them (§17.1)
+        return job
 
     def job(self, gn, items, labels, debias, uid=""):
         """The Job for these words, items (an ItemList or its items) and labels. Pure, like Ask's and Pick's."""
