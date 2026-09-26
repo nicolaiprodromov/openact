@@ -2,15 +2,17 @@
 
 No bpy and no model. tests/fixtures/jev_v010_entries.json holds the exact entries strings that the
 v0.1.0 prototype's set_entries() wrote for Ask Yes/No, Ask Amount, Pick from text and Pick from a
-collection.
+collection, once with an empty Items text and once with Items text that the collection overrode.
 
 Run:  python tests/store_test.py
       blender -b --factory-startup --python tests/store_test.py
 """
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import sys
 
@@ -29,6 +31,8 @@ def import_store():
 
 store = import_store()
 NodeStore, MB, SOFT_CAP = store.NodeStore, store.MB, store.SOFT_CAP
+EMPTY = '{"schema":2,"entries":[]}'
+KEPT = "live and pinned contexts are kept; pin fewer word sets to shrink the file"
 with open(os.path.join(ROOT, "tests", "fixtures", "jev_v010_entries.json"), encoding="utf-8") as handle:
     V010 = json.load(handle)
 
@@ -44,12 +48,34 @@ def size_of(node):
     return len(node.entries.encode("utf-8"))
 
 
+def mb(size):
+    """Megabytes as the notes give them: rounded up to 0.1."""
+    return f"{math.ceil(size * 10 / MB) / 10:.1f}"
+
+
 def words(entries):
     return [entry.gn[0] for entry in entries]
 
 
 def gn(first):
     return (first, "", "//factors.csv", "//outcomes.csv", "", "")
+
+
+def saving(node, kept, live_gns=None):
+    """The ValueError that save() raises, or None."""
+    try:
+        store.save(node, kept, live_gns)
+    except ValueError as error:
+        return error
+    return None
+
+
+def loading(text):
+    """The first words of the entries that load() returns, or the exception it raises."""
+    try:
+        return words(store.load(Node(text)).entries)
+    except Exception as error:  # noqa: BLE001  (a raising load() is the failure being checked)
+        return error
 
 
 def rules(first, t, rows, pinned=False):
@@ -87,7 +113,7 @@ def life():
 
 
 def phase_conversion():
-    for case in ("ask_yes_no", "ask_amount", "pick_text", "pick_collection"):
+    for case in ("ask_yes_no", "ask_amount", "pick_text", "pick_collection", "pick_collection_and_text"):
         old = json.loads(V010[case])
         node = Node(V010[case])
         new = store.load(node).entries
@@ -107,8 +133,9 @@ def phase_conversion():
                   all(e.single == {"Answer": o["a"]["value"], "Yes": o["a"]["value"] >= 0.5,
                                    "Confidence": o["a"]["confidence"]} for e, o in pairs), [e.single for e in new])
         else:
-            check(f"{case}: gn (Prompt, Items) becomes (Prompt, '', Items, '', '')",
-                  all(e.gn == (o["gn"][0], "", o["gn"][1], "", "") for e, o in pairs), [e.gn for e in new])
+            check(f"{case}: gn (Prompt, Items) becomes (Prompt, '', Items, '', ''), with no Items for a collection",
+                  all(e.gn == (o["gn"][0], "", "" if o["a"]["collection"] else o["gn"][1], "", "") for e, o in pairs),
+                  [e.gn for e in new])
             check(f"{case}: kind pick, answer type ONE_OF",
                   all((e.kind, e.answer_type) == ("pick", "ONE_OF") for e in new))
             check(f"{case}: single holds Index, Item and Confidence",
@@ -128,10 +155,13 @@ def phase_conversion():
 
     answers = [e.single["Yes"] for e in store.load(Node(V010["ask_yes_no"])).entries]
     check("ask_yes_no: the fixture has a Yes and a No", answers == [True, False], answers)
-    lamp = [(e.gn, e.rows.name) for e in store.load(Node(V010["pick_collection"])).entries]
-    check("pick_collection: Items stays empty, and the rows are the collection's children",
-          lamp == [(("something that gives light", "", "", "", ""),
-                    ["Armchair", "Bookshelf", "Floor Lamp", "Rug", "Table"])], lamp)
+    for case, prompt, text in (("pick_collection", "something that gives light", ""),
+                               ("pick_collection_and_text", "something to put a cup on", "tray, saucer")):
+        stored = json.loads(V010[case])[0]["gn"][1]
+        new = [(e.gn, e.rows.name) for e in store.load(Node(V010[case])).entries]
+        check(f"{case}: the Items text {text!r} is left out, and the rows are the collection's children",
+              stored == text and new == [((prompt, "", "", "", ""),
+                                          ["Armchair", "Bookshelf", "Floor Lamp", "Rug", "Table"])], new)
 
 
 def phase_round_trip():
@@ -199,6 +229,29 @@ def phase_soft_cap():
           kept.note == f"{dropped} old context{'s' if dropped > 1 else ''} dropped to keep the file small", kept.note)
 
 
+def phase_both_caps():
+    live = rules("live", 1, 2000)
+    old = [rules(f"old {i}", 10 + (7 * i) % 20, 2000) for i in range(20)]
+    by_age = sorted(old, key=lambda e: e.t)
+    recent = Node()
+    store.save(recent, NodeStore([live, *by_age[-store.MAX_ENTRIES:]]))
+    check("both caps: live and the 16 most recent others still exceed 2 MB", size_of(recent) > SOFT_CAP,
+          size_of(recent))
+    kept, node = NodeStore(old[:10] + [live] + old[10:]), Node()
+    store.save(node, kept, frozenset({gn("live")}))
+    others = [e for e in kept.entries if e.gn[0] != "live"]
+    check("both caps: keeps live and the most recent others that fit",
+          "live" in words(kept.entries) and 0 < len(others) < store.MAX_ENTRIES
+          and set(words(others)) == set(words(by_age[-len(others):])), words(kept.entries))
+    check("both caps: the node fits 2 MB", size_of(node) <= SOFT_CAP, size_of(node))
+    probe = Node()
+    store.save(probe, NodeStore(kept.entries + [by_age[-len(others) - 1]]))
+    check("both caps: evicts no more than needed", size_of(probe) > SOFT_CAP, size_of(probe))
+    drops = store.MAX_ENTRIES - len(others)
+    check("both caps: the note counts only the drops for 2 MB",
+          kept.note == f"{drops} old context{'s' if drops > 1 else ''} dropped to keep the file small", kept.note)
+
+
 def phase_precedence():
     live = [rules(f"live {i}", 10 + i, 4096) for i in range(4)]
     pinned = [rules(f"pinned {i}", 1 + i, 4096, pinned=True) for i in range(4)]
@@ -207,20 +260,22 @@ def phase_precedence():
     entries = [others[0], live[0], pinned[0], others[1], live[1], live[2], pinned[1], others[2], pinned[2],
                others[3], live[3], pinned[3], others[4], others[5]]
     live_gns = frozenset(gn(f"live {i}") for i in range(4))  # built from the words, as the pass will
-    alone = Node()
-    store.save(alone, NodeStore(live + pinned))
+    alone, both = Node(), NodeStore(live + pinned)
+    store.save(alone, both, live_gns)
     check("precedence: live and pinned entries alone exceed 2 MB", size_of(alone) > SOFT_CAP, size_of(alone))
+    check("precedence: with nothing to drop, the note gives the size",
+          both.note == f"entries use {mb(size_of(alone))} MB: {KEPT}", both.note)
 
     kept, node = NodeStore(list(entries)), Node()
     store.save(node, kept, live_gns)
-    size = size_of(node)
     check("precedence: every live and pinned entry is kept, and every warm and cold one evicted",
           words(kept.entries) == [first for first in words(entries) if not first.startswith("old")],
           words(kept.entries))
     check("precedence: the node holds exactly what save() kept", store.load(node).entries == kept.entries)
-    check("precedence: the size is reported",
-          size > SOFT_CAP and kept.note == f"entries use {size / MB:.1f} MB: live and pinned contexts are kept; "
-                                           "pin fewer word sets to shrink the file", kept.note)
+    check("precedence: the note reports the drops and the size",
+          size_of(node) > SOFT_CAP
+          and kept.note == f"{len(others)} old contexts dropped; entries still use {mb(size_of(node))} MB: {KEPT}",
+          kept.note)
 
     kept, node = NodeStore(list(entries)), Node()
     store.save(node, kept)
@@ -237,32 +292,69 @@ def phase_hard_cap():
     store.save(node, NodeStore([fits]))
     check("hard cap: an entry within 4 MB is saved", store.load(node).entries == [fits], size_of(node))
     before, kept = node.entries, NodeStore([fits, huge])
-    try:
-        store.save(node, kept, frozenset({gn("fits"), gn("huge")}))
-        error = None
-    except ValueError as raised:
-        error = raised
-    check("hard cap: an entry above 4 MB is an error, even when live", error is not None, error)
+    error = saving(node, kept, frozenset({gn("fits"), gn("huge")}))
+    check("hard cap: an entry above 4 MB is an error, even when live, and its size rounds up",
+          error is not None and "(4.1 MB; the limit is 4 MB)" in str(error), error)
     check("hard cap: then nothing is written or evicted", node.entries == before and kept.entries == [fits, huge])
 
 
 def phase_damaged():
     for label, text in (("the node default '[]'", "[]"), ("an empty string", ""), ("broken JSON", '{"schema": 2, "en'),
-                        ("an unknown schema", '{"schema": 3, "entries": []}'), ("a JSON string", '"entries"')):
+                        ("a store without a schema", '{"entries": []}'), ("a JSON string", '"entries"')):
         check(f"damaged: {label} loads as an empty store", store.load(Node(text)) == NodeStore())
-    good = store.load(Node(V010["ask_yes_no"])).entries[0]
+
+    ask, pick = (store.load(Node(V010[case])).entries[0] for case in ("ask_yes_no", "pick_text"))
     written = Node()
-    store.save(written, NodeStore([good]))
-    raw = json.loads(written.entries)["entries"][0]
-    damaged = [42, {"words_key": "no gn"}, dict(raw, gn="Is it night?"), dict(raw, gn=["Is it night?", 7]),
-               dict(raw, rows={"name": ["a", "b"], "wkey": ["w"], "ask": [0, 0], "src": "mm"})]
-    loaded = store.load(Node(json.dumps({"schema": 2, "entries": [damaged[0], raw, *damaged[1:]]})))
-    check("damaged: schema 2 skips only the damaged entries", loaded.entries == [good], words(loaded.entries))
-    pick = json.loads(V010["pick_text"])[0]
-    damaged = ["junk", {"key": "k"}, dict(pick, gn=["one word"]), dict(pick, a=dict(pick["a"], probabilities=[1.0]))]
-    loaded = store.load(Node(json.dumps([*damaged[:2], pick, *damaged[2:]])))
-    check("damaged: v0.1.0 skips only the damaged entries",
-          loaded.entries == store.load(Node(json.dumps([pick]))).entries != [], words(loaded.entries))
+    store.save(written, NodeStore([ask, pick]))
+    a, p = json.loads(written.entries)["entries"]
+    damaged = [
+        42, {"words_key": "no gn"}, dict(a, gn="Is it night?"), dict(a, gn=["Is it night?", 7]), dict(a, rows=[]),
+        dict(a, pv="1e400"), dict(a, pv=float("inf")), dict(a, t=10 ** 400), dict(a, t=float("nan")),
+        dict(a, t=float("inf")), dict(a, pinned="false"), dict(a, legacy=1), dict(a, words_key=None),
+        dict(a, kind=["ask"]), dict(a, single=[]),
+        *(dict(p, rows=dict(p["rows"], **change)) for change in (
+            {"name": ["table", 7, "armchair", "bookshelf", "rug"]}, {"wkey": [None] * 5}, {"wkey": [""]},
+            {"ask": [0, 0, 1, 0, 0]}, {"ask": [0, -1, 0, 0, 0]}, {"v": {"prob": [0.1, "x", 0.2, 0.3, 0.4]}},
+            {"payload": {"alive": [0, 1, None, 0, 1]}}, {"top": []}))]
+    text = json.dumps({"schema": 2, "entries": [a, *damaged, p]}).replace('"1e400"', "1e400")
+    loaded = loading(text)
+    check("damaged: schema 2 skips only the damaged entries, overflowing numbers included",
+          loaded == words([ask, pick]) and store.load(Node(text)).entries == [ask, pick], loaded)
+
+    old_ask, old_pick = (json.loads(V010[case])[0] for case in ("ask_yes_no", "pick_text"))
+    damaged = ["junk", {"key": "k"}, dict(old_pick, gn=["one word"]),
+               dict(old_pick, a=dict(old_pick["a"], probabilities=[1.0])),
+               dict(old_pick, a=dict(old_pick["a"], index="1e400")), dict(old_pick, t=10 ** 400),
+               dict(old_pick, t=float("nan")), dict(old_ask, a=dict(old_ask["a"], value=10 ** 400)),
+               dict(old_ask, a=dict(old_ask["a"], mode=None))]
+    text = json.dumps([old_ask, *damaged, old_pick]).replace('"1e400"', "1e400")
+    loaded = loading(text)
+    check("damaged: v0.1.0 skips only the damaged entries, overflowing numbers included",
+          loaded == words([ask, pick]) and store.load(Node(text)).entries == [ask, pick], loaded)
+
+    for label, bad in (
+            ("a top list of the wrong length", dataclasses.replace(pick, rows=dataclasses.replace(pick.rows, top=[]))),
+            ("a short wkey column", dataclasses.replace(pick, rows=dataclasses.replace(pick.rows, wkey=[""]))),
+            ("words in a list", dataclasses.replace(pick, gn=list(pick.gn)))):
+        node = Node()
+        error = saving(node, NodeStore([ask, bad]))
+        check(f"damaged: save refuses {label}, which load would skip, and writes nothing",
+              error is not None and node.entries == "[]", error)
+
+
+def phase_newer_schema():
+    text = json.dumps({"schema": 3, "entries": [{"written by": "a newer OpenAct"}]})
+    node = Node(text)
+    loaded = store.load(node)
+    check("newer schema: loads as an empty store", loaded == NodeStore() and loaded.schema == 3, loaded.schema)
+    error = saving(node, loaded, frozenset())
+    check("newer schema: save refuses to write over it", error is not None and node.entries == text, error)
+    store.save(node, NodeStore())
+    check("newer schema: a new store replaces it on purpose", node.entries == EMPTY, node.entries)
+    broken = Node('{"schema": 2, "en')
+    store.save(broken, store.load(broken))
+    check("broken JSON: the next save replaces it, since nothing in it can be read", broken.entries == EMPTY,
+          broken.entries)
 
 
 def main():
@@ -270,9 +362,11 @@ def main():
     phase_round_trip()
     phase_max_entries()
     phase_soft_cap()
+    phase_both_caps()
     phase_precedence()
     phase_hard_cap()
     phase_damaged()
+    phase_newer_schema()
     finish()
 
 
