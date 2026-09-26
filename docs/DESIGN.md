@@ -2453,7 +2453,8 @@ that matched the known current state turned 3 wrong cells into an exact table.
 
 All cells of a Rules context share **one state**. Each cell's facts go into its instructions.
 That gives maximal batching (§5.5), and editing one level's `when` changes only the keys of the
-cells that include it (§5.4). Templates live in `specs/rules.py` (`PROMPT_VERSION = 1`).
+cells that include it (§5.4). Templates live in `rules_core.py`, which `specs/rules.py` builds on
+(`PROMPT_VERSION = 2`).
 
 **State** (shared by every cell):
 ```
@@ -2461,7 +2462,18 @@ cells that include it (§5.4). Templates live in `specs/rules.py` (`PROMPT_VERSI
 Each question describes one situation with these facts:
 - state: dead | alive
 - neighbours: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
+Each option is an outcome and when it applies.
+Decide only by the conditions the options state, not by outside knowledge.
+Choose the outcome whose condition this situation meets.
 ```
+
+- **The last three lines** (the conditions lines) are added only in One-of mode, and only when
+  at least one outcome has a `when`. They make the outcomes' conditions decide the answer, not
+  what the model knows about the subject (4.c). With `PROMPT_VERSION = 1`, which lacked them, the
+  model followed Conway's rules over the Seeds outcomes: a dead cell with two neighbours stayed
+  empty instead of being born. It was also unsure on three Day & Night cells.
+- Yes/No and Amount states end after the facts, and so do One-of states whose outcomes are bare
+  names: those answers need what the model knows.
 
 **Instructions** (one per cell, here cell 12):
 ```
@@ -2488,8 +2500,9 @@ What happens to this cell in the next generation?
   - Yes/No and Amount show the hint "Type a question", because a scale without a question is
     meaningless.
 - **Acceptance.** Template changes must keep all four Game of Life rule sets at 18/18 exact with 0
-  unsure cells in the e2e suite (§18). `PROMPT_VERSION` is stored per entry but never forces a
-  re-ask (§5.4).
+  unsure cells in the e2e suite (§18). Measured with `PROMPT_VERSION = 2`: all four at 18/18 with
+  0 unsure; the lowest confidence is 0.44 (Day & Night, a live cell with three neighbours).
+  `PROMPT_VERSION` is stored per entry but never forces a re-ask (§5.4).
 
 **Cost.** Each cell with 2–16 options is 2 scored rows with debias. A cell with *m* > 16 options is
 a tournament of `2 × (ceil(m / 16) + 1)` rows.

@@ -62,6 +62,7 @@ def factor_of(data) -> csvfmt.Factor:
 
 class RulesSpec(Spec):
     name, idname, label = "rules", "GeometryNodeOpenActRules", "Rules"
+    PROMPT_VERSION = rules_core.PROMPT_VERSION  # the §9.5 templates live in rules_core
     WORDS = ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
     empty_hint = FACTORS_HINT
 
