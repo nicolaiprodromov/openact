@@ -49,9 +49,12 @@ def load_package():
 
 
 def fake_runtime(P, root, model=True):
-    """Just enough for runtime_installed(): the venv's Python and, optionally, a one-shard model."""
+    """Just enough for runtime_installed(): the venv's Python, a pyvenv.cfg whose home exists and, optionally, a
+    one-shard model."""
     os.makedirs(os.path.dirname(P.venv_python(root)), exist_ok=True)
     open(P.venv_python(root), "wb").close()
+    with open(os.path.join(root, "venv", "pyvenv.cfg"), "w", encoding="utf-8") as handle:
+        handle.write(f"home = {root}\n")
     if model:
         folder = P.model_dir(root)
         os.makedirs(folder, exist_ok=True)
@@ -125,6 +128,7 @@ def phase_old_server(engine, server, P, root):
     port = old.server_address[1]
     P._Defaults.runtime_dir, P._Defaults.port = root, port
     subprocess.Popen, server.executor = FakeProcess, Inline
+    server.STATE.probes[P.runtime_root()] = ""  # the fake runtime has no Python to probe: count it as passed
     legacy = ("error", server.LEGACY_SERVER_MESSAGE)
     tree = bpy.data.node_groups.new("Legacy", 'GeometryNodeTree')
     ask = tree.nodes.new(engine.ASK_ID)
