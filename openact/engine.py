@@ -25,6 +25,7 @@ from bpy.app.handlers import persistent
 
 from . import evaluator, inner, natsort, server, store
 from . import prefs as P
+from . import tables
 from .evaluator import Ctx, Hint, Pending, Unresolvable, as_text, eval_input, find_uses, is_field
 from .inner import INNER_PREFIX, SocketDef, sock
 
@@ -321,6 +322,7 @@ def ensure_owned(nodes):
             own = group.copy()
             own.name = inner.inner_name(node)
             node.node_tree = own
+            tables.copy_for(node)  # the copied group still reads the original's table object
         elif fresh:  # frees the old uid's group name. Only once: a taken name would be retried every pass
             group.name = inner.inner_name(node)
 

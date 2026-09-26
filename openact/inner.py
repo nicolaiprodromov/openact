@@ -1,27 +1,49 @@
 """The hidden node group inside every OpenAct node, `.OpenAct <Node> <uid>`.
 
-It is derived data: build() regenerates it from the node's stored entries (store.py) at any time.
-Geometry Nodes selects the entry whose words equal the node's live inputs (the match chain) and
-reads that entry's values from Index Switches, so one tree answers every context that uses it, with
-no Python at evaluation. The interface is never cleared: sync_interface() diffs it, so the links
-from the outer tree survive every rebuild.
+It is derived data: build() regenerates it, and the node's table object (tables.py), from the node's
+stored entries (store.py) at any time. Only the materialised entries (§8.1) are laid out. Geometry
+Nodes selects the entry whose words equal the node's live inputs (the joined-key match chain, §8.2),
+reads that entry's single values from Index Switches, and its per-element rows from the table object
+at base + ID (§8.3), so one tree answers every context that uses it, with no Python at evaluation.
+The interface is never cleared: sync_interface() diffs it, so the links from the outer tree survive
+every rebuild.
 """
 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import math
 import struct
 from dataclasses import dataclass
 
 import bpy
 
-from . import compat
+from . import compat, tables
 from . import store as _store  # build() and update_values() take `store`, the name §13.3 fixes
 
 INNER_PREFIX = ".OpenAct "
 SPECS = {}  # node bl_idname -> spec (label, iface, build); the engine adds the OpenAct nodes
-BUILT = "openact_built"  # ID property of the group: which entries build() laid out, for update_values()
+BUILT = "openact_built"  # ID property of the group: what build() laid out, for update_values()
+SEP = "\x1f"  # joins a word tuple into one key (§8.2)
+MATERIALISED_MAX = 16  # entries in the graph and table object, pinned included (§8.1)
+WARM_TOTAL = 4  # warm entries are materialised only while the total is below this
+ROW_BUDGET = 16 * 4096  # flat rows warm entries may bring the table object to
+K_DEFAULT = "OpenAct k_default"  # the chain's innermost Switch: its False value is what a no-match shows
+BASE, COUNT = "OpenAct base", "OpenAct count"  # Index Switches: each entry's first flat row, its row count
+
+
+@dataclass(frozen=True)
+class Column:
+    """A per-element output, read from the node's table object at base + ID (§8.3). A spec lists its columns
+    in the optional `per_element` attribute (a tuple, or a callable taking the node); the default is none."""
+
+    output: str  # the group output it feeds, e.g. "Probability"
+    name: str  # the entries' rows.v column, stored as the attribute "oa_<name>"
+    data_type: str  # 'FLOAT', 'INT' or 'BOOLEAN'
+    fallback: object  # §6.0: 0.0, -1 or False, for invalid IDs and unanswered contexts
+    linked_only: bool = False  # built only while the output is linked, else the node holds no table (Pick)
 
 
 @dataclass(frozen=True)
@@ -50,13 +72,20 @@ def _items(switch):
     return [s for s in switch.inputs if s.identifier not in ("Index", "__extend__")]
 
 
+def _enabled(sockets, name):
+    return next(s for s in sockets if s.name == name and s.enabled)
+
+
 class _Builder:
     """Adds nodes and links to an inner group. finish() writes every location in one batched call,
     because each single write costs up to a few milliseconds once the tree is large."""
 
-    def __init__(self, tree):
+    def __init__(self, tree, default=0, per_word=False):
         self.tree = tree
         self.locations = {}  # node pointer -> (x, y)
+        self.default = default  # k_default: what the match chain yields when no entry matches (§8.2)
+        self.per_word = per_word  # a word contains SEP: compare word by word
+        self.k = None  # the match chain's output, which the per-element lookup reads
 
     def new(self, idname, x, y):
         node = self.tree.nodes.new(idname)
@@ -66,16 +95,39 @@ class _Builder:
     def link(self, a, b):
         return self.tree.links.new(a, b)
 
+    def words(self, gi, names):
+        """The Group Input sockets of the node's word tuple, in order, None where the interface has no such
+        String socket (e.g. Items under a Collection source): match_chain() joins those as "" (§8.2)."""
+        return [next((s for s in gi.outputs if s.name == name and s.type == 'STRING'), None) for name in names]
+
     def match_chain(self, sockets, keys):
-        """Integer socket: 1 + index of the entry whose key strings equal the inputs, else 0. A key of
-        another length (converted from schema 1) never matches: its words sit at other positions."""
-        previous = None
+        """Integer socket k: 1 + index of the entry whose words equal the live words, else k_default; None
+        when no entry can match. `sockets` has one item per word position, None for an absent socket.
+
+        One Join Strings joins the live words with SEP, and each entry costs a Compare with its stored
+        SEP.join(gn) and a Switch (§8.2). A key of another length (converted from schema 1) never matches:
+        its words sit at other positions."""
+        keys = [tuple(key) for key in keys]
+        self.k = None
+        if not any(len(key) == len(sockets) for key in keys):
+            return None
+        sockets = [self._empty(j) if s is None else s for j, s in enumerate(sockets)]
+        if self.per_word:
+            joined = None
+        else:
+            join = self.new("GeometryNodeStringJoin", -760, 400)
+            join.hide = True
+            join.inputs["Delimiter"].default_value = SEP
+            for socket in reversed(sockets):  # Join Strings puts the most recently linked item first
+                self.link(socket, join.inputs["Strings"])
+            joined = join.outputs[0]
         for i, key in enumerate(keys, start=1):
             if len(key) != len(sockets):
                 continue
             y = 400 - i * 110
+            pairs = list(zip(sockets, key)) if joined is None else [(joined, SEP.join(key))]
             conditions = []
-            for j, (socket, value) in enumerate(zip(sockets, key)):
+            for j, (socket, value) in enumerate(pairs):
                 compare = self.new("FunctionNodeCompare", -600 + j * 40, y - j * 40)
                 compare.data_type = 'STRING'
                 compare.operation = 'EQUAL'
@@ -95,13 +147,81 @@ class _Builder:
             switch.input_type = 'INT'
             switch.hide = True
             self.link(condition, sock(switch.inputs, "Switch"))
-            if previous is None:
-                sock(switch.inputs, "False").default_value = 0
+            if self.k is None:
+                switch.name = K_DEFAULT  # update_values() rewrites its False value
+                sock(switch.inputs, "False").default_value = self.default
             else:
-                self.link(previous, sock(switch.inputs, "False"))
+                self.link(self.k, sock(switch.inputs, "False"))
             sock(switch.inputs, "True").default_value = i
-            previous = switch.outputs[0]
-        return previous
+            self.k = switch.outputs[0]
+        return self.k
+
+    def _empty(self, j):
+        node = self.new("FunctionNodeInputString", -960, 400 - 40 * j)  # holds ""
+        node.hide = True
+        return node.outputs[0]
+
+    def _compare(self, operation, a, b, x, y):
+        """An INT Compare of a socket with a socket or a number."""
+        compare = self.new("FunctionNodeCompare", x, y)
+        compare.data_type = 'INT'
+        compare.operation = operation
+        for identifier, value in (("A_INT", a), ("B_INT", b)):
+            if isinstance(value, int):
+                sock(compare.inputs, identifier).default_value = value
+            elif value is not None:  # None: linked by the caller
+                self.link(value, sock(compare.inputs, identifier))
+        return compare.outputs[0]
+
+    def _and(self, a, b, x, y):
+        both = self.new("FunctionNodeBooleanMath", x, y)
+        both.operation = 'AND'
+        self.link(a, both.inputs[0])
+        self.link(b, both.inputs[1])
+        return both.outputs[0]
+
+    def per_element(self, gi, go, entries, columns, table):
+        """Per-element outputs (§8.3): each column sampled from the table object at flat = base + ID behind
+        valid = 0 <= ID < count, else its fallback. base and count are Index Switches on k, so a no-match
+        (k = 0) and an invalid ID both give the fallbacks. Without an ID input, the element index is used."""
+        ident = next((s for s in gi.outputs if s.name == "ID"), None)
+        if ident is None:
+            ident = self.new("GeometryNodeInputIndex", -900, -700).outputs[0]
+        counts = [row_count(entry) for entry in entries]
+        bases = list(itertools.accumulate([0] + counts))[:-1]
+        flat = self.new("FunctionNodeIntegerMath", 300, -600)
+        flat.operation = 'ADD'
+        self.lookup(self.k, 'INT', 0, bases, flat.inputs[0], -600).node.name = BASE
+        self.link(ident, flat.inputs[1])
+        below = self._compare('LESS_THAN', ident, None, 300, -750)
+        self.lookup(self.k, 'INT', 0, counts, sock(below.node.inputs, "B_INT"), -750).node.name = COUNT
+        valid = self._and(self._compare('GREATER_EQUAL', ident, 0, 300, -900), below, 450, -800)
+        info = self.new("GeometryNodeObjectInfo", 300, -1050)
+        info.name = tables.NODE
+        info.inputs["Object"].default_value = table
+        for j, column in enumerate(columns):
+            y = -1050 - 150 * j
+            attribute = self.new("GeometryNodeInputNamedAttribute", 450, y)
+            attribute.data_type = column.data_type
+            attribute.inputs["Name"].default_value = tables.ATTR + column.name
+            sampled = self.new("GeometryNodeSampleIndex", 600, y)
+            sampled.data_type = column.data_type
+            self.link(info.outputs["Geometry"], sampled.inputs["Geometry"])
+            self.link(_enabled(attribute.outputs, "Attribute"), _enabled(sampled.inputs, "Value"))
+            self.link(flat.outputs[0], sampled.inputs["Index"])
+            switch = self.new("GeometryNodeSwitch", 750, y)
+            switch.input_type = column.data_type
+            self.link(valid, sock(switch.inputs, "Switch"))
+            sock(switch.inputs, "False").default_value = column.fallback
+            self.link(_enabled(sampled.outputs, "Value"), sock(switch.inputs, "True"))
+            self.link(switch.outputs[0], go.inputs[column.output])
+
+    def selection(self, ident, picked, target):
+        """Pick's Selection = (ID == Index) AND (Index >= 0) (§8.3): `picked` is the entry-level Index."""
+        answered = self._compare('GREATER_EQUAL', picked, 0, 300, -1500)
+        both = self._and(self._compare('EQUAL', ident, picked, 300, -1400), answered, 450, -1450)
+        self.link(both, target)
+        return both
 
     def lookup(self, index, data_type, fallback, values, target, y):
         """An entry-level value: an Index Switch on the match chain, items [fallback, value 1 ...]."""
@@ -138,45 +258,154 @@ def create_inner(node, store=None):
     return tree
 
 
-def build(node, store):
-    """Rebuild the inner group's nodes from the store; the interface is kept."""
+def build(node, store, live=None, default=None):
+    """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept.
+
+    live: the gn tuples of the node's live contexts, in context order (§8.1). None means unknown: every
+    stored entry is laid out, in store order, as before the materialised set existed; only the pass knows
+    the live set. default: the words_key of the entry a no-match shows (k_default_key(), §8.2)."""
     tree = node.node_tree
     if tree is None:
         create_inner(node, store)
         return
     tree.pop(BUILT, None)  # a build that raises leaves a partial graph, which update_values() must not write
+    entries = materialised(store.entries, live, default)
+    columns = _columns(node)
+    table = tables.ensure_table(node) if columns else None  # before clear(), which drops the reference
     tree.nodes.clear()
-    builder = _Builder(tree)
+    split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
+    builder = _Builder(tree, _k(entries, default), split)
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
-    SPECS[node.bl_idname].build(builder, group_in, group_out, store.entries)
+    SPECS[node.bl_idname].build(builder, group_in, group_out, entries)
+    if columns:
+        builder.per_element(group_in, group_out, entries, columns, table)
     builder.finish()
-    tree[BUILT] = _built(node, store.entries)
+    if columns:
+        tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
+    tree[BUILT] = _built(node, entries, columns, split)
 
 
-def update_values(node, store):
-    """Write the changed entry-level values without rebuilding: every Index Switch that feeds an output
-    holds the fallback, then each entry's `single` value for that output. Returns False, writing
-    nothing, when build() laid out other entries than the store's, so build() is needed."""
+def update_values(node, store, live=None, default=None, rows=True):
+    """Values only (§8.8): write the changed entry-level Index Switch values (each output's single values,
+    each entry's base and row count) and k_default, and with `rows` the table object's per-element rows.
+    Returns False, writing nothing, when build() laid out another materialised set or shape, so build() is
+    needed. live and default as for build(); the pass passes the same ones to both."""
     tree = node.node_tree
-    entries = store.entries
-    if tree is None or tree.get(BUILT) != _built(node, entries):
+    if tree is None:
+        return False
+    entries = materialised(store.entries, live, default)
+    columns = _columns(node)
+    split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
+    if tree.get(BUILT) != _built(node, entries, columns, split) or (columns and tables.find(node) is None):
         return False
     feeds = [(link.to_socket.name, _items(link.from_node)) for link in tree.links
              if link.to_node.bl_idname == "NodeGroupOutput" and link.from_node.bl_idname == "GeometryNodeIndexSwitch"]
     if any(len(slots) != len(entries) + 1 for _name, slots in feeds):
         return False
     for name, slots in feeds:
-        for slot, entry in zip(slots[1:], entries):
-            value = entry.single[name]
-            if not _same(slot.default_value, value):  # every write costs a tree update
-                slot.default_value = value
+        _write(slots[1:], [entry.single[name] for entry in entries])
+    counts = [row_count(entry) for entry in entries]
+    for name, values in ((BASE, list(itertools.accumulate([0] + counts))[:-1]), (COUNT, counts)):
+        switch = tree.nodes.get(name)
+        if switch is not None:
+            _write(_items(switch)[1:], values)
+    end = tree.nodes.get(K_DEFAULT)
+    if end is not None:
+        _write([sock(end.inputs, "False")], [_k(entries, default)])
+    if rows and columns:
+        tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
     return True
 
 
-def _built(node, entries):
-    """The node type and every entry's words, in order: what the graph build() lays out depends on."""
-    text = json.dumps([node.bl_idname, [entry.gn for entry in entries]], ensure_ascii=False)
+def _write(slots, values):
+    for slot, value in zip(slots, values):
+        if not _same(slot.default_value, value):  # every write costs a tree update
+            slot.default_value = value
+
+
+def materialised(entries, live=None, default=None):
+    """The entries the graph and table object hold (§8.1), in store order: every entry whose gn is live (the
+    first MATERIALISED_MAX in context order), then pinned ones in pin order, then warm ones, the default
+    first and then the most recently used, while the total is below WARM_TOTAL and their rows fit ROW_BUDGET.
+    live=None (unknown) gives every stored entry. Pass live as a list: a set has no context order."""
+    if live is None:
+        return list(entries)
+    ordered, live = isinstance(live, (list, tuple)), [tuple(gn) for gn in live]
+    alive = set(live)
+    rank = {gn: i for i, gn in reversed(list(enumerate(live)))} if ordered else {}
+    chosen = sorted((e for e in entries if e.gn in alive), key=lambda e: rank.get(e.gn, 0))[:MATERIALISED_MAX]
+    pins = sorted((e for e in entries if e.pinned and e.gn not in alive), key=_pin_order)
+    chosen += pins[:MATERIALISED_MAX - len(chosen)]
+    total = sum(row_count(e) for e in chosen)
+    for entry in sorted((e for e in entries if not e.pinned and e.gn not in alive),
+                        key=lambda e: (default is None or e.words_key != default, -e.t)):
+        if len(chosen) >= WARM_TOTAL:
+            break
+        if total + row_count(entry) <= ROW_BUDGET:
+            chosen.append(entry)
+            total += row_count(entry)
+    keep = {id(entry) for entry in chosen}
+    return [entry for entry in entries if id(entry) in keep]
+
+
+def _pin_order(entry):
+    """By the first frame at which the entry's words occur, ties broken by the words (§5.5)."""
+    return min((span[0] for span in entry.frames if span), default=math.inf), entry.gn
+
+
+def k_default_key(last_shown, blocked=False):
+    """The words_key a no-match shows (§8.2): the last-shown entry when exactly one context is live and the
+    node is in neither a hint nor an error state (blocked); else None, so k_default = 0 and every no-match
+    shows the neutral fallbacks. last_shown: LAST_SHOWN of each live context, None where it never showed one."""
+    return last_shown[0] if len(last_shown) == 1 and not blocked else None
+
+
+def per_word(gns):
+    """True when a word contains SEP: its joined key could equal another tuple's, so the node compares word
+    by word (§8.2). The pass can show it in the node's status."""
+    return any(SEP in word for gn in gns for word in gn)
+
+
+def row_count(entry):
+    return len(entry.rows.name)
+
+
+def flat_rows(entries, columns):
+    """The table object's columns (§8.1): entry e's rows at base_e + r, entries in materialised order. An
+    entry without a column holds that column's fallback."""
+    flat = {}
+    for column in columns:
+        if column.name in flat:
+            continue
+        values = flat[column.name] = []
+        for entry in entries:
+            own = entry.rows.v.get(column.name)
+            values.extend(own if own is not None else [column.fallback] * row_count(entry))
+    return flat
+
+
+def _columns(node):
+    """The spec's per-element columns whose output the node has; a linked_only one only while it is linked."""
+    wanted = getattr(SPECS[node.bl_idname], "per_element", ())
+    if callable(wanted):
+        wanted = wanted(node)
+    outputs = {socket.name: socket for socket in node.outputs}
+    return [c for c in wanted if c.output in outputs and (outputs[c.output].is_linked or not c.linked_only)]
+
+
+def _k(entries, default):
+    """k of the entry with words_key `default`, 0 when there is none: k_default (§8.2)."""
+    return next((k for k, entry in enumerate(entries, start=1) if default is not None and entry.words_key == default), 0)
+
+
+def _built(node, entries, columns, split):
+    """What the graph build() lays out depends on: the node type, the materialised entries' words in order,
+    the per-element columns, per-word compares, and the interface (an absent word is joined as "")."""
+    face = sorted((i.in_out, i.name, i.socket_type) for i in node.node_tree.interface.items_tree
+                  if i.item_type == 'SOCKET')
+    text = json.dumps([node.bl_idname, [entry.gn for entry in entries],
+                       [(c.output, c.name, c.data_type) for c in columns], split, face], ensure_ascii=False)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
