@@ -105,12 +105,12 @@ def _plan(spec, node, ctx):
     return cached[1]
 
 
-def _jobs(node):
-    """(ctx, Job) for each use of the node that has a question."""
+def _jobs(node, contexts=None):
+    """(ctx, Job) for each of the contexts, by default every use of the node, that has a question."""
     tree = node.id_data
     spec = SPECS[node.bl_idname]
     jobs = []
-    for ctx in find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
+    for ctx in contexts or find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
         try:
             jobs.append((ctx, _plan(spec, node, ctx)))
         except (Hint, Pending, Unresolvable):
@@ -255,6 +255,10 @@ def _process(tree, node, contexts):
     hidden = set()  # (gn, words key) of stored entries whose words mean something else now: kept for their rows
     problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
+    # §6.0: the sockets follow the live jobs (Rules). Jobs that disagree answer nothing, so the last good table stays
+    conflict = spec.agree(node, _jobs(node, contexts)) if hasattr(spec, "agree") else ""
+    if conflict:
+        problems.append(conflict)
     for ctx in contexts:
         key = (node.uid, ctx.key())
         try:
@@ -275,6 +279,8 @@ def _process(tree, node, contexts):
         warnings += job.problems
         if job.gn not in live:
             live.append(job.gn)
+        if conflict:
+            continue
         other = jobs.setdefault(job.gn, (job, ctx))
         if other[0] is not job and other[0].words_key != job.words_key:
             problems.append(CLASH.format(other[1].label(), ctx.label()))
