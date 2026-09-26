@@ -101,8 +101,7 @@ def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = N
     newer OpenAct's JSON, or if an entry is damaged (load() would skip it) or larger than HARD_CAP.
     """
     if store.schema > SCHEMA:
-        raise ValueError(f"These answers were saved by a newer OpenAct (schema {store.schema}): "
-                         "update OpenAct to change them")
+        raise ValueError(newer_message(store))
     parts = []  # (entry, JSON, bytes): each entry is serialised once, because its size decides the caps
     for entry in store.entries:
         _check(entry)
@@ -136,6 +135,11 @@ def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = N
     node.entries = _HEAD + ",".join(part[1] for part in kept) + _TAIL
     store.entries = [part[0] for part in kept]
     store.note = note
+
+
+def newer_message(store: NodeStore) -> str:
+    """Why a store that holds a newer OpenAct's JSON can't change: save() raises it, the pass shows it."""
+    return f"These answers were saved by a newer OpenAct (schema {store.schema}): update OpenAct to change them"
 
 
 def _mb(size):

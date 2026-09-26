@@ -403,6 +403,9 @@ def _process(tree, node, contexts):
         wanted[req.gn] = req
 
     node_store = store.load(node)
+    if node_store.schema > store.SCHEMA:  # save() would refuse any answer, and the group holds the newer ones
+        STATUS[node.uid] = ('ERROR', store.newer_message(node_store))
+        return
     entries = node_store.entries
     changed = False
     asks = []
@@ -421,8 +424,8 @@ def _process(tree, node, contexts):
             asks.append(req)
     if changed:
         try:
-            store.save(node, node_store, frozenset(wanted))  # the only save that knows the live set, so it evicts
-        except ValueError as error:  # newer OpenAct's answers, or a table too large: the node keeps what it has
+            store.save(node, node_store, frozenset(wanted))  # live contexts are never evicted
+        except ValueError as error:  # a damaged or too large entry: the node keeps what it has
             problems.append(str(error))
         else:
             inner.build(node, node_store)
@@ -508,15 +511,18 @@ def answers_for(node):
 
 
 def reask(node):
-    """Forget this node's answers and ask again."""
+    """Forget this node's answers and ask again. Raises ValueError, changing nothing, if a newer OpenAct
+    saved them."""
     if node.id_data.library is not None:  # linked data is read-only
         return
-    for entry in store.load(node).entries:
+    node_store = store.load(node)
+    forgotten = node_store.entries
+    node_store.entries = []
+    store.save(node, node_store)
+    for entry in forgotten:
         MEMORY.pop(entry.words_key, None)
     FAILED.clear()
-    empty = store.NodeStore()
-    store.save(node, empty)  # live_gns=None, as for every save outside the pass: only the pass evicts
-    inner.build(node, empty)
+    inner.build(node, node_store)
     schedule(immediate=True)
 
 

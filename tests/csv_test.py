@@ -773,6 +773,9 @@ def test_settings():
     inverted = csvfmt.parse_settings(read("settings_inverted.csv", content, schema="settings"))
     good = (inverted[0].min, inverted[0].max) == (30.0, 0.0) and (inverted[1].min, inverted[1].max) == (0.0, 1.0)
     check("settings: min above max is allowed; min and max only count for amount", good, inverted)
+    content = SETTINGS + lines(32, lambda i: f"s{i},yes/no,q?,,,")
+    at_limit = csvfmt.parse_settings(read("settings_32.csv", content, schema="settings"))
+    check("settings: 32 settings, the limit, are accepted", len(at_limit) == 32, len(at_limit))
 
     for case, body, line, message in (
         ("one_of_none", "T,one-of,q?,,,\n", 2, "Line 2: a one-of setting needs answers"),
@@ -813,7 +816,7 @@ def test_settings():
         ),
         ("empty_name", ",yes/no,q?,,,\n", 2, "Line 2: the setting name is empty"),
         ("min_text", "W,amount,q?,,low,30\n", 2, "Line 2: 'min' must be a number, not 'low'"),
-        ("many", lines(65, lambda i: f"s{i},yes/no,q?,,,"), 0, "settings_many.csv has 65 settings (limit 64)"),
+        ("many", lines(33, lambda i: f"s{i},yes/no,q?,,,"), 0, "settings_many.csv has 33 settings (limit 32)"),
         ("none", "", 0, "No settings"),
     ):
         problems = raised(csvfmt.parse_settings, read(f"settings_{case}.csv", SETTINGS + body, schema="settings"))

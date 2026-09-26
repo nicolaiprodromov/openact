@@ -300,7 +300,7 @@ reading of evaluated geometry through `GeometrySet`.
 | Largest table | 4096 cells and ≤ 8192 scored rows per node context | fill time ≈ 3–5 min worst case |
 | Per-element lookup cost, 1M elements | ≤ 5 ms above a no-lookup baseline, up to 8 interpolation corners (review measurement: within ~1 ms on 4.5.2 and 5.1.1) | §8.7 |
 | Main-thread cost per pass | ≤ 5 ms per unchanged node; ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts | §5.3 |
-| Graph edits on the main thread | `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and ≤ 1 s at each derived worst shape (§8.4), run only on shape or materialised-set changes, at most one per edit; `update_values()` (entry-level Index Switches only) ≤ 30 ms per changed entry, ≤ 150 ms when every entry-level value of 16 entries changes at once; a table-object write ≤ 5 ms | §8.4, §8.8 |
+| Graph edits on the main thread | `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and ≤ 1 s at each derived worst shape (§8.4), run only on shape or materialised-set changes, at most one per edit; `update_values()` (entry-level Index Switches only) ≤ 30 ms when one entry's values change, ≤ 150 ms when all 16 entries' values change at once; a table-object write ≤ 5 ms | §8.4, §8.8 |
 | Add-on upgrade (new templates), toggling a node's *Balance Option Order*, or upgrade of a v0.1.0 file | 0 requests until the words change | §5.4, §10.3 |
 | Prepare for Playback over 250 frames | < 1 s on the F-curve path (channelbag F-curves, no scene evaluation). The fallback for drivers, NLA, tweak mode or blended actions costs frames × one scene evaluation, with progress and Esc | §5.5 |
 | Blender versions | 4.5 LTS, 5.0, 5.1 | §11 |
@@ -1531,7 +1531,8 @@ Fog,amount,How foggy is it?,,,
 **Inline Settings** support only `yes/no` and `amount`. There is one entry per setting, in the
 form `name (type): question`, for example `Rain (yes/no): Is it raining?; Wind (amount): How
 windy is it?`. A `one-of` setting needs the CSV, because its options would collide with the `;`
-separator.
+separator. Inline Settings share the CSV's limit of 32 settings (§7.5), because their graph costs
+the same.
 
 **Behaviour.**
 - Every setting is one question. All of them share the Prompt as state and travel in **one**
@@ -1545,8 +1546,8 @@ separator.
     names and types agree (§6.0).
   - Editing `min`/`max` triggers a values-only update (`tables.write_rows()`) and never a model
     call.
-  - If the PR-08 spike finds that `Sample Index` with a single-value index does not yield a single
-    value, Dials falls back to Index Switches on `k` and a limit of 16 settings (§8.4).
+  - `Sample Index` with a single-value index yields a single value, verified by the PR-08 spike
+    (§8.4). Index Switches on `k` with at most 16 settings remain a contingency only.
 - Outputs are single values, read from the node's one-row-per-entry table object at `k − 1`
   (§8.4), with `k` from the match chain over (Prompt, Settings, Overrides, Key) (§8.2). One tree on
   many objects gives each object its own dial values.
@@ -1768,8 +1769,9 @@ altitude,amount,high,"mountains and high slopes",,
 | `answers` | yes for `one-of`, optional otherwise | Inline answer set (§6.0): `;`-separated `name: when` entries. One-of: 2–255 options (a tournament above 16). Amount: 2–16 ordered levels. Yes/No: `yes`/`no` whens |
 | `min`, `max` | optional, `amount` only | Numbers, default 0 and 1. `min > max` inverts the mapping. Python writes them into the Map Range (§6.6) |
 
-A Settings CSV has at most 32 settings, the limit at which the Dials graph still builds within its
-budget (§8.4). It is not a payload source: Dials outputs are the answers themselves (§6.6).
+A Dials node has at most 32 settings, from a Settings CSV or inline (§6.6): the limit at which its
+graph still builds within its budget (§8.4). A Settings CSV is not a payload source: Dials outputs
+are the answers themselves (§6.6).
 
 ### 7.6 Overrides CSV (all six nodes)
 
@@ -2131,9 +2133,9 @@ flowchart LR
 - Rules band centres (at most 16 per Amount factor).
 
 **Dials is the exception to watch.** At its 32-setting limit (§7.5), one Index Switch per setting
-plus per-entry `min`/`max` switches would mean more than 100 Index Switches of 17 items. Writing a
-new entry's 32–96 values at about 0.9 ms per socket would take 30–85 ms, above the
-`update_values()` budget.
+plus per-entry `min`/`max` switches would mean about 100 Index Switches of 17 items. Writing a
+new entry's 32–96 values at about 0.9 ms per socket would take 30–85 ms, at or above the ≤ 30 ms
+`update_values()` budget for one entry.
 - Dials therefore stores its values in a **one-row-per-entry table object** (columns: each
   setting's value, `min`, `max`), read with `Sample Index` at `k − 1` behind a `Switch` on
   `k > 0`. Map Range then applies `min`/`max`, and a value update is a `foreach_set`.
@@ -2183,8 +2185,8 @@ so about 34 nodes (§8.2).
   - `inner.build()` ≤ 100 ms for the demo shapes, and ≤ 1 s at each derived worst shape. The
     interpolated Rules demo (snow) is allowed ≤ 250 ms: its 8-corner blend is a fixed graph of about
     170 nodes, whatever the table's size;
-  - `update_values()` ≤ 30 ms per changed entry (entry-level Index Switches only), and ≤ 150 ms
-    when every entry-level value of 16 entries changes at once (a numeric CSV edit re-baking the
+  - `update_values()` (entry-level Index Switches only) ≤ 30 ms when one entry's values change,
+    and ≤ 150 ms when all 16 entries' values change at once (a numeric CSV edit re-baking the
     payload of every Pick context);
   - `tables.write_rows()` ≤ 5 ms.
 - `inner.build()` runs only when the **shape or the materialised set** changes (§8.8), at most once
@@ -2211,8 +2213,11 @@ so about 34 nodes (§8.2).
   These are three runs on an otherwise idle machine. With another project's 8-thread Blender job
   running, the 16-entry Rules and Dials builds rose to 0.71–0.91 s, still within budget, and planning
   to about 0.2–0.27 s.
-- `tests/lookup_blender.py --bench` enforces these numbers as merge gates (§18), timing each as the
-  fastest of several runs so that other work on the machine does not fail it.
+- `tests/lookup_blender.py --bench` enforces these budgets as merge gates: `tests/run_all.ps1` runs
+  it on every Blender version (§18.1). It times each measurement as the fastest of several runs and
+  follows the timing rule of §18.2, because the gate runs while other work uses the machine: it
+  prints every measurement against its budget, warns above the budget, and fails only above twice
+  the budget.
 
 | Typical node | Table object (per materialised entry) | Index Switch |
 |---|---|---|
@@ -2294,7 +2299,7 @@ Entry-level outputs use the prototype's `_Builder.lookup`: one Index Switch per 
 | Pick: Index, Item, Confidence, payload | Index Switch (INT / STRING / FLOAT / INT or FLOAT) on `k` |
 | Pick: Instance | As in the prototype: Collection Info (Separate Children, Reset Children) → Delete Geometry (INSTANCE, `Index ≠ picked`) |
 | Pick: Material | Index Switch (**MATERIAL**, verified) on `k`, with items `[None, m_1 … m_E]`, where `m_e` is entry *e*'s **picked** material. It is stored by name in `single` (§14.2) and resolved with `bpy.data.materials.get()` at build time; a missing material gives None and a warning. Contexts on different objects therefore each get their own material |
-| Dials: each setting | `Sample Index` on the node's **one-row-per-entry table object** at `k − 1`, behind a `Switch` on `k > 0`, with fallback (§8.4). Amount settings then go through `Map Range` (FLOAT, Linear, no clamp, From 0–1), whose *To Min* and *To Max* are sampled from the same row (`min_<s>`, `max_<s>`, per-entry data, §6.0). Fallback if the PR-08 spike rejects single-value sampling: Index Switches on `k`, with at most 16 settings |
+| Dials: each setting | `Sample Index` on the node's **one-row-per-entry table object** at `k − 1`, behind a `Switch` on `k > 0`, with fallback (§8.4). Amount settings then go through `Map Range` (FLOAT, Linear, no clamp, From 0–1), whose *To Min* and *To Max* are sampled from the same row (`min_<s>`, `max_<s>`, per-entry data, §6.0). Single-value sampling was verified by the PR-08 spike; Index Switches on `k` with at most 16 settings remain a contingency only (§8.4) |
 | Dials: Confidence | Sampled from the same table row (`conf`): the minimum confidence of each entry |
 
 These outputs are **single values**: their graphs use no field input. They therefore connect to
@@ -2310,17 +2315,20 @@ prototype.
   table object on every evaluation, so lookup works inside Simulation and Repeat zones. The Game of
   Life acceptance test runs 32 frames inside a Simulation Zone and compares every cell with a
   Python reference (§18).
-- **Budgets** (from §3.2), enforced by `tests/lookup_blender.py --bench` as merge gates:
+- **Budgets** (from §3.2), enforced by `tests/lookup_blender.py --bench`, which `tests/run_all.ps1`
+  runs as a merge gate (§18.1):
   - **Per-element lookup, 1M points:** ≤ 5 ms above a no-lookup baseline, for up to 4096 rows and
     8 interpolation corners. The review measured within ~1 ms.
   - **Main thread, the expensive side:**
     - `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and
       ≤ 1 s at the documented worst shape;
-    - `update_values()` ≤ 30 ms per changed entry, ≤ 150 ms when every entry-level value of 16
-      entries changes at once (§8.4);
+    - `update_values()` ≤ 30 ms when one entry's values change, ≤ 150 ms when all 16 entries'
+      values change at once (§8.4);
     - `tables.write_rows()` ≤ 5 ms for 16 × 4096 rows.
 
-  If a budget fails, the PR that introduced the cost must fix it before merge.
+  The bench follows the timing rule of §18.2: it prints every measurement against its budget, warns
+  above the budget and fails only above twice the budget, so other work on the machine cannot fail
+  the gate. If a measurement fails, the PR that introduced the cost must fix it before merge.
 - **No model at evaluation.** Evaluation touches only Index Switch, Compare, Switch, Integer
   Math, Map Range, Random Value, Object Info, Named Attribute and Sample Index. No Python runs
   (4.b).
@@ -2998,9 +3006,10 @@ undo step:
    `label`, `location`, `width`, `parent` frame, `mute`, `hide` and `color`.
 2. **Copy settings.**
    - Ask: `mode` → `answer_type`.
-   - Pick: the prototype's precedence is kept (`parse_items(items) or collection_items(coll)`):
-     - `list_source = TEXT` if the Items socket is linked or its text is non-empty;
-     - otherwise `COLLECTION` if the Collection socket is linked or set;
+   - Pick: the prototype's precedence is kept, a set Collection winning over the Items text
+     (`collection_items(coll) if coll is not None else parse_items(items)`):
+     - `list_source = COLLECTION` if the Collection socket is set or linked; its Items text is
+       ignored;
      - otherwise `TEXT`.
    - Pick nodes also get the hidden property `items_parse_v0 = True` (below).
    - `balance_order` is seeded from the `debias` preference. The imported value of `jev_nodes`'
@@ -3382,9 +3391,10 @@ In both cases `gn` is re-ordered to v1's fixed-length `spec.words()` tuple (§8.
   Answers, Overrides and Key words.
 - Pick `(Prompt, Items)` becomes `(Prompt, "", Items, "", "")`. The `""` are the new empty Context,
   Overrides and Key words.
-  - For a collection Pick, the prototype's Items text was empty, which is why the collection
-    applied. Under `COLLECTION` the absent Items socket also contributes `""`, so the converted
-    tuple matches the live words exactly.
+  - For a collection Pick, the collection applied because it was set, not because the Items text
+    was empty: the prototype ignored any Items text then (§12.3). The conversion therefore writes
+    `""` at the Items position. Under `COLLECTION` the absent Items socket also contributes `""`,
+    so the converted tuple matches the live words exactly.
   - Item names are re-derived with legacy parsing (`items_parse_v0`, §12.3), so the words key
     matches too.
 
@@ -3444,7 +3454,7 @@ The start-up probe checks that external interpreter (§12.2).
 | Case | `entries` JSON | Inner group | Table object |
 |---|---|---|---|
 | Ask (one context) | < 1 KB | about 10 nodes | — |
-| Dials, 5 settings (one context) | < 1 KB | about 20 nodes | 1 vertex × (5 values + 2 × amount settings + `conf`), a few hundred bytes |
+| Dials, 5 settings (one context) | < 1 KB | about 35–50 nodes | 1 vertex × (5 values + 2 × amount settings + `conf`), a few hundred bytes |
 | Game of Life, 18 rows, 1 payload | ≈ 1.5 KB | about 40 nodes | 18 vertices × 3 columns, < 1 KB |
 | Pick, 255 items (Probability field linked) | ≈ 5 KB | about 20 nodes | 255 vertices, about 4 KB |
 | Rules, 4096 rows, 2 payload columns, one context | ≈ 250 KB (no `top` above 1024 rows) | about 60 nodes | 4096 vertices, about 150 KB |
@@ -3804,7 +3814,9 @@ There is no remote alerting. The "alerts" are user-facing messages that name the
 Tests keep the prototype's line protocol: `PASS …` / `FAIL …` / `RESULT OK|FAILED: …`, then
 `os._exit` with the matching code. They add:
 - `TIMING <table> rows=<n> <s>s <rows/s>` lines, compared against §3.2;
-- `BENCH <path> <elements> <ms>` lines from `tests/lookup_blender.py --bench`.
+- `BENCH <path> <elements> <ms>` lines from `tests/lookup_blender.py --bench`;
+- `WARN …` lines for a timing above its budget but within twice it (§18.2), which the runner counts
+  in its summary.
 
 A later run can diff these lines to spot performance regressions.
 
@@ -3820,9 +3832,10 @@ A later run can diff these lines to spot performance regressions.
   Blender 4.5 and 5.0 bundle Python 3.11, Blender 5.1 bundles 3.13, and this machine has 3.12 on
   PATH.
 - **Runner.** `tests/run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1]` runs the pure suites once and
-  every Blender suite on every installed version. The real-model e2e runs only with `-Model`,
-  because it needs the runtime and the GPU. The runner ends with a summary table and a non-zero
-  exit code if anything failed.
+  every Blender suite on every installed version, `tests/lookup_blender.py` with `--bench`, so the
+  §8.4 budgets gate every merge under the timing rule of §18.2. The real-model e2e runs only with
+  `-Model`, because it needs the runtime and the GPU. The runner ends with a summary table, which
+  counts each run's warnings, and a non-zero exit code if anything failed.
 - **Fake backend.** Suites that need a server set `OPENACT_BACKEND=fake`. The add-on then starts
   `openact_server.py --backend fake [--fake-script tests/fixtures/<name>.json]`. That path imports
   no torch, so `OPENACT_SERVER_PYTHON` may point at any Python 3.10 or newer, Blender's bundled one
@@ -3844,20 +3857,22 @@ A later run can diff these lines to spot performance regressions.
 | **`tests/evaluator_blender.py`** (extended) | Blender | none | Every existing case, plus **Menu Switch**: a value typed on the socket and a value coming from a modifier's Group Input menu, for String, Int and Float, covering both storage forms (§10.1). Also Special Characters, String Length, OpenAct single-value outputs used as words, field outputs rejected with the breadcrumb message, and the per-pass memo returning identical values. All are checked against Geometry Nodes ground truth with Compare nodes, the existing technique. **`trace_csv_source()`** (added by PR-13): a direct link; a Path exposed on the modifier; Reroute, nested-group and Geometry Menu Switch pass-through; the Import CSV Path/Delimiter socket identifiers pinned on 4.5, 5.0 and 5.1; both error messages |
 | `tests/csv_probe_blender.py` | Blender | none | **Import CSV parity** per fixture: point count equals `csvfmt` data rows; kept attributes equal `csvfmt` numeric columns with the same INT/FLOAT types and values. It records Blender's behaviour for blank lines, quoted line breaks, BOM and `;` in `tests/fixtures/import_csv_behaviour.json`. It re-asserts the path-cache fact (an edited file still returns old rows), so a future Blender change is noticed |
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
-| `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick, an upgraded collection Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()` |
+| `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick, an upgraded collection Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses; two Blender processes share one server through the token file. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
-| **`tests/migrate_blender.py`** | Blender 4.5 and 5.1 | none | §12.5: a v0.1.0 file built with the untouched `jev_nodes` → `openact.upgrade_legacy` → identical outputs, 0 requests, inner groups renamed and owned, links kept, and undo restores the old nodes. It covers the prototype's **collection Pick** (the e2e scene's `lamp` node), which must **match its converted entry through the joined key**, with the absent Items position joined as `""` (§8.2), a Pick whose Items text contains `;` and `": "` (legacy parsing keeps its names), and a Pick with both Items text and a Collection (text wins). It also imports custom `jev_nodes` preferences (§12.2) |
+| **`tests/migrate_blender.py`** | Blender 4.5 and 5.1 | none | §12.5: a v0.1.0 file built with the untouched `jev_nodes` → `openact.upgrade_legacy` → identical outputs, 0 requests, inner groups renamed and owned, links kept, and undo restores the old nodes. It covers the prototype's **collection Pick** (the e2e scene's `lamp` node), which must **match its converted entry through the joined key**, with the absent Items position joined as `""` (§8.2), a Pick whose Items text contains `;` and `": "` (legacy parsing keeps its names), and a Pick with both Items text and a Collection (collection wins, its answers kept). It also imports custom `jev_nodes` preferences (§12.2) |
 | `tests/e2e_blender.py` (extended) | Blender + real model | real | The existing `build` / `noaddon` / `reopen` phases, now covering all six nodes. **Game of Life acceptance:** Conway, HighLife, Seeds and Day & Night, each 18/18 exact with 0 unsure. Biome: mean confidence ≥ 0.55 with all 7 outcomes used. Sanity checks for Match, Classify and Dials; Pick's Probability field; `noaddon` with table objects and entry-level Index Switches; `reopen` sends 0 requests. TIMING lines are compared with §3.2 |
 
 **Timing checks.** They print always and fail only above 2× the §3.2 target, so a busy GPU does
-not make the suite flaky. Accuracy checks (the Game of Life tables and the biome thresholds) are
-hard failures.
+not make the suite flaky. The `--bench` budgets (§8.4) follow the same rule, because the gate runs
+while other work uses the machine: every measurement is printed against its budget, one above its
+budget prints a `WARN` line, and only one above twice its budget fails. Accuracy checks (the Game
+of Life tables and the biome thresholds) are hard failures.
 
 ### 18.3 Gates
 
 | When | Must pass |
 |---|---|
-| Every PR | Pure suites, evaluator, interface and lookup suites on Blender 4.5 and 5.1. None needs a model; together they take a few minutes |
+| Every PR | Pure suites, evaluator, interface and lookup suites on Blender 4.5 and 5.1, the lookup suite with `--bench` (the §8.4 budgets, under the timing rule of §18.2), as `tests/run_all.ps1` runs them. None needs a model; together they take a few minutes |
 | PRs that touch `server.py`, `pipeline.py` or `openact_server.py` | Also `tests/pipeline_blender.py` (fake backend) |
 | PRs that touch specs, templates or scoring | Also `tests/e2e_blender.py` with the real model, on the RTX 3090 machine |
 | PRs that touch migration or storage | Also `tests/store_test.py` and `tests/migrate_blender.py` |
@@ -4528,8 +4543,9 @@ flowchart LR
 
 ### PR-08: Inner builder module and interface sync
 - **Files/components:**
-  - `openact/inner.py` (new: `_Builder`, match chain, entry-level `lookup`, `build()`,
-    `create_inner()`, `sync_interface()`);
+  - `openact/inner.py` (new: `SocketDef`, `_Builder`, match chain, entry-level `lookup`, `build()`,
+    `update_values()`, `create_inner()`, `sync_interface()`);
+  - `openact/compat.py` (new: `structure_type()`, §11);
   - `openact/engine.py` (uses `inner` and `store`);
   - `openact/nodes.py` (`init()` and `copy()` go through `inner`);
   - `tests/interface_blender.py` (new).
@@ -4571,8 +4587,8 @@ flowchart LR
   - `tests/rules_math_test.py` (new; PR-18 and PR-19 extend it).
 - **Depends on:** PR-08. **Parallel with:** PR-07.
 - **Changes:**
-  - `Spec` and `SocketDef` (§10.2), plus the helpers `option_text`, `state_text` and
-    `confidence()` (all three 4.e formulas).
+  - `Spec` (§10.2), using `inner.SocketDef` (PR-08), plus the helpers `option_text`, `state_text`
+    and `confidence()` (all three 4.e formulas).
   - `AskSpec` and `PickSpec` move into `specs/`. Ask's `mode` becomes `answer_type`, and Amount
     confidence switches to the σ formula.
   - **The `Key` word** (§6.0): every spec declares a hidden String `Key` as the last position of its
@@ -4664,8 +4680,7 @@ flowchart LR
     `write_rows()` (`foreach_set`, at most every 0.5 s during a fill).
   - Every per-element column is read through Object Info + Sample Index, with the §6.0 fallbacks.
   - **Materialised set:** live entries, then pinned, then warm up to 4 in total, with the hard cap
-    `MATERIALISED_MAX = 16` (§8.1). It drops to 8 only if the PR-08 spike fails the §8.4 budgets
-    at 16.
+    `MATERIALISED_MAX = 16` (§8.1), confirmed by the PR-08 spike (§8.4).
   - **`k_default`** (§8.2): set only when exactly one context is live and the node is not in a hint
     or error state, otherwise 0.
   - `update_values()` touches only entry-level Index Switches.
@@ -4941,7 +4956,8 @@ flowchart LR
     `tests/e2e_blender.py`.
 - **Depends on:** PR-14, PR-15. **Parallel with:** PR-16 … PR-19.
 - **Changes:** §6.6, §8.6.
-  - Settings, inline (Yes/No and Amount only) or from a CSV.
+  - Settings, inline (Yes/No and Amount only) or from a CSV, at most 32 either way (§7.5;
+    `csvfmt.MAX_SETTINGS`, lowered from 64 by the PR-08 spike).
   - `min`/`max` are per-entry data stored in `shape.settings` (§14.2). Contexts may use different
     ranges, as long as the setting names and types agree (§6.0).
   - Dynamic outputs, synced by name and type.
@@ -4949,7 +4965,8 @@ flowchart LR
   - All settings go in one P0 request.
   - A warning when a setting is renamed or retyped.
 - **Tests to merge:**
-  - **csv_test:** the settings parser, including the inline form.
+  - **csv_test:** the settings parser, including the inline form; 32 settings are accepted and 33
+    give the limit error, inline and from a CSV.
   - **pipeline:**
     - 5 settings travel in 1 request;
     - editing `min`/`max` is a values-only update with 0 requests;
@@ -5103,7 +5120,8 @@ flowchart LR
   1 → 2 conversion.
   - The conversion computes v1 `words_key`s with fixed-length word tuples (§8.2, §14.4), so the
     upgraded nodes' live plans reuse the converted entries.
-  - Pick keeps the prototype's precedence (Items text over collection) and legacy item parsing.
+  - Pick keeps the prototype's precedence (a set Collection over the Items text, §12.3) and legacy
+    item parsing.
 - **Tests to merge:**
   - `tests/migrate_blender.py` on 4.5 and 5.1: a v0.1.0 file built with the untouched prototype
     is upgraded, then:

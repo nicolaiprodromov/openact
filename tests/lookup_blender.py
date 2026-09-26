@@ -2,7 +2,8 @@
 values-only updates and rebuilds, and single-value sampling from a table object. With --bench, also the
 main-thread budgets of §8.4, as BENCH lines: inner.build() and update_values() for the Ask and Pick
 shapes and the contract spike's stand-ins for the demo and worst shapes of the nodes still to come; and,
-recorded without a gate, the planning cost of a 4096-cell context (§5.3).
+recorded without a gate, the planning cost of a 4096-cell context (§5.3). As §18.2 checks timings, a
+measurement above its budget prints a WARN line and fails only above twice the budget.
 
 Run:  blender -b --factory-startup --python tests/lookup_blender.py [-- --bench]
       OPENACT_BENCH_SHAPE=demo|worst limits --bench to one set of shapes (default: both).
@@ -10,6 +11,7 @@ Run:  blender -b --factory-startup --python tests/lookup_blender.py [-- --bench]
 
 import contextlib
 import itertools
+import json
 import os
 import sys
 import time
@@ -18,13 +20,14 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, finish, sock, store  # noqa: E402
-from openact import engine, evaluator, inner, nodes  # noqa: E402  (bpy must be imported first)
+from openact import engine, evaluator, inner, nodes, ops  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
 
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
+ops.register()
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 MATERIALISED_MAX = 16  # the cap of §8.1: every worst shape has this many entries
 DIALS_MAX_SETTINGS = 32  # §7.5
@@ -140,15 +143,50 @@ def phase_lookup():
     inner.build(ask, grown)
     got = {key: read(key) for key in WORDS}
     check("build: the new entry reaches its context", got["C"]["answer"] == 1.0 and got["C"]["yes"] is True, got["C"])
+    try:
+        inner.build(ask, S.NodeStore(grown.entries + [S.Entry(gn=("Is it broken?", ""))]))  # no values
+        raised = False
+    except KeyError:
+        raised = True
+    check("build: after a build that raised, update_values() refuses even the entries built before it",
+          raised and inner.update_values(ask, grown) is False, raised)
     inner.build(ask, grown)
     inner.build(pick, picks)
     check("build: a rebuild from the same entries leaves every output unchanged",
           {key: read(key) for key in WORDS} == got, got)
 
 
+def phase_converted():
+    """Entries converted from schema 1 keep v1's 5-word gn (§14.4), which the 2-word prototype specs can't
+    compare. Compared word by word, a converted text Pick (Prompt, "", Items, "", "") would give its answer to
+    any context with that prompt and no Items text, such as a collection Pick."""
+    pick.entries = json.dumps([
+        {"key": "a", "gn": [WORDS["A"]["Prompt"], WORDS["A"]["Items"]], "t": 1.0,
+         "a": {"index": 1, "item": "chair", "confidence": 0.5, "probabilities": [0.25, 0.75],
+               "items": ["table", "chair"], "collection": ""}},
+        {"key": "b", "gn": [WORDS["B"]["Prompt"], ""], "t": 1.0,
+         "a": {"index": 0, "item": "book", "confidence": 0.5, "probabilities": [0.75, 0.25],
+               "items": ["book", "lamp"], "collection": "Shelf"}}])  # v0.1.0, schema 1
+    converted = S.load(pick)
+    inner.build(pick, converted)
+    got = {key: read(key)["index"] for key in ("A", "B")}
+    mod = objects["C"].modifiers["Lookup"]
+    for key in ("A", "B"):  # C with that prompt and no Items text: a collection Pick's words
+        mod[ids["Prompt"]], mod[ids["Items"]] = WORDS[key]["Prompt"], ""
+        objects["C"].update_tag()
+        got[f"C with {key}'s prompt"] = read("C")["index"]
+    mod[ids["Prompt"]], mod[ids["Items"]] = WORDS["C"]["Prompt"], WORDS["C"]["Items"]
+    objects["C"].update_tag()
+    check("converted entries: a text Pick and a collection Pick show the fallback, never another context's answer",
+          [e.gn for e in converted.entries] == [(WORDS["A"]["Prompt"], "", WORDS["A"]["Items"], "", ""),
+                                                (WORDS["B"]["Prompt"], "", "", "", "")]
+          and set(got.values()) == {-1}, got)
+
+
 def phase_pass():
-    """The pass keeps entries through store.py: schema 1 is converted on read, schema 2 is written, and the
-    live set it passes to save() keeps a live entry that eviction would otherwise remove."""
+    """The pass keeps entries through store.py: schema 1 is converted on read, schema 2 is written, the live
+    set it passes to save() keeps a live entry that eviction would otherwise remove, and a newer OpenAct's
+    JSON is left as it is."""
     live = bpy.data.node_groups.new("Pass", 'GeometryNodeTree')
     live.interface.new_socket("Question", in_out='INPUT', socket_type='NodeSocketString')
     node_ = live.nodes.new(engine.ASK_ID)
@@ -191,6 +229,25 @@ def phase_pass():
     engine.reask(node_)
     check("Ask Again: the node's answers are forgotten, saved as schema 2 and the group rebuilt",
           node_.entries == '{"schema":2,"entries":[]}' and inner.update_values(node_, S.NodeStore()), node_.entries)
+
+    newer = '{"schema":3,"entries":[{"written by":"a newer OpenAct"}]}'
+    node_.entries = newer
+    group, asked = pointers(node_), []
+    submit, engine._submit = engine._submit, lambda node, _req: asked.append(node.uid)
+    try:
+        engine.run_pass()
+    finally:
+        engine._submit = submit
+    check("pass: a newer OpenAct's answers show an error, and are not asked for, written over or rebuilt",
+          node_.entries == newer and node_.uid not in asked and pointers(node_) == group
+          and engine.STATUS[node_.uid] == ('ERROR', S.newer_message(S.load(node_))), engine.STATUS[node_.uid])
+    try:
+        bpy.ops.openact.reask(uid=node_.uid)
+        shown = ""
+    except RuntimeError as error:  # how an operator's ERROR report reaches a Python caller
+        shown = str(error).strip()
+    check("Ask Again: a newer OpenAct's answers are kept, and the operator says why",
+          node_.entries == newer and "saved by a newer OpenAct" in shown and "Traceback" not in shown, shown)
 
 
 # ------------------------------------------------------------------ stand-ins for later nodes
@@ -574,9 +631,14 @@ def timed(fn, runs=5):
 
 
 def bench_line(path, elements, ms, budget=None):
+    """A BENCH line and, against a budget, the timing rule of §18.2: other work on the machine may slow a run,
+    so above the budget is a warning and only above twice the budget a failure."""
     print(f"BENCH {path} {elements} {ms:.1f}", flush=True)
-    if budget is not None:
-        check(f"bench: {path} within {budget} ms", ms <= budget, f"{ms:.1f} ms, {elements} elements")
+    if budget is None:
+        return
+    if ms > budget:
+        print(f"WARN bench: {path} took {ms:.1f} ms, above its {budget} ms budget", flush=True)
+    check(f"bench: {path} within 2x its {budget} ms budget", ms <= 2 * budget, f"{ms:.1f} ms, {elements} elements")
 
 
 def bench_shape(label, node_, store_a, store_b, shape, budget=None):
@@ -678,6 +740,7 @@ def phase_bench(shapes):
 
 
 phase_lookup()
+phase_converted()
 phase_pass()
 phase_single_value_sample()
 if "--bench" in ARGS:

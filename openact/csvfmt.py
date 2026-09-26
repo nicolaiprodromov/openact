@@ -27,7 +27,7 @@ MAX_PAYLOAD = 16
 MAX_NAME = 63  # bytes of UTF-8: Blender cuts longer socket names
 MAX_FACTORS = 8
 MAX_CELLS = 4096
-MAX_SETTINGS = 64
+MAX_SETTINGS = 32
 KEY_SEP = "\x1f"  # joins the key cells of an Overrides row
 
 KINDS = ("yes_no", "amount", "one_of", "items")

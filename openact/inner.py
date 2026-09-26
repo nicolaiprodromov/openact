@@ -16,7 +16,8 @@ from dataclasses import dataclass
 
 import bpy
 
-from . import compat, store
+from . import compat
+from . import store as _store  # build() and update_values() take `store`, the name §13.3 fixes
 
 INNER_PREFIX = ".OpenAct "
 SPECS = {}  # node bl_idname -> spec (label, iface, build); the engine adds the OpenAct nodes
@@ -66,9 +67,12 @@ class _Builder:
         return self.tree.links.new(a, b)
 
     def match_chain(self, sockets, keys):
-        """Integer socket: 1 + index of the entry whose key strings equal the inputs, else 0."""
+        """Integer socket: 1 + index of the entry whose key strings equal the inputs, else 0. A key of
+        another length (converted from schema 1) never matches: its words sit at other positions."""
         previous = None
         for i, key in enumerate(keys, start=1):
+            if len(key) != len(sockets):
+                continue
             y = 400 - i * 110
             conditions = []
             for j, (socket, value) in enumerate(zip(sockets, key)):
@@ -125,36 +129,37 @@ def inner_name(node):
     return f"{INNER_PREFIX}{SPECS[node.bl_idname].label} {node.uid}"
 
 
-def create_inner(node, node_store=None):
+def create_inner(node, store=None):
     """Give the node a new inner group with its spec's interface, built from its stored entries."""
     tree = bpy.data.node_groups.new(inner_name(node), 'GeometryNodeTree')
     node.node_tree = tree
     sync_interface(node, SPECS[node.bl_idname].iface)
-    build(node, store.load(node) if node_store is None else node_store)
+    build(node, _store.load(node) if store is None else store)
     return tree
 
 
-def build(node, node_store):
+def build(node, store):
     """Rebuild the inner group's nodes from the store; the interface is kept."""
     tree = node.node_tree
     if tree is None:
-        create_inner(node, node_store)
+        create_inner(node, store)
         return
+    tree.pop(BUILT, None)  # a build that raises leaves a partial graph, which update_values() must not write
     tree.nodes.clear()
     builder = _Builder(tree)
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
-    SPECS[node.bl_idname].build(builder, group_in, group_out, node_store.entries)
+    SPECS[node.bl_idname].build(builder, group_in, group_out, store.entries)
     builder.finish()
-    tree[BUILT] = _built(node, node_store.entries)
+    tree[BUILT] = _built(node, store.entries)
 
 
-def update_values(node, node_store):
+def update_values(node, store):
     """Write the changed entry-level values without rebuilding: every Index Switch that feeds an output
     holds the fallback, then each entry's `single` value for that output. Returns False, writing
     nothing, when build() laid out other entries than the store's, so build() is needed."""
     tree = node.node_tree
-    entries = node_store.entries
+    entries = store.entries
     if tree is None or tree.get(BUILT) != _built(node, entries):
         return False
     feeds = [(link.to_socket.name, _items(link.from_node)) for link in tree.links
@@ -207,13 +212,9 @@ def sync_interface(node, wanted):
             _set(item, "hide_value", d.hide_value)
             if hasattr(item, "default_input"):  # not on every socket type
                 _set(item, "default_input", d.default_input)
-    position = 0  # the interface lists outputs first, then inputs
-    for in_out in ('OUTPUT', 'INPUT'):
-        for key in defs:
-            if key[0] == in_out:
-                if items[key].position != position:
-                    interface.move(items[key], position)  # always upwards: the items above are in place
-                position += 1
+    for position, key in enumerate(sorted(defs, key=lambda k: k[0] != 'OUTPUT')):  # outputs first, then inputs
+        if items[key].position != position:
+            interface.move(items[key], position)  # always upwards: the items above are in place
     for d, identifier in created:
         if d.hidden:
             sock(node.inputs if d.in_out == 'INPUT' else node.outputs, identifier).hide = True
