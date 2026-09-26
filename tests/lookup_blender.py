@@ -22,12 +22,14 @@ import time
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import check, finish, sock, store  # noqa: E402
+from _harness import ROOT, check, finish, sock, store  # noqa: E402
 from openact import engine, evaluator, inner, nodes, ops, pipeline, tables  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
 from openact.specs.base import Spec  # noqa: E402
+from openact.specs.match import MatchSpec  # noqa: E402
+from openact.specs.rules import RulesSpec  # noqa: E402
 
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
@@ -393,6 +395,280 @@ def phase_pick_pass():
     check("pass, Pick: with a Key each, both show their own answer; the context already answered sends 0 requests",
           asked == [kitchen] and questions == asked and got == ([1] * 4, [0] * 4)
           and engine.STATUS[picker.uid].icon == 'CHECKMARK', (asked == [kitchen], got, engine.STATUS[picker.uid]))
+
+
+def phase_converted_default():
+    """Every entry converted from v0.1.0 has the words key "", so that key names none of them (§8.2): a single context
+    whose words changed shows its own last answer or neutral values while it waits, never another converted entry's;
+    and the warm entries are the most recent ones, not the converted ones."""
+    group = bpy.data.node_groups.new("Converted", 'GeometryNodeTree')
+    for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Question", 'NodeSocketString')):
+        group.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi, go = group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput")
+    asker = group.nodes.new(engine.ASK_ID)
+    group.links.new(gi.outputs["Question"], asker.inputs["Question"])
+    group.links.new(store(group, gi.outputs["Geometry"], asker.outputs["Answer"], "answer", 'FLOAT'), go.inputs[0])
+    asker.entries = json.dumps([  # v0.1.0 (schema 1): two answers of this node, converted on read
+        {"key": "n", "gn": ["Is it night?", ""], "t": 1.0, "a": {"mode": "YES_NO", "value": 0.875, "confidence": 0.75}},
+        {"key": "c", "gn": ["Is it cold?", ""], "t": 2.0, "a": {"mode": "YES_NO", "value": 0.125, "confidence": 0.75}}])
+    mesh = bpy.data.meshes.new("Converted")
+    mesh.from_pydata([(0, 0, 0)], [], [])
+    user = bpy.data.objects.new("Converted", mesh)
+    bpy.context.scene.collection.objects.link(user)
+    user.modifiers.new("Converted", 'NODES').node_group = group
+    ident = group.interface.items_tree["Question"].identifier
+
+    def shown(question):
+        user.modifiers["Converted"][ident] = question
+        user.update_tag()
+        with asking(asker, []):  # nothing answers: edited words wait
+            engine.run_pass()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        depsgraph.update()
+        evaluated = user.evaluated_get(depsgraph)
+        result = evaluated.to_mesh()
+        try:
+            return round(result.attributes["answer"].data[0].value, 6)
+        finally:
+            evaluated.to_mesh_clear()
+
+    before, after = shown("Is it cold?"), shown("Is it cold outside?")
+    check("converted entries: a single context whose words changed keeps its own answer or shows neutral values, "
+          "never the other converted entry's", before == 0.125 and after in (0.125, 0.0), (before, after))
+    live = S.Entry(words_key="live", gn=("Live?", "", "", "", ""))
+    old = [S.Entry(words_key="", gn=(f"Converted {i}?", "", "", "", ""), t=float(i), legacy=True) for i in range(3)]
+    recent = [S.Entry(words_key=f"recent {i}", gn=(f"Recent {i}?", "", "", "", ""), t=10.0 + i) for i in range(3)]
+    warm = [e.gn[0] for e in inner.materialised(old + recent + [live], [live.gn], "")]
+    check("converted entries: with the default \"\", the warm entries are the most recent, not the converted ones",
+          warm == ["Recent 0?", "Recent 1?", "Recent 2?", "Live?"], warm)
+    bpy.data.objects.remove(user)
+    bpy.data.node_groups.remove(group)
+
+
+def phase_table_only():
+    """Rules in Yes/No mode declares only table-only columns, and before its first answer nothing samples them: the
+    group still holds its table object, so the next pass is values only, with no new object and no pass loop."""
+    group = bpy.data.node_groups.new("TableOnly", 'GeometryNodeTree')
+    rules = group.nodes.new(RulesSpec.idname)
+    rules.answer_type = 'YES_NO'
+    rules.inputs["Question"].default_value = "Is it snowy?"
+    rules.inputs["Factors"].default_value = os.path.join(ROOT, "tests", "fixtures", "biome_factors.csv")
+    build, rebuilt = inner.build, []
+
+    def recorded(node_, *args):
+        rebuilt.append(node_ == rules)
+        build(node_, *args)
+
+    with asking(rules, []):
+        engine.run_pass()  # plans: the factor sockets appear, and the cells wait for the model
+        held = tables.find(rules)
+        inner.build = recorded
+        try:
+            engine.run_pass()
+        finally:
+            inner.build = build
+    check("table-only columns: an unanswered Rules Yes/No node holds its table object, and the next pass is values "
+          "only", held is not None and tables.find(rules) == held and not any(rebuilt), (held, rebuilt))
+    bpy.data.node_groups.remove(group)
+    tables.collect_garbage(list(engine.iter_nodes()))  # its table goes now: phase_table_copies counts what goes
+
+
+def user_of(group, name, points=1):
+    """An object of `points` points in the scene whose modifier uses the group."""
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([(i, 0, 0) for i in range(points)], [], [])
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.modifiers.new(name, 'NODES').node_group = group
+    return obj
+
+
+def phase_carry():
+    """Carry-over by wkey (§5.4) in a new session, where only the stored entry can answer: a text edit of a Match's
+    Items CSV (the same words) asks only the row whose wkey changed, the old answers never showing meanwhile, and
+    nothing more once its answer arrives; undoing the edit before then asks nothing and shows the stored answers."""
+    folder = tempfile.mkdtemp(prefix="openact-carry-")
+    path = os.path.join(folder, "items.csv")
+
+    def items(lamp, stamp):  # each edit gets a new stamp, which the fingerprint holds
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(f"answer,when\nchair,a seat\ntable,a flat surface\nlamp,{lamp}\n")
+        os.utime(path, ns=(stamp, stamp))
+
+    group = bpy.data.node_groups.new("Carry", 'GeometryNodeTree')
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    matcher = group.nodes.new(MatchSpec.idname)
+    matcher.inputs["Question"].default_value = "Would you find it in a kitchen?"
+    matcher.inputs["Items"].default_value = path
+    geometry = store(group, group.nodes.new("NodeGroupInput").outputs["Geometry"], matcher.outputs["Probability"],
+                     "prob", 'FLOAT')
+    group.links.new(geometry, group.nodes.new("NodeGroupOutput").inputs[0])
+    user = user_of(group, "Carry", 3)
+
+    def cells():
+        return [row.cell.key for row in
+                engine.SPECS[MatchSpec.idname].plan(matcher, evaluator.find_uses()[group.as_pointer()][0]).rows]
+
+    items("gives light", 10 ** 18)
+    old, questions = cells(), []
+    for key, p in zip(old, (0.875, 0.75, 0.25)):
+        pipeline.remember(key, {"p": p, "model": "fake"})
+    try:
+        with asking(matcher, questions):
+            engine.run_pass()
+        stored = table_read(user)["prob"]
+        pipeline.forget(old)  # a new session, in which the CSV was edited while Blender was closed
+        engine.on_load_post()
+        items("gives light at night", 2 * 10 ** 18)  # only lamp's wkey changes
+        with asking(matcher, questions):
+            engine.run_pass()
+        edited, meanwhile, lamp = list(questions), table_read(user)["prob"], cells()[2]
+        check("carry-over, new session: a text edit asks only the row whose wkey changed, and the old answers never "
+              "show meanwhile", stored == [0.875, 0.75, 0.25] and edited == [lamp] and meanwhile == [0.0] * 3,
+              (stored, len(edited), meanwhile))
+        questions.clear()
+        items("gives light", 3 * 10 ** 18)  # undone before lamp's answer arrives
+        with asking(matcher, questions):
+            engine.run_pass()
+        check("carry-over: undoing the edit before its answer arrives asks nothing and shows the stored answers",
+              not questions and table_read(user)["prob"] == stored, (len(questions), table_read(user)["prob"]))
+        items("gives light at night", 4 * 10 ** 18)
+        with asking(matcher, questions):
+            engine.run_pass()
+        pipeline.remember(lamp, {"p": 0.125, "model": "fake"})
+        questions.clear()
+        with asking(matcher, questions):
+            engine.run_pass()
+        check("carry-over: once the changed row is answered nothing more is asked, and the others keep their stored "
+              "answers", not questions and table_read(user)["prob"] == [0.875, 0.75, 0.125],
+              (len(questions), table_read(user)["prob"]))
+    finally:
+        pipeline.forget(old + cells())
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def phase_live_set():
+    """The live set (§5.3 step 6, §8.1): a context whose Answers CSV now has errors keeps showing its last good table,
+    so save() never evicts that entry, even when another context stores a new one in the same pass. Two contexts with
+    the same words show one entry, and in a new session a new Key on either carries its rows over, with 0 requests."""
+    folder = tempfile.mkdtemp(prefix="openact-live-")
+    path = os.path.join(folder, "a.csv")
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write("answer,when\nyes,it is dark\nno,it is light\n")
+    group = bpy.data.node_groups.new("LiveSet", 'GeometryNodeTree')
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    for name in ("Answers", "Key"):
+        group.interface.new_socket(name, in_out='INPUT', socket_type='NodeSocketString')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi = group.nodes.new("NodeGroupInput")
+    group.links.new(gi.outputs["Geometry"], group.nodes.new("NodeGroupOutput").inputs[0])
+    asker = group.nodes.new(engine.ASK_ID)
+    asker.inputs["Question"].default_value = "Is it night?"
+    for name in ("Answers", "Key"):
+        group.links.new(gi.outputs[name], asker.inputs[name])
+    idents = {i.name: i.identifier for i in group.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
+    users = {name: user_of(group, name) for name in ("LA", "LB", "LC")}
+
+    def use(name, **words):
+        for word, value in words.items():
+            users[name].modifiers[name][idents[word]] = value
+        users[name].update_tag()
+
+    def cell(name):
+        ctx = next(c for c in evaluator.find_uses()[group.as_pointer()] if c.obj.name == name)
+        return engine.SPECS[engine.ASK_ID].plan(asker, ctx).rows[0].cell.key
+
+    use("LA", Answers=path, Key="")
+    use("LB", Answers="", Key="")
+    use("LC", Answers="", Key="")  # LB's words exactly
+    keys = [cell("LA"), cell("LB")]
+    for key in keys:
+        pipeline.remember(key, {"p": 0.875, "model": "fake"})
+    try:
+        engine.run_pass()
+        pipeline.forget(keys)  # a new session: only the stored entries can answer
+        engine.on_load_post()
+        engine.run_pass()
+        asked = {}
+        for name in ("LC", "LB"):
+            questions = []
+            use(name, Key=name.lower())
+            with asking(asker, questions):
+                engine.run_pass()
+            asked[name] = len(questions)
+            use(name, Key="")
+            engine.run_pass()
+        check("same words, new session: a new Key on either context carries its rows over, 0 requests",
+              asked == {"LC": 0, "LB": 0}, asked)
+
+        node_store = S.load(asker)
+        errored = next(e.gn for e in node_store.entries if e.gn[2] == path)
+        for entry in node_store.entries:
+            entry.t = 1.0  # the least recently used: the first to go
+        node_store.entries += [S.Entry(words_key=f"warm {i}", gn=(f"Warm {i}?", "", "", "", ""), t=10.0 + i, kind="ask",
+                                       answer_type='YES_NO', single={"Answer": 0.5, "Yes": True, "Confidence": 0.0})
+                               for i in range(S.MAX_ENTRIES + 1)]
+        S.save(asker, node_store)
+        with open(path, "w", encoding="utf-8", newline="") as handle:  # LA's CSV breaks while Blender is closed
+            handle.write('name;;;\n"unclosed\n')
+        engine.on_load_post()
+        pipeline.remember(keys[1], {"p": 0.25, "model": "fake"})
+        use("LB", Key="b")  # LB stores a new entry in the same pass
+        engine.run_pass()
+        kept = [e.gn for e in S.load(asker).entries]
+        check("live set: the entry of a context whose CSV now has errors is never evicted, as it still shows",
+              errored in kept and ("Warm 0?", "", "", "", "") not in kept and engine.STATUS[asker.uid].icon == 'CANCEL',
+              (errored in kept, len(kept), engine.STATUS[asker.uid]))
+    finally:
+        pipeline.forget(keys)
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def phase_converted_last_shown():
+    """k_default never names a converted v0.1.0 entry, which has no words key: a context showing one gets new words
+    that no model answers, and shows neutral values, never another question's converted answer (§8.2)."""
+    group = bpy.data.node_groups.new("Converted", 'GeometryNodeTree')
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    asker = group.nodes.new(engine.ASK_ID)
+    geometry = store(group, group.nodes.new("NodeGroupInput").outputs["Geometry"], asker.outputs["Answer"], "prob",
+                     'FLOAT')
+    group.links.new(geometry, group.nodes.new("NodeGroupOutput").inputs[0])
+    user = user_of(group, "Converted")
+    asker.entries = json.dumps([  # v0.1.0, schema 1
+        {"key": "a", "gn": ["Is it cold?", ""], "t": 1.0, "a": {"mode": "YES_NO", "value": 0.125, "confidence": 0.75}},
+        {"key": "b", "gn": ["Is it night?", ""], "t": 2.0, "a": {"mode": "YES_NO", "value": 0.875, "confidence": 0.75}}])
+    got = []
+    with asking(asker, []):
+        for question in ("Is it night?", "Is it dark?"):
+            asker.inputs["Question"].default_value = question
+            engine.run_pass()
+            got.append(table_read(user)["prob"][0])
+    check("converted entries: a context shows its own, and with new words neutral values, never another question's "
+          "converted answer", got == [0.875, 0.0], got)
+
+
+def phase_statuses():
+    """A Pick with nothing typed asks for its prompt first: its list's hint waits for plan(). A node that reads a newer
+    OpenAct's answers as words says why, rather than waiting for them."""
+    group = bpy.data.node_groups.new("Statuses", 'GeometryNodeTree')
+    picker = group.nodes.new(engine.PICK_ID)
+    reader = group.nodes.new(engine.ASK_ID)
+    engine.run_pass()
+    empty = engine.STATUS[picker.uid]
+    picker.inputs["Prompt"].default_value = "something to sit on"
+    picker.inputs["Items"].default_value = "table, chair"
+    picker.entries = '{"schema":3,"entries":[]}'
+    group.links.new(picker.outputs["Item"], reader.inputs["Question"])
+    with asking(reader, []):
+        engine.run_pass()
+    status = engine.STATUS[reader.uid]
+    check("status: an empty Pick asks for its prompt first", (empty.icon, empty.text) == ('INFO', "Type a prompt"),
+          empty)
+    check("status: a node that reads a newer OpenAct's answers as words says why, rather than waiting",
+          status.icon == 'CANCEL' and "newer OpenAct" in status.text, status)
 
 
 # ------------------------------------------------------------------ stand-ins for later nodes
@@ -1023,6 +1299,15 @@ def phase_write_rows(picker, users, node_store, live):
         steps.append(len(mesh.vertices) == count and written == columns
                      and {name: mesh.attributes[tables.ATTR + name].data_type for name in columns} == types)
     check("write_rows: grow -> shrink -> grow keeps every column, its values and its type", steps == [True] * 3, steps)
+    long_name = "pl_" + "x" * 65  # oa_pl_x...: 71 bytes, more than Blender 4.5 takes for an attribute name
+    try:
+        mesh = tables.write_rows(picker, {long_name: [0.5] * 20}).data
+        error = None
+    except Exception as caught:  # anything but a ValueError fails the check
+        error = caught
+    check("write_rows: a column Blender can't create raises a ValueError naming it (4.5), else it is written (5.x)",
+          isinstance(error, ValueError) and tables.ATTR + long_name in str(error) if error is not None
+          else tables.ATTR + long_name in mesh.attributes, repr(error))
     restored = inner.update_values(picker, node_store, live)
     names = sorted(a.name for a in tables.find(picker).data.attributes if a.name.startswith(tables.ATTR))
     got, want = reads(users, node_store.entries)
@@ -1104,6 +1389,20 @@ def phase_save_reload():
               == [d.value for d in mine.data.attributes["oa_prob"].data], (theirs and theirs.name, removed))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
+
+
+def phase_layout_version():
+    """A newer OpenAct whose build() lays out another graph for the same entries bumps inner.LAYOUT: update_values()
+    then refuses the groups built before it, so the first pass after an upgrade or a file load rebuilds them."""
+    asks = S.NodeStore([ask_entry("A", 0.875, 0.75)])
+    inner.build(ask, asks)
+    inner.LAYOUT += 1
+    try:
+        bumped = inner.update_values(ask, asks)
+    finally:
+        inner.LAYOUT -= 1
+    check("layout version: a group laid out under another LAYOUT needs build()",
+          bumped is False and inner.update_values(ask, asks), bumped)
 
 
 def phase_tables():
@@ -1247,9 +1546,16 @@ phase_lookup()
 phase_converted()
 phase_pass()
 phase_pick_pass()
+phase_converted_default()
+phase_table_only()
+phase_carry()
+phase_live_set()
+phase_converted_last_shown()
+phase_statuses()
 phase_single_value_sample()
 phase_materialised()
 phase_tables()
+phase_layout_version()
 if "--bench" in ARGS:
     chosen = os.environ.get("OPENACT_BENCH_SHAPE", "")
     phase_bench({chosen} if chosen in ("demo", "worst") else {"demo", "worst"})

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import bpy
 
-from . import engine, inner, sources, store, ui
+from . import engine, inner, sources, ui
 from . import prefs as P
 from .specs import dials
 from .specs.classify import ClassifySpec
@@ -17,11 +17,10 @@ def _changed(self, context):
     engine.schedule(immediate=True, node=self)
 
 
-def _list_source_changed(self, context):
-    # the dropdown swaps sockets (§6.0); the group is rebuilt for them, as a stored entry may show again unchanged
+def _interface_changed(self, context):
+    # the dropdown swaps sockets at once (§6.0); the pass rebuilds the group, as update_values() sees the change
     if self.node_tree is not None:
         inner.sync_interface(self, engine.SPECS[self.bl_idname].interface(self))
-        inner.build(self, store.load(self))
     engine.schedule(immediate=True, node=self)
 
 
@@ -39,7 +38,7 @@ class _OpenActNode:
                     "model's bias toward early options, at twice the cost. Changing it keeps the answers given so far",
     )
     list_source: bpy.props.EnumProperty(  # Pick, Match and Classify (§6.0); unused by the others
-        name="List Source", items=sources.LIST_SOURCE_ITEMS, default='TEXT', update=_list_source_changed,
+        name="List Source", items=sources.LIST_SOURCE_ITEMS, default='TEXT', update=_interface_changed,
         description="Where the items come from",
     )
 
@@ -99,9 +98,9 @@ class _OpenActNode:
             col.label(text=spec.summary(answer), icon='CHECKMARK')
             if engine.older_settings(self, answer):
                 col.label(text="Asked with older settings: Ask Again refreshes it", icon='BLANK1')
-            if self.bl_idname == engine.PICK_ID:
-                ranked = sorted(zip(answer.rows.name, answer.rows.v["prob"]), key=lambda pair: -pair[1])[:5]
-                for name, probability in ranked:
+            if self.bl_idname == engine.PICK_ID:  # the top 5 items, without empty material slots
+                named = [(name, p) for name, p in zip(answer.rows.name, answer.rows.v["prob"]) if name]
+                for name, probability in sorted(named, key=lambda pair: -pair[1])[:5]:
                     row = col.row()
                     row.label(text=name, icon='BLANK1')
                     row.label(text=f"{probability * 100:.1f}%")
@@ -217,13 +216,6 @@ class GeometryNodeOpenActDials(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_label = "Dials"
 
 
-def _rules_mode(self, context):
-    # the outputs, and Dither and Seed, follow the answer type at once; the pass then re-plans
-    inner.sync_interface(self, engine.SPECS[self.bl_idname].interface(self))
-    inner.build(self, store.load(self))
-    engine.schedule(immediate=True, node=self)
-
-
 class GeometryNodeOpenActRules(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     """Ask one question per combination of factor levels, then look up each element's cell"""
 
@@ -238,7 +230,7 @@ class GeometryNodeOpenActRules(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
             ('AMOUNT', "Amount", "How much (0-1), blended across up to 3 Amount factors"),
         ),
         default='ONE_OF',
-        update=_rules_mode,
+        update=_interface_changed,  # the outputs, and Dither and Seed, follow the answer type
     )
 
     def draw_settings(self, layout):

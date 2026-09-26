@@ -69,9 +69,7 @@ class AskSpec(Spec):
         asked = sources.question(kind, question, answers)
         columns = (("amount", "FLOAT"), ("c", "FLOAT")) if kind == "amount" else (("p", "FLOAT"), ("c", "FLOAT"))
         state = state_text(context)
-        criteria = asked["criteria"]
-        ordered = list(criteria.items()) if isinstance(criteria, dict) else criteria  # the cell key keeps the order
-        cell = pipeline.Cell(pipeline.cell_key(asked["type"], state, question, ordered, debias), state, asked,
+        cell = pipeline.Cell(pipeline.cell_key(asked["type"], state, question, asked["criteria"], debias), state, asked,
                              pipeline.cost(len(options), debias))
         row = pipeline.Row(question, pipeline.wkey(self.name, answer_type, [question, context], [], options),
                            cell=cell)

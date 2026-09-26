@@ -18,7 +18,7 @@ from .base import KEY, Spec, confidence, lock_answer, named, number_text, overri
 FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
 OUTCOMES_HINT = "Add outcomes"
 UNSURE_BELOW = 0.30  # 4.e; the preference arrives with PR-22
-PAYLOAD = "pl_"  # table column prefix of a payload output
+PAYLOAD = "pl_"  # table column prefix of a payload output, followed by its position
 HEAD = ("Question", "Context", "Factors", "Factors CSV", "Outcomes", "Outcomes CSV", "Overrides", "Overrides CSV",
         "Dither", "Seed", "Key")  # inputs that are not factors
 SOCKETS = {"amount": 'NodeSocketFloat', "category": 'NodeSocketInt', "flag": 'NodeSocketBool'}
@@ -290,33 +290,34 @@ class RulesSpec(Spec):
         columns = [Column("", "map", 'INT', -1)]
         if mode == 'ONE_OF':
             columns += [Column("Outcome", "outcome", 'INT', -1), Column("Confidence", "c", 'FLOAT', 0.0)]
-            for out in node.outputs:
-                if out.name not in MODES and out.name != "Confidence" and out.type in ('INT', 'VALUE'):
-                    integer = out.type == 'INT'
-                    columns.append(Column(out.name, PAYLOAD + out.name, 'INT' if integer else 'FLOAT',
-                                          -1 if integer else 0.0))
+            payload = [out for out in node.outputs
+                       if out.name not in MODES and out.name != "Confidence" and out.type in ('INT', 'VALUE')]
+            for k, out in enumerate(payload):  # by position: a header may be too long for an attribute name (§8.5)
+                integer = out.type == 'INT'
+                columns.append(Column(out.name, f"{PAYLOAD}{k}", 'INT' if integer else 'FLOAT', -1 if integer else 0.0,
+                                      payload=True))
         elif mode is not None:
             columns += [Column("", rules_core.value_column(mode), 'FLOAT', 0.0), Column("", "c", 'FLOAT', 0.0),
                         Column("", "ok", 'FLOAT', 0.0)]
         return tuple(columns)
 
     def table_rows(self, node, entries, columns):
-        """inner.flat_rows() with payload from rows.payload, then the category maps after every cell row (§9.2)."""
+        """inner.flat_rows(), then the category maps after every cell row (§9.2)."""
+        from ..inner import flat_rows
+
         tree = node.node_tree
-        fallbacks = {}
-        for column in columns:
-            fallbacks.setdefault(column.name, column.fallback)
-        flat = {}
-        for name, fallback in fallbacks.items():
-            values = flat[name] = []
-            for entry in entries:
-                count = len(entry.rows.name)
-                own = entry.rows.payload.get(name[len(PAYLOAD):]) if name.startswith(PAYLOAD) else entry.rows.v.get(name)
-                values.extend(own if own is not None and len(own) == count else [fallback] * count)
+        flat, fallbacks = flat_rows(entries, columns), {column.name: column.fallback for column in columns}
         for rows in _maps(_reference(tree, entries, _mode(tree))):
             for name, values in flat.items():
                 values.extend(rows if name == "map" else [fallbacks[name]] * len(rows))
         return flat
+
+    def layout(self, node, entries):
+        """What build() bakes from the entries besides their words (inner._built()): the reference entry's
+        factors, and the cell rows that the category maps follow."""
+        tree = node.node_tree
+        reference = _reference(tree, entries, _mode(tree))
+        return reference and [reference.shape["factors"], sum(len(entry.rows.name) for entry in entries)]
 
     # ------------------------------------------------------------------ the graph
 

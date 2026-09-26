@@ -4,7 +4,8 @@ Without arguments no model is needed: fake answers stand in for it. The weather 
 one-row-per-entry table object gives each output its setting's answer, Amount mapped into min-max; a min/max edit is
 a values-only update with 0 requests; two contexts with different ranges each get their own values; different setting
 names give the shape-agreement error; an output drives Grid's Vertices X through a valid link; renaming a setting warns
-(in the CSV or inline), and renaming it back brings its output back.
+(in the CSV or inline), and renaming it back brings its output back; after Ask Again, or while an edited question is
+asked again, the outputs and their links stay.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -202,8 +203,8 @@ def phase_nomodel():
         settle()
     icon, text = engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text
     check("status: a Settings CSV warning shows after the summary, and nothing is asked",
-          icon == 'ERROR' and text.startswith("5 settings · lowest confidence 0.50 · 1 warning: a.csv line 6: Line 6 "
-                                              "is blank") and not calls, (icon, text, len(calls)))
+          icon == 'ERROR' and text.startswith("5 settings · lowest confidence 0.50 · 1 warning: a.csv: Line 6 is "
+                                              "blank") and not calls, (icon, text, len(calls)))
 
     # a min/max edit: the rows carry over (their wkeys hold no min/max), the shape changes, the graph doesn't
     before, rebuilt = pointers(node), []
@@ -298,6 +299,65 @@ def phase_inline():
     names = [s.name for s in node.outputs]
     check("inline rename back: the stored entry's outputs return, with 0 requests",
           names == ["Rain", "Fog", "Confidence"] and not calls, (names, len(calls)))
+    phase_live_outputs()
+
+
+def settle_answered(calls):
+    """Passes that answer every Amount cell they ask for with the same middling answer, until nothing is asked."""
+    for _ in range(3):
+        calls.clear()
+        with asking(calls):
+            engine.run_pass()
+        for _job, missing in calls:
+            for cell in missing:
+                pipeline.remember(cell.key, {"probabilities": [0.0, 0.25, 0.5, 0.25, 0.0], "amount": 0.5,
+                                             "model": "fake"})
+    calls.clear()
+    with asking(calls):
+        settle(2)
+
+
+def phase_live_outputs():
+    """The outputs follow the entries the node's contexts show, and stay while none does (§6.0): after Ask Again, or
+    while a question edited in the Settings CSV (the same words) is asked again, an older stored entry with other
+    settings never takes them over, so the links to them survive."""
+    tree, node, users = scene("DialsReask", [("R", CALM, "Fog (amount): How foggy is the bay?")])
+    calls = []
+    settle_answered(calls)
+    words(users["R"], Settings="Mist (amount): How misty is the bay?")
+    settle_answered(calls)
+    wire(tree, node)
+    linked = [s.name for s in node.outputs if s.is_linked]
+    engine.reask(node)
+    right_after = [s.name for s in node.outputs if s.is_linked]
+    settle_answered(calls)
+    got = [s.name for s in node.outputs if s.is_linked]
+    check("Ask Again: another stored entry's settings never take the outputs over, so their links survive",
+          linked == right_after == got == ["Mist", "Confidence"] and len(S.load(node).entries) == 2
+          and not dials.WARNINGS.get(node.uid), (linked, right_after, got, dials.WARNINGS.get(node.uid)))
+
+    def settings(name, question):
+        path = os.path.join(TMP, f"{name.lower()}.csv")
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"setting,type,question,answers,min,max\n{name},amount,{question},,,\n")
+        return path
+
+    fog, mist = settings("Fog", "How foggy is the pier?"), settings("Mist", "How misty is the pier?")
+    tree, node, users = scene("DialsEdit", [("E", CALM, fog)])
+    settle_answered(calls)
+    words(users["E"], Settings=mist)
+    settle_answered(calls)
+    wire(tree, node)
+    settings("Mist", "How misty is the pier right now?")  # the same setting and words, a new question
+    with asking(calls):
+        settle()
+    asked = {cell.question["instructions"] for _job, missing in calls for cell in missing}
+    meanwhile = [s.name for s in node.outputs if s.is_linked]
+    settle_answered(calls)
+    got = [s.name for s in node.outputs if s.is_linked]
+    check("Settings CSV edit: while its question is asked again, and after, the outputs and their links stay",
+          asked == {"How misty is the pier right now?"} and meanwhile == got == ["Mist", "Confidence"]
+          and not dials.WARNINGS.get(node.uid), (asked, meanwhile, got, dials.WARNINGS.get(node.uid)))
 
 
 def phase_grid(csv):

@@ -337,7 +337,7 @@ def phase_lines():
     got = status(warned)
     warning = next((problem.message for problem in got.problems if problem.severity == "warning"), "")
     check("warning line: the summary, then the number of warnings and the first one; the triangle icon",
-          got.state == "warning" and got.icon == 'ERROR' and warning.startswith("answers.csv line 3: ")
+          got.state == "warning" and got.icon == 'ERROR' and warning.startswith("answers.csv: Line 3 is blank")
           and got.text == f"{engine.SPECS[warned.bl_idname].summary(got.uses[0][2])} · 1 warning: {warning}", got)
     check("warning line: status_rows lists the warning with the triangle", ('ERROR', warning) in ui.status_rows(got),
           ui.status_rows(got))

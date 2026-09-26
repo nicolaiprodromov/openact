@@ -81,7 +81,6 @@ class Job:
 
 
 def digest(*parts) -> str:
-    """sha1 over canonical JSON, like the prototype's request key."""
     return hashlib.sha1(json.dumps(parts, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -101,7 +100,10 @@ def ask_key(prompt_version: int, debias: bool, backend_model_id: str) -> str:
 
 
 def cell_key(kind: str, state: str, instructions: str, options, debias: bool) -> str:
-    """The exact question sent, its options in the order sent, and debias: MEMORY never answers another question."""
+    """The exact question sent, its options in the order sent, and debias: MEMORY never answers another question.
+    options: the question's criteria; a dict keeps its order, which digest() would lose by sorting its keys."""
+    if isinstance(options, dict):
+        options = list(options.items())
     return digest("cell", kind, state, instructions, options, debias)
 
 
