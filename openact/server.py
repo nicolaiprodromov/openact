@@ -183,6 +183,11 @@ def _lost_connection():
 # ------------------------------------------------------------------------------ lifecycle
 
 
+def _backend():
+    """The server's --backend. OPENACT_BACKEND=fake needs no GPU or installed runtime (tests)."""
+    return "fake" if os.environ.get("OPENACT_BACKEND") == "fake" else "semif"
+
+
 def refresh(prefs=None):
     """Update the status from the file system and a quick /health probe (non-blocking)."""
     prefs = prefs or P.get_prefs()
@@ -190,7 +195,7 @@ def refresh(prefs=None):
     root = P.runtime_root(prefs)
     if STATE.status in ("installing", "starting"):
         return
-    if not P.runtime_installed(root):
+    if _backend() != "fake" and not P.runtime_installed(root):
         if STATE.status != "error":  # keep an install error visible
             STATE.set("not_installed", "The model runtime is not installed")
         return
@@ -233,7 +238,8 @@ def start(prefs=None):
         return True
     STATE.port = prefs.port
     root = P.runtime_root(prefs)
-    if not P.runtime_installed(root):
+    backend = _backend()
+    if backend != "fake" and not P.runtime_installed(root):
         STATE.set("not_installed", "The model runtime is not installed")
         return False
     try:
@@ -251,8 +257,9 @@ def start(prefs=None):
     except Exception:
         pass  # nothing is listening: start our own
 
-    python = P.venv_python(root)
-    STATE.log_path = os.path.join(root, "server.log")
+    python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
+    state_dir = os.environ.get("OPENACT_STATE_DIR") or root  # writable state; the runtime may be shared read-only
+    STATE.log_path = os.path.join(state_dir, "server.log")
     env = dict(os.environ)
     for key in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
@@ -263,16 +270,17 @@ def start(prefs=None):
         "PYTHONIOENCODING": "utf-8",
         "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
     })
-    args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--device", prefs.device,
+    args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--backend", backend, "--device", prefs.device,
             "--parent-pid", str(os.getpid())]
     if prefs.device != "cpu":
         args += ["--gpu", str(prefs.gpu)]
     try:
+        os.makedirs(state_dir, exist_ok=True)
         log = open(STATE.log_path, "w", encoding="utf-8")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         STATE.process = subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            cwd=root, env=env, creationflags=flags,
+            cwd=state_dir, env=env, creationflags=flags,
         )
         log.close()  # the child keeps its own handle
     except OSError as error:
