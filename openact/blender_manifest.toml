@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "openact"
+version = "0.1.0"
+name = "OpenAct"
+tagline = "Decision nodes for Geometry Nodes, run by a local model"
+maintainer = "Nic"
+type = "add-on"
+
+blender_version_min = "4.5.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Geometry Nodes", "Node"]
+
+[permissions]
+network = "Download the model runtime once, then talk to it on localhost"
+files = "Store the model runtime; read text and CSV files; write CSVs"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", "/.git/", "*.zip"]
