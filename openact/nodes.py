@@ -1,4 +1,5 @@
-"""The OpenAct nodes: Ask, Pick and Dials (whole situation), Match and Classify (each item)."""
+"""The six OpenAct nodes: Ask, Pick and Dials (whole situation), Match and Classify (each item), Rules (each
+situation)."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from . import prefs as P
 from .specs import dials
 from .specs.classify import ClassifySpec
 from .specs.match import MatchSpec
+from .specs.rules import RulesSpec
 
 PREVIEW_ROWS = 8  # per-item rows the sidebar lists
 
@@ -210,6 +212,7 @@ MENU = (  # the Add menu's groups (§6.0)
     ("Whole situation", ((engine.ASK_ID, "Ask", 'QUESTION'), (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF'),
                          (dials.DialsSpec.idname, "Dials", 'OPTIONS'))),
     ("Each item", ((MatchSpec.idname, "Match", 'CHECKMARK'), (ClassifySpec.idname, "Classify", 'SORTALPHA'))),
+    ("Each situation", ((RulesSpec.idname, "Rules", 'PRESET'),)),
 )
 
 
@@ -224,6 +227,35 @@ class GeometryNodeOpenActDials(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
         warning = dials.WARNINGS.get(self.uid)
         if warning:
             layout.label(text=warning, icon='ERROR')
+
+
+def _rules_mode(self, context):
+    # the outputs, and Dither and Seed, follow the answer type at once; the pass then re-plans
+    inner.sync_interface(self, engine.SPECS[self.bl_idname].interface(self))
+    inner.build(self, store.load(self))
+    engine.schedule(immediate=True, node=self)
+
+
+class GeometryNodeOpenActRules(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
+    """Ask one question per combination of factor levels, then look up each element's cell"""
+
+    bl_idname = RulesSpec.idname
+    bl_label = "Rules"
+
+    answer_type: bpy.props.EnumProperty(
+        name="Answer",
+        items=(
+            ('ONE_OF', "One of", "The outcome that applies to each element's cell"),
+            ('YES_NO', "Yes / No", "Probability of yes, blended across up to 3 Amount factors"),
+            ('AMOUNT', "Amount", "How much (0-1), blended across up to 3 Amount factors"),
+        ),
+        default='ONE_OF',
+        update=_rules_mode,
+    )
+
+    def draw_settings(self, layout):
+        layout.row().prop(self, "answer_type", expand=True)
+        super().draw_settings(layout)
 
 
 class NODE_MT_openact_add(bpy.types.Menu):
@@ -254,7 +286,7 @@ def draw_add_menu(self, context):
 
 
 classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActDials, GeometryNodeOpenActMatch,
-           GeometryNodeOpenActClassify, NODE_MT_openact_add)
+           GeometryNodeOpenActClassify, GeometryNodeOpenActRules, NODE_MT_openact_add)
 
 
 def register():

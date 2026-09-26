@@ -5,5 +5,6 @@ from .classify import ClassifySpec
 from .dials import DialsSpec
 from .match import MatchSpec
 from .pick import PickSpec
+from .rules import RulesSpec
 
-SPECS = {spec.idname: spec for spec in (AskSpec(), PickSpec(), MatchSpec(), ClassifySpec(), DialsSpec())}
+SPECS = {spec.idname: spec for spec in (AskSpec(), PickSpec(), DialsSpec(), MatchSpec(), ClassifySpec(), RulesSpec())}
