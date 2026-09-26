@@ -9,7 +9,9 @@ after an object rename, while the same settings in another order agree; an outpu
 valid link; renaming a setting warns (in the CSV or inline) until its new socket is linked, or it comes back linked
 (File > Revert), and typed back it warns until linked again; after Ask Again, or while an edited question is asked
 again, the outputs and their links stay; a CSV whose rows only move keeps each output on its own setting; a new
-setting gets its output before its answer; a node reading a setting as a word waits while Dials shows a hint.
+setting gets its output before its answer; a node reading a setting as a word waits while Dials shows a hint; while a
+context has no job (a missing Settings CSV, an inline error), every output keeps its link, another context's new
+prompt is still asked and shown, and a rename in it waits.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -510,6 +512,55 @@ def phase_chained_hint():
     asked = [job.rows[0].name for job, _missing in calls if job.uid == one_of.uid]
     check("chained hint: a One-of read through an Index Switch waits too, instead of asking about item 0",
           not asked and engine.STATUS[one_of.uid][0] in ('PAUSE', 'SORTTIME'), (asked, engine.STATUS[one_of.uid]))
+    phase_hold()
+
+
+def phase_hold():
+    """§6.0: a context without a job (its Settings CSV missing, an inline error) may still show the outputs as they
+    are, so they stay, with their links. Another context's new prompt, which fits them, is still asked and shown;
+    a rename, which would change them, waits, and gives the error once that context plans again."""
+    csv_a, csv_b = weather("hold_a.csv"), weather("hold_b.csv")
+    tree, node, users = scene("DialsHold", [("HA", STORM, csv_a), ("HB", STORM, csv_b)])
+    calls = []
+
+    def passes(change, times=3):
+        """Make a change and run the passes: (status, what both objects read, the links, the cells this node asks)."""
+        change()
+        calls.clear()
+        with asking(calls):
+            settle(times)
+        return (engine.STATUS[node.uid], (read(users["HA"]), read(users["HB"])), linked(node),
+                [cell for job, missing in calls if job.uid == node.uid for cell in missing])
+
+    passes(lambda: None)  # the weather cells are cached
+    wire(tree, node)
+    good, links = (read(users["HA"]), read(users["HB"])), linked(node)
+    os.remove(csv_a)
+    waited = passes(lambda: words(users["HB"], Prompt=CALM), 1)
+    for cell in waited[3]:  # the calm morning is dry
+        pipeline.remember(cell.key, dict(FAKE[cell.question["instructions"]], model="fake",
+                                         **({"p": 0.1} if cell.question["instructions"] == "Is it raining?" else {})))
+    got = passes(lambda: None)
+    check("hold: while a Settings CSV is missing, another context's new prompt is asked, and shown once answered; "
+          "every output keeps its link, and the object whose CSV is missing its last table",
+          waited[0] == got[0] == ('ERROR', f"Can't find {os.path.normpath(csv_a)}") and len(waited[3]) == 5
+          and not got[3] and got[1] == (good[0], dict(good[1], Rain=False)) and got[2] == links, (waited, got))
+    got = passes(lambda: (weather("hold_a.csv"), words(users["HB"], Prompt=STORM)))
+    check("hold: the CSV back, a checkmark, and both objects show their tables again, 0 requests",
+          got == (('CHECKMARK', "5 settings · lowest confidence 0.50   +1 more"), good, links, []), got)
+    renamed = ("Dials: 'HA > Dials' and 'HB > Dials' use different settings ('Wind speed' (amount) vs 'Gust' (amount));"
+               " setting names and types must agree")
+    got = (passes(lambda: weather("hold_b.csv", ("Wind speed,amount", "Gust,amount"))),
+           passes(lambda: words(users["HA"], Settings="Rain (yes/no): Is it raining?; Rain (yes/no): Is it wet?")),
+           passes(lambda: words(users["HA"], Settings=csv_a)))
+    check("hold: while the context whose settings the outputs show has an inline error, another context's rename "
+          "waits: every output keeps its link and the renamed context its last table, with 0 requests; fixed, the "
+          "error is back",
+          got[0] == got[2] == (('ERROR', renamed), good, links, []) and got[1][0] == (
+              'ERROR', "Settings: Entry 2: 'Rain' appears twice") and got[1][1][1] == good[1] and got[1][2:] == (
+              links, []) and not dials.WARNINGS.get(node.uid), got)
+    got = passes(lambda: weather("hold_b.csv"))
+    check("hold: the rename undone, a checkmark", got[0][0] == 'CHECKMARK' and got[1:] == (good, links, []), got)
     phase_revert()
 
 

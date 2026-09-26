@@ -106,12 +106,15 @@ class RulesSpec(Spec):
         defs += [SocketDef('OUTPUT', name, socket_type, description) for name, socket_type, description in outputs]
         return defs + [SocketDef(*KEY)]
 
-    def agree(self, node, jobs):
-        """§6.0, once per pass before any context is answered: every live context must bake the same graph. Jobs that
-        agree give the node the sockets they declare, and "" is returned. Otherwise the error naming the first two
-        contexts that differ is returned, and the node, its entries and its graph stay as they are.
+    def agree(self, node, jobs, unknown=False, entries=()):
+        """§6.0, once per pass before any context is answered: every context that plans must bake the same graph.
+        Jobs that agree give the node the sockets they declare, and "" is returned. Otherwise the error naming the
+        first two contexts that differ is returned, and the node, its entries and its graph stay as they are.
 
-        jobs: (ctx, Job) of each live context. Only level names and whens, and payload values, may differ."""
+        jobs: (ctx, Job) of each context that plans. Only level names and whens, and payload values, may differ.
+        unknown: a live context has no job, and may still show its last table (engine._process()): the sockets and the
+        graph stay, and None is returned unless the jobs fit them, i.e. declare the node's sockets and bake the layout
+        of the reference entry among `entries`, the node's stored ones (_reference())."""
         from .. import inner  # imports bpy
 
         if not jobs:
@@ -123,9 +126,16 @@ class RulesSpec(Spec):
             if _columns(job.shape.payload) != _columns(first.shape.payload):
                 return (f"Rules: '{first_ctx.label()}' and '{ctx.label()}' use Outcomes CSVs with different payload "
                         f"columns")
-        if node.node_tree is not None:
-            factors = [(f["name"], f["kind"]) for f in first.shape.factors]
-            inner.sync_interface(node, self.interface(node, factors, _columns(first.shape.payload)))
+        tree = node.node_tree
+        if tree is None:
+            return ""
+        factors, payload = [(f["name"], f["kind"]) for f in first.shape.factors], _columns(first.shape.payload)
+        if unknown:  # the new entries would become the reference, and the kept tables would be read through them
+            reference = _reference(tree, entries, _mode(tree))
+            fits = factors == _factor_sockets(tree) and payload == _payload_outputs(tree) and (
+                reference is None or _layout(reference.shape["factors"]) == _layout(first.shape.factors))
+            return "" if fits else None
+        inner.sync_interface(node, self.interface(node, factors, payload))
         return ""
 
     # ------------------------------------------------------------------ planning

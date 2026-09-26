@@ -8,8 +8,10 @@
 - a draw (the sidebar's answers_for(), where Blender refuses ID writes) never writes a Classify node: after a Labels
   CSV path is typed, a header renamed or a column removed, the next pass syncs the payload outputs, also after an undo
   that keeps the plans;
-- two contexts must agree on their Labels CSVs' payload headers and types (§6.0): other ones give the error, and the
-  outputs, their links and the last good table stay, also while a CSV has an error.
+- two contexts must agree on their Labels CSVs' payload headers and types, in any order (§6.0): other ones give the
+  error, and the outputs, their links and the last good table stay, also while a CSV has an error; while a context
+  has no job (a missing CSV, an item-list error, a Context waiting for a Pick), the outputs and their links stay,
+  and another context's new words are still asked and shown.
 With -- --model PORT GPU, also a spot check with the real model on that port and GPU: pan = yes and sofa = no for
 "Would you find it in a kitchen?"; "steel" -> metal and "oak planks" -> wood.
 
@@ -480,28 +482,58 @@ def phase_draw_classify():
 
 
 def phase_agree_classify():
-    """§6.0: the contexts of one Classify must read the same payload headers and types. Labels CSVs that share them
-    with other values each show their own. Other headers or types give the error naming both contexts, and nothing
-    is asked, stored or rebuilt: the outputs, the links to them and the last good table stay, also while either
-    CSV has an error (§7.8)."""
+    """§6.0: the contexts of one Classify must read the same payload headers and types, in any order. Labels CSVs that
+    share them with other values each show their own. Other headers or types give the error naming both contexts,
+    and nothing is asked, stored or rebuilt: the outputs, the links to them and the last good table stay, also while
+    either CSV has an error (§7.8). A context without a job (a CSV with errors, an item-list error, a Context that
+    waits for a Pick) keeps the outputs and their links as they are, and another context's new words that fit them
+    are still asked and shown."""
     folder = tempfile.mkdtemp(prefix="openact-agree-")
     try:
         with open(FAMILIES, encoding="utf-8") as handle:
             text = handle.read()
         paths = [os.path.join(folder, name) for name in ("a.csv", "b.csv")]
         bodies = dict(zip(paths, (text, text.replace("0.35,1", "0.4,1"))))  # the same headers, other values
-        for path, body in bodies.items():
+
+        def write(path, body):
             with open(path, "w", encoding="utf-8", newline="") as handle:
                 handle.write(body)
-        tree, node = make_tree("ClassifyAgree", ClassifySpec.idname, ("Labels",))
-        node.inputs["Items"].default_value = "steel, oak planks, marble, silk"
-        objs = [user(name, tree, Labels=path, Shift=0) for name, path in zip(("CGA", "CGB"), paths)]
+
+        for path, body in bodies.items():
+            write(path, body)
+        items = "steel, oak planks, marble, silk"
+        tree, node = make_tree("ClassifyAgree", ClassifySpec.idname, ("Labels", "Items"))
+        tree.interface.new_socket("Where", in_out='INPUT', socket_type='NodeSocketString')
+        pick = tree.nodes.new(engine.PICK_ID)  # its answer is the Context: while it has none, the context waits
+        pick.inputs["Items"].default_value = "a museum, a kitchen"
+        tree.links.new(next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput").outputs["Where"],
+                       pick.inputs["Prompt"])
+        tree.links.new(pick.outputs["Item"], node.inputs["Context"])
+        objs = [user(name, tree, Labels=path, Items=items, Where="Where is it?", Shift=0)
+                for name, path in zip(("CGA", "CGB"), paths)]
         uses = evaluator.find_uses()[tree.as_pointer()]
+        idents = {i.name: i.identifier for i in tree.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
+        answers = dict(FAMILY_ANSWERS, granite=[0.05, 0.05, 0.85, 0.05])
+
+        def use(obj, **words):
+            for word, value in words.items():
+                obj.modifiers["OpenAct"][idents[word]] = value
+            obj.update_tag()
+
+        def picked(ctx):
+            """The Pick answers "a museum" to the prompt ctx has now."""
+            cell = next(row.cell for row in engine.SPECS[engine.PICK_ID].plan(pick, ctx).rows if row.cell is not None)
+            pipeline.remember(cell.key, {"probabilities": [0.9, 0.1], "model": "fake"})
+
+        def answered(ctx):
+            for row in CLASSIFY.plan(node, ctx).rows:
+                pipeline.remember(row.cell.key, {"probabilities": answers[row.name], "model": "fake"})
+
+        picked(uses[0])  # both objects have the same prompt
         with Capture():
             engine.run_pass()
         for ctx in uses:
-            for row in CLASSIFY.plan(node, ctx).rows:
-                pipeline.remember(row.cell.key, {"probabilities": FAMILY_ANSWERS[row.name], "model": "fake"})
+            answered(ctx)
         with Capture():
             engine.run_pass()
         store_outputs(tree, node, {"Label": 'INT', "roughness": 'FLOAT', "metallic": 'INT'})
@@ -516,23 +548,26 @@ def phase_agree_classify():
         first, second = (CLASSIFY.gn(node, ctx)[3] for ctx in uses)  # first-wins would follow the first's CSV
         stored, shown = [(entry.gn, entry.words_key) for entry in S.load(node).entries], face(node)
 
-        def edited(path, body):
-            """Write a context's CSV and run a pass: (status, cells asked, whether the entries, the outputs, their
-            links and the group stayed, whether both objects read what they did)."""
-            with open(path, "w", encoding="utf-8", newline="") as handle:
-                handle.write(body)
+        def after(change):
+            """Make a change and run a pass: (status, cells asked, whether the entries, the outputs, their links and
+            the group stayed, what both objects read)."""
+            change()
             with Capture() as capture:
                 engine.run_pass()
             kept = [(entry.gn, entry.words_key) for entry in S.load(node).entries] == stored and face(node) == shown
-            return (engine.STATUS.get(node.uid), len(capture.keys(node)), kept,
-                    [read(obj, names) for obj in objs] == before)
+            return engine.STATUS.get(node.uid), len(capture.keys(node)), kept, [read(obj, names) for obj in objs]
+
+        def edited(path, body):
+            """Write a context's CSV and run a pass: after()."""
+            return after(lambda: write(path, body))
 
         def broken(path):
-            return ('ERROR', f"{os.path.basename(path)}: Two columns are named 'Answer'"), 0, True, True
+            return ('ERROR', f"{os.path.basename(path)}: Two columns are named 'Answer'"), 0, True, before
 
         labels = [ctx.label() for ctx in uses]
         conflict = "Classify: '{}' and '{}' use Labels CSVs with different payload columns ({})".format
-        headers = ('ERROR', conflict(*labels, "'hardness' (INT) vs 'roughness' (FLOAT), 'metallic' (INT)")), 0, True, True
+        headers = (('ERROR', conflict(*labels, "'hardness' (INT) vs 'roughness' (FLOAT), 'metallic' (INT)")), 0, True,
+                   before)
         hardness = "answer,when,hardness\n" + "".join(f"{line.rsplit(',', 2)[0]},{value}\n" for line, value
                                                       in zip(text.splitlines()[1:], (9, 3, 7, 1)))
         got = edited(first, hardness)
@@ -547,10 +582,48 @@ def phase_agree_classify():
               got == broken(first), got)
         got = edited(first, text.replace("0.35,1", "0.35,1.5"))
         check("agreement: readable again, with a payload column of another type: the error names it",
-              got == (('ERROR', conflict(*labels, "'metallic' (FLOAT) vs 'metallic' (INT)")), 0, True, True), got)
+              got == (('ERROR', conflict(*labels, "'metallic' (FLOAT) vs 'metallic' (INT)")), 0, True, before), got)
         got = edited(first, bodies[first])
         check("agreement: once both agree again, each object reads its own payload with its links, 0 requests",
-              got == (('CHECKMARK', summary), 0, True, True), got)
+              got == (('CHECKMARK', summary), 0, True, before), got)
+
+        # the hold is on the outputs, not on the answers: another context's new words that fit them are answered
+        os.remove(first)
+        waited = after(lambda: use(objs[1], Items=items + ", granite"))
+        answered(uses[1])
+        got = after(lambda: None)
+        granite = {"Label": [0, 1, 2, 3, 2, -1], "metallic": [1, 0, 0, 0, 0, 0],
+                   "roughness": [0.4, 0.6, 0.8, 0.9, 0.8, 0.0]}
+        check("agreement: while a Labels CSV is missing, another context's new item is asked, and shown once answered; "
+              "the outputs keep their links, and the object whose CSV is missing its last table",
+              waited[0] == got[0] == ('ERROR', f"Can't find {os.path.normpath(first)}") and waited[1] == 1
+              and got[1] == 0 and face(node)[:2] == shown[:2] and got[3] == [before[0], granite], (waited, got))
+        got = after(lambda: (write(first, bodies[first]), use(objs[1], Items=items)))
+        check("agreement: once the CSV is back, both contexts show their tables again with a checkmark, 0 requests",
+              got[0] == ('CHECKMARK', summary) and got[1] == 0 and got[3] == before, got)
+        stored, shown = [(entry.gn, entry.words_key) for entry in S.load(node).entries], face(node)
+        got = edited(first, hardness)
+        check("agreement: the other payload columns give the error again", got == headers, got)
+        got = after(lambda: use(objs[1], Items="steel, steel, marble, silk")), after(lambda: use(objs[1], Items=items))
+        check("agreement: while the context whose columns the outputs show has an item-list error, the outputs, their "
+              "links, the entries and the other object's values stay; fixed, the error is back",
+              got[0][:3] == (('ERROR', "Items: Entry 2: 'steel' appears twice"), 0, True)
+              and got[0][3][0] == before[0] and got[1] == headers, got)
+        got = after(lambda: use(objs[1], Where="Where is it now?"))
+        picked(uses[1])
+        got = got, after(lambda: None)
+        check("agreement: while that context's Context waits for the Pick, the outputs, their links, the entries and "
+              "the other object's values stay; answered, the error is back",
+              got[0][:3] == (('PAUSE', "Model server is stopped (OpenAct tab)"), 0, True)
+              and got[0][3][0] == before[0] and got[1] == headers, got)
+        reordered = "".join(f"{head},{metallic},{roughness}\n" for head, roughness, metallic
+                            in (line.rsplit(",", 2) for line in text.splitlines()))
+        got = edited(first, reordered)
+        check("agreement: the same payload columns in another order agree: each object reads its own payload, the "
+              "outputs follow the first context's order and keep their links, 0 requests",
+              got[0] == ('CHECKMARK', summary) and got[1] == 0 and got[3] == before and face(node)[1] == shown[1]
+              and [s.name for s in node.outputs] == ["Label", "Confidence", "metallic", "roughness"],
+              (got, [s.name for s in node.outputs]))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 

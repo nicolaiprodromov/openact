@@ -255,27 +255,30 @@ def _process(tree, node, contexts):
     hidden = set()  # (gn, words key) of stored entries whose words mean something else now: kept for their rows
     problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
+    planned = _scan(spec, node, contexts)
     # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
-    # good table stays, as it does while a context's CSV has errors (§7.8): that context still shows its last table
-    held = hasattr(spec, "agree") and _csv_error(spec, node, contexts)
-    conflict = spec.agree(node, _jobs(node, contexts)) if hasattr(spec, "agree") and not held else ""
+    # good table stays. A context without a job (Pending, or Unresolvable: a CSV with errors, too many items...) still
+    # shows its last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't
+    # fit them wait (None) until that context plans again or goes away; jobs that fit them are answered
+    unknown = any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
+    conflict = spec.agree(node, [(ctx, job) for ctx, job in planned if not isinstance(job, Exception)], unknown,
+                          entries) if hasattr(spec, "agree") else ""
+    held = conflict is None
     if conflict:
         problems.append(conflict)
-    for ctx in contexts:
+    for ctx, job in planned:
         key = (node.uid, ctx.key())
-        try:
-            job = _plan(spec, node, ctx)
-        except Pending:  # its words wait for another node's answer: the entry it showed last stays in the graph
+        if isinstance(job, Pending):  # its words wait for another node's answer: the entry it showed last stays live
             upstream = True
             last = next((entry for entry in entries if entry.words_key == LAST_SHOWN.get(key)), None)
             if last is not None and last.gn not in live:
                 live.append(last.gn)
             continue
-        except Hint as hint:
-            hints.append(str(hint))
+        if isinstance(job, Hint):
+            hints.append(str(job))
             continue
-        except Unresolvable as error:  # e.g. a CSV with errors: its words stay live, so the last good table shows
-            problems.append(str(error))
+        if isinstance(job, Unresolvable):  # e.g. a CSV with errors: its words stay live, so the last good table shows
+            problems.append(str(job))
             _live(live, spec, node, ctx)
             continue
         warnings += job.problems
@@ -355,16 +358,16 @@ def _live(live, spec, node, ctx):
         live.append(gn)
 
 
-def _csv_error(spec, node, contexts):
-    """True when a context reads a CSV with errors (evaluator.FileError)."""
+def _scan(spec, node, contexts):
+    """(ctx, its Job, or the Hint, Pending or Unresolvable that planning raised) of each context: a visit plans each
+    context once, for agree() and for answering."""
+    planned = []
     for ctx in contexts:
         try:
-            _plan(spec, node, ctx)
-        except evaluator.FileError:
-            return True
-        except (Hint, Pending, Unresolvable):
-            continue
-    return False
+            planned.append((ctx, _plan(spec, node, ctx)))
+        except (Hint, Pending, Unresolvable) as error:
+            planned.append((ctx, error))
+    return planned
 
 
 def _submit(job, missing):

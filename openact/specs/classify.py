@@ -96,26 +96,31 @@ class ClassifySpec(PerItemSpec):
         label = values["label"]
         return job.options[label] if 0 <= label < len(job.options) else ""
 
-    def agree(self, node, jobs):
-        """§6.0, once per pass before any context is answered: every live context must read the same payload headers
-        and types. Jobs that agree give the node their payload outputs, and "" is returned; with no job, the node
-        keeps its outputs and the links to them. Otherwise the error naming the first two contexts that differ is
-        returned, and the node, its entries and its graph stay as they are.
+    def agree(self, node, jobs, unknown=False, _entries=()):
+        """§6.0, once per pass before any context is answered: every context that plans must read the same payload
+        headers and types, in any order, since the table reads each entry's payload by header. Jobs that agree give
+        the node their payload outputs, in the first one's order, and "" is returned; with no job, the node keeps its
+        outputs and the links to them. Otherwise the error naming the first two contexts that differ is returned, and
+        the node, its entries and its graph stay as they are.
 
-        jobs: (ctx, Job) of each live context. Payload values may differ: they are per-entry data."""
+        jobs: (ctx, Job) of each context that plans. Payload values may differ: they are per-entry data. unknown: a
+        live context has no job, and may still show the outputs as they are (engine._process()): they stay, and None
+        is returned unless the jobs fit them."""
         from ..inner import sync_interface  # imports bpy
 
         if not jobs:
             return ""
         (first_ctx, first), *others = jobs
         for ctx, job in others:
-            if job.payload != first.payload:
+            if sorted(job.payload) != sorted(first.payload):
                 one, other = ([f"'{header}' ({kind})" for header, kind in a if (header, kind) not in b]
                               for a, b in ((first.payload, job.payload), (job.payload, first.payload)))
-                what = f"{', '.join(one) or '-'} vs {', '.join(other) or '-'}" if one or other else "another order"
                 return (f"Classify: '{first_ctx.label()}' and '{ctx.label()}' use Labels CSVs with different payload "
-                        f"columns ({what})")
-        if node.node_tree is not None and list(first.payload) != self.payload_outputs(node):
+                        f"columns ({', '.join(one) or '-'} vs {', '.join(other) or '-'})")
+        have = self.payload_outputs(node)
+        if unknown:
+            return "" if sorted(first.payload) == sorted(have) else None
+        if node.node_tree is not None and list(first.payload) != have:
             sync_interface(node, self.interface(node, list(first.payload)))
         return ""
 
