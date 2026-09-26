@@ -261,6 +261,36 @@ def test_classes():
             good,
             (doc.num_cols, summary(doc.problems)),
         )
+    for parse, content, message in (
+        (csvfmt.parse_factors, "factor,level,from,to\nt,a,0,0.5\nt,b,0.5,\n", "No 'kind' column"),
+        (csvfmt.parse_settings, "setting,question,min,max\nW,How windy?,0,\n", "No 'type' column"),
+    ):
+        problems = raised(parse, read(f"incomplete_{parse.__name__}.csv", content))
+        check(
+            f"classes: an incomplete file for {parse.__name__} gives only its real error",
+            only(problems, "error", 0, message),
+            summary(problems),
+        )
+    doc = read("items_with_settings_names.csv", "answer,when,setting,type,question\n1,10,a,b,c\n")
+    items = csvfmt.parse_answer_set(doc, "items", node="pick")
+    check(
+        "classes: a file taken for Settings keeps the answer-set names reserved",
+        not doc.num_cols and items.options[0].payload == {},
+        doc.num_cols,
+    )
+    doc = read(
+        "dials_overrides.csv", "setting,type,question,answer,lock,confidence\nRain,yes/no,Is it raining?,yes,1,0.93\n"
+    )
+    good = (
+        not doc.problems
+        and not doc.num_cols
+        and csvfmt.parse_overrides(doc, ["setting"]) == {"rain": csvfmt.Lock("yes", 2)}
+    )
+    check(
+        "classes: a Dials Overrides file with type and question keeps lock and confidence reserved",
+        good,
+        (doc.num_cols, summary(doc.problems)),
+    )
 
     digits = "7" * 5000
     doc = read("digits.csv", f"answer,v\na,{digits}\n")
@@ -298,9 +328,15 @@ def test_limits():
     message = "Line 2: column 'when' has 2 001 characters (limit 2 000)"
     check("limits: 2 001 characters in a cell", only(doc.problems, "error", 2, message), summary(doc.problems))
     doc = read("cell_huge.csv", "answer,when\na," + "w" * 140000 + "\nb,c\n")
-    message = "Line 2: a cell has over 131 072 characters (limit 2 000)"
+    message = "Line 2: a cell has over 131 072 characters (limit 2 000), or a quote is not closed"
     check(
         "limits: a cell over the csv module's own cap", only(doc.problems, "error", 2, message), summary(doc.problems)
+    )
+    doc = read("runaway_quote.csv", 'answer,when\na,"never closed\n' + lines(49000, lambda i: "b,c"))
+    check(
+        "limits: a quote never closed in a big file names both causes",
+        only(doc.problems, "error", 2, message),
+        summary(doc.problems),
     )
 
     doc = read("rows_many.csv", "answer\n" + lines(6000, lambda i: f"r{i}"))
@@ -308,16 +344,12 @@ def test_limits():
     check("limits: rows past the limit are counted, not kept", good, (len(doc.rows), summary(doc.problems)))
     doc = read("long_rows.csv", "answer\n" + lines(60, lambda i: f"r{i},extra"))
     listed = summary(doc.problems)
-    good = len(listed) == 51 and listed[0] == ("error", 2, "Line 2 has 2 cells; the header has 1")
-    check(
-        "limits: at most 50 long rows are listed",
-        good and listed[-1] == ("error", 0, "10 more rows have more cells than the header"),
-        listed[-2:],
-    )
+    good = listed == [("error", n, f"Line {n} has 2 cells; the header has 1") for n in range(2, 62)]
+    check("limits: every long row is listed", good, (len(listed), listed[-1:]))
     doc = read("long_cells.csv", "answer,when\n" + lines(55, lambda i: f"r{i}," + "w" * 2001))
     listed = summary(doc.problems)
-    good = len(listed) == 51 and listed[-1] == ("error", 0, "5 more cells have over 2 000 characters")
-    check("limits: at most 50 long cells are listed", good, listed[-2:])
+    good = listed == [("error", n, f"Line {n}: column 'when' has 2 001 characters (limit 2 000)") for n in range(2, 57)]
+    check("limits: every long cell is listed", good, (len(listed), listed[-1:]))
 
 
 def test_messages():
@@ -550,12 +582,17 @@ def test_answer_sets():
     problems = raised(csvfmt.parse_answer_set, csvfmt.read_csv(fixture("broken_utf8.csv")), "one_of")
     good = len(problems or ()) == 1 and problems[0].message.startswith("broken_utf8.csv is not UTF-8 text")
     check("answers: a file that could not be read gives only its read error", good, summary(problems))
-    try:
-        csvfmt.parse_answer_set(life.doc, "one-of")
-        unknown = False
-    except ValueError:
-        unknown = True
-    check("answers: an unknown kind is a programming error", unknown)
+    for case, args in (
+        ("kind", ("one-of", "rules")),
+        ("node 'Pick'", ("items", "Pick")),
+        ("node 'Rules'", ("one_of", "Rules")),
+    ):
+        try:
+            csvfmt.parse_answer_set(life.doc, *args)
+            unknown = False
+        except ValueError:
+            unknown = True
+        check(f"answers: an unknown {case} is a programming error", unknown)
 
 
 def test_factors():

@@ -28,16 +28,16 @@ MAX_NAME = 63  # bytes of UTF-8: Blender cuts longer socket names
 MAX_FACTORS = 8
 MAX_CELLS = 4096
 MAX_SETTINGS = 64
-MAX_LISTED = 50  # problems of one kind per file; the sidebar shows at most 50
 KEY_SEP = "\x1f"  # joins the key cells of an Overrides row
 
 KINDS = ("yes_no", "amount", "one_of", "items")
+NODES = ("", "ask", "pick", "match", "classify", "rules", "dials")  # Spec names; "" when the caller doesn't know
 NAME_COLUMNS = ("answer", "name", "item", "label", "outcome")  # the first one present names the options
 WHEN_COLUMNS = ("when", "description")
 FACTOR_REQUIRED = ("factor", "kind", "level")
 SETTING_REQUIRED = ("setting", "type", "question")
-# Never payload: each schema's own column names. read_csv() tells Factors and Settings files by their required
-# columns; any other file is an answer set or an Overrides file.
+# Never payload: the answer-set and Overrides names in every file, plus the Factors or Settings names in a file that
+# read_csv() takes for one (it has factor + level, or setting + question), as those files carry no payload.
 ANSWER_COLUMNS = frozenset(
     NAME_COLUMNS + WHEN_COLUMNS + ("if", "lock", "unsure", "confidence", "model_answer", "source")
 )
@@ -198,20 +198,20 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
     if delimiter is None:
         first = next((line for line in io.StringIO(text, newline="") if line.strip()), "")
         delimiter = next((sign for sign in (",", ";", "\t") if sign in first), ",")
-    elif len(delimiter) != 1 or delimiter in '"\r\n':
-        message = f"The delimiter must be one character other than a quote or a line break, not {delimiter!r}"
-        problems.add(ERROR, 0, "", message)
-        text, delimiter = "", ","
-    try:  # skipping the spaces after a delimiter lets a quote follow them; a space delimiter keeps its empty cells
+    try:
+        if len(delimiter) != 1 or delimiter in '"\r\n':  # Python 3.13 rejects these, earlier ones misparse them
+            raise ValueError(delimiter)
+        # Skipping the spaces after a delimiter lets a quote follow them; a space delimiter keeps its empty cells.
         reader = csv.reader(
             io.StringIO(text, newline=""), delimiter=delimiter, skipinitialspace=delimiter != " ", strict=True
         )
-    except (TypeError, ValueError) as error:  # the check above covers what Python 3.11 to 3.13 reject
-        problems.add(ERROR, 0, "", f"The delimiter {delimiter!r} can't be used: {error}")
+    except (TypeError, ValueError):  # also whatever a later Python's csv refuses
+        message = f"The delimiter must be one character other than a quote or a line break, not {delimiter!r}"
+        problems.add(ERROR, 0, "", message)
         reader = ()
 
     header, rows, lines = None, [], []
-    end = width = counted = blank = long_rows = long_cells = 0
+    end = width = counted = blank = 0
     wrapped = gap = False
     try:
         for cells in reader:
@@ -245,40 +245,31 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
                 gap = True
             blank = 0
             if len(cells) > width:
-                long_rows += 1
-                if long_rows <= MAX_LISTED:
-                    problems.add(ERROR, start, "", f"Line {start} has {len(cells)} cells; the header has {width}")
+                problems.add(ERROR, start, "", f"Line {start} has {len(cells)} cells; the header has {width}")
                 del cells[width:]
             cells += [""] * (width - len(cells))
             for column, cell in zip(header, cells):
                 if len(cell) > MAX_CELL:
-                    long_cells += 1
-                    if long_cells <= MAX_LISTED:
-                        size = f"{_n(len(cell))} characters (limit {_n(MAX_CELL)})"
-                        problems.add(ERROR, start, column, f"Line {start}: column '{column}' has {size}")
+                    size = f"{_n(len(cell))} characters (limit {_n(MAX_CELL)})"
+                    problems.add(ERROR, start, column, f"Line {start}: column '{column}' has {size}")
             rows.append(tuple(cells))
             lines.append(start)
     except csv.Error as error:
-        if "field limit" in str(error):  # the csv module's own cap on a cell
+        if "field limit" in str(error):  # the csv module's own cap on a cell, usually hit by a quote never closed
             size = f"over {_n(csv.field_size_limit())} characters (limit {_n(MAX_CELL)})"
-            problems.add(ERROR, end + 1, "", f"Line {end + 1}: a cell has {size}")
+            problems.add(ERROR, end + 1, "", f"Line {end + 1}: a cell has {size}, or a quote is not closed")
         else:
             problems.add(ERROR, end + 1, "", f"Line {end + 1}: bad quoting ({error})")
     header = header or []
-    if long_rows > MAX_LISTED:
-        problems.add(ERROR, 0, "", f"{_n(long_rows - MAX_LISTED)} more rows have more cells than the header")
-    if long_cells > MAX_LISTED:
-        problems.add(ERROR, 0, "", f"{_n(long_cells - MAX_LISTED)} more cells have over {_n(MAX_CELL)} characters")
     if counted:
         problems.add(ERROR, 0, "", f"{name} has {_n(MAX_ROWS + counted)} rows (limit {_n(MAX_ROWS)})")
 
     names = {column.casefold() for column in header}
-    if names.issuperset(FACTOR_REQUIRED):
-        reserved = FACTOR_COLUMNS
-    elif names.issuperset(SETTING_REQUIRED):
-        reserved = SETTING_COLUMNS
-    else:
-        reserved = ANSWER_COLUMNS
+    reserved = ANSWER_COLUMNS
+    if names >= {"factor", "level"}:
+        reserved |= FACTOR_COLUMNS
+    if names >= {"setting", "question"}:
+        reserved |= SETTING_COLUMNS
     texts, num_cols, numbers = {}, {}, {}  # texts: text column -> its cells
     for i, column in enumerate(header):
         cells = [row[i] for row in rows]
@@ -340,13 +331,16 @@ def parse_inline(text: str) -> list[tuple[str, str]]:
 def parse_answer_set(doc: CsvDoc, kind: str, node: str = "") -> AnswerSet:
     """The options of an answer-set CSV (Answers, Labels, Outcomes or Items). Row r is option r.
 
-    kind: "yes_no" | "amount" | "one_of" | "items". node: the Spec name of the node that reads the set, or "" when not
-    known. A known node other than Rules drops 'if', with a warning. Numeric columns are payload only where the node
-    bakes them (Pick items, Classify labels, Rules one-of outcomes; for an unknown node, wherever one of those could),
-    and there they must not take one of the node's fixed output names. Raises CsvError when the file has an error.
+    kind: "yes_no" | "amount" | "one_of" | "items". node: the Spec name of the node that reads the set (one of NODES,
+    lower case), or "" when not known. A known node other than Rules drops 'if', with a warning. Numeric columns are
+    payload only where the node bakes them (Pick items, Classify labels, Rules one-of outcomes; for an unknown node,
+    wherever one of those could), and there they must not take one of the node's fixed output names. Raises CsvError
+    when the file has an error.
     """
     if kind not in KINDS:
         raise ValueError(f"unknown answer-set kind {kind!r}")
+    if node not in NODES:
+        raise ValueError(f"unknown node {node!r}")
     problems = _Problems(doc.path, doc.problems)
     problems.check()
     name_at = _find(doc.header, NAME_COLUMNS)
