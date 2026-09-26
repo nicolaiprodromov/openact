@@ -357,10 +357,6 @@ class Spec:
         """The answer in a few words, for the status line and the sidebar."""
         raise NotImplementedError
 
-    def word_sockets(self, gi) -> list:
-        """The inner group's input of each word, None for a word the node has no socket for."""
-        return [gi.outputs.get(name) for name in self.WORDS]
-
     def build(self, b, gi, go, entries) -> None:
         """Lay out the inner group's nodes for these entries (inner.build())."""
         raise NotImplementedError

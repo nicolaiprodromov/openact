@@ -3,12 +3,14 @@
 Checks that itertools.product order equals a C-order ravel, the level and cell index references, the `if` allowed
 sets, cells decided by code, error rows, the 9.5 question text of the worked example, the 9.8 limits, the 9.6
 interpolation reference (hand-computed corners, renormalisation) and the 9.7 dithering probabilities against 100 000
-seeded samples, plus PR-09's three 4.e confidence formulas (specs.base.confidence).
+seeded samples, plus PR-09's three 4.e confidence formulas (specs.base.confidence). The Rules spec's pure part: rows
+carried across Outcomes edits (5.4), the problems a Job shows, and the ask key of code rows.
 
 Run:  python tests/rules_math_test.py
       blender -b --factory-startup --python tests/rules_math_test.py
 """
 
+import dataclasses
 import math
 import os
 import random
@@ -24,9 +26,10 @@ from _harness import ROOT, check, finish  # noqa: E402
 _package = types.ModuleType("openact")
 _package.__path__ = [os.path.join(ROOT, "openact")]
 sys.modules["openact"] = _package
-from openact import csvfmt  # noqa: E402
+from openact import csvfmt, pipeline, sources  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
 from openact.specs.base import confidence  # noqa: E402
+from openact.specs.rules import RulesSpec  # noqa: E402
 
 try:
     import numpy
@@ -63,6 +66,11 @@ def answers(name, content=None, kind="one_of"):
 
 def inline(*names):
     return csvfmt.AnswerSet(tuple(csvfmt.Option(name, "", "", {}) for name in names), None)
+
+
+def default(answer_type):
+    """The answer set an empty Yes/No or Amount Outcomes input gives the node."""
+    return sources.default_set(sources.KINDS[answer_type])
 
 
 def amount(name, n, edges=None):
@@ -247,7 +255,7 @@ def test_error_rows():
         "Dies,dies,state=alive;neighbours!=2|3\n",
     )
     plan = rc.plan_table(life, "ONE_OF", missing, GOL_QUESTION, GOL_CONTEXT)
-    errors = [cell.index for cell in plan.cells if cell.source == "error"]
+    errors = [r for r, cell in enumerate(plan.cells) if cell.source == "error"]
     check("error: dead cells without three neighbours have no outcome", errors == [0, 1, 2, 4, 5, 6, 7, 8], errors)
     rows = [cell for cell in plan.cells if cell.source == "error"]
     good = all(
@@ -321,19 +329,20 @@ def test_templates():
         "9.5 no context, One-of's default question, bare names and levels", good and plan.cells[1].question == question
     )
     for answer_type in ("YES_NO", "AMOUNT"):
-        error = raised(rc.plan_table, life, answer_type, None, " ", GOL_CONTEXT)
+        error = raised(rc.plan_table, life, answer_type, default(answer_type), " ", GOL_CONTEXT)
         check(
             f"9.5 {answer_type} without a question is a hint",
             isinstance(error, rc.RulesHint) and str(error) == "Type a question",
         )
-    plan = rc.plan_table(life, "YES_NO", None, "Alive?", "")
+    plan = rc.plan_table(life, "YES_NO", default("YES_NO"), "Alive?", "")
     check(
         "9.5 Yes/No without Outcomes: Yes. and No.",
         plan.cells[0].question["criteria"] == {"true": "Yes.", "false": "No."},
     )
-    plan = rc.plan_table(life, "AMOUNT", None, "How lively?", "")
-    good = plan.cells[0].question["type"] == "score" and plan.cells[0].question["criteria"] == list(rc.AMOUNT_LEVELS)
-    check("9.5 Amount without Outcomes: the five AMOUNT_LEVELS", good and plan.rows == 36)
+    plan = rc.plan_table(life, "AMOUNT", default("AMOUNT"), "How lively?", "")
+    good = plan.cells[0].question["type"] == "score"
+    check("9.5 Amount without Outcomes: the five AMOUNT_LEVELS the node sends",
+          good and plan.cells[0].question["criteria"] == list(sources.AMOUNT_LEVELS) and plan.rows == 36)
     levels = answers(
         "snow.csv", "answer,when,if\nnone,bare ground,state=dead\nsome,a thin layer,\nlots,deep snow,\n", "amount"
     )
@@ -344,24 +353,27 @@ def test_templates():
     check("9.5 Amount levels lowest first; 'if' ignored with a warning", good and summary(plan.warnings) == warning)
 
 
+def factors_file(name, counts):
+    """csvfmt.parse_factors() of a Factors CSV with factors of these level counts (Amount up to 16 levels, else a
+    category), or the CsvError it raises: it keeps every table within 4 096 cells before planning."""
+    rows = "".join(f"f{j},amount,l{b},\n" if n <= 16 else f"f{j},category,l{b},{b}\n"
+                   for j, n in enumerate(counts) for b in range(n))
+    doc = csvfmt.read_csv(write(name, "factor,kind,level,value\n" + rows), schema="factors")
+    return raised(csvfmt.parse_factors, doc) or csvfmt.parse_factors(doc)
+
+
 def test_limits():
-    check("limits: 4 096 cells are fine", rc.cells_error((16, 16, 16)) == "")
-    message = "Rules has 5 400 cells (limit 4 096): use fewer bands"
-    check("limits: over 4 096 cells", rc.cells_error((15, 15, 24)) == message, rc.cells_error((15, 15, 24)))
+    check("limits: 4 096 cells are fine", len(factors_file("cells_4096.csv", (16, 16, 16))) == 3)
+    for counts, count in (((15, 15, 24), "5 400"), ((16, 16, 16, 2), "8 192")):
+        error = factors_file(f"cells_{count[0]}.csv", counts)
+        message = f"Rules has {count} cells (limit 4 096): use fewer bands"
+        check(f"limits: {count} cells are refused before planning",
+              isinstance(error, csvfmt.CsvError) and summary(error.problems) == [("error", 0, message)], error)
     cube = [amount("a", 16), amount("b", 16), amount("c", 16)]
-    error = raised(rc.plan_table, cube + [flag("f")], "YES_NO", None, "Snowy?", "")
-    message = "Rules has 8 192 cells (limit 4 096): use fewer bands"
-    check(
-        "limits: planning over 4 096 cells is a RulesError", isinstance(error, rc.RulesError) and str(error) == message
-    )
-    costs = [rc.cell_cost(m) for m in (0, 1, 2, 16, 17, 20, 255)], [rc.cell_cost(m, False) for m in (1, 2, 16, 20, 255)]
-    check(
-        "limits: scored rows per cell, tournaments above 16", costs == ([0, 0, 2, 2, 6, 6, 34], [0, 1, 1, 3, 17]), costs
-    )
-    check("limits: 8 192 scored rows are fine", rc.rows_error(8192) == "")
-    message = "Rules needs 8 500 scored rows (limit 8 192): offer at most 16 outcomes per cell, or use fewer bands"
-    check("limits: over 8 192 scored rows", rc.rows_error(8500) == message, rc.rows_error(8500))
-    plan = rc.plan_table(cube, "YES_NO", None, "Snowy?", "")
+    costs = [pipeline.cost(m, True) for m in (2, 16, 17, 20, 255)], [pipeline.cost(m, False) for m in (2, 16, 20, 255)]
+    check("limits: scored rows per asked cell (pipeline.cost), tournaments above 16",
+          costs == ([2, 2, 6, 6, 34], [1, 1, 3, 17]), costs)
+    plan = rc.plan_table(cube, "YES_NO", default("YES_NO"), "Snowy?", "")
     check(
         "limits: the largest table, 4 096 cells of 2 options, is 8 192 rows",
         plan.rows == 8192 and len(plan.cells) == 4096,
@@ -372,7 +384,7 @@ def test_limits():
         "limits: planning over 8 192 rows is a RulesError", isinstance(error, rc.RulesError) and str(error) == message
     )
     five = [amount("a", 2), amount("b", 2), flag("f"), amount("c", 2), amount("d", 3)]
-    plan = rc.plan_table(five, "AMOUNT", None, "How much?", "")
+    plan = rc.plan_table(five, "AMOUNT", default("AMOUNT"), "How much?", "")
     warning = [("warning", 0, "interpolating over 3 Amount factors; 'd' uses its nearest band")]
     good = summary(plan.warnings) == warning and rc.interpolated_factors(five) == (0, 1, 3)
     check("limits: a 4th Amount factor uses its nearest band, with a warning", good, summary(plan.warnings))
@@ -467,11 +479,18 @@ def test_renormalisation():
     check("renormalisation: answered corners weighing under 1e-6 give the fallbacks", value == (0.0, 0.0, False), value)
     value = rc.blend([category("c", (0, 1)), amount("a", 2)], [5, 0.5], [(1.0, 1.0, 1.0)] * 4)
     check("renormalisation: an unknown category value gives the fallbacks", value == (0.0, 0.0, False), value)
-    got = [rc.ok_value(source) for source in ("model", "lock", "code", "pending", "error")]
-    check(
-        "renormalisation: ok is 1 for answered, locked and code rows, 0 for pending and error rows",
-        got == [1, 1, 1, 0, 0],
-    )
+    life = factors_csv("life_factors.csv")
+    yes_no = answers("ok.csv", "answer,if\nyes,neighbours=3\nno,state=alive\n", "yes_no")
+    plan = rc.plan_table(life, "YES_NO", yes_no, "Alive?", "")
+    job = pipeline.Job("", (), "", pipeline.TableShape(), [], answer_type='YES_NO', options=("yes", "no"))
+    written = {
+        "model": RulesSpec.answer_values('YES_NO', None, {"p": 0.8, "model": "m"})["ok"],
+        "lock": RulesSpec().lock_values(job, (0,), "yes")[0]["ok"],
+        "code": plan.cells[3].values["ok"] if plan.cells[3].source == "code" else None,
+        "error": plan.cells[0].values["ok"] if plan.cells[0].source == "error" else None,
+    }
+    check("renormalisation: the rows the node writes have ok 1 when answered, locked or decided by code, 0 in error",
+          written == {"model": 1.0, "lock": 1.0, "code": 1.0, "error": 0.0}, written)
 
 
 def test_dither():
@@ -540,6 +559,142 @@ def test_dither():
     check("dither: an unknown category value gives no cell", invalid == ({}, -1), invalid)
 
 
+RULES = RulesSpec()
+GN = (GOL_QUESTION, GOL_CONTEXT, "life_factors.csv", "life_edit.csv", "", "")
+GOL_ROWS = {  # Outcomes rows by name, for the edits below
+    "Birth": "Birth,A dead cell with exactly three live neighbours comes to life.,state=dead,1",
+    "Stays empty": "Stays empty,A dead cell with any other number of live neighbours stays empty.,state=dead,0",
+    "Survives": "Survives,A live cell with two or three live neighbours stays alive.,state=alive,1",
+    "Dies": "Dies,A live cell with fewer than two or more than three live neighbours dies.,state=alive,0",
+    "Explodes": "Explodes,A live cell with eight live neighbours explodes.,state=alive;neighbours=8,0",
+}
+
+
+def right_outcome(state, n, names):
+    """B3/S23, with Explodes for a live cell of 8 neighbours while that row exists."""
+    if state == "dead":
+        return "Birth" if n == 3 and "Birth" in names else "Stays empty"
+    if n == 8 and "Explodes" in names:
+        return "Explodes"
+    return "Survives" if n in (2, 3) else "Dies"
+
+
+def life_job(names):
+    """The Game of Life Job whose Outcomes CSV has these rows, in this order."""
+    edited = answers("life_edit.csv", "answer,when,if,alive\n" + "\n".join(GOL_ROWS[n] for n in names) + "\n")
+    return RULES.job(GN, factors_csv("life_factors.csv"), edited, "ONE_OF", True, ["f", edited.doc.text_hash], "u")
+
+
+def life_edit(names, entries, shown=""):
+    """life_job(names) resolved against the stored entries as the pass does: every cell the entries don't answer
+    is asked (answered right) and counted. Returns (entry, cells asked, wrong cells)."""
+    job = life_job(names)
+    entry, missing, _failed = RULES.resolve(job, entries, shown)
+    for cell in missing:
+        name = next(row.name for row in job.rows if row.cell is cell)
+        state, n = name.split("|")
+        keys = list(cell.question["criteria"])
+        pipeline.remember(cell.key, {"model": "m", "probabilities": [
+            0.9 if names[int(key)] == right_outcome(state, int(n), names) else 0.1 for key in keys]})
+    if missing:
+        entry, _missing, _failed = RULES.resolve(job, entries, shown)
+    got = [names[o] if 0 <= o < len(names) else o for o in entry.rows.v["outcome"]]
+    want = [right_outcome(s, n, names) for s in ("dead", "alive") for n in range(9)]
+    alive = [int(g in ("Birth", "Survives")) for g in got]
+    wrong = [(entry.rows.name[i], g, w) for i, (g, w) in enumerate(zip(got, want)) if g != w]
+    if entry.rows.payload.get("alive") != alive:
+        wrong.append(("payload", entry.rows.payload.get("alive"), alive))
+    return entry, len(missing), wrong
+
+
+def test_outcome_edits():
+    """5.4: a wkey holds the names and whens of the outcomes a cell offers, so moving, inserting or deleting an
+    Outcomes row carries every other row; its outcome is renumbered by name, never kept as a stale row index."""
+    conway = ["Birth", "Stays empty", "Survives", "Dies"]
+    entry, asked, wrong = life_edit(conway, [])
+    check("outcome edits: Conway answered, the entry naming its outcomes",
+          asked == 18 and not wrong and entry.shape.get("outcomes") == conway, (wrong, entry.shape.get("outcomes")))
+    moved = ["Survives", "Dies", "Birth", "Stays empty"]  # every cell offers its outcomes in the same order
+    for label, names, want in (
+            ("moving the live cells' rows to the top", moved, 0),
+            ("moving Dies above Survives, which live cells then offer in another order", ["Dies"] + conway[:3], 9),
+            ("deleting Birth (row 0), which leaves dead cells one outcome", conway[1:], 0),
+            ("inserting Explodes on top, which alive|8 offers", ["Explodes"] + conway, 1)):
+        edited, asked, wrong = life_edit(names, [entry], entry.words_key)
+        check(f"outcome edits: {label}: the carried rows are renumbered by name, and {want} cells are asked",
+              asked == want and not wrong and edited.words_key != entry.words_key, (asked, wrong))
+
+    # an entry stored before entries kept their outcome names: its words key is the same, its shape lacks them
+    old = dataclasses.replace(entry, shape={key: value for key, value in entry.shape.items() if key != "outcomes"})
+    same = RULES.resolve(life_job(conway), [old], "")[0]
+    check("outcome edits: an entry stored without its outcome names holds while its words do, and gets the names",
+          same is not old and same.words_key == old.words_key and same.rows is old.rows
+          and same.shape == dict(old.shape, outcomes=conway), same.shape.get("outcomes"))
+    _moved, asked, wrong = life_edit(moved, [old], old.words_key)
+    check("outcome edits: without the names its rows are never carried into another outcome order; the cells are "
+          "asked again", asked == 18 and not wrong, (asked, wrong))
+
+
+def test_problems():
+    """17.1: the problems a Rules Job shows, first to last: the cells no outcome applies to (9.4), then the warnings
+    of the Factors CSV, of the Outcomes CSV and of the plan."""
+    factors = write("blank_factors.csv", "factor,kind,level,value,when\nstate,flag,dead,0,Empty.\n\n"
+                                         "state,flag,alive,1,Alive.\nneighbours,category,0,0,\n"
+                                         + "".join(f"neighbours,category,{n},{n},\n" for n in range(1, 9)))
+    doc = csvfmt.read_csv(factors, schema="factors")
+    outcomes = answers("status_outcomes.csv", 'answer,when,if,scale\nBirth,comes to life,state=dead;neighbours=3,"1,5"\n'
+                       "Survives,stays alive,state=alive;neighbours=2|3,2\nDies,dies,state=alive;neighbours!=2|3,3\n"
+                       "Ghost,never,state=dead;state=alive,4\n")
+    job = RULES.job(GN, csvfmt.parse_factors(doc), outcomes, "ONE_OF", True, (), "u", doc.problems)
+    want = ("No outcome applies to state=dead, neighbours=0; state=dead, neighbours=1; state=dead, neighbours=2 and "
+            "5 more cells",
+            "blank_factors.csv: Line 3 is blank: blank lines between rows are skipped",
+            "status_outcomes.csv line 2: Column 'scale' has '1,5' in line 2; treated as text, no output",
+            "status_outcomes.csv line 5: 'Ghost' is never offered: its 'if' matches no cell")
+    check("problems: the Job shows the cells without an outcome, then the Factors, Outcomes and plan warnings",
+          job.problems == want, job.problems)
+    amount = answers("snow_if.csv", "answer,when,if\nnone,bare,state=dead\nsome,thin,\n", "amount")
+    job = RULES.job(("How much?",) + GN[1:], factors_csv("life_factors.csv"), amount, "AMOUNT", True)
+    check("problems: 'if' in Amount answers is a warning the Job shows",
+          job.problems == ("snow_if.csv line 2: 'if' is not used for Amount answers",), job.problems)
+
+
+def test_code_asks():
+    """A code row was asked nothing: its ask key is "", so a table whose model rows were all asked again with other
+    settings never reads as asked with older settings (engine.older_settings())."""
+    names = ["Birth", "Stays empty", "Dies"]
+    rows = dict(GOL_ROWS, Dies="Dies,Every live cell dies in the next generation.,state=alive,0")
+
+    def seeds(birth, debias, entries, shown):
+        text = "answer,when,if,alive\n" + "\n".join(rows[n] for n in names) + "\n"
+        edited = answers("seeds_ask.csv", text.replace("exactly three", birth))
+        job = RULES.job(GN, factors_csv("life_factors.csv"), edited, "ONE_OF", debias, ["f", edited.doc.text_hash],
+                        "u")
+        for row in job.rows:
+            if row.cell is not None:
+                keys = list(row.cell.question["criteria"])
+                pipeline.remember(row.cell.key, {"model": "m", "probabilities": [0.9] + [0.1] * (len(keys) - 1)})
+        return RULES.resolve(job, entries, shown)[0]
+
+    first = seeds("exactly two", True, [], "")
+    second = seeds("two", False, [first], first.words_key)
+    asks = {src: {second.asks[second.rows.ask[i]] for i, s in enumerate(second.rows.src) if s == src} for src in "mc"}
+    current = RULES.ask_key(False, "m")
+    check("ask keys: code rows store \"\", and a table asked again with other settings has only current keys",
+          asks == {"m": {current}, "c": {""}} and not any(ask and ask != current for ask in second.asks), asks)
+
+
+def test_one_definition():
+    """The Rules modules keep no copies of what the other modules define: the unsure threshold (specs.base), the
+    default Amount levels (sources, which the node sends) and the cost of a question (pipeline)."""
+    from openact.specs import base, rules
+
+    copies = [name for name, copy in (("UNSURE_BELOW", rules.UNSURE_BELOW is not base.UNSURE_BELOW),
+                                      ("AMOUNT_LEVELS", hasattr(rc, "AMOUNT_LEVELS")),
+                                      ("cell_cost", hasattr(rc, "cell_cost"))) if copy]
+    check("one definition: no Rules copy of UNSURE_BELOW, AMOUNT_LEVELS or the question cost", not copies, copies)
+
+
 LEVELS = range(2, 17)
 UNSURE_BELOW = 0.30  # the preference's default
 
@@ -588,6 +743,10 @@ test_limits()
 test_interpolation()
 test_renormalisation()
 test_dither()
+test_outcome_edits()
+test_problems()
+test_code_asks()
+test_one_definition()
 phase_endpoints()
 phase_examples()
 shutil.rmtree(TMP, ignore_errors=True)
