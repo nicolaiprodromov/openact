@@ -1,4 +1,4 @@
-"""The Ask and Pick nodes."""
+"""The Ask, Pick and Dials nodes."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import bpy
 
 from . import engine, inner
 from . import prefs as P
+from .specs import dials
 
 
 def _changed(self, context):
@@ -137,6 +138,19 @@ class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_label = "Pick"
 
 
+class GeometryNodeOpenActDials(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
+    """Judge many named settings against one prompt, in one request: one output per setting"""
+
+    bl_idname = dials.DialsSpec.idname
+    bl_label = "Dials"
+
+    def draw_status(self, layout, full=False):
+        super().draw_status(layout, full)
+        warning = dials.WARNINGS.get(self.uid)
+        if warning:
+            layout.label(text=warning, icon='ERROR')
+
+
 class NODE_MT_openact_add(bpy.types.Menu):
     bl_idname = "NODE_MT_openact_add"
     bl_label = "OpenAct"
@@ -144,7 +158,8 @@ class NODE_MT_openact_add(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         for idname, label, icon in ((engine.ASK_ID, "Ask", 'QUESTION'),
-                                    (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF')):
+                                    (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF'),
+                                    (dials.DialsSpec.idname, "Dials", 'OPTIONS')):
             op = layout.operator("node.add_node", text=label, icon=icon)
             op.type = idname
             op.use_transform = True
@@ -161,7 +176,7 @@ def draw_add_menu(self, context):
     self.layout.menu(NODE_MT_openact_add.bl_idname, icon='NODETREE')
 
 
-classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, NODE_MT_openact_add)
+classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActDials, NODE_MT_openact_add)
 
 
 def register():
