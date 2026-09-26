@@ -2,8 +2,8 @@
 
 Checks the CSV dialect (BOM, CRLF and CR, ";" and tab delimiters, quoting), the INT/FLOAT/text split, the limits,
 every design 7.9 message that the reader and the parsers give (one broken fixture each), the Answers, Factors,
-Settings and Overrides parsers, the Rules `if` grammar (rules_core.parse_if), the change hashes, and the inline-list
-rules.
+Settings and Overrides parsers, the Rules `if` grammar (rules_core.parse_if), the change hashes, the inline-list
+rules, and the cells Dials asks.
 
 Run:  python tests/csv_test.py
       blender -b --factory-startup --python tests/csv_test.py
@@ -1153,6 +1153,41 @@ def test_per_item_cells():
           rows[0].cell.question["type"] == "score" and len(rows[0].cell.question["criteria"]) == len(levels.options))
 
 
+def test_dials_cells():
+    """Dials asks each setting as Ask asks its answer set (sources.question()), so equal questions share a cell. And the
+    warning for contexts whose settings differ names both, and what only one of them has."""
+    from openact.specs.ask import AskSpec
+    from openact.specs.dials import DialsSpec, differ
+
+    storm = "A stormy night in a fishing village"
+    settings = csvfmt.parse_settings(csvfmt.read_csv(fixture("weather_dials.csv"), schema="settings"))
+    job = DialsSpec().job((storm, "weather_dials.csv", "", ""), settings, True)
+    rain, wind, time_, street, fog = (row.cell.question for row in job.rows)
+    check("dials cells: yes/no asks 'Yes.'/'No.' without whens, and its whens with them",
+          rain.get("criteria") == {"true": "Yes.", "false": "No."}
+          and street["criteria"] == {"true": "it is dark or foggy", "false": "there is enough daylight"}, (rain, street))
+    check("dials cells: amount scores its levels, else the five default ones; one-of chooses by row index",
+          wind["criteria"][:2] == ["calm: still air", "breeze: leaves move"] and len(wind["criteria"]) == 5
+          and fog["criteria"] == list(sources.AMOUNT_LEVELS) and time_["type"] == "choice"
+          and time_["criteria"] == {"0": "dawn: first light", "1": "day: the sun is high", "2": "dusk: evening glow",
+                                    "3": "night: dark sky"}, (wind, fog, time_))
+    ask = AskSpec().job(("Is it raining?", storm, "", "", ""), 'YES_NO', True)
+    check("dials cells: a yes/no setting and an Ask with the same question and situation share one cell",
+          job.rows[0].cell.key == ask.rows[0].cell.key, (job.rows[0].cell.key, ask.rows[0].cell.key))
+    check("dials cells: one state, 2 scored rows each with order balancing, wkeys without the name or range",
+          {row.cell.state for row in job.rows} == {storm} and {row.cell.cost for row in job.rows} == {2}
+          and job.rows[4].wkey == pipeline.wkey("dials", "amount", [storm], ["How foggy is it?"], []),
+          [(row.cell.state, row.cell.cost) for row in job.rows])
+    wet, snow, when = ("Wet", "yes_no"), ("Snow", "amount"), ("When", "one_of")
+    got = [differ("A > Dials", [wet, when], "B > Dials", theirs) for theirs in ([wet, snow], [wet, when, snow],
+                                                                                [when, wet])]
+    tail = "; setting names and types must agree"
+    check("dials cells: the disagreement warning names both contexts, and what only one of them has", got == [
+        f"Dials: 'A > Dials' and 'B > Dials' use different settings ('When' (one-of) vs 'Snow' (amount)){tail}",
+        f"Dials: 'A > Dials' and 'B > Dials' use different settings (only 'B > Dials' has 'Snow' (amount)){tail}",
+        f"Dials: 'A > Dials' and 'B > Dials' use different settings (the same settings in another order){tail}"], got)
+
+
 def test_cache():
     path = write("cached.csv", "answer,when,scale\npan,cooking,1\nsofa,sitting,2\n")
     first = csvfmt.load(path)
@@ -1195,6 +1230,7 @@ test_inline()
 test_inline_sets()
 test_answer_set_helpers()
 test_per_item_cells()
+test_dials_cells()
 test_cache()
 shutil.rmtree(TMP, ignore_errors=True)
 finish()
