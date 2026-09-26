@@ -1,14 +1,26 @@
-"""The Ask and Pick nodes."""
+"""The OpenAct nodes: Ask and Pick (whole situation), Match and Classify (each item)."""
 
 from __future__ import annotations
 
 import bpy
 
-from . import engine, inner
+from . import engine, inner, sources, store
 from . import prefs as P
+from .specs.classify import ClassifySpec
+from .specs.match import MatchSpec
+
+PREVIEW_ROWS = 8  # per-item rows the sidebar lists
 
 
 def _changed(self, context):
+    engine.schedule(immediate=True, node=self)
+
+
+def _list_source_changed(self, context):
+    # the dropdown swaps sockets (§6.0); the group is rebuilt for them, as a stored entry may show again unchanged
+    if self.node_tree is not None:
+        inner.sync_interface(self, engine.SPECS[self.bl_idname].interface(self))
+        inner.build(self, store.load(self))
     engine.schedule(immediate=True, node=self)
 
 
@@ -24,6 +36,10 @@ class _OpenActNode:
         name="Balance Option Order", default=True, update=_changed,
         description="Ask every question with its options in both orders and average the answers. Removes the small "
                     "model's bias toward early options, at twice the cost. Changing it keeps the answers given so far",
+    )
+    list_source: bpy.props.EnumProperty(
+        name="List Source", items=sources.LIST_SOURCE_ITEMS, default='TEXT', update=_list_source_changed,
+        description="Where the items come from",
     )
 
     @classmethod
@@ -90,7 +106,15 @@ class _OpenActNode:
                     row = col.row()
                     row.label(text=name, icon='BLANK1')
                     row.label(text=f"{probability * 100:.1f}%")
-            else:
+            elif hasattr(spec, "preview"):  # Match and Classify: every output is per element
+                rows = spec.preview(answer)
+                for name, text in rows[:PREVIEW_ROWS]:
+                    row = col.row()
+                    row.label(text=name, icon='BLANK1')
+                    row.label(text=text)
+                if len(rows) > PREVIEW_ROWS:
+                    col.label(text=f"... {len(rows) - PREVIEW_ROWS} more", icon='BLANK1')
+            elif "Confidence" in answer.single:
                 col.label(text=f"Confidence {answer.single['Confidence']:.2f}", icon='BLANK1')
 
     def draw_settings(self, layout):
@@ -137,17 +161,66 @@ class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_label = "Pick"
 
 
+class GeometryNodeOpenActMatch(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
+    """Ask the local decision model the same question about every item of a list; outputs per element"""
+
+    bl_idname = MatchSpec.idname
+    bl_label = "Match"
+
+    answer_type: bpy.props.EnumProperty(
+        name="Answer",
+        items=(
+            ('YES_NO', "Yes / No", "Probability that the answer is yes for each item (0-1)"),
+            ('AMOUNT', "Amount", "How much for each item, from 0 (not at all) to 1 (extremely)"),
+        ),
+        default='YES_NO',
+        update=_changed,
+    )
+
+    def init(self, context):
+        super().init(context)
+        # Threshold is 0.5 by default (§6.3); SocketDef carries no default value
+        item = self.node_tree.interface.items_tree["Threshold"]
+        item.min_value, item.max_value, item.default_value = 0.0, 1.0, 0.5
+        self.inputs["Threshold"].default_value = 0.5
+
+    def draw_settings(self, layout):
+        layout.row().prop(self, "answer_type", expand=True)
+        layout.prop(self, "list_source", text="")
+        super().draw_settings(layout)
+
+
+class GeometryNodeOpenActClassify(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
+    """Let the local decision model give every item of a list one of several labels; outputs per element"""
+
+    bl_idname = ClassifySpec.idname
+    bl_label = "Classify"
+
+    def draw_settings(self, layout):
+        layout.prop(self, "list_source", text="")
+        super().draw_settings(layout)
+
+
+MENU = (  # the Add menu's groups (§6.0)
+    ("Whole situation", ((engine.ASK_ID, "Ask", 'QUESTION'), (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF'))),
+    ("Each item", ((MatchSpec.idname, "Match", 'CHECKMARK'), (ClassifySpec.idname, "Classify", 'SORTALPHA'))),
+)
+
+
 class NODE_MT_openact_add(bpy.types.Menu):
     bl_idname = "NODE_MT_openact_add"
     bl_label = "OpenAct"
 
     def draw(self, context):
         layout = self.layout
-        for idname, label, icon in ((engine.ASK_ID, "Ask", 'QUESTION'),
-                                    (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF')):
-            op = layout.operator("node.add_node", text=label, icon=icon)
-            op.type = idname
-            op.use_transform = True
+        for i, (group, entries) in enumerate(MENU):
+            if i:
+                layout.separator()
+            layout.label(text=group)
+            for idname, label, icon in entries:
+                op = layout.operator("node.add_node", text=label, icon=icon)
+                op.type = idname
+                op.use_transform = True
 
 
 def draw_add_menu(self, context):
@@ -161,7 +234,8 @@ def draw_add_menu(self, context):
     self.layout.menu(NODE_MT_openact_add.bl_idname, icon='NODETREE')
 
 
-classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, NODE_MT_openact_add)
+classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActMatch, GeometryNodeOpenActClassify,
+           NODE_MT_openact_add)
 
 
 def register():

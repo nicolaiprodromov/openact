@@ -44,6 +44,7 @@ class Column:
     data_type: str  # 'FLOAT', 'INT' or 'BOOLEAN'
     fallback: object  # §6.0: 0.0, -1 or False, for invalid IDs and unanswered contexts
     linked_only: bool = False  # built only while the output is linked, else the node holds no table (Pick)
+    payload: bool = False  # read from rows.payload[output], a baked CSV column (§14.2), instead of rows.v[name]
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ class _Builder:
         self.default = default  # k_default: what the match chain yields when no entry matches (§8.2)
         self.per_word = per_word  # a word contains SEP: compare word by word
         self.k = None  # the match chain's output, which the per-element lookup reads
+        self.after_elements = []  # a spec's callables (valid, {output: value}), run once per_element() built them
 
     def new(self, idname, x, y):
         node = self.tree.nodes.new(idname)
@@ -199,6 +201,7 @@ class _Builder:
         info = self.new("GeometryNodeObjectInfo", 300, -1050)
         info.name = tables.NODE
         info.inputs["Object"].default_value = table
+        values = {}
         for j, column in enumerate(columns):
             y = -1050 - 150 * j
             attribute = self.new("GeometryNodeInputNamedAttribute", 450, y)
@@ -215,6 +218,9 @@ class _Builder:
             sock(switch.inputs, "False").default_value = column.fallback
             self.link(_enabled(sampled.outputs, "Value"), sock(switch.inputs, "True"))
             self.link(switch.outputs[0], go.inputs[column.output])
+            values[column.output] = switch.outputs[0]
+        for then in self.after_elements:  # outputs derived from the columns, e.g. Match's Selection (§6.3)
+            then(valid, values)
 
     def selection(self, ident, picked, target):
         """Pick's Selection = (ID == Index) AND (Index >= 0) (§8.3): `picked` is the entry-level Index."""
@@ -380,7 +386,7 @@ def flat_rows(entries, columns):
             continue
         values = flat[column.name] = []
         for entry in entries:
-            own = entry.rows.v.get(column.name)
+            own = entry.rows.payload.get(column.output) if column.payload else entry.rows.v.get(column.name)
             values.extend(own if own is not None else [column.fallback] * row_count(entry))
     return flat
 
