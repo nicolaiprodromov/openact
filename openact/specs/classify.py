@@ -9,8 +9,6 @@ from .. import pipeline
 from .base import KEY, confidence, named, overrides_inputs, warnings
 from .match import PerItemSpec
 
-FACE = "openact classify payload"  # evaluator.MEMO key: the payload the pass's first planned context of a node reads
-
 
 @dataclasses.dataclass
 class LabelsJob(pipeline.Job):
@@ -34,7 +32,7 @@ class ClassifySpec(PerItemSpec):
         return "one_of"
 
     def payload_outputs(self, node) -> list:
-        """(header, type) of the node's payload outputs. They follow its Labels CSV, set by sync()."""
+        """(header, type) of the node's payload outputs. They follow the Labels CSVs of its live contexts (agree())."""
         tree = node.node_tree
         if tree is None:
             return []
@@ -98,13 +96,32 @@ class ClassifySpec(PerItemSpec):
         label = values["label"]
         return job.options[label] if 0 <= label < len(job.options) else ""
 
+    def agree(self, node, jobs):
+        """§6.0, once per pass before any context is answered: every live context must read the same payload headers
+        and types. Jobs that agree give the node their payload outputs, and "" is returned; with no job, the node
+        keeps its outputs and the links to them. Otherwise the error naming the first two contexts that differ is
+        returned, and the node, its entries and its graph stay as they are.
+
+        jobs: (ctx, Job) of each live context. Payload values may differ: they are per-entry data."""
+        from ..inner import sync_interface  # imports bpy
+
+        if not jobs:
+            return ""
+        (first_ctx, first), *others = jobs
+        for ctx, job in others:
+            if job.payload != first.payload:
+                one, other = ([f"'{header}' ({kind})" for header, kind in a if (header, kind) not in b]
+                              for a, b in ((first.payload, job.payload), (job.payload, first.payload)))
+                what = f"{', '.join(one) or '-'} vs {', '.join(other) or '-'}" if one or other else "another order"
+                return (f"Classify: '{first_ctx.label()}' and '{ctx.label()}' use Labels CSVs with different payload "
+                        f"columns ({what})")
+        if node.node_tree is not None and list(first.payload) != self.payload_outputs(node):
+            sync_interface(node, self.interface(node, list(first.payload)))
+        return ""
+
     def resolve(self, job, entries, last_shown=""):
         """Spec.resolve(), with each row's payload baked from its label (denormalised, §8.1). A numbers-only edit of
         the Labels CSV keeps the words key: the stored entry comes back with the new payload, and nothing is asked."""
-        from .. import evaluator  # imports bpy
-
-        if evaluator.MEMO is not None:  # a pass: sync() follows the plan, so the outputs exist before the first answer
-            evaluator.MEMO.setdefault((FACE, job.uid), list(job.payload))
         entry, missing, failed = super().resolve(job, entries, last_shown)
         if entry is None:
             return entry, missing, failed
@@ -115,16 +132,6 @@ class ClassifySpec(PerItemSpec):
         if shape != entry.shape or columns != entry.rows.payload:
             entry = dataclasses.replace(entry, shape=shape, rows=dataclasses.replace(entry.rows, payload=columns))
         return entry, missing, failed
-
-    def sync(self, node, _entries):
-        """Give the node the payload outputs of the Labels CSV its first planned context reads, as resolve() recorded
-        it in this pass. Outside a pass, or while no context plans, the node keeps its outputs and the links to them."""
-        from .. import evaluator  # imports bpy
-        from ..inner import sync_interface
-
-        wanted = (evaluator.MEMO or {}).get((FACE, node.uid))
-        if wanted is not None and wanted != self.payload_outputs(node):
-            sync_interface(node, self.interface(node, wanted))
 
     def summary(self, entry):
         rows = self.offered(entry, "label")
