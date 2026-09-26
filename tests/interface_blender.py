@@ -74,24 +74,27 @@ def items(node):
 
 
 def phase_sync():
-    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # Question, Context, Answer, Yes, Confidence, Key
+    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # Question, Context, Answer, Yes, Confidence, Answers (+CSV), Key
+    by = {d.name: d for d in spec}
     kept = {s.name: s.identifier for s in (*ask.inputs, *ask.outputs)}
     tag = SocketDef('INPUT', "Tag", 'NodeSocketString', "Compared, never sent to the model", kind="word", hidden=True)
     extra = SocketDef('OUTPUT', "Extra", 'NodeSocketInt', "An extra output")
-    wanted = [spec[1], spec[0], tag, spec[5], spec[4], spec[2], spec[3], extra]  # Context first, Confidence first
+    wanted = [by["Context"], by["Question"], by["Answers"], by["Answers CSV"], tag, by["Key"], by["Confidence"],
+              by["Answer"], by["Yes"], extra]  # Context first, Confidence first
+    inputs = ("Question", "Context", "Answers", "Answers CSV", "Key")
     inner.sync_interface(ask, wanted)
     check("sync: new sockets reach the node, in the wanted order",
-          names(ask.inputs) == ["Context", "Question", "Tag", "Key"]
+          names(ask.inputs) == ["Context", "Question", "Answers", "Answers CSV", "Tag", "Key"]
           and names(ask.outputs) == ["Confidence", "Answer", "Yes", "Extra"], (names(ask.inputs), names(ask.outputs)))
     check("sync: matched sockets keep their identifiers (the interface is never cleared)",
-          all(sock(ask.inputs if name in ("Question", "Context", "Key") else ask.outputs, identifier).name == name
+          all(sock(ask.inputs if name in inputs else ask.outputs, identifier).name == name
               for name, identifier in kept.items()), kept)
     check("sync: links to the node survive", question_link.is_valid and question_link.to_socket == ask.inputs["Question"]
           and all(link.is_valid for link in L), [(link.to_socket.name, link.is_valid) for link in L if not link.is_valid])
     check("sync: the node still evaluates through its links", read(host, "answer") == [0.75] * 4, read(host, "answer"))
     check("sync: tooltips come from the descriptions",
           items(ask)[('INPUT', "Tag")].description == tag.description
-          and items(ask)[('OUTPUT', "Answer")].description == spec[2].description)
+          and items(ask)[('OUTPUT', "Answer")].description == by["Answer"].description)
     check("sync: a socket declared hidden is hidden when it is created, like every node's Key",
           ask.inputs["Tag"].hide and ask.inputs["Key"].hide and not ask.inputs["Question"].hide)
 
@@ -112,8 +115,8 @@ def phase_sync():
 
     inner.sync_interface(ask, spec)
     check("sync: obsolete sockets are removed and the order restored",
-          names(ask.inputs) == ["Question", "Context", "Key"] and names(ask.outputs) == ["Answer", "Yes", "Confidence"],
-          (names(ask.inputs), names(ask.outputs)))
+          names(ask.inputs) == ["Question", "Context", "Answers", "Answers CSV", "Key"]
+          and names(ask.outputs) == ["Answer", "Yes", "Confidence"], (names(ask.inputs), names(ask.outputs)))
     check("sync: kept sockets and links are untouched by the removals",
           all(sock((*ask.inputs, *ask.outputs), identifier).name == name for name, identifier in kept.items())
           and question_link.is_valid and read(host, "answer") == [0.75] * 4)

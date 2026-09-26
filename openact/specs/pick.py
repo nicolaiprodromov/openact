@@ -2,97 +2,136 @@
 
 from __future__ import annotations
 
-from .. import natsort, pipeline
-from .base import Spec, confidence, option_text, state_text
+import dataclasses
 
-MAX_ITEMS = 255
+from .. import pipeline
+from .base import KEY, Spec, confidence, option_text, state_text, warnings
+
 PICK_STATE = "Choose one of the listed items."
 
 
-def parse_items(text):
-    """Items are separated by commas, or by new lines when there are any (e.g. Import Text)."""
-    if not text:
-        return []
-    parts = text.splitlines() if ("\n" in text or "\r" in text) else text.split(",")
-    return [part.strip() for part in parts if part.strip()]
+@dataclasses.dataclass
+class PickJob(pipeline.Job):
+    list_source: str = 'TEXT'  # under MATERIALS the entry also stores the picked material's name (§8.6)
 
 
-def collection_items(collection):
-    """Children in the order Collection Info (Separate Children) instances them."""
-    names = [obj.name for obj in collection.objects] + [child.name for child in collection.children]
-    return sorted(names, key=natsort.sort_key)
+@dataclasses.dataclass(frozen=True)
+class _Named:  # an item given by name only (the pure suites plan from names)
+    name: str
+    when: str = ""
+    offered: bool = True
 
 
 class PickSpec(Spec):
     name, idname, label = "pick", "GeometryNodeOpenActPick", "Pick"
     WORDS = ("Prompt", "Context", "Items", "Overrides", "Key")
-    SOCKETS = (
+    INPUTS = (
         ('INPUT', "Prompt", 'NodeSocketString', "What to pick, e.g. 'something to sit on'", "word"),
-        ('INPUT', "Items", 'NodeSocketString',
-         "Items separated by commas (or one per line, e.g. from Import Text). Ignored when a Collection is set",
-         "word"),
-        ('INPUT', "Collection", 'NodeSocketCollection',
-         "Pick one of this collection's children instead, in the same order as Collection Info", "word"),
-        ('OUTPUT', "Index", 'NodeSocketInt',
-         "Position of the picked item, -1 until answered. Matches Collection Info / Pick Instance order"),
-        ('OUTPUT', "Item", 'NodeSocketString', "Name of the picked item"),
-        ('OUTPUT', "Confidence", 'NodeSocketFloat', "How clearly the pick wins over the runner-up (0-1)"),
-        ('OUTPUT', "Instance", 'NodeSocketGeometry',
-         "The picked collection child as an instance (empty when picking from text)"),
+        ('INPUT', "Context", 'NodeSocketString',
+         "Optional situation the pick is for, e.g. 'a beach bar at noon'. Sent to the model", "word"),
     )
+    ID = ('INPUT', "ID", 'NodeSocketInt',
+          "The entry Selection and Probability describe. Unlinked: the element's index", "field", False, 'INDEX', True)
+    OUTPUTS = (
+        ('OUTPUT', "Index", 'NodeSocketInt',
+         "Position of the picked entry, -1 until answered. Matches Collection Info order and material indices"),
+        ('OUTPUT', "Item", 'NodeSocketString', "Name of the picked entry"),
+        ('OUTPUT', "Confidence", 'NodeSocketFloat', "How clearly the pick wins over the runner-up (0-1)"),
+        ('OUTPUT', "Selection", 'NodeSocketBool', "True for the element whose ID is the picked entry"),
+        ('OUTPUT', "Probability", 'NodeSocketFloat', "How well entry ID fits (0-1); 0 outside the list"),
+    )
+    EXTRA = {  # list_source -> its extra output
+        'COLLECTION': ('OUTPUT', "Instance", 'NodeSocketGeometry', "The picked collection child as an instance"),
+        'MATERIALS': ('OUTPUT', "Material", 'NodeSocketMaterial', "The picked slot's material"),
+    }
     FALLBACK = {"Index": -1, "Item": "", "Confidence": 0.0}
     empty_hint = "Type a prompt and items"
 
-    def collection(self, node, ctx):
-        import bpy
+    def per_element(self, node):
+        from ..inner import Column  # imports bpy
 
-        from ..evaluator import eval_input
+        return (Column("Probability", "prob", 'FLOAT', 0.0, linked_only=True),)
 
-        value = eval_input(node.inputs["Collection"], ctx)
-        return value if isinstance(value, bpy.types.Collection) else None
+    def interface(self, node):
+        from ..inner import SocketDef  # imports bpy
+        from ..sources import list_inputs
+
+        source = getattr(node, "list_source", 'TEXT')
+        extra = (self.EXTRA[source],) if source in self.EXTRA else ()
+        return [*(SocketDef(*args) for args in self.INPUTS), *list_inputs(source), SocketDef(*self.ID),
+                *(SocketDef(*args) for args in (*self.OUTPUTS, *extra)), SocketDef(*KEY)]
+
+    def items(self, node, ctx):
+        from ..lists import resolve_items  # imports bpy
+
+        return resolve_items(node, ctx, spec="pick")
 
     def listed(self, node, ctx):
-        collection = self.collection(node, ctx)
-        return None if collection is None else collection_items(collection)
+        return self.items(node, ctx).fingerprint
 
     def plan(self, node, ctx):
-        from ..evaluator import Hint, Unresolvable  # imports bpy
+        from ..evaluator import Hint  # imports bpy
 
         gn = self.gn(node, ctx)
-        children = self.listed(node, ctx)
-        items = parse_items(gn[2]) if children is None else children
         if not gn[0].strip():
             raise Hint("Type a prompt")
-        if not items:
-            raise Hint("Type items separated by commas, or set a collection" if children is None else
-                       "The collection is empty")
-        if len(items) > MAX_ITEMS:
-            raise Unresolvable(f"Too many items ({len(items)}); the limit is {MAX_ITEMS}")
-        return self.job(gn, items, node.balance_order, node.uid)
+        items = self.items(node, ctx)
+        gn = gn[:2] + (items.raw,) + gn[3:]  # "" under Collection, Materials and Attributes (§8.2)
+        job = self.job(gn, items.items, node.balance_order, node.uid, items.source,
+                       [items.doc.text_hash] if items.doc is not None else [])
+        job.problems = warnings(items.problems)
+        return job
 
-    def job(self, gn, items, debias, uid=""):
-        """The Job for these words and items. Pure, so the pure suites plan exactly like the pass."""
+    def job(self, gn, items, debias, uid="", source='TEXT', csv_hashes=()):
+        """The Job for these words and items (lists.Item, or names). Pure, so the pure suites plan exactly like the
+        pass. Entries that can't be offered (an empty material slot) keep their ID with probability 0; a list with
+        one offered entry is decided by code and never sent (4.d)."""
+        items = [_Named(item) if isinstance(item, str) else item for item in items]
         prompt, context = gn[0].strip(), gn[1].strip()
-        options = tuple((name, "") for name in items)
-        criteria = {str(i): option_text(option) for i, option in enumerate(options)}
+        offered = [(i, item) for i, item in enumerate(items) if item.offered]
+        options = tuple((item.name, item.when) for _i, item in offered)
+        criteria = {str(i): option_text(item) for i, item in offered}
         instructions = f"Which item best fits: {prompt.rstrip('?').strip()}?"
         state = state_text(context, PICK_STATE)
-        cell = pipeline.Cell(pipeline.cell_key("choice", state, instructions, list(criteria.items()), debias), state,
-                             {"type": "choice", "instructions": instructions, "criteria": criteria},
-                             pipeline.cost(len(options), debias))
-        rows = [pipeline.Row(name, pipeline.wkey(self.name, 'ONE_OF', [prompt, context], [name, when], options),
-                             cell=cell) for name, when in options]
+        cell = None
+        if len(offered) > 1:
+            cell = pipeline.Cell(pipeline.cell_key("choice", state, instructions, list(criteria.items()), debias),
+                                 state, {"type": "choice", "instructions": instructions, "criteria": criteria},
+                                 pipeline.cost(len(options), debias))
+        rows = []
+        for item in items:
+            wkey = pipeline.wkey(self.name, 'ONE_OF', [prompt, context], [item.name, item.when], options)
+            if cell is not None and item.offered:
+                rows.append(pipeline.Row(item.name, wkey, cell=cell))
+            else:  # code rows: never asked, and ask "" (no model's settings behind them)
+                rows.append(pipeline.Row(item.name, wkey, "code", {"prob": float(item.offered)}, ""))
         shape = pipeline.TableShape(len(rows), (("prob", "FLOAT"),))
-        words_key = pipeline.words_key(gn, [], 'ONE_OF', shape.digest(), [row.wkey for row in rows])
-        return pipeline.Job(uid, tuple(gn), words_key, shape, rows, answer_type='ONE_OF', debias=debias)
+        words_key = pipeline.words_key(gn, list(csv_hashes), 'ONE_OF', shape.digest(), [row.wkey for row in rows])
+        return PickJob(uid, tuple(gn), words_key, shape, rows, answer_type='ONE_OF', debias=debias,
+                       list_source=source)
 
-    def values(self, index, answer):
-        return {"prob": answer["probabilities"][index]}
+    def rows(self, job, answers):
+        """As Spec.rows(), but the server's probabilities come in the order of the offered IDs (criteria keys)."""
+        rows = []
+        for index, row in enumerate(job.rows):
+            answer = answers.get(row.cell.key) if row.source == "pending" and row.cell is not None else None
+            if answer is not None:
+                position = list(row.cell.question["criteria"]).index(str(index))
+                row = dataclasses.replace(row, source="model", values={"prob": answer["probabilities"][position]},
+                                          ask=self.ask_key(job.debias, answer["model"]))
+            rows.append(row)
+        return rows
 
     def single(self, rows):
         probabilities = [row.values["prob"] for row in rows]
         index = max(range(len(rows)), key=probabilities.__getitem__)  # the first of equal ones, as the server picks
         return {"Index": index, "Item": rows[index].name, "Confidence": confidence('ONE_OF', probabilities)}
+
+    def entry(self, job, rows, model=""):
+        entry = super().entry(job, rows, model)
+        if getattr(job, "list_source", "") == 'MATERIALS':
+            entry.single["Material"] = entry.single["Item"]  # by name, resolved at build time (§8.6)
+        return entry
 
     def summary(self, entry):
         p = entry.rows.v["prob"][entry.single["Index"]]
@@ -101,12 +140,20 @@ class PickSpec(Spec):
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy
 
-        index = b.match_chain(self.word_sockets(gi), [e.gn for e in entries])
+        index = b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
         picked = b.lookup(index, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
         b.lookup(index, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
         b.lookup(index, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
+        ident = next((s for s in gi.outputs if s.name == "ID"), None)
+        if ident is not None and "Selection" in go.inputs:
+            b.selection(ident, picked, go.inputs["Selection"])
+        if "Material" in go.inputs:
+            b.lookup(index, 'MATERIAL', None, [e.single.get("Material") for e in entries], go.inputs["Material"], -250)
+        collection = next((s for s in gi.outputs if s.name == "Collection"), None)
+        if collection is None or "Instance" not in go.inputs:
+            return
         info = b.new("GeometryNodeCollectionInfo", 150, -350)
-        b.link(gi.outputs["Collection"], sock(info.inputs, "Collection"))
+        b.link(collection, sock(info.inputs, "Collection"))  # the list's collection, live per context
         sock(info.inputs, "Separate Children").default_value = True
         sock(info.inputs, "Reset Children").default_value = True
         position = b.new("GeometryNodeInputIndex", 150, -560)

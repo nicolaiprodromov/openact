@@ -224,7 +224,8 @@ class _Builder:
         return both
 
     def lookup(self, index, data_type, fallback, values, target, y):
-        """An entry-level value: an Index Switch on the match chain, items [fallback, value 1 ...]."""
+        """An entry-level value: an Index Switch on the match chain, items [fallback, value 1 ...]. A MATERIAL
+        value may be a material's name (entries store it so, §8.6)."""
         node = self.new("GeometryNodeIndexSwitch", 150, y)
         node.data_type = data_type
         items = node.index_switch_items
@@ -233,7 +234,7 @@ class _Builder:
             items.new()
         slots = _items(node)
         slots[0].default_value = fallback
-        for slot, value in zip(slots[1:], values):
+        for slot, value in zip(slots[1:], _values(data_type, values)):
             slot.default_value = value
         if index is not None:
             self.link(index, sock(node.inputs, "Index"))
@@ -299,12 +300,12 @@ def update_values(node, store, live=None, default=None, rows=True):
     split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
     if tree.get(BUILT) != _built(node, entries, columns, split) or (columns and tables.find(node) is None):
         return False
-    feeds = [(link.to_socket.name, _items(link.from_node)) for link in tree.links
+    feeds = [(link.to_socket.name, link.from_node.data_type, _items(link.from_node)) for link in tree.links
              if link.to_node.bl_idname == "NodeGroupOutput" and link.from_node.bl_idname == "GeometryNodeIndexSwitch"]
-    if any(len(slots) != len(entries) + 1 for _name, slots in feeds):
+    if any(len(slots) != len(entries) + 1 for _name, _type, slots in feeds):
         return False
-    for name, slots in feeds:
-        _write(slots[1:], [entry.single[name] for entry in entries])
+    for name, data_type, slots in feeds:  # an entry without the value (e.g. no Material) holds the fallback
+        _write(slots[1:], _values(data_type, [entry.single.get(name, slots[0].default_value) for entry in entries]))
     counts = [row_count(entry) for entry in entries]
     for name, values in ((BASE, list(itertools.accumulate([0] + counts))[:-1]), (COUNT, counts)):
         switch = tree.nodes.get(name)
@@ -316,6 +317,13 @@ def update_values(node, store, live=None, default=None, rows=True):
     if rows and columns:
         tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
     return True
+
+
+def _values(data_type, values):
+    """Stored single values as the Index Switch items take them: a material by name, None when missing (§8.6)."""
+    if data_type != 'MATERIAL':
+        return values
+    return [bpy.data.materials.get(v) if isinstance(v, str) else v for v in values]
 
 
 def _write(slots, values):

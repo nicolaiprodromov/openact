@@ -235,8 +235,10 @@ def phase_pass():
           node_.entries.startswith('{"schema":2,') and [e.gn[0] for e in saved[:1] + saved[-1:]] == ["Old words", "New words"]
           and [e.gn[0] for e in saved[1:-1]] == [f"Warm {i}?" for i in range(2, S.MAX_ENTRIES + 2)],
           [e.gn[0] for e in saved])
-    check("pass: the inner group shows the stored answers", engine.STATUS[node_.uid][0] == 'CHECKMARK'
-          and inner.update_values(node_, S.load(node_)), engine.STATUS[node_.uid])
+    check("pass: the inner group shows the stored answers, the live ones materialised", engine.STATUS[node_.uid][0]
+          == 'CHECKMARK' and inner.update_values(node_, S.load(node_), [job.gn for job in jobs.values()])
+          and len(inner.materialised(saved, [job.gn for job in jobs.values()])) == inner.WARM_TOTAL,
+          engine.STATUS[node_.uid])
 
     before, questions = node_.entries, []
     with asking(node_, questions):
@@ -292,6 +294,104 @@ def phase_pass():
         shown = str(error).strip()
     check("Ask Again: a newer OpenAct's answers are kept, and the operator says why",
           node_.entries == newer and "saved by a newer OpenAct" in shown and "Traceback" not in shown, shown)
+
+
+def phase_pick_pass():
+    """Pick through the pass (§6.2, §8.2, §6.0): a Collection-source Pick matches its stored entry, the absent Items
+    joined as a constant ""; Probability at the picked ID is the stored top probability; switching back to a stored
+    prompt asks nothing; two contexts that differ only by collection get "only one answer can show" until each has
+    its own Key, and then the context already answered asks nothing."""
+    group = bpy.data.node_groups.new("PickPass", 'GeometryNodeTree')
+    for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Prompt", 'NodeSocketString'),
+                              ("Collection", 'NodeSocketCollection'), ("Key", 'NodeSocketString')):
+        group.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi, go = group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput")
+    picker = group.nodes.new(engine.PICK_ID)
+    picker.list_source = 'COLLECTION'  # swaps Items for Collection
+    for name in ("Prompt", "Collection", "Key"):
+        group.links.new(gi.outputs[name], picker.inputs[name])
+    geometry = gi.outputs["Geometry"]
+    for name, output, data_type in (("prob", "Probability", 'FLOAT'), ("sel", "Selection", 'BOOLEAN'),
+                                    ("idx", "Index", 'INT')):
+        geometry = store(group, geometry, picker.outputs[output], name, data_type)
+    group.links.new(geometry, go.inputs[0])
+    idents = {i.name: i.identifier for i in group.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
+    lists_ = {}
+    for name, children in (("Shelf", ("book", "lamp", "vase")), ("Kitchen", ("cup", "pan", "plate"))):
+        lists_[name] = bpy.data.collections.new(name)
+        for child in children:
+            lists_[name].objects.link(bpy.data.objects.new(child, None))
+    users = {}
+
+    def use(name, **words):
+        if name not in users:
+            mesh = bpy.data.meshes.new(name)
+            mesh.from_pydata([(i, 0, 0) for i in range(4)], [], [])
+            users[name] = bpy.data.objects.new(name, mesh)
+            bpy.context.scene.collection.objects.link(users[name])
+            users[name].modifiers.new("PickPass", 'NODES').node_group = group
+        for word, value in words.items():
+            users[name].modifiers["PickPass"][idents[word]] = value
+        users[name].update_tag()
+
+    def cell(name):
+        ctx = next(c for c in evaluator.find_uses()[group.as_pointer()] if c.obj.name == name)
+        return engine.SPECS[engine.PICK_ID].plan(picker, ctx).rows[0].cell.key
+
+    def answer(name, probabilities):
+        key = cell(name)
+        pipeline.remember(key, {"probabilities": probabilities, "model": "fake"})
+        return key
+
+    light, flowers, questions = "something that gives light", "something to put flowers in", []
+    use("P1", Prompt=light, Collection=lists_["Shelf"])
+    shelf = answer("P1", [0.125, 0.75, 0.125])
+    with asking(picker, questions):
+        engine.run_pass()
+    stored, got = S.load(picker).entries, table_read(users["P1"])
+    check("pass, Pick (Collection): the answer is stored for words with Items \"\", and the inner group matches it",
+          not questions and [e.gn for e in stored] == [(light, "", "", "", "")] and got["idx"] == [1] * 4
+          and engine.STATUS[picker.uid][0] == 'CHECKMARK', (engine.STATUS[picker.uid], got))
+    top = stored[0].rows.v["prob"] if stored else [0.0]
+    check("pass, Pick: Probability at the picked ID is the stored top probability, and Selection marks that ID",
+          got["prob"][1] == max(top) == 0.75 and got["prob"] == [0.125, 0.75, 0.125, 0.0]
+          and got["sel"] == [False, True, False, False], got)
+
+    use("P1", Prompt=flowers)
+    vase = answer("P1", [0.0625, 0.0625, 0.875])
+    with asking(picker, questions):
+        engine.run_pass()
+    edited = table_read(users["P1"])["idx"]
+    pipeline.forget([shelf, vase])  # from here on only the stored entries can answer
+    use("P1", Prompt=light)
+    with asking(picker, questions):
+        engine.run_pass()
+    check("pass, Pick: switching back to a stored prompt sends 0 requests and shows its answer again",
+          edited == [2] * 4 and not questions and table_read(users["P1"])["idx"] == [1] * 4, (edited, questions))
+
+    use("P2", Prompt=light, Collection=lists_["Kitchen"])
+    with asking(picker, questions):
+        engine.run_pass()
+    status = engine.STATUS[picker.uid]
+    check("pass, Pick: two contexts that differ only by collection: \"only one answer can show\", naming the Key",
+          status[0] == 'ERROR' and "only one answer can show" in status[1] and "Key" in status[1] and not questions,
+          status)
+    use("P1", Key="shelf")
+    use("P2", Key="kitchen")
+    with asking(picker, questions):
+        engine.run_pass()
+    asked = list(questions)
+    kitchen = answer("P2", [0.5, 0.25, 0.25])
+    try:
+        with asking(picker, questions):
+            engine.run_pass()
+    finally:
+        pipeline.forget([kitchen])
+    got = table_read(users["P1"])["idx"], table_read(users["P2"])["idx"]
+    check("pass, Pick: with a Key each, both show their own answer; the context already answered sends 0 requests",
+          asked == [kitchen] and questions == asked and got == ([1] * 4, [0] * 4)
+          and engine.STATUS[picker.uid][0] == 'CHECKMARK', (asked == [kitchen], got, engine.STATUS[picker.uid]))
 
 
 # ------------------------------------------------------------------ stand-ins for later nodes
@@ -704,12 +804,12 @@ def phase_materialised():
           max(sizes) <= 4 and all(rebuilds) and "k100" in back and len(back) <= 4, (sizes, rebuilds, back))
 
 
-class PickV1:
+class PickV1(Spec):
     """Pick as the 5-word specs declare it (§6.2, §8.2), built from inner's primitives only: the recipe for
     specs/pick.py. Context, Overrides and Key are absent from this interface, so the chain joins them as ""."""
 
-    label = "Pick"
-    words = ("Prompt", "Context", "Items", "Overrides", "Key")
+    name, label = "pick", "Pick"
+    WORDS = words = ("Prompt", "Context", "Items", "Overrides", "Key")
     per_element = (inner.Column("Probability", "prob", 'FLOAT', 0.0, linked_only=True),)
     iface = (SocketDef('INPUT', "Prompt", 'NodeSocketString', kind="word"),
              SocketDef('INPUT', "Items", 'NodeSocketString', kind="word"),
@@ -717,6 +817,9 @@ class PickV1:
              SocketDef('OUTPUT', "Index", 'NodeSocketInt'), SocketDef('OUTPUT', "Item", 'NodeSocketString'),
              SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'), SocketDef('OUTPUT', "Selection", 'NodeSocketBool'),
              SocketDef('OUTPUT', "Probability", 'NodeSocketFloat'))
+
+    def interface(self, node):
+        return list(self.iface)
 
     @staticmethod
     def build(b, gi, go, entries):
@@ -1005,7 +1108,7 @@ def phase_save_reload():
 def phase_tables():
     """The per-element path on synthetic tables, through a stand-in Pick (PickV1) on a real Pick node."""
     saved = inner.SPECS[engine.PICK_ID]
-    inner.SPECS[engine.PICK_ID] = PickV1
+    inner.SPECS[engine.PICK_ID] = PickV1()
     try:
         tree_, picker, users, idents = table_scene()
         node_store, live = phase_table(tree_, picker, users, idents)
@@ -1142,6 +1245,7 @@ def phase_bench(shapes):
 phase_lookup()
 phase_converted()
 phase_pass()
+phase_pick_pass()
 phase_single_value_sample()
 phase_materialised()
 phase_tables()

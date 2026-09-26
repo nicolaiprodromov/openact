@@ -31,16 +31,19 @@ from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
 from .specs.pick import PickSpec
+from .watch import WATCH
 
 ASK_ID, PICK_ID = AskSpec.idname, PickSpec.idname
 OPENACT_TYPES = tuple(SPECS)
 DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
-CLASH = "Same prompt and items used with different collections; only one answer can show"
+CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
+         "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
 
 STATUS = {}  # node uid -> (icon, text)
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
 LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last
+LIVE = {}  # node uid -> words keys of the entries its contexts showed at its last pass
 DIRTY = set()  # uids of the nodes the next pass visits, when not all of them are dirty
 
 _dirty = True  # a pass is due
@@ -186,6 +189,10 @@ def run_pass(everything=True):
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
+    for uid in WATCH.take_dirty():  # a CSV they read changed on disk: plan them again (§7.8)
+        for key in [key for key in PLANS if key[0] == uid]:
+            del PLANS[key]
+        dirty.add(uid)
     _dirty = _dirty_all = False
     _last_pass = time.monotonic()
     nodes = list(iter_nodes())
@@ -194,8 +201,12 @@ def run_pass(everything=True):
     if not nodes:
         PLANS.clear()
         LAST_SHOWN.clear()
+        LIVE.clear()
+        WATCH.retain(())
+        tables.collect_garbage(nodes)
         return
     ensure_owned(nodes)
+    tables.collect_garbage(nodes)  # after ensure_owned(), which gives copies their own table objects
     uses = find_uses()
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
@@ -217,6 +228,9 @@ def run_pass(everything=True):
     for cache in (PLANS, LAST_SHOWN):  # contexts that disappeared, and nodes that did
         for key in [key for key in cache if key[1] not in contexts.get(key[0], ())]:
             del cache[key]
+    for uid in [uid for uid in LIVE if uid not in contexts]:
+        del LIVE[uid]
+    WATCH.retain(contexts)  # stop watching the files of deleted nodes
     redraw()
 
 
@@ -231,10 +245,11 @@ def _process(tree, node, contexts):
         return False
     spec = SPECS[node.bl_idname]
     entries = node_store.entries
-    jobs, shown = {}, []  # words -> Job, one per distinct words; the entries the contexts show
-    problems, hints, failed = [], [], []
+    contexts = contexts or [Ctx(None, None, (), tree)]
+    jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
+    problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
-    for ctx in contexts or [Ctx(None, None, (), tree)]:
+    for ctx in contexts:
         key = (node.uid, ctx.key())
         try:
             job = _plan(spec, node, ctx)
@@ -244,13 +259,17 @@ def _process(tree, node, contexts):
         except Hint as hint:
             hints.append(str(hint))
             continue
-        except Unresolvable as error:
+        except Unresolvable as error:  # e.g. a CSV with errors: its words stay live, so the last good table shows
             problems.append(str(error))
+            _live(live, spec, node, ctx)
             continue
-        other = jobs.setdefault(job.gn, job)
-        if other is not job:
-            if other.words_key != job.words_key:
-                problems.append(CLASH)
+        warnings += job.problems
+        if job.gn not in live:
+            live.append(job.gn)
+        other = jobs.setdefault(job.gn, (job, ctx))
+        if other[0] is not job:
+            if other[0].words_key != job.words_key:
+                problems.append(CLASH.format(other[1].label(), ctx.label()))
             continue
         found = next((entry for entry in entries if entry.gn == job.gn), None)
         if found is not None:
@@ -275,16 +294,39 @@ def _process(tree, node, contexts):
         if missing:
             waiting = True
             _submit(job, missing)
+    rows = changed  # entries were added, replaced or dropped: the table object's rows change too
+    showing = {entry.words_key for entry in shown}
+    left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
+    LIVE[node.uid] = showing
+    if changed or left:  # warm order and eviction go by last use (§8.1): stamp what was just in use
+        now = time.time()
+        for entry in entries:
+            if entry.words_key in showing or entry.words_key in left:
+                entry.t = now
+        changed = True
     if changed:
         try:
             store.save(node, node_store, frozenset(jobs))  # live contexts are never evicted
         except ValueError as error:  # a damaged or too large entry: the node keeps what it has
             problems.append(str(error))
-            changed = False
-        else:
-            inner.build(node, node_store)
-    STATUS[node.uid] = _status(spec, jobs, shown, problems, hints, failed, upstream, waiting)
+            changed = rows = False
+            node_store = store.load(node)
+    last = [LAST_SHOWN.get((node.uid, ctx.key())) for ctx in contexts]
+    default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
+    if not inner.update_values(node, node_store, live, default, rows=rows):  # values only when it can (§8.8)
+        inner.build(node, node_store, live, default)
+    STATUS[node.uid] = _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings)
     return changed
+
+
+def _live(live, spec, node, ctx):
+    """Add the words ctx has now to the live gns, when they can be read."""
+    try:
+        gn = spec.gn(node, ctx)
+    except (Hint, Pending, Unresolvable):
+        return
+    if gn not in live:
+        live.append(gn)
 
 
 def _submit(job, missing):
@@ -296,7 +338,7 @@ def _submit(job, missing):
         server.start()  # asked by the pass that runs when the server is ready
 
 
-def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting):
+def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings=()):
     if problems:
         return ('ERROR', problems[0])
     if failed:
@@ -321,6 +363,8 @@ def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting):
     text = spec.summary(shown[0])
     if len(jobs) > 1:
         text += f"   +{len(jobs) - 1} more"
+    if warnings:  # a usable list or answer set that has a warning (§17.1)
+        return ('ERROR', f"{warnings[0]}   ({text})")
     return ('CHECKMARK', text)
 
 
@@ -336,7 +380,8 @@ def older_settings(node, entry):
     """True when a row of the entry was asked with other templates, order balancing or backend than the node would
     use now. Unknown, so False, until the model server has reported its backend."""
     model = pipeline.provenance(server.STATE.health)
-    return bool(model) and any(ask != SPECS[node.bl_idname].ask_key(node.balance_order, model) for ask in entry.asks)
+    current = SPECS[node.bl_idname].ask_key(node.balance_order, model)
+    return bool(model) and any(ask and ask != current for ask in entry.asks)  # "": code rows, no model asked
 
 
 def reask(node):
@@ -379,7 +424,7 @@ def _playing():
 
 
 def tick():
-    global _last_refresh
+    global _last_refresh, _dirty
     try:
         if server.pump():
             redraw()
@@ -388,6 +433,8 @@ def tick():
             _last_refresh = now
             server.refresh()
         if not _playing():
+            if WATCH.poll(now):  # a watched CSV changed: the pass visits the nodes that read it (take_dirty())
+                _dirty = True
             if _dirty and now - _last_change >= DEBOUNCE:
                 run_pass(everything=False)
             elif _has_nodes and now - _last_pass >= SAFETY_PASS:
@@ -412,6 +459,7 @@ def on_load_post(*_args):
     pipeline.FAILED.clear()
     PLANS.clear()
     LAST_SHOWN.clear()
+    LIVE.clear()
     schedule(immediate=True)
 
 

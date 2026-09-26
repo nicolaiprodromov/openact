@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import bpy
 
-from . import engine, inner
+from . import engine, inner, sources
 from . import prefs as P
 
 
 def _changed(self, context):
+    engine.schedule(immediate=True, node=self)
+
+
+def _list_source_changed(self, context):
+    if self.node_tree is not None:  # swaps the list sockets; links to the others survive (§6.0)
+        inner.sync_interface(self, engine.SPECS[self.bl_idname].interface(self))
     engine.schedule(immediate=True, node=self)
 
 
@@ -24,6 +30,10 @@ class _OpenActNode:
         name="Balance Option Order", default=True, update=_changed,
         description="Ask every question with its options in both orders and average the answers. Removes the small "
                     "model's bias toward early options, at twice the cost. Changing it keeps the answers given so far",
+    )
+    list_source: bpy.props.EnumProperty(  # Pick, Match and Classify (§6.0); unused by the others
+        name="List", items=sources.LIST_SOURCE_ITEMS, default='TEXT', update=_list_source_changed,
+        description="Where the entries come from",
     )
 
     @classmethod
@@ -135,6 +145,10 @@ class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
 
     bl_idname = engine.PICK_ID
     bl_label = "Pick"
+
+    def draw_settings(self, layout):
+        layout.prop(self, "list_source", text="")
+        super().draw_settings(layout)
 
 
 class NODE_MT_openact_add(bpy.types.Menu):
