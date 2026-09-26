@@ -202,7 +202,7 @@ class DialsSpec(Spec):
         from ..inner import sock
 
         node = b.node
-        outputs = self.sync(node, entries)
+        outputs = self.outputs(node)
         k = b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
         if k is None:  # nothing stored: every output shows its fallback
             zero = b.new("FunctionNodeInputInt", -200, 400)
@@ -252,7 +252,8 @@ class DialsSpec(Spec):
         return _enabled(sampled.outputs, "Value")
 
     def sync(self, node, entries):
-        """Give the node the outputs of its newest entry (§6.0): matched by name and type, so a renamed or retyped
+        """Give the node the outputs of the newest entry its contexts show, as the pass passes them (§6.0); while none
+        shows, the node keeps its outputs and the links to them. Matched by name and type, so a renamed or retyped
         setting replaces its socket, and a link to it is dropped with a warning. Returns the outputs."""
         from ..inner import sync_interface  # imports bpy
 
@@ -271,12 +272,8 @@ class DialsSpec(Spec):
 
     def entry_table(self, node, entries):
         """The one-row-per-entry table (§8.4): row e holds materialised entry e's value of each output setting (its
-        fallback where the entry lacks it), min and max for Amount, and its lowest confidence. None when the newest
-        entry wants other outputs than the node has, so build() must run."""
+        fallback where the entry lacks it), min and max for Amount, and its lowest confidence."""
         outputs = self.outputs(node)
-        newest = max(entries, key=lambda entry: entry.t, default=None)
-        if newest is not None and outputs_of(newest) != outputs:
-            return None
         columns = {"conf": [min(entry.rows.v.get("c", ()), default=0.0) for entry in entries]}
         types = {"conf": 'FLOAT'}
         for j, (name, kind) in enumerate(outputs):

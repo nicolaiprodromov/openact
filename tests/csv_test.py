@@ -22,7 +22,8 @@ from _harness import ROOT, check, finish  # noqa: E402
 _package = types.ModuleType("openact")
 _package.__path__ = [os.path.join(ROOT, "openact")]
 sys.modules["openact"] = _package
-from openact import csvfmt, lists, rules_core, sources  # noqa: E402
+from openact import csvfmt, lists, pipeline, rules_core, sources  # noqa: E402
+from openact.specs.base import NO_CONTEXT  # noqa: E402
 
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
 TMP = tempfile.mkdtemp(prefix="openact_csv_")
@@ -1101,9 +1102,8 @@ def test_answer_set_helpers():
     check("amount: score / (L - 1), clamped", values == [0.5, 0.5, 1.0, 0.0, 1.0], values)
     check("decided: a single option only", sources.decided(csvfmt.parse_inline_set("only", "one_of"))
           and not sources.decided(labels))
-    costs = [sources.cost({"type": t, "criteria": list(range(n))}, debias)
-             for t, n, debias in (("noul", 2, True), ("score", 5, False), ("choice", 16, True), ("choice", 17, True),
-                                  ("choice", 20, True), ("choice", 255, True))]
+    costs = [pipeline.cost(n, debias) for n, debias in ((2, True), (5, False), (16, True), (17, True), (20, True),
+                                                         (255, True))]
     check("cost: 2 x (groups + 1) above 16 options", costs == [2, 1, 2, 6, 6, 34], costs)
 
 
@@ -1111,38 +1111,46 @@ def test_per_item_cells():
     Item = lists.Item
     items = [Item("pan", "a flat metal pan"), Item("", offered=False), Item("sofa")]
     yes_no = sources.default_set("yes_no")
-    rows = sources.per_item_cells("match", 'YES_NO', items, yes_no, " Would you find it in a kitchen? ", "", True)
-    check("cells: one row per item, the empty slot a fallback",
-          [(r.index, r.name, r.source) for r in rows] == [(0, "pan", "model"), (1, "", "fallback"), (2, "sofa", "model")])
+    neutral = {"p": 0.0, "c": 0.0}
+    rows = sources.per_item_cells("match", 'YES_NO', items, yes_no, " Would you find it in a kitchen? ", "", True,
+                                  neutral)
+    check("cells: one row per item, the empty slot a code row",
+          [(r.name, r.source, r.cell is None) for r in rows] == [("pan", "pending", False), ("", "code", True),
+                                                                 ("sofa", "pending", False)])
     pan, slot, sofa = rows
-    check("cells: Match template", pan.question == {
+    check("cells: Match template", pan.cell.question == {
         "type": "noul", "instructions": "Item: pan — a flat metal pan\nWould you find it in a kitchen?",
-        "criteria": {"true": "Yes.", "false": "No."}} and sofa.question["instructions"] == (
-        "Item: sofa\nWould you find it in a kitchen?"), pan.question)
-    check("cells: one shared state", pan.state == sofa.state == sources.NO_CONTEXT, (pan.state, sofa.state))
-    check("cells: a fallback row has no question and costs nothing",
-          slot.question is None and slot.key == "" and slot.cost == 0 and slot.values == {})
-    check("cells: cell keys and wkeys differ per item", pan.key != sofa.key and pan.wkey != sofa.wkey)
-    check("cells: debias doubles the cost", (pan.cost, sofa.cost) == (2, 2), (pan.cost, sofa.cost))
+        "criteria": {"true": "Yes.", "false": "No."}} and sofa.cell.question["instructions"] == (
+        "Item: sofa\nWould you find it in a kitchen?"), pan.cell.question)
+    check("cells: one shared state", pan.cell.state == sofa.cell.state == NO_CONTEXT, (pan.cell.state, sofa.cell.state))
+    check("cells: an empty slot is never asked and holds the neutral values", slot.values == neutral
+          and slot.values is not neutral, slot)
+    check("cells: cell keys and wkeys differ per item", pan.cell.key != sofa.cell.key and pan.wkey != sofa.wkey)
+    check("cells: debias doubles the cost", (pan.cell.cost, sofa.cell.cost) == (2, 2), (pan.cell.cost, sofa.cell.cost))
+    check("cells: pipeline's keys and cost, the options in the order sent",
+          pan.wkey == pipeline.wkey("match", 'YES_NO', ["", "Would you find it in a kitchen?"],
+                                    ["pan", "a flat metal pan"], [["yes", ""], ["no", ""]])
+          and pan.cell.key == pipeline.cell_key("noul", NO_CONTEXT, pan.cell.question["instructions"],
+                                                [("true", "Yes."), ("false", "No.")], True)
+          and pan.cell.cost == pipeline.cost(2, True))
     edited = sources.per_item_cells("match", 'YES_NO', [Item("pan", "a heavy pan")] + items[1:], yes_no,
                                     "Would you find it in a kitchen?", "", False)
     check("cells: editing one item's when changes only its wkey",
-          edited[0].wkey != pan.wkey and edited[2].wkey == sofa.wkey and edited[2].key != sofa.key)
+          edited[0].wkey != pan.wkey and edited[2].wkey == sofa.wkey and edited[2].cell.key != sofa.cell.key)
     labels = csvfmt.parse_inline_set("kitchen: cooking; office: work and paper", "one_of")
     rows = sources.per_item_cells("classify", 'ONE_OF', items, labels, "", "a house", True)
-    check("cells: Classify's default question and its choice over the labels", rows[0].question == {
+    check("cells: Classify's default question and its choice over the labels", rows[0].cell.question == {
         "type": "choice", "instructions": "Item: pan — a flat metal pan\nWhich label fits this item best?",
-        "criteria": {"0": "kitchen: cooking", "1": "office: work and paper"}} and rows[0].state == "a house",
-        rows[0].question)
+        "criteria": {"0": "kitchen: cooking", "1": "office: work and paper"}} and rows[0].cell.state == "a house",
+        rows[0].cell.question)
     rows = sources.per_item_cells("classify", 'ONE_OF', items, csvfmt.parse_inline_set("only", "one_of"), "", "", True)
     check("cells: a single label is decided by code for every item",
-          [(r.source, r.values, r.question) for r in rows] == [("code", {"label": 0, "c": 1.0}, None),
-                                                              ("fallback", {}, None),
-                                                              ("code", {"label": 0, "c": 1.0}, None)])
+          [(r.source, r.values, r.cell) for r in rows] == [("code", {"label": 0, "c": 1.0}, None), ("code", {}, None),
+                                                           ("code", {"label": 0, "c": 1.0}, None)])
     levels = sources.default_set("amount")
     rows = sources.per_item_cells("match", 'AMOUNT', items[:1], levels, "How heavy?", "", True)
     check("cells: Amount asks a score over the levels",
-          rows[0].question["type"] == "score" and len(rows[0].question["criteria"]) == len(levels.options))
+          rows[0].cell.question["type"] == "score" and len(rows[0].cell.question["criteria"]) == len(levels.options))
 
 
 def test_cache():
