@@ -115,7 +115,8 @@ class OpenActPreferences(bpy.types.AddonPreferences):
     device: bpy.props.EnumProperty(
         name="Device",
         items=(
-            ('auto', "Auto", "Use an NVIDIA GPU if there is one, otherwise the CPU"),
+            ('auto', "Auto", "Use the NVIDIA GPU. Without CUDA the model server reports an error instead of "
+                             "using the CPU"),
             ('cuda', "GPU (CUDA)", "Use an NVIDIA GPU"),
             ('cpu', "CPU", "Use the CPU (much slower)"),
         ),
