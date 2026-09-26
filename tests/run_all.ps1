@@ -27,6 +27,55 @@ param(
 $Versions = @($Versions -split '[,\s]+' -ne '' -replace '^\d+$', '$0.0')
 $Rows = New-Object System.Collections.Generic.List[object]
 
+# Each run goes into a job object. The kernel adds everything the suite starts, so ending the job never
+# depends on parent PIDs (which Windows reuses) and still reaches orphans. Kill-on-close ends the suite's
+# processes when its handle closes, including when the runner itself dies.
+Add-Type -Namespace OpenAct -Name Job -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] struct Limits {  // JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    public long PerProcessUserTime, PerJobUserTime; public uint Flags; public UIntPtr MinWorkingSet, MaxWorkingSet;
+    public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass;
+    public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes;
+    public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemory, PeakJobMemory;
+}
+[DllImport("kernel32.dll")] static extern IntPtr CreateJobObject(IntPtr attributes, IntPtr name);
+[DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref Limits info, int size);
+[DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+[DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, int size, IntPtr returned);
+[DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+[DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+[DllImport("kernel32.dll")] static extern int WaitForSingleObject(IntPtr handle, int milliseconds);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+// A zero handle means "the caller's own job" to the information calls, so every method refuses it.
+public static IntPtr Contain(IntPtr process) {  // zero if the suite could not be put in a job
+    IntPtr job = CreateJobObject(IntPtr.Zero, IntPtr.Zero);
+    if (job == IntPtr.Zero) return job;
+    Limits limits = new Limits { Flags = 0x2000 };  // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    SetInformationJobObject(job, 9, ref limits, Marshal.SizeOf(limits));  // JobObjectExtendedLimitInformation
+    if (AssignProcessToJobObject(job, process)) return job;
+    CloseHandle(job);
+    return IntPtr.Zero;
+}
+public static void End(IntPtr job) { if (job != IntPtr.Zero) TerminateJobObject(job, 1); }
+public static int Leftovers(IntPtr job) {
+    // Members of JOBOBJECT_BASIC_PROCESS_ID_LIST still running after one shared second: processes that end on
+    // their own just after the suite (console hosts, launcher stubs) are not leftovers.
+    if (job == IntPtr.Zero) return 0;
+    int size = 8 + 1024 * IntPtr.Size;
+    IntPtr list = Marshal.AllocHGlobal(size);
+    try {
+        if (!QueryInformationJobObject(job, 3, list, size, IntPtr.Zero)) return 0;
+        int count = 0, deadline = Environment.TickCount + 1000;
+        for (int i = 0; i < Marshal.ReadInt32(list, 4); i++) {
+            IntPtr process = OpenProcess(0x00100000, false, Marshal.ReadIntPtr(list, 8 + i * IntPtr.Size).ToInt32());  // SYNCHRONIZE
+            if (process == IntPtr.Zero) continue;
+            if (WaitForSingleObject(process, Math.Max(0, deadline - Environment.TickCount)) == 0x102) count++;  // WAIT_TIMEOUT
+            CloseHandle(process);
+        }
+        return count;
+    } finally { Marshal.FreeHGlobal(list); }
+}
+'@
+
 function Add-Row($Suite, $Where, $Ok, $Pass, $Fail, $Seconds, $Detail) {
     $Rows.Add([pscustomobject]@{
         Suite = $Suite; Where = $Where; Result = $(if ($Ok) { "PASS" } else { "FAIL" })
@@ -44,42 +93,51 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"  # else CPython writes the ANSI code page into the pipe
     $start.EnvironmentVariables["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so the server's --gpu is the card nvidia-smi -i reads
-    $pass = $fail = 0
-    $result = $null
+    $pass = $fail = $leftover = 0
+    $result = $endedAt = $null
     $timedOut = $false
-    $exitedAt = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $process = [Diagnostics.Process]::Start($start)
-    $errors = $process.StandardError.ReadToEndAsync()  # drained alongside, so a full stderr pipe cannot stall the suite
-    $next = $process.StandardOutput.ReadLineAsync()
+    $job = [OpenAct.Job]::Contain($process.Handle)
+    $streams = $process.StandardOutput, $process.StandardError
+    # Both pipes are read line by line, so a traceback on stderr shows even while a descendant holds the pipe open.
+    $reads = @($streams[0].ReadLineAsync(), $streams[1].ReadLineAsync())
     while ($true) {
-        if ($next.Wait(1000)) {
-            $line = $next.Result
-            if ($null -eq $line) {
-                if ($process.WaitForExit(1000)) { break }
-            } else {
-                $next = $process.StandardOutput.ReadLineAsync()
-                Write-Host $line
-                if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ }
-                if ($line -match '^(?:BLENDER (.+)|PYTHON \S+) RESULT (OK|FAILED: .*)$') {
-                    $result = $Matches[2]
-                    if ($Matches[1]) { $Where = "Blender " + $Matches[1] }
-                }
+        $open = @($reads -ne $null)
+        if ($open) { $null = [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$open, 1000) } else { $null = $process.WaitForExit(1000) }
+        foreach ($k in 0, 1) {
+            if (-not $reads[$k] -or -not $reads[$k].IsCompleted) { continue }
+            $line = $reads[$k].Result
+            $reads[$k] = if ($null -ne $line) { $streams[$k].ReadLineAsync() }
+            if ($null -eq $line) { continue }
+            Write-Host $line
+            if ($k -eq 1) { continue }
+            if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ }
+            if ($line -match '^(?:BLENDER (.+)|PYTHON \S+) RESULT (OK|FAILED: .*)$') {
+                $result = $Matches[2]
+                if ($Matches[1]) { $Where = "Blender " + $Matches[1] }
             }
         }
-        if ($process.HasExited) {
-            # Descendants that inherited the pipes can hold them open: 10 s grace, then judge the child's output.
-            if ($null -eq $exitedAt) { $exitedAt = $clock.Elapsed.TotalSeconds }
-            elseif ($clock.Elapsed.TotalSeconds - $exitedAt -ge 10) { break }
-        } elseif (-not $timedOut -and $clock.Elapsed.TotalMinutes -ge $Minutes) {
-            $timedOut = $true
-            taskkill.exe /PID $process.Id /T /F | Write-Host  # the whole tree, while the child can still name it
+        if ($null -eq $endedAt) {
+            # End the job once the suite has exited (whatever it left running) or at the deadline (everything).
+            if ($process.HasExited) { $leftover = [OpenAct.Job]::Leftovers($job) }
+            elseif ($clock.Elapsed.TotalMinutes -ge $Minutes) { $timedOut = $true }
+            else { continue }
+            [OpenAct.Job]::End($job)
+            $endedAt = $clock.Elapsed.TotalSeconds
+        }
+        if ($process.HasExited -and -not ($reads[0] -or $reads[1])) { break }
+        if ($clock.Elapsed.TotalSeconds - $endedAt -ge 5) {
+            if ($process.HasExited) { break }  # a pipe is held by a process outside the job
+            $process.Kill()  # the suite is not in a job (Contain returned zero)
+            $endedAt = $clock.Elapsed.TotalSeconds
         }
     }
-    if ($errors.Wait(10000) -and $errors.Result.Trim()) { Write-Host $errors.Result.TrimEnd() }
+    $null = [OpenAct.Job]::CloseHandle($job)
     $code = $process.ExitCode
     $ok = -not $timedOut -and $result -eq "OK" -and $code -eq 0
     $detail = if ($ok) { "" } elseif ($timedOut) { "timeout after $Minutes min" } elseif (-not $result) { "no RESULT line (exit code $code)" } elseif ($result -eq "OK") { "exit code $code" } else { $result }
+    if ($leftover) { $detail = (@($detail, "leftover processes ended: $leftover") -ne "") -join "; " }
     Add-Row $Suite $Where $ok $pass $fail $clock.Elapsed.TotalSeconds $detail
 }
 
