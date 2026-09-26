@@ -40,10 +40,8 @@ Add-Type -Namespace OpenAct -Name Job -MemberDefinition @'
 [DllImport("kernel32.dll")] static extern IntPtr CreateJobObject(IntPtr attributes, IntPtr name);
 [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref Limits info, int size);
 [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-[DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, int size, IntPtr returned);
+[DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, long[] info, int size, IntPtr returned);
 [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
-[DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
-[DllImport("kernel32.dll")] static extern int WaitForSingleObject(IntPtr handle, int milliseconds);
 [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
 // A zero handle means "the caller's own job" to the information calls, so every method refuses it.
 public static IntPtr Contain(IntPtr process) {  // zero if the suite could not be put in a job
@@ -57,22 +55,16 @@ public static IntPtr Contain(IntPtr process) {  // zero if the suite could not b
 }
 public static void End(IntPtr job) { if (job != IntPtr.Zero) TerminateJobObject(job, 1); }
 public static int Leftovers(IntPtr job) {
-    // Members of JOBOBJECT_BASIC_PROCESS_ID_LIST still running after one shared second: processes that end on
-    // their own just after the suite (console hosts, launcher stubs) are not leftovers.
-    if (job == IntPtr.Zero) return 0;
-    int size = 8 + 1024 * IntPtr.Size;
-    IntPtr list = Marshal.AllocHGlobal(size);
-    try {
-        if (!QueryInformationJobObject(job, 3, list, size, IntPtr.Zero)) return 0;
-        int count = 0, deadline = Environment.TickCount + 1000;
-        for (int i = 0; i < Marshal.ReadInt32(list, 4); i++) {
-            IntPtr process = OpenProcess(0x00100000, false, Marshal.ReadIntPtr(list, 8 + i * IntPtr.Size).ToInt32());  // SYNCHRONIZE
-            if (process == IntPtr.Zero) continue;
-            if (WaitForSingleObject(process, Math.Max(0, deadline - Environment.TickCount)) == 0x102) count++;  // WAIT_TIMEOUT
-            CloseHandle(process);
-        }
-        return count;
-    } finally { Marshal.FreeHGlobal(list); }
+    // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION: ActiveProcesses is the DWORD at byte 40. Processes that end on their
+    // own within a second of the suite (console hosts, launcher stubs) are not leftovers.
+    long[] info = new long[6];
+    int started = Environment.TickCount;
+    while (job != IntPtr.Zero && QueryInformationJobObject(job, 1, info, 48, IntPtr.Zero)) {
+        int active = (int)info[5];
+        if (active == 0 || Environment.TickCount - started >= 1000) return active;
+        System.Threading.Thread.Sleep(50);
+    }
+    return 0;
 }
 '@
 
