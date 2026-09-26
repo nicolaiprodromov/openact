@@ -6,6 +6,9 @@ Runs the OpenAct test suites and prints a summary table.
 - *_test.py suites (pure Python) run under every CPython 3.11+ found (PATH, py -3.11, py -3.13),
   and always inside Blender 4.5 (Python 3.11) and 5.1 (Python 3.13).
 - *_blender.py suites run on every Blender in -Versions, as blender -b --factory-startup --python.
+  lookup_blender.py runs with -- --bench: its main-thread budgets are merge gates. Following the
+  design's timing rule, a result above its budget prints a WARN line, counted in the summary, and
+  fails only above twice the budget.
 - e2e_blender.py runs only with -Model: build, noaddon and reopen in a temporary folder, with the
   real model on -Gpu and -Port (a GPU lease: port 18765 on GPU 0, 18767 on GPU 1). Each build
   needs the port free and 9 GB free on the GPU; the runner waits up to 30 minutes for the memory.
@@ -85,7 +88,7 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"  # else CPython writes the ANSI code page into the pipe
     $start.EnvironmentVariables["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so the server's --gpu is the card nvidia-smi -i reads
-    $pass = $fail = $leftover = 0
+    $pass = $fail = $warn = $leftover = 0
     $result = $endedAt = $null
     $timedOut = $false
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -104,7 +107,7 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
             if ($null -eq $line) { continue }
             Write-Host $line
             if ($k -eq 1) { continue }
-            if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ }
+            if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ } elseif ($line.StartsWith("WARN ")) { $warn++ }
             if ($line -match '^(?:BLENDER (.+)|PYTHON \S+) RESULT (OK|FAILED: .*)$') {
                 $result = $Matches[2]
                 if ($Matches[1]) { $Where = "Blender " + $Matches[1] }
@@ -130,6 +133,7 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     $ok = -not $timedOut -and $result -eq "OK" -and $code -eq 0
     $detail = if ($ok) { "" } elseif ($timedOut) { "timeout after $Minutes min" } elseif (-not $result) { "no RESULT line (exit code $code)" } elseif ($result -eq "OK") { "exit code $code" } else { $result }
     if ($leftover) { $detail = (@($detail, "leftover processes ended: $leftover") -ne "") -join "; " }
+    if ($warn) { $detail = (@($detail, "warnings: $warn") -ne "") -join "; " }
     Add-Row $Suite $Where $ok $pass $fail $clock.Elapsed.TotalSeconds $detail
 }
 
@@ -176,7 +180,12 @@ try {
     foreach ($version in $Versions) {
         $exe = Get-Blender $version
         if (-not $exe) { continue }
-        foreach ($suite in $suites) { Invoke-Suite $suite.Name "Blender $version" $exe @("-b", "--factory-startup", "--python", $suite.FullName) }
+        foreach ($suite in $suites) {
+            $name = $suite.Name
+            $argv = @("-b", "--factory-startup", "--python", $suite.FullName)
+            if ($name -eq "lookup_blender.py") { $name += " --bench"; $argv += "--", "--bench" }
+            Invoke-Suite $name "Blender $version" $exe $argv
+        }
         if (-not $Model) { continue }
         # The build starts a model server: it must not attach to (and later shut down) a server already on the
         # port, and it needs 9 GB on a GPU that other jobs may be using.

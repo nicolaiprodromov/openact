@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import bpy
 
-from . import engine
+from . import engine, inner
 
 
 def _changed(self, context):
@@ -22,11 +22,11 @@ class _OpenActNode:
 
     @classmethod
     def poll(cls, ntree):
-        return ntree.bl_idname == 'GeometryNodeTree' and not ntree.name.startswith(engine.INNER_PREFIX)
+        return ntree.bl_idname == 'GeometryNodeTree' and not ntree.name.startswith(inner.INNER_PREFIX)
 
     def init(self, context):
         self.uid = engine.new_uid()
-        engine.create_inner(self)
+        inner.create_inner(self)
         engine.schedule(immediate=True)
 
     def copy(self, other):
@@ -76,13 +76,13 @@ class _OpenActNode:
                 continue
             col.label(text=spec.summary(answer), icon='CHECKMARK')
             if self.bl_idname == engine.PICK_ID:
-                ranked = sorted(zip(answer["items"], answer["probabilities"]), key=lambda pair: -pair[1])[:5]
+                ranked = sorted(zip(answer.rows.name, answer.rows.v["prob"]), key=lambda pair: -pair[1])[:5]
                 for name, probability in ranked:
                     row = col.row()
                     row.label(text=name, icon='BLANK1')
                     row.label(text=f"{probability * 100:.1f}%")
             else:
-                col.label(text=f"Confidence {answer['confidence']:.2f}", icon='BLANK1')
+                col.label(text=f"Confidence {answer.single['Confidence']:.2f}", icon='BLANK1')
 
     def draw_settings(self, layout):
         pass
@@ -145,7 +145,7 @@ def draw_add_menu(self, context):
     if getattr(space, "tree_type", None) != 'GeometryNodeTree':
         return
     tree = getattr(space, "edit_tree", None)
-    if tree is not None and tree.name.startswith(engine.INNER_PREFIX):
+    if tree is not None and tree.name.startswith(inner.INNER_PREFIX):
         return
     self.layout.separator()
     self.layout.menu(NODE_MT_openact_add.bl_idname, icon='NODETREE')

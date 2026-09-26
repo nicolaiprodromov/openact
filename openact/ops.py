@@ -80,7 +80,11 @@ class OPENACT_OT_reask(bpy.types.Operator):
         _tree, node = engine.find_node(self.uid)
         if node is None:
             return {'CANCELLED'}
-        engine.reask(node)
+        try:
+            engine.reask(node)
+        except ValueError as error:  # a newer OpenAct's answers
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
