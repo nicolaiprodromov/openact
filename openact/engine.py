@@ -3,11 +3,7 @@
 Geometry Nodes cannot run Python while it evaluates (Blender has no script node), so an OpenAct
 node is answered outside evaluation:
 
-1. After a change, each OpenAct node's inputs are read by the static evaluator (evaluator.py):
-   values typed on the node, Group Input values from the modifier (through nested groups),
-   String, Join Strings, Value to String, Replace/Slice String, String Length, Special
-   Characters, Switch, Index Switch, Menu Switch, Import Text, Reroute, and the outputs of other
-   OpenAct nodes.
+1. After a change, each OpenAct node's inputs are read by the static evaluator (evaluator.py).
 2. The local model is asked in the background (see server.py).
 3. The answer is written into the node's hidden node group as a small lookup table keyed by the
    exact input strings. Geometry Nodes picks the matching answer by itself, so one node group
@@ -28,7 +24,7 @@ from bpy.app.handlers import persistent
 
 from . import evaluator, natsort, server
 from . import prefs as P
-from .evaluator import Ctx, Hint, Pending, Unresolvable, _text, eval_input, find_uses, is_field
+from .evaluator import Ctx, Hint, Pending, Unresolvable, as_text, eval_input, find_uses, is_field
 
 ASK_ID = "GeometryNodeOpenActAsk"
 PICK_ID = "GeometryNodeOpenActPick"
@@ -130,8 +126,8 @@ class AskSpec:
 
     @staticmethod
     def request(node, ctx):
-        q_raw = _text(eval_input(node.inputs["Question"], ctx))
-        c_raw = _text(eval_input(node.inputs["Context"], ctx))
+        q_raw = as_text(eval_input(node.inputs["Question"], ctx))
+        c_raw = as_text(eval_input(node.inputs["Context"], ctx))
         question, context = q_raw.strip(), c_raw.strip()
         if not question:
             raise Hint(AskSpec.empty_hint)
@@ -208,8 +204,8 @@ class PickSpec:
 
     @staticmethod
     def request(node, ctx):
-        prompt_raw = _text(eval_input(node.inputs["Prompt"], ctx))
-        items_raw = _text(eval_input(node.inputs["Items"], ctx))
+        prompt_raw = as_text(eval_input(node.inputs["Prompt"], ctx))
+        items_raw = as_text(eval_input(node.inputs["Items"], ctx))
         collection = eval_input(node.inputs["Collection"], ctx)
         if not isinstance(collection, bpy.types.Collection):
             collection = None
@@ -406,15 +402,16 @@ def ensure_owned(nodes):
 
     Copies (duplicated nodes or trees, appended data) arrive sharing the original's group; the
     rightful owner is the node whose uid matches the group's name, everyone else gets a copy.
-    Linked data is read-only: linked nodes are left alone, and a local node whose group is linked
-    (a tree made local on its own) gets a local copy."""
+    Linked data is read-only: linked nodes are left alone and keep their uids, so a local node that
+    shares one (appended from the library that is also linked) gets a new uid. A local node whose
+    group is linked (a tree made local on its own) gets a local copy."""
+    seen = {node.uid for tree, node in nodes if tree.library is not None}
     nodes = [(tree, node) for tree, node in nodes if tree.library is None]
     owners = {}
     for _tree, node in nodes:
         inner = node.node_tree
         if node.uid and inner is not None and inner.name == inner_name(node):
             owners.setdefault(inner.as_pointer(), node)
-    seen = set()
     for _tree, node in nodes:
         if not node.uid or node.uid in seen:
             node.uid = new_uid()
@@ -426,6 +423,8 @@ def ensure_owned(nodes):
             own = inner.copy()
             own.name = inner_name(node)
             node.node_tree = own
+        elif inner.name != inner_name(node):  # an owner given a new uid frees its old group name
+            inner.name = inner_name(node)
 
 
 def iter_nodes():
@@ -466,13 +465,15 @@ def run_pass():
     ensure_owned(nodes)
     uses = find_uses()
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
-    for tree, node in nodes:
-        try:
-            _process(tree, node, uses.get(tree.as_pointer()))
-        except Exception as error:
-            traceback.print_exc()
-            STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
-    evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
+    try:
+        for tree, node in nodes:
+            try:
+                _process(tree, node, uses.get(tree.as_pointer()))
+            except Exception as error:
+                traceback.print_exc()
+                STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
+    finally:
+        evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
     redraw()
 
 

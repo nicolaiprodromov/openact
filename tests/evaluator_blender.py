@@ -198,6 +198,17 @@ for node in (edited, by_name):  # delete A, then move B to the end: C, D, B
     node.enum_items.move(0, 2)
 cases.append(("menu switch: modifier int after deleted and reordered items", edited.outputs[0], 'INT'))
 cases.append(("menu switch: socket name after deleted and reordered items", by_name.outputs[0]))
+per_item = [o for ms in (edited, by_name) for o in ms.outputs if o.identifier != "Output"]
+check("menu switch: a Boolean output per item on 5.0+ only", bool(per_item) == (bpy.app.version >= (5, 0, 0)),
+      [o.identifier for o in per_item])
+for flag in per_item:  # true for the chosen item only
+    chosen = N.new("GeometryNodeSwitch")
+    chosen.input_type = 'STRING'
+    L.new(flag, sock(chosen.inputs, "Switch"))
+    sock(chosen.inputs, "False").default_value = "not chosen"
+    sock(chosen.inputs, "True").default_value = "chosen"
+    cases.append((f"menu switch: per-item output '{flag.name}' of {flag.node.name} as a Switch condition",
+                  chosen.outputs[0]))
 menu_sub = bpy.data.node_groups.new("MenuSub", 'GeometryNodeTree')
 menu_sub.interface.new_socket("Mode", in_out='INPUT', socket_type='NodeSocketMenu')
 menu_sub.interface.new_socket("S", in_out='OUTPUT', socket_type='NodeSocketString')
@@ -319,6 +330,20 @@ per_context = [read(words[[name for name, _, _ in expected].index("reroute chain
                for c in (ctx, evaluator.Ctx(host2, mod2, (), tree))]
 evaluator.MEMO = None
 check("memo: contexts keep their own values", per_context == ["héllo wörld", "second"], per_context)
+chain = [string("deep")]
+for _ in range(40):  # each Reroute takes two of the 64 levels MAX_DEPTH allows
+    hop = N.new("NodeReroute")
+    L.new(chain[-1], hop.inputs[0])
+    chain.append(hop.outputs[0])
+near, far = join([]), join([])
+L.new(chain[20], near.inputs["Delimiter"])
+L.new(chain[40], far.inputs["Delimiter"])
+alone = read(far.inputs["Delimiter"])
+evaluator.MEMO = {}
+got = (read(near.inputs["Delimiter"]), read(far.inputs["Delimiter"]))
+evaluator.MEMO = None
+check("memo: a nearer read doesn't carry a deeper one past MAX_DEPTH",
+      got == ("deep", alone) and "too deep" in alone, (got, alone))
 
 # a red (invalid) link must be reported, not silently read
 bad = N.new("GeometryNodeStringJoin")
@@ -352,6 +377,12 @@ L.new(context.outputs[0], ask.inputs["Context"])
 got = read(ask.inputs["Context"])
 check("breadcrumb: from an OpenAct node's word", got == f"<Unresolvable: Context ← {context.name} ← {missing.name}: "
       f"Can't read the text file '{missing.inputs['Path'].default_value}'>", got)
+pick = N.new(engine.PICK_ID)
+L.new(missing.outputs[0], pick.inputs["Prompt"])
+L.new(pick.outputs["Item"], ask.inputs["Question"])
+got = read(ask.inputs["Question"])
+check("breadcrumb: a chained OpenAct node carries the socket it read", got == f"<Unresolvable: Question ← "
+      f"{pick.name}.Prompt ← {missing.name}: Can't read the text file '{missing.inputs['Path'].default_value}'>", got)
 attribute = N.new("GeometryNodeInputNamedAttribute")
 chosen = N.new("GeometryNodeSwitch")
 chosen.input_type = 'FLOAT'
@@ -405,14 +436,19 @@ def linked_library():
     inner = node.node_tree
     bpy.data.node_groups.remove(library_tree)
     bpy.data.node_groups.remove(inner)
-    with bpy.data.libraries.load(path, link=True) as (_source, target):
-        target.node_groups = ["Library Tree"]
-    linked = target.node_groups[0]
+    loaded = []
+    for link in (False, True):  # appended, then linked: two nodes that arrive with one uid
+        with bpy.data.libraries.load(path, link=link) as (_source, target):
+            target.node_groups = ["Library Tree"]
+        loaded.append(target.node_groups[0])
+    appended, linked = loaded
     user = bpy.data.objects.new("Library User", bpy.data.meshes.new("Library User"))
     bpy.context.scene.collection.objects.link(user)
     user_mod = user.modifiers.new("Linked", 'NODES')
     user_mod.node_group = linked
     node = next(n for n in linked.nodes if n.bl_idname == engine.ASK_ID)
+    local_node = next(n for n in appended.nodes if n.bl_idname == engine.ASK_ID)
+    shared = local_node.uid == node.uid
     linked_inner = node.node_tree
     before = (node.uid, node.entries, linked_inner, len(bpy.data.node_groups), len(linked_inner.nodes))
     engine.run_pass()
@@ -423,6 +459,15 @@ def linked_library():
     check("linked: the node says where its answers come from",
           status == ('LINKED', f"Linked from {linked.library.name}: answers come from that file"), status)
     check("linked: a pass writes nothing", after == before, (before, after))
+    local_status = engine.STATUS.get(local_node.uid)
+    check("append then link: the local copy gets its own uid and status",
+          shared and local_node.uid != node.uid and local_status is not None and local_status[0] != 'LINKED',
+          (shared, local_node.uid, node.uid, local_status))
+    check("append then link: each uid finds its own node, so Ask Again can't clear the wrong one",
+          engine.find_node(node.uid)[1] == node and engine.find_node(local_node.uid)[1] == local_node)
+    check("append then link: the local copy's hidden group follows its new uid",
+          local_node.node_tree.library is None and local_node.node_tree.name == engine.inner_name(local_node),
+          local_node.node_tree.name)
     check("linked: the pass's memo is gone after it", evaluator.MEMO is None, evaluator.MEMO)
     engine.reask(node)
     check("linked: Ask Again writes nothing", node.entries == before[1] and len(linked_inner.nodes) == before[4])

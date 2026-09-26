@@ -95,7 +95,9 @@ class _OpenActNode:
         self.draw_settings(layout)
         self.draw_status(layout, full=True)
         self.draw_answers(layout)
-        layout.operator("openact.reask", icon='FILE_REFRESH').uid = self.uid
+        row = layout.row()
+        row.enabled = self.id_data.library is None  # a linked node's answers come from its library file
+        row.operator("openact.reask", icon='FILE_REFRESH').uid = self.uid
 
 
 class GeometryNodeOpenActAsk(_OpenActNode, bpy.types.GeometryNodeCustomGroup):

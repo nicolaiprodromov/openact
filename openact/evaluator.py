@@ -25,14 +25,17 @@ class Unresolvable(Exception):
 
     def __init__(self, message):
         super().__init__(message)
-        self.hops = []  # socket and node names, from the socket that was read to the node that failed
+        self.socket = ""  # the socket that was read
+        self.hops = []  # node names, from that socket to the node that failed
 
     def __str__(self):
         message = super().__str__()
-        if not self.hops:
+        names = [self.socket, *self.hops] if self.socket else self.hops
+        if not names:
             return message
-        hops = self.hops if len(self.hops) <= 3 else [self.hops[0], "…", *self.hops[-2:]]
-        return f"{' ← '.join(hops)}: {message}"
+        if len(names) > 3:
+            names = [names[0], "…", *names[-2:]]
+        return f"{' ← '.join(names)}: {message}"
 
 
 class Pending(Exception):
@@ -110,7 +113,8 @@ def _in(node, name):
     raise Unresolvable(f"'{node.name}' has no input '{name}'")
 
 
-def _text(value):
+def as_text(value):
+    """A word's value as a string: an ID gives its name, None gives ""."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -150,7 +154,7 @@ def eval_input(sock, ctx, depth=0):
         return eval_output(links[0].from_node, links[0].from_socket, ctx, depth + 1)
     except Unresolvable as error:
         if depth == 0:  # the breadcrumb starts at the socket that was asked for
-            error.hops.insert(0, sock.name)
+            error.socket = sock.name
         raise
 
 
@@ -158,16 +162,19 @@ def eval_output(node, out, ctx, depth):
     key = None
     if MEMO is not None:
         key = (out.as_pointer(), ctx.key())
-        if key in MEMO:
-            return MEMO[key]
+        hit = MEMO.get(key)
+        if hit is not None and depth <= hit[1]:  # reached deeper, the chain might pass MAX_DEPTH
+            return hit[0]
     try:
         value = _eval_output(node, out, ctx, depth)
     except Unresolvable as error:
         if node.bl_idname != "NodeReroute":
-            error.hops.insert(0, node.name)
+            # An OpenAct node reads its own words from depth 0: that socket belongs to its hop.
+            error.hops.insert(0, f"{node.name}.{error.socket}" if error.socket else node.name)
+            error.socket = ""
         raise
     if key is not None:
-        MEMO[key] = value
+        MEMO.setdefault(key, (value, depth))  # a shallower entry serves more readers
     return value
 
 
@@ -242,11 +249,11 @@ def _group_output(node, out, ctx, depth):
 
 
 def _h_join(node, out, ctx, depth):
-    delimiter = _text(eval_input(_in(node, "Delimiter"), ctx, depth))
+    delimiter = as_text(eval_input(_in(node, "Delimiter"), ctx, depth))
     parts = eval_input(_in(node, "Strings"), ctx, depth)
     if not isinstance(parts, list):
         parts = [parts]
-    return delimiter.join(_text(part) for part in parts)
+    return delimiter.join(as_text(part) for part in parts)
 
 
 def _h_value_to_string(node, out, ctx, depth):
@@ -258,21 +265,21 @@ def _h_value_to_string(node, out, ctx, depth):
 
 
 def _h_replace(node, out, ctx, depth):
-    text = _text(eval_input(_in(node, "String"), ctx, depth))
-    find = _text(eval_input(_in(node, "Find"), ctx, depth))
-    replace = _text(eval_input(_in(node, "Replace"), ctx, depth))
+    text = as_text(eval_input(_in(node, "String"), ctx, depth))
+    find = as_text(eval_input(_in(node, "Find"), ctx, depth))
+    replace = as_text(eval_input(_in(node, "Replace"), ctx, depth))
     return text.replace(find, replace) if find else text
 
 
 def _h_slice(node, out, ctx, depth):
-    text = _text(eval_input(_in(node, "String"), ctx, depth))
+    text = as_text(eval_input(_in(node, "String"), ctx, depth))
     position = max(int(eval_input(_in(node, "Position"), ctx, depth) or 0), 0)
     length = max(int(eval_input(_in(node, "Length"), ctx, depth) or 0), 0)
     return text[position:position + length]
 
 
 def _h_string_length(node, out, ctx, depth):
-    return len(_text(eval_input(_in(node, "String"), ctx, depth)))  # code points, as Geometry Nodes counts
+    return len(as_text(eval_input(_in(node, "String"), ctx, depth)))  # code points, as Geometry Nodes counts
 
 
 def _h_special_characters(node, out, ctx, depth):
@@ -297,12 +304,14 @@ def _h_menu_switch(node, out, ctx, depth):
     items = [s for s in node.inputs if s.identifier not in ("Menu", "__extend__")]  # in enum_items order
     for item, sock in zip(node.enum_items, items):
         if item.name == name:
+            if out.identifier != "Output":  # 5.0+: a Boolean output per item, with its input's identifier
+                return out.identifier == sock.identifier
             return eval_input(sock, ctx, depth)
-    raise Unresolvable(f"'{node.name}' has no item '{_text(name)}'")
+    raise Unresolvable(f"'{node.name}' has no item '{as_text(name)}'")
 
 
 def _h_import_text(node, out, ctx, depth):
-    path = _text(eval_input(_in(node, "Path"), ctx, depth))
+    path = as_text(eval_input(_in(node, "Path"), ctx, depth))
     if not path:
         return ""
     try:
