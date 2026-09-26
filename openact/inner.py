@@ -18,9 +18,9 @@ import bpy
 
 from . import compat
 from . import store as _store  # build() and update_values() take `store`, the name §13.3 fixes
+from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
-SPECS = {}  # node bl_idname -> spec (label, iface, build); the engine adds the OpenAct nodes
 BUILT = "openact_built"  # ID property of the group: which entries build() laid out, for update_values()
 
 
@@ -67,15 +67,17 @@ class _Builder:
         return self.tree.links.new(a, b)
 
     def match_chain(self, sockets, keys):
-        """Integer socket: 1 + index of the entry whose key strings equal the inputs, else 0. A key of
-        another length (converted from schema 1) never matches: its words sit at other positions."""
+        """Integer socket: 1 + index of the entry whose key strings equal the inputs, else 0. `sockets` has the
+        input of each position of the node's word tuple, None where the node has no such socket: a key matches
+        there only with "". A key of another length (the prototype's) never matches: its words sit at other
+        positions."""
         previous = None
         for i, key in enumerate(keys, start=1):
-            if len(key) != len(sockets):
+            if len(key) != len(sockets) or any(socket is None and word for socket, word in zip(sockets, key)):
                 continue
             y = 400 - i * 110
             conditions = []
-            for j, (socket, value) in enumerate(zip(sockets, key)):
+            for j, (socket, value) in enumerate((s, w) for s, w in zip(sockets, key) if s is not None):
                 compare = self.new("FunctionNodeCompare", -600 + j * 40, y - j * 40)
                 compare.data_type = 'STRING'
                 compare.operation = 'EQUAL'
@@ -133,7 +135,7 @@ def create_inner(node, store=None):
     """Give the node a new inner group with its spec's interface, built from its stored entries."""
     tree = bpy.data.node_groups.new(inner_name(node), 'GeometryNodeTree')
     node.node_tree = tree
-    sync_interface(node, SPECS[node.bl_idname].iface)
+    sync_interface(node, SPECS[node.bl_idname].interface(node))
     build(node, _store.load(node) if store is None else store)
     return tree
 

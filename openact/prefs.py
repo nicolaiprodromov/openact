@@ -131,9 +131,9 @@ class OpenActPreferences(bpy.types.AddonPreferences):
         description="Start the model server as soon as an OpenAct node needs an answer",
     )
     debias: bpy.props.BoolProperty(
-        name="Balance Option Order", default=True,
-        description="Ask every question with the options in both orders and average the answers. "
-                    "Removes the small model's bias toward early options, at twice the cost",
+        name="Balance Option Order for New Nodes", default=True,
+        description="The Balance Option Order setting that new OpenAct nodes start with: every question asked with "
+                    "the options in both orders, at twice the cost. Existing nodes keep their own setting",
     )
 
     def draw(self, context):

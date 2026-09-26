@@ -57,6 +57,7 @@ blender -b --factory-startup --python tests/legacy_blender.py
 blender -b --factory-startup --python tests/e2e_blender.py -- build   <file.blend> [port] [gpu]
 blender -b --factory-startup --python tests/e2e_blender.py -- noaddon <file.blend>
 blender -b --factory-startup --python tests/e2e_blender.py -- reopen  <file.blend>
+blender -b --factory-startup --python tests/e2e_blender.py -- reopen-bumped <file.blend>
 ```
 
 The e2e phases drive the add-on with the real model.

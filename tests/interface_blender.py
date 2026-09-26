@@ -47,8 +47,8 @@ bpy.context.scene.collection.objects.link(host)
 mod = host.modifiers.new("Interface", 'NODES')
 mod.node_group = tree
 mod[tree.interface.items_tree["Question"].identifier] = "Is it night?"
-S.save(ask, S.NodeStore([S.Entry(words_key="night", gn=("Is it night?", ""), kind="ask", answer_type='YES_NO',
-                                 single={"Answer": 0.75, "Yes": True, "Confidence": 0.5})]))
+S.save(ask, S.NodeStore([S.Entry(words_key="night", gn=("Is it night?", "", "", "", ""), kind="ask",
+                                 answer_type='YES_NO', single={"Answer": 0.75, "Yes": True, "Confidence": 0.5})]))
 inner.build(ask, S.load(ask))
 
 
@@ -74,32 +74,31 @@ def items(node):
 
 
 def phase_sync():
-    spec = list(engine.AskSpec.iface)
+    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # Question, Context, Answer, Yes, Confidence, Key
     kept = {s.name: s.identifier for s in (*ask.inputs, *ask.outputs)}
-    key = SocketDef('INPUT', "Key", 'NodeSocketString', "Compared, never sent to the model", kind="word", hidden=True)
+    tag = SocketDef('INPUT', "Tag", 'NodeSocketString', "Compared, never sent to the model", kind="word", hidden=True)
     extra = SocketDef('OUTPUT', "Extra", 'NodeSocketInt', "An extra output")
-    wanted = [spec[1], spec[0], key, spec[4], spec[2], spec[3], extra]  # Context first, Confidence first
+    wanted = [spec[1], spec[0], tag, spec[5], spec[4], spec[2], spec[3], extra]  # Context first, Confidence first
     inner.sync_interface(ask, wanted)
     check("sync: new sockets reach the node, in the wanted order",
-          names(ask.inputs) == ["Context", "Question", "Key"] and names(ask.outputs) == ["Confidence", "Answer", "Yes",
-                                                                                        "Extra"],
-          (names(ask.inputs), names(ask.outputs)))
+          names(ask.inputs) == ["Context", "Question", "Tag", "Key"]
+          and names(ask.outputs) == ["Confidence", "Answer", "Yes", "Extra"], (names(ask.inputs), names(ask.outputs)))
     check("sync: matched sockets keep their identifiers (the interface is never cleared)",
-          all(sock(ask.inputs if name in ("Question", "Context") else ask.outputs, identifier).name == name
+          all(sock(ask.inputs if name in ("Question", "Context", "Key") else ask.outputs, identifier).name == name
               for name, identifier in kept.items()), kept)
     check("sync: links to the node survive", question_link.is_valid and question_link.to_socket == ask.inputs["Question"]
           and all(link.is_valid for link in L), [(link.to_socket.name, link.is_valid) for link in L if not link.is_valid])
     check("sync: the node still evaluates through its links", read(host, "answer") == [0.75] * 4, read(host, "answer"))
     check("sync: tooltips come from the descriptions",
-          items(ask)[('INPUT', "Key")].description == key.description
+          items(ask)[('INPUT', "Tag")].description == tag.description
           and items(ask)[('OUTPUT', "Answer")].description == spec[2].description)
-    check("sync: a socket declared hidden is hidden when it is created",
-          ask.inputs["Key"].hide and not ask.inputs["Question"].hide)
+    check("sync: a socket declared hidden is hidden when it is created, like every node's Key",
+          ask.inputs["Tag"].hide and ask.inputs["Key"].hide and not ask.inputs["Question"].hide)
 
-    ask.inputs["Key"].hide = False  # the artist reveals it with Ctrl H
+    ask.inputs["Tag"].hide = False  # the artist reveals it with Ctrl H
     inner.sync_interface(ask, wanted)
     inner.build(ask, S.load(ask))
-    check("sync: a revealed socket stays visible through later syncs and rebuilds", not ask.inputs["Key"].hide)
+    check("sync: a revealed socket stays visible through later syncs and rebuilds", not ask.inputs["Tag"].hide)
 
     grid = N.new("GeometryNodeMeshGrid")
     L.new(ask.outputs["Extra"], grid.inputs["Vertices X"])
@@ -113,7 +112,7 @@ def phase_sync():
 
     inner.sync_interface(ask, spec)
     check("sync: obsolete sockets are removed and the order restored",
-          names(ask.inputs) == ["Question", "Context"] and names(ask.outputs) == ["Answer", "Yes", "Confidence"],
+          names(ask.inputs) == ["Question", "Context", "Key"] and names(ask.outputs) == ["Answer", "Yes", "Confidence"],
           (names(ask.inputs), names(ask.outputs)))
     check("sync: kept sockets and links are untouched by the removals",
           all(sock((*ask.inputs, *ask.outputs), identifier).name == name for name, identifier in kept.items())
