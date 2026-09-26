@@ -61,6 +61,20 @@ def venv_python(root: str) -> str:
     return os.path.join(root, "venv", "bin", "python")
 
 
+def venv_home(root: str) -> str:
+    """The base interpreter's folder named by the venv's pyvenv.cfg ("" if unreadable). It can lie outside the
+    runtime: the Jev Nodes runtime's venv uses the user's global uv Python."""
+    try:
+        with open(os.path.join(root, "venv", "pyvenv.cfg"), encoding="utf-8") as handle:
+            for line in handle:
+                key, sep, value = line.partition("=")
+                if sep and key.strip().lower() == "home":
+                    return value.strip()
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def hf_home(root: str) -> str:
     return os.path.join(root, "hf")
 
@@ -74,8 +88,9 @@ _installed_cache = {}
 
 
 def runtime_installed(root: str) -> bool:
-    """The venv exists and every weight shard listed in the model index is on disk."""
-    if not os.path.isfile(venv_python(root)):
+    """The venv's Python, the base interpreter folder it points at, and every weight shard listed in the model index
+    are on disk. File-system checks only: whether that Python imports torch is the probe's job (server.py)."""
+    if not os.path.isfile(venv_python(root)) or not os.path.isdir(venv_home(root)):
         return False
     folder = model_dir(root)
     index = os.path.join(folder, "model.safetensors.index.json")

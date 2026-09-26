@@ -1,4 +1,4 @@
-"""Operators: install, start and stop the model; re-ask a node; open files."""
+"""Operators: install or locate the runtime, start and stop the model; re-ask a node; open files."""
 
 from __future__ import annotations
 
@@ -34,14 +34,38 @@ class OPENACT_OT_install_runtime(bpy.types.Operator):
         )
 
     def execute(self, context):
-        if not bpy.app.online_access:
-            self.report({'ERROR'}, "Online access is disabled. Enable Preferences > System > Network > "
-                                   "Allow Online Access to download the model")
-            return {'CANCELLED'}
         if not server.install():
-            self.report({'WARNING'}, "An install is already running")
+            state, message = server.status()
+            if state == "installing":
+                self.report({'WARNING'}, "An install is already running")
+            else:
+                self.report({'ERROR'}, message)  # refused, e.g. online access is off
             return {'CANCELLED'}
         self.report({'INFO'}, "Installing the model in the background")
+        return {'FINISHED'}
+
+
+class OPENACT_OT_locate_runtime(bpy.types.Operator):
+    bl_idname = "openact.locate_runtime"
+    bl_label = "Locate Existing Runtime..."
+    bl_description = ("Use a model runtime that is already installed, such as the one Jev Nodes installed, "
+                      "instead of downloading it again")
+
+    directory: bpy.props.StringProperty(subtype='DIR_PATH')
+    filter_folder: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        root = os.path.normpath(bpy.path.abspath(self.directory))
+        if not P.runtime_installed(root):
+            self.report({'ERROR'}, f"No installed runtime in {root}: choose the folder that holds 'venv' and 'hf'")
+            return {'CANCELLED'}
+        prefs = P.get_prefs()
+        prefs.runtime_dir = root
+        server.probe_runtime(prefs)
         return {'FINISHED'}
 
 
@@ -114,8 +138,8 @@ class OPENACT_OT_open_runtime_folder(bpy.types.Operator):
         return {'FINISHED'}
 
 
-classes = (OPENACT_OT_install_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop, OPENACT_OT_reask,
-           OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder)
+classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
+           OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder)
 
 
 def register():

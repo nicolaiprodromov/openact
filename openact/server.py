@@ -8,8 +8,11 @@ thread through a queue that a timer drains, because bpy may only be touched from
 
 from __future__ import annotations
 
+import glob
+import hashlib
 import json
 import os
+import pathlib
 import platform
 import queue
 import shutil
@@ -37,8 +40,20 @@ MODEL_NAME = "semif-qwen3.5-4b"
 
 SEMIF_COMMIT = "23cf1f39fc9534fe81437200959b6dfc7106e45a"
 SEMIF_URL = f"https://github.com/TheoLeeCJ/SemIf-OpenJev/archive/{SEMIF_COMMIT}.zip"
-TORCH_VERSION = "2.10.0"
+SEMIF_SHA256 = "6eaab1415902b8c3b703fe2d02b23851c2c0c9a0f09cfdc4f8df176e2b7ce463"  # GitHub may re-pack archives
 UV_VERSION = "0.8.17"
+UV_SHA256 = {  # the release's published checksums, for the platforms that can have an NVIDIA GPU
+    "uv-x86_64-pc-windows-msvc.zip": "0d051779fbcb173b183efeae1c3e96148764fd82709bbbf0966df3efe48b67c5",
+    "uv-x86_64-unknown-linux-gnu.tar.gz": "920cbcaad514cc185634f6f0dcd71df5e8f4ee4456d440a22e0f8c0f142a8203",
+    "uv-aarch64-unknown-linux-gnu.tar.gz": "9a20d65b110770bbaa2ee89ed76eb963d8c6a480b9ebef584ea9df2ae85b4f0f",
+}
+# torch and every dependency of torch and SemIf, pinned with hashes (tools/make_locks.ps1). v1 is CUDA only.
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime", "requirements-cu128.lock")
+MIN_FREE_GB = 15
+MIN_VRAM_GB = 10
+PROBE_CODE = "import torch, semif_phase1"
+CHECKING = "Checking the runtime..."
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows only: no console window for child processes
 
 # ---------------------------------------------------------------------------------- state
 
@@ -56,6 +71,9 @@ class _State:
         self.install_step = ""
         self.log_path = ""
         self.conflict = ""  # the error shown while an OpenAct server with another backend holds the port
+        self.probes = {}  # runtime folder -> "" once its import probe passed this session, else the probe's error
+        self.checking = ""  # the runtime folder whose import probe is running
+        self.start_queued = False  # a start that runs when that probe passes
 
     def set(self, status, message=""):
         with self.lock:
@@ -203,9 +221,87 @@ def _refuse_backend(other):
 
 
 def state_dir(root):
-    """Writable state such as server.log: OPENACT_STATE_DIR, so the runtime can be shared read-only,
-    else the runtime folder."""
+    """Writable state such as server.log and probe.json: OPENACT_STATE_DIR, so the runtime can be shared
+    read-only, else the runtime folder."""
     return os.environ.get("OPENACT_STATE_DIR") or root
+
+
+def _child_env():
+    """os.environ without the variables that would point the runtime's Python at other packages."""
+    env = dict(os.environ)
+    for key in ("PYTHONPATH", "PYTHONHOME"):
+        env.pop(key, None)
+    return env
+
+
+def _imports_ok(python, env=None):
+    """The runtime probe: does this Python import torch and SemIf? Takes seconds on a cold disk."""
+    try:
+        return subprocess.run([python, "-c", PROBE_CODE], capture_output=True, stdin=subprocess.DEVNULL,
+                              env=env or _child_env(), timeout=300, creationflags=_NO_WINDOW).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _probe_key(root):
+    """What a passed probe depends on: the folder, and the mtimes of pyvenv.cfg and of torch's dist-info."""
+    venv = os.path.join(root, "venv")
+    site = ("Lib", "site-packages") if sys.platform == "win32" else ("lib", "python3*", "site-packages")
+    try:
+        torch = glob.glob(os.path.join(glob.escape(venv), *site, "torch-*.dist-info"))[0]
+        return [root, os.path.getmtime(os.path.join(venv, "pyvenv.cfg")), os.path.getmtime(torch)]
+    except (IndexError, OSError):
+        return None
+
+
+def _probe(root):
+    """Executor: probe the runtime, unless probe.json holds a pass for it as it is now. Posts the result."""
+    key = _probe_key(root)
+    path = os.path.join(state_dir(root), "probe.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            passed = key is not None and json.load(handle)["passed"] == key
+    except (OSError, ValueError, KeyError, TypeError):
+        passed = False
+    if not passed and _imports_ok(P.venv_python(root)):
+        passed = True
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"passed": key}, handle)
+        except OSError:
+            pass  # the next session probes again
+    error = "" if passed else (f"The runtime's Python at {P.venv_home(root)} is missing or broken (was it removed "
+                               "with `uv python uninstall`?): reinstall the runtime")
+    post(_probed, root, error)
+
+
+def _check(root):
+    """Start the probe of this runtime folder on the executor, unless it is running: nothing waits for it."""
+    if STATE.checking != root:
+        STATE.checking = root
+        STATE.set("unknown", CHECKING)
+        executor().submit(_probe, root)
+
+
+def _probed(root, error):
+    STATE.probes[root] = error
+    if STATE.checking != root:
+        return  # another runtime folder was chosen meanwhile: its own probe decides
+    STATE.checking = ""
+    queued, STATE.start_queued = STATE.start_queued, False
+    if error:
+        STATE.set("error", error)  # this also cancels a queued start
+    elif queued:
+        start()
+    else:
+        refresh()
+
+
+def probe_runtime(prefs=None):
+    """Probe the runtime folder again in the background, e.g. after Locate Existing Runtime chose it."""
+    STATE.probes.pop(P.runtime_root(prefs or P.get_prefs()), None)
+    refresh(prefs)
 
 
 def refresh(prefs=None):
@@ -215,10 +311,18 @@ def refresh(prefs=None):
     root = P.runtime_root(prefs)
     if STATE.status in ("installing", "starting"):
         return
-    if _backend() != "fake" and not P.runtime_installed(root):
-        if STATE.status != "error":  # keep an install error visible
-            STATE.set("not_installed", "The model runtime is not installed")
-        return
+    if _backend() != "fake":
+        if not P.runtime_installed(root):
+            if STATE.status != "error":  # keep an install error visible
+                STATE.set("not_installed", "The model runtime is not installed")
+            return
+        error = STATE.probes.get(root)
+        if error is None:  # once per session; the status reads "Checking the runtime..." meanwhile
+            _check(root)
+            return
+        if error:
+            STATE.set("error", error)  # until Start Model or Locate Existing Runtime probes again
+            return
     if STATE.status in ("unknown", "not_installed"):
         STATE.set("stopped", "")
     port = STATE.port
@@ -263,9 +367,15 @@ def start(prefs=None):
     STATE.port = prefs.port
     root = P.runtime_root(prefs)
     backend = _backend()
-    if backend != "fake" and not P.runtime_installed(root):
-        STATE.set("not_installed", "The model runtime is not installed")
-        return False
+    if backend != "fake":
+        if not P.runtime_installed(root):
+            STATE.set("not_installed", "The model runtime is not installed")
+            return False
+        if STATE.probes.get(root) != "":  # queued, not waited for: _probed() starts it once the probe passes
+            STATE.probes.pop(root, None)  # a failed runtime is probed again, it may have been repaired
+            STATE.start_queued = True
+            _check(root)
+            return True
     try:
         code, health = http("GET", "/health", timeout=0.5)
         if code == 200 and health.get("server") == SERVER_ID:
@@ -288,9 +398,7 @@ def start(prefs=None):
     python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
     folder = state_dir(root)
     STATE.log_path = os.path.join(folder, "server.log")
-    env = dict(os.environ)
-    for key in ("PYTHONPATH", "PYTHONHOME"):
-        env.pop(key, None)
+    env = _child_env()
     env.pop("OPENACT_TOKEN", None)  # this add-on sends no X-OpenAct-Token, so its server must not require one
     env.update({
         "HF_HOME": P.hf_home(root),
@@ -306,10 +414,9 @@ def start(prefs=None):
     try:
         os.makedirs(folder, exist_ok=True)
         log = open(STATE.log_path, "w", encoding="utf-8")
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         STATE.process = subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            cwd=folder, env=env, creationflags=flags,
+            cwd=folder, env=env, creationflags=_NO_WINDOW,
         )
         log.close()  # the child keeps its own handle
     except OSError as error:
@@ -395,6 +502,8 @@ def shutdown_owned():
     """On add-on unregister: stop the server only if this Blender started it."""
     if STATE.process is not None and STATE.process.poll() is None:
         stop()
+    STATE.probes.clear()  # the next registration probes again: a probe cancelled below would never report
+    STATE.checking, STATE.start_queued = "", False
     global _executor
     if _executor is not None:
         _executor.shutdown(wait=False, cancel_futures=True)
@@ -414,48 +523,92 @@ def _uv_asset():
     return f"uv-{arch}-unknown-linux-gnu.tar.gz"
 
 
-def _has_nvidia():
+def _nvidia_gpus():
+    """[(name, MiB of VRAM)] as nvidia-smi reports them: empty without an NVIDIA GPU and driver."""
     tool = shutil.which("nvidia-smi")
     if not tool:
-        return False
+        return []
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        return subprocess.run([tool, "-L"], capture_output=True, timeout=20, creationflags=flags).returncode == 0
-    except Exception:
-        return False
+        result = subprocess.run([tool, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                                capture_output=True, stdin=subprocess.DEVNULL, timeout=20, creationflags=_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    gpus = []
+    for line in result.stdout.decode("utf-8", "replace").splitlines() if result.returncode == 0 else ():
+        name, _, memory = line.rpartition(",")
+        if memory.strip().isdigit():
+            gpus.append((name.strip(), int(memory)))
+    return gpus
 
 
-def install(prefs=None):
-    """Download and set up the runtime in the background (about 12 GB). Main thread only."""
+def install(prefs=None, dry_run=False):
+    """Download and set up the runtime in the background (about 13 GB). Main thread only.
+
+    dry_run writes every command and download to install.log without running it."""
     prefs = prefs or P.get_prefs()
     if STATE.install_thread and STATE.install_thread.is_alive():
         return False
+    if not bpy.app.online_access:
+        STATE.set("error", "Online access is disabled. Enable Preferences > System > Network > Allow Online Access "
+                           "to download the model")
+        return False
     root = P.runtime_root(prefs)
+    previous = status()
+    STATE.probes.pop(root, None)  # the runtime is about to change: probe it again afterwards
     STATE.set("installing", "Preparing...")
+    warning = ""
 
     def run(cmd, log, env=None):
         log.write("\n$ " + " ".join(cmd) + "\n")
         log.flush()
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        if dry_run:
+            return
         result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                env=env, creationflags=flags)
+                                env=env, creationflags=_NO_WINDOW)
         if result.returncode != 0:
             raise RuntimeError(f"'{os.path.basename(cmd[0])}' failed with code {result.returncode} (see install.log)")
 
+    def fetch(url, path, sha256, log):
+        log.write(f"downloading {url} (SHA-256 {sha256})\n")
+        log.flush()
+        if dry_run:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        urllib.request.urlretrieve(url, path)
+        with open(path, "rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        if digest != sha256:
+            os.remove(path)
+            log.write(f"SHA-256 mismatch: got {digest}\n")
+            raise RuntimeError(f"{os.path.basename(path)} does not match its recorded SHA-256: update OpenAct")
+
     def step(text):
         STATE.install_step = text
-        STATE.set("installing", text)
+        STATE.set("installing", f"{text} {warning}".strip())
 
     def work():
+        nonlocal warning
         os.makedirs(root, exist_ok=True)
         log_path = os.path.join(root, "install.log")
         STATE.log_path = log_path
         try:
             with open(log_path, "a", encoding="utf-8") as log:
-                log.write(f"\n===== OpenAct runtime install {time.ctime()} =====\n")
-                env = dict(os.environ)
-                for key in ("PYTHONPATH", "PYTHONHOME"):
-                    env.pop(key, None)
+                log.write(f"\n===== OpenAct runtime install{' (dry run)' if dry_run else ''} {time.ctime()} =====\n")
+                free = shutil.disk_usage(root).free / 1024 ** 3
+                log.write(f"free disk space: {free:.1f} GB\n")
+                if free < MIN_FREE_GB:
+                    raise RuntimeError(f"not enough disk space: the runtime needs {MIN_FREE_GB} GB free for {root}, "
+                                       f"{free:.1f} GB is free")
+                gpus = _nvidia_gpus()
+                log.write(f"NVIDIA GPUs (MiB of VRAM): {gpus}\n")
+                if not gpus:
+                    raise RuntimeError("OpenAct 1.0 needs an NVIDIA GPU")  # v1 has no CPU runtime
+                vram = max(memory for _name, memory in gpus) / 1024
+                if vram < MIN_VRAM_GB:
+                    warning = (f"Warning: the GPU has {vram:.0f} GB of VRAM; the model needs about 9 GB, and "
+                               f"{MIN_VRAM_GB} GB or more is recommended.")
+                    log.write(warning + "\n")
+                env = _child_env()
                 env["HF_HOME"] = P.hf_home(root)
                 env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
                 # Keep everything inside the runtime folder: uv's own Python and its download cache.
@@ -466,20 +619,20 @@ def install(prefs=None):
 
                 step("1/5 Getting uv (Python package manager)...")
                 exe = "uv.exe" if sys.platform == "win32" else "uv"
-                uv = shutil.which("uv") or os.path.join(root, "tools", exe)
+                uv = os.path.join(root, "tools", exe)  # never a uv on PATH: its version isn't the pinned one
                 if not os.path.isfile(uv):
                     asset = _uv_asset()
-                    url = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{asset}"
+                    if asset not in UV_SHA256:
+                        raise RuntimeError(f"there is no pinned uv for this platform ({asset})")
                     archive = os.path.join(root, "tools", asset)
-                    os.makedirs(os.path.dirname(archive), exist_ok=True)
-                    log.write(f"downloading {url}\n")
-                    urllib.request.urlretrieve(url, archive)
-                    if archive.endswith(".zip"):
+                    fetch(f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{asset}", archive,
+                          UV_SHA256[asset], log)
+                    if not dry_run and archive.endswith(".zip"):
                         with zipfile.ZipFile(archive) as zf:
                             member = next(n for n in zf.namelist() if n.endswith("/" + exe) or n == exe)
                             with zf.open(member) as src, open(uv, "wb") as dst:
                                 shutil.copyfileobj(src, dst)
-                    else:
+                    elif not dry_run:
                         with tarfile.open(archive) as tf:
                             member = next(m for m in tf.getmembers() if m.name.endswith("/" + exe) or m.name == exe)
                             with tf.extractfile(member) as src, open(uv, "wb") as dst:
@@ -487,32 +640,31 @@ def install(prefs=None):
                         os.chmod(uv, 0o755)
 
                 step("2/5 Creating the Python environment...")
-                if not os.path.isfile(python):
-                    run([uv, "venv", "--python", "3.12", os.path.join(root, "venv")], log, env)
-
-                def importable(module):
-                    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-                    return subprocess.run([python, "-c", f"import {module}"], capture_output=True, env=env,
-                                          creationflags=flags).returncode == 0
+                # --clear replaces a venv whose base Python is gone, e.g. removed with `uv python uninstall`
+                if not (os.path.isfile(python) and os.path.isdir(P.venv_home(root))):
+                    run([uv, "venv", "--clear", "--python", "3.12", os.path.join(root, "venv")], log, env)
 
                 step("3/5 Installing PyTorch (about 3 GB)...")
-                if not importable("torch"):
-                    cmd = [uv, "pip", "install", "--python", python, f"torch=={TORCH_VERSION}"]
-                    if sys.platform != "darwin":
-                        index = "cu128" if _has_nvidia() else "cpu"
-                        cmd += ["--index-url", f"https://download.pytorch.org/whl/{index}"]
-                    run(cmd, log, env)
+                installed = not dry_run and _imports_ok(python, env)
+                if not installed:
+                    run([uv, "pip", "install", "--python", python, "--require-hashes", "--torch-backend", "cu128",
+                         "-r", LOCK_FILE], log, env)
 
                 step("4/5 Installing SemIf...")
-                if not importable("semif_phase1"):
-                    run([uv, "pip", "install", "--python", python, f"semif-phase1 @ {SEMIF_URL}"], log, env)
+                if not installed:
+                    archive = os.path.join(root, "tools", f"SemIf-OpenJev-{SEMIF_COMMIT}.zip")
+                    fetch(SEMIF_URL, archive, SEMIF_SHA256, log)
+                    # Its dependencies came from the lock. Building with the lock's setuptools, not a fresh
+                    # download, keeps every installed package hash-checked.
+                    run([uv, "pip", "install", "--python", python, "--no-deps", "--no-build-isolation",
+                         f"semif-phase1 @ {pathlib.Path(archive).absolute().as_uri()}"], log, env)
 
                 step("5/5 Downloading the model (8.7 GB)...")
                 if not P.runtime_installed(root):  # resumes an interrupted download
                     code = ("from huggingface_hub import snapshot_download; "
                             f"print(snapshot_download(repo_id={P.MODEL_SOURCE!r}, revision={P.MODEL_REVISION!r}))")
                     run([python, "-c", code], log, env)
-                if not P.runtime_installed(root):
+                if not dry_run and not P.runtime_installed(root):
                     raise RuntimeError("the model files are incomplete after the download")
                 try:  # the venv holds its own copies; the download cache is not needed any more
                     run([uv, "cache", "clean"], log, env)
@@ -520,7 +672,10 @@ def install(prefs=None):
                     pass
                 log.write("===== done =====\n")
             STATE.install_step = ""
-            STATE.set("stopped", "Runtime installed")
+            if dry_run:
+                STATE.set(*previous)
+                return
+            STATE.set("stopped", f"Runtime installed. {warning}" if warning else "Runtime installed")
             post(_became_installed)
         except Exception as error:
             STATE.install_step = ""
