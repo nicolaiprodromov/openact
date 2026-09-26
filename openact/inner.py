@@ -88,6 +88,7 @@ class _Builder:
         self.per_word = per_word  # a word contains SEP: compare word by word
         self.k = None  # the match chain's output, which the per-element lookup reads
         self.after_elements = []  # a spec's callables (valid, {output: value}), run once per_element() built them
+        self.node = self.table = None  # for a spec that samples its own table object (entry_table, below)
 
     def new(self, idname, x, y):
         node = self.tree.nodes.new(idname)
@@ -278,10 +279,12 @@ def build(node, store, live=None, default=None):
     tree.pop(BUILT, None)  # a build that raises leaves a partial graph, which update_values() must not write
     entries = materialised(store.entries, live, default)
     columns = _columns(node)
-    table = tables.ensure_table(node) if columns else None  # before clear(), which drops the reference
+    own = _entry_table(node)
+    table = tables.ensure_table(node) if columns or own else None  # before clear(), which drops the reference
     tree.nodes.clear()
     split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
     builder = _Builder(tree, _k(entries, default), split)
+    builder.node, builder.table = node, table
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
     SPECS[node.bl_idname].build(builder, group_in, group_out, entries)
@@ -290,6 +293,8 @@ def build(node, store, live=None, default=None):
     builder.finish()
     if columns:
         tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
+    elif own:
+        tables.write_rows(node, *own(node, entries))
     tree[BUILT] = _built(node, entries, columns, split)
 
 
@@ -303,8 +308,12 @@ def update_values(node, store, live=None, default=None, rows=True):
         return False
     entries = materialised(store.entries, live, default)
     columns = _columns(node)
+    own = _entry_table(node)
     split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
-    if tree.get(BUILT) != _built(node, entries, columns, split) or (columns and tables.find(node) is None):
+    if tree.get(BUILT) != _built(node, entries, columns, split) or ((columns or own) and tables.find(node) is None):
+        return False
+    own_rows = own(node, entries) if own else None
+    if own and own_rows is None:  # the spec wants other outputs
         return False
     feeds = [(link.to_socket.name, link.from_node.data_type, _items(link.from_node)) for link in tree.links
              if link.to_node.bl_idname == "NodeGroupOutput" and link.from_node.bl_idname == "GeometryNodeIndexSwitch"]
@@ -322,6 +331,8 @@ def update_values(node, store, live=None, default=None, rows=True):
         _write([sock(end.inputs, "False")], [_k(entries, default)])
     if rows and columns:
         tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
+    elif rows and own_rows:
+        tables.write_rows(node, *own_rows)
     return True
 
 
@@ -466,3 +477,12 @@ def sync_interface(node, wanted):
 def _set(item, name, value):
     if getattr(item, name) != value:  # every write updates the interface and the nodes using it
         setattr(item, name, value)
+
+
+# ------------------------------------------------------------ one-row-per-entry tables (Dials, §8.4)
+# A spec with entry_table(node, entries) -> (columns, types), or None when build() must run, samples its own table
+# object at k - 1 in its build(), through builder.node and builder.table. build() and update_values() write the rows.
+
+
+def _entry_table(node):
+    return getattr(SPECS[node.bl_idname], "entry_table", None)

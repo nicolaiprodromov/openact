@@ -884,6 +884,36 @@ def test_settings():
     )
 
 
+def test_inline_settings():
+    parse = csvfmt.parse_inline_settings
+    got = [(s.name, s.type, s.question, s.min, s.max, s.answers)
+           for s in parse("Rain (yes/no): Is it raining?; Wind speed (amount): How windy is it?")]
+    check("inline settings: 'name (type): question' separated by ';'",
+          got == [("Rain", "yes_no", "Is it raining?", 0.0, 1.0, ()),
+                  ("Wind speed", "amount", "How windy is it?", 0.0, 1.0, ())], got)
+    got = [(s.name, s.type, s.question) for s in parse("Wet (bool): Is it wet, cold or windy?\nFog (Amount):How foggy?\n")]
+    check("inline settings: one per line keeps commas, type synonyms, no space after ':'",
+          got == [("Wet", "yes_no", "Is it wet, cold or windy?"), ("Fog", "amount", "How foggy?")], got)
+    got = [s.name for s in parse("Speed (km/h) (amount): How fast?")]
+    check("inline settings: the last parentheses hold the type", got == ["Speed (km/h)"], got)
+    at_limit = parse("; ".join(f"s{i} (yes/no): q?" for i in range(32)))
+    check("inline settings: 32 settings, the limit, are accepted", len(at_limit) == 32, len(at_limit))
+    for text, message in (
+        ("; ".join(f"s{i} (yes/no): q?" for i in range(33)), "33 settings (limit 32)"),
+        ("Time (one-of): What time is it?", "Entry 1: a one-of setting needs a Settings CSV"),
+        ("Rain: Is it raining?", "Entry 1: write it as 'name (type): question', e.g. 'Rain (yes/no): Is it raining?'"),
+        ("Rain (yes/no)", "Entry 1: write it as 'name (type): question', e.g. 'Rain (yes/no): Is it raining?'"),
+        ("Rain (maybe): Is it raining?", "Entry 1: type 'maybe' is not yes/no or amount"),
+        ("Rain (yes/no):  ", "Entry 1: the question is empty"),
+        ("Rain (yes/no): q?; rain (amount): q?", "Entry 2: 'rain' appears twice"),
+        ("Confidence (amount): q?", "Entry 1: rename setting 'Confidence': it clashes with a node output"),
+        ("s" * 64 + " (yes/no): q?", "Entry 1: the setting name has 64 bytes in UTF-8 (limit 63)"),
+        (" ; ", "No settings"),
+    ):
+        problems = raised(parse, text)
+        check(f"inline settings: {message[:60]}", only(problems, "error", 0, message), summary(problems))
+
+
 def test_overrides():
     doc = read(
         "life_overrides.csv",
@@ -1150,6 +1180,7 @@ test_answer_sets()
 test_factors()
 test_if()
 test_settings()
+test_inline_settings()
 test_overrides()
 test_hashes()
 test_inline()

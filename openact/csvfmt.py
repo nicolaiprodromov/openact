@@ -68,6 +68,7 @@ _FLOAT = re.compile(r"[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?")
 _LOCALE_NUMBER = re.compile("[+-]?[0-9]*,[0-9]+|[+-]?[0-9]{1,3}([ .,'\u00a0\u202f][0-9]{3})+([.,][0-9]+)?")
 # Cells that make a column text although it was meant to hold numbers.
 _NUMBER_LIKE = re.compile(f"{_LOCALE_NUMBER.pattern}|[+-]?(inf|infinity|nan)|true|false", re.IGNORECASE)
+_INLINE_SETTING = re.compile(r"(.*?)\s*\(([^()]*)\)")  # "Wind speed (amount)": the name, then the type
 
 
 @dataclass(frozen=True)
@@ -591,17 +592,9 @@ def parse_settings(doc: CsvDoc) -> list[Setting]:
     for row, line in zip(doc.rows, doc.lines):
         cells = {column: row[i] if i is not None else "" for column, i in at.items()}
         name, kind = cells["setting"], SETTING_TYPES.get(cells["type"].casefold())
-        size = len(name.encode("utf-8"))
-        if not name:
-            problems.add(ERROR, line, "", f"Line {line}: the setting name is empty")
-        elif size > MAX_NAME:
-            message = f"Line {line}: the setting name has {size} bytes in UTF-8 (limit {MAX_NAME})"
-            problems.add(ERROR, line, "", message)
-        elif name.casefold() == "confidence":
-            problems.add(ERROR, line, "", f"Line {line}: rename setting '{name}': it clashes with a node output")
-        elif name.casefold() in seen:
-            problems.add(ERROR, line, "", f"Line {line}: '{name}' appears twice")
-        seen.add(name.casefold())
+        message = _setting_name_problem(name, seen)
+        if message:
+            problems.add(ERROR, line, "", f"Line {line}: {message}")
         if kind is None:
             problems.add(ERROR, line, "", f"Line {line}: type '{cells['type']}' is not yes/no, amount or one-of")
         if not cells["question"]:
@@ -632,6 +625,58 @@ def parse_settings(doc: CsvDoc) -> list[Setting]:
         problems.add(ERROR, 0, "", message)
     problems.check()
     return settings
+
+
+def parse_inline_settings(text: str) -> list[Setting]:
+    """Settings typed inline (design 6.6): 'name (type): question' entries, one per line, else separated by ';'
+    (never ',': questions have commas). Yes/No and Amount only, with min 0 and max 1: a One-of setting's options would
+    collide with the separator, so it needs the CSV. Names are checked as in the CSV, and the limit is the same.
+    Raises CsvError."""
+    problems = _Problems("")
+    entries = [entry.strip() for entry in (text.splitlines() if len(text.strip().splitlines()) > 1 else text.split(";"))]
+    entries = [entry for entry in entries if entry]
+    settings, seen = [], set()
+    for number, entry in enumerate(entries, start=1):
+        head, colon, question = entry.partition(":")
+        match = _INLINE_SETTING.fullmatch(head.strip())
+        if not colon or match is None:
+            problems.add(ERROR, 0, "", f"Entry {number}: write it as 'name (type): question', "
+                                       f"e.g. 'Rain (yes/no): Is it raining?'")
+            continue
+        name, written = match[1].strip(), match[2].strip()
+        kind = SETTING_TYPES.get(written.casefold())
+        message = _setting_name_problem(name, seen)
+        if message:
+            problems.add(ERROR, 0, "", f"Entry {number}: {message}")
+        if kind == "one_of":
+            problems.add(ERROR, 0, "", f"Entry {number}: a one-of setting needs a Settings CSV")
+        elif kind is None:
+            problems.add(ERROR, 0, "", f"Entry {number}: type '{written}' is not yes/no or amount")
+        if not question.strip():
+            problems.add(ERROR, 0, "", f"Entry {number}: the question is empty")
+        settings.append(Setting(name, kind or "", question.strip(), (), 0.0, 1.0, 0))
+    if not entries:
+        problems.add(ERROR, 0, "", "No settings")
+    elif len(entries) > MAX_SETTINGS:
+        problems.add(ERROR, 0, "", f"{len(entries)} settings (limit {MAX_SETTINGS})")
+    problems.check()
+    return settings
+
+
+def _setting_name_problem(name, seen):
+    """What is wrong with a setting's name, or ""; seen collects the names so far, ignoring case."""
+    size = len(name.encode("utf-8"))
+    problem = ""
+    if not name:
+        problem = "the setting name is empty"
+    elif size > MAX_NAME:
+        problem = f"the setting name has {size} bytes in UTF-8 (limit {MAX_NAME})"
+    elif name.casefold() == "confidence":
+        problem = f"rename setting '{name}': it clashes with a node output"
+    elif name.casefold() in seen:
+        problem = f"'{name}' appears twice"
+    seen.add(name.casefold())
+    return problem
 
 
 def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]:

@@ -1,4 +1,4 @@
-"""The OpenAct nodes: Ask and Pick (whole situation), Match and Classify (each item)."""
+"""The OpenAct nodes: Ask, Pick and Dials (whole situation), Match and Classify (each item)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import bpy
 
 from . import engine, inner, sources, store
 from . import prefs as P
+from .specs import dials
 from .specs.classify import ClassifySpec
 from .specs.match import MatchSpec
 
@@ -206,9 +207,23 @@ class GeometryNodeOpenActClassify(_OpenActNode, bpy.types.GeometryNodeCustomGrou
 
 
 MENU = (  # the Add menu's groups (§6.0)
-    ("Whole situation", ((engine.ASK_ID, "Ask", 'QUESTION'), (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF'))),
+    ("Whole situation", ((engine.ASK_ID, "Ask", 'QUESTION'), (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF'),
+                         (dials.DialsSpec.idname, "Dials", 'OPTIONS'))),
     ("Each item", ((MatchSpec.idname, "Match", 'CHECKMARK'), (ClassifySpec.idname, "Classify", 'SORTALPHA'))),
 )
+
+
+class GeometryNodeOpenActDials(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
+    """Judge many named settings against one prompt, in one request: one output per setting"""
+
+    bl_idname = dials.DialsSpec.idname
+    bl_label = "Dials"
+
+    def draw_status(self, layout, full=False):
+        super().draw_status(layout, full)
+        warning = dials.WARNINGS.get(self.uid)
+        if warning:
+            layout.label(text=warning, icon='ERROR')
 
 
 class NODE_MT_openact_add(bpy.types.Menu):
@@ -238,8 +253,8 @@ def draw_add_menu(self, context):
     self.layout.menu(NODE_MT_openact_add.bl_idname, icon='NODETREE')
 
 
-classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActMatch, GeometryNodeOpenActClassify,
-           NODE_MT_openact_add)
+classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActDials, GeometryNodeOpenActMatch,
+           GeometryNodeOpenActClassify, NODE_MT_openact_add)
 
 
 def register():
