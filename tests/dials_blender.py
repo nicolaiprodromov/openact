@@ -302,7 +302,6 @@ def phase_model(port, gpu):
     storm = read(village)
     print("storm:", storm, flush=True)
     check("model: the storm prompt gives Rain = true", storm.get("Rain") is True, storm)
-    requests = server.STATE.health.get("requests")
 
     words(village, Prompt=CALM)
     engine.schedule(immediate=True)
@@ -322,8 +321,6 @@ def phase_model(port, gpu):
     t0 = time.time()
     drive(engine, lambda: read(village) == storm, timeout=10)
     check("model: switching back is instant", read(village) == storm, f"{time.time() - t0:.2f}s")
-    server.refresh()
-    print("server requests:", requests, "->", server.STATE.health.get("requests"), flush=True)
     server.stop()
     check("server stopped", not server.is_ready())
 
