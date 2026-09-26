@@ -200,19 +200,17 @@ def submit(job: Job, missing: list[Cell], priority: int, on_rows=None) -> None:
         if not waiters:
             cells.append(cell)
         waiters.add(waiter)
-    if not cells:
-        return
-    priority = min(max(priority, 0), 2)
-    with _QUEUED:
-        QUEUE[priority].append(deque(Chunk(job, tuple(part), priority, on_rows) for part in chunked(cells)))
-        _QUEUED.notify()
-    server.worker()
+    if cells:
+        with _QUEUED:
+            QUEUE[priority].append(deque(Chunk(job, tuple(part), priority, on_rows) for part in chunked(cells)))
+            _QUEUED.notify()
+    server.worker()  # also when every cell was pending: unregistering stops the worker, and its chunk may be requeued
 
 
-def chunked(cells, limits=None) -> list[list[Cell]]:
-    """The chunk builder (§5.5): consecutive cells of one state, at most `limits` (questions, scored rows; LIMITS by
-    default) in each. A cell that costs more rows than the limit travels alone."""
-    questions, rows = limits or LIMITS
+def chunked(cells) -> list[list[Cell]]:
+    """The chunk builder (§5.5): consecutive cells of one state, at most LIMITS (questions, scored rows) in each. A
+    cell that costs more rows than the limit travels alone."""
+    questions, rows = LIMITS
     parts, cost = [], 0
     for cell in cells:
         if not parts or len(parts[-1]) >= questions or cost + cell.cost > rows or parts[-1][0].state != cell.state:
@@ -269,26 +267,29 @@ def requeue(*chunks: Chunk) -> None:
     loading model or no server, or the parts of a refused one (§10.5)."""
     with _QUEUED:
         for chunk in reversed(chunks):
-            jobs = QUEUE[chunk.priority]
-            own = next((waiting for waiting in jobs if waiting[0].job is chunk.job), None)
-            if own is None:
-                own = deque()
-            else:
-                jobs.remove(own)
-            own.appendleft(chunk)
-            jobs.appendleft(own)
+            QUEUE[chunk.priority].appendleft(deque([chunk]))
         _QUEUED.notify()
 
 
-def cancel(uid: str, below: int) -> None:
-    """Drop the node's queued chunks of generations below `below` (§5.5, §13.3). The one in flight completes, and its
-    answers land in MEMORY. The dropped cells stop being pending, so another node waiting for one asks again. Main
-    thread only."""
+def cancel(uid: str, below: float) -> None:
+    """Drop the node's queued chunks of generations below `below` (§5.5, §13.3), all of them with math.inf (a deleted
+    node). The one in flight completes, and its answers land in MEMORY. The dropped cells stop being pending, so
+    another node waiting for one asks again. Main thread only."""
+    _drop(lambda job: job.uid == uid and job.generation < below)
+
+
+def cancel_all() -> None:
+    """Drop every queued chunk, as cancel() does: another file was opened, or the add-on unregisters. Main thread
+    only."""
+    _drop(lambda job: True)
+
+
+def _drop(wanted) -> None:
     dropped = []
     with _QUEUED:
         for jobs in QUEUE:
             for chunks in jobs:
-                for chunk in [chunk for chunk in chunks if chunk.job.uid == uid and chunk.job.generation < below]:
+                for chunk in [chunk for chunk in chunks if wanted(chunk.job)]:
                     chunks.remove(chunk)
                     dropped += chunk.cells
             kept = [chunks for chunks in jobs if chunks]
@@ -301,7 +302,8 @@ def cancel(uid: str, below: int) -> None:
 
 def answered(chunk: Chunk, kind: str, data) -> None:
     """A chunk's result, posted by the worker to the main thread: "ok" with the server's reply, whose answers go into
-    MEMORY, or "error" with the message its cells keep in FAILED (no automatic retry). Then its job's on_rows."""
+    MEMORY; "error" with the message its cells keep in FAILED (no automatic retry); or "refused" (403), which leaves
+    them unanswered, so a pass asks again once a server takes this Blender's token (§10.5). Then its job's on_rows."""
     from . import server
 
     model = provenance(server.STATE.health)
@@ -309,6 +311,8 @@ def answered(chunk: Chunk, kind: str, data) -> None:
     for qid, cell in zip(_question_ids(chunk.cells), chunk.cells):
         for waiter in {waiter for waiter, _generation in PENDING.pop(cell.key, ())}:
             _fill(waiter, cell, answered=1)
+        if kind == "refused":
+            continue
         if kind != "ok":
             FAILED[cell.key] = data
             continue

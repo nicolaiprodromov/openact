@@ -40,7 +40,7 @@ SERVER_ID = "openact-semif"
 LEGACY_SERVER_ID = "jev-nodes-semif"  # started by the jev_nodes v0.1.0 add-on
 LEGACY_SERVER_MESSAGE = ("An old Jev Nodes model server is running on this port: disable the Jev Nodes add-on "
                          "or choose another port.")
-TOKEN_REFUSED = "The model server refused this Blender (token)"
+TOKEN_REFUSED = "A model server started by another Blender holds port {}: close that Blender or choose another port"
 FAKE_ARGS: list[str] = []  # tests: more openact_server.py flags for the fake backend, e.g. --record <path.jsonl>
 
 SEMIF_COMMIT = "23cf1f39fc9534fe81437200959b6dfc7106e45a"
@@ -75,7 +75,8 @@ class _State:
         self.install_thread = None
         self.install_step = ""
         self.log_path = ""
-        self.conflict = ""  # the error shown while an OpenAct server with another backend holds the port
+        self.conflict = ""  # the error shown while an OpenAct server this Blender can't use holds the port
+        self.refused = None  # the pid of the one that refused this Blender's token (403), else None
         self.probes = {}  # runtime folder -> "" once its import probe passed this session, else the probe's error
         self.checking = ""  # the runtime folder whose import probe is running
         self.probe_id = 0  # that probe's: a result with another id comes from a superseded probe
@@ -159,7 +160,8 @@ def http(method, path, body=None, port=None, timeout=10.0):
     url = f"http://127.0.0.1:{port or STATE.port}{path}"
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if method == "POST" and STATE.token:  # every POST needs it; GETs don't, so /health never shows it around
+    # Every POST needs the token. GETs never carry it: the probes may reach a program on the port that isn't ours
+    if method == "POST" and STATE.token:
         headers["X-OpenAct-Token"] = STATE.token
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
@@ -242,9 +244,9 @@ class Worker(threading.Thread):
                 half = len(chunk.cells) // 2
                 pipeline.requeue(dataclasses.replace(chunk, cells=chunk.cells[:half]),
                                  dataclasses.replace(chunk, cells=chunk.cells[half:]))
-        elif code == 403:
-            STATE.set("error", TOKEN_REFUSED)
-            post(pipeline.answered, chunk, "error", TOKEN_REFUSED)
+        elif code == 403:  # another Blender's server: nothing fails, the cells are asked again once it has gone
+            _refused_by(STATE.health.get("pid"))
+            post(pipeline.answered, chunk, "refused", None)
         elif code == 503:  # the model failed to load: a failure, never requeued
             error = body.get("error") or "The model failed to load"
             STATE.set("error", error)
@@ -310,6 +312,13 @@ def _refuse_backend(other):
     """Treat an OpenAct server with another backend on the port like any other program there."""
     STATE.conflict = (f"Port {STATE.port} is used by an OpenAct model server with the {other} backend. "
                       "Stop it or pick another port in the preferences")
+    STATE.set("error", STATE.conflict)
+
+
+def _refused_by(pid):
+    """The server on the port refused this Blender's token (403): another Blender started it. It stays unusable, and
+    the status an error, while /health reports its pid (§10.5). Any thread."""
+    STATE.refused, STATE.conflict = pid, TOKEN_REFUSED.format(STATE.port)
     STATE.set("error", STATE.conflict)
 
 
@@ -446,6 +455,10 @@ def refresh(prefs=None):
 
 def _apply_health(health):
     STATE.health = health
+    if STATE.refused is not None and health.get("pid") == STATE.refused:  # still the server that refused the token
+        STATE.set("error", STATE.conflict)
+        return
+    STATE.refused = None
     state = health.get("status")
     if state == "ready":
         STATE.set("ready", f"{health.get('source', '')} on {health.get('device') or 'unknown device'}")
@@ -577,11 +590,12 @@ def _log_tail(lines=6):
 
 
 def stop():
-    """Stop the server this Blender started (one another Blender started refuses: /shutdown needs its token)."""
+    """Stop the server this Blender started. One another Blender started refuses (/shutdown needs its token) and keeps
+    running, which the status then says."""
     try:
-        http("POST", "/shutdown", body={}, timeout=2.0)
+        code, _reply = http("POST", "/shutdown", body={}, timeout=2.0)
     except Exception:
-        pass
+        code = 0
     process = STATE.process
     if process is not None:
         try:
@@ -593,12 +607,16 @@ def stop():
             except subprocess.TimeoutExpired:
                 process.kill()
         STATE.process = None
+    elif code == 403:
+        _refused_by(STATE.health.get("pid"))
+        return
     STATE.health = {}
     STATE.set("stopped", "")
 
 
 def shutdown_owned():
-    """On add-on unregister: stop the server only if this Blender started it."""
+    """On add-on unregister: stop the server only if this Blender started it, and the worker, whose queued chunks go.
+    The modules stay loaded (re-enabling, Reload Scripts): the next registration's passes ask again."""
     if STATE.process is not None and STATE.process.poll() is None:
         stop()
     STATE.probes.clear()  # the next registration probes again: a probe cancelled below would never report
@@ -611,6 +629,7 @@ def shutdown_owned():
     if _worker is not None:
         _worker.stopped = True  # it ends within 0.25 s, or when its request in flight returns
         _worker = None
+    pipeline.cancel_all()  # a chunk the worker still holds may come back to the queue: the next submit() sends it
 
 
 # ------------------------------------------------------------------------------ installer

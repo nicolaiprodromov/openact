@@ -251,14 +251,16 @@ class Spec:
             model = sources[0].model if sources else ""
         rows = self.rows(dataclasses.replace(job, rows=rows), answers)
         if missing or failed:
-            rows = self.stale(job, rows, shown)
+            rows = self.stale(job, rows, shown, failed)
             if all(row.source == "pending" for row in rows):  # nothing known yet: no table worth storing
                 return None, list(missing.values()), list(failed.values())
         return self.entry(job, rows, model), list(missing.values()), list(failed.values())
 
-    def stale(self, job: pipeline.Job, rows: list[pipeline.Row], shown) -> list[pipeline.Row]:
+    def stale(self, job: pipeline.Job, rows: list[pipeline.Row], shown, failed=()) -> list[pipeline.Row]:
         """The rows of a partial table (stale-while-refilling, §5.4): a row not answered yet takes the values of the
-        row of its name in `shown`, the entry its context showed last, marked stale; else neutral() values, pending."""
+        row of its name in `shown`, the entry its context showed last, marked stale; else neutral() values, pending.
+        A row whose cell failed (a key in `failed`) always takes neutral() values: nothing refills it, so the old
+        answer would stay."""
         before = {}
         if shown is not None:
             for i, name in enumerate(shown.rows.name):
@@ -268,10 +270,10 @@ class Spec:
         out = []
         for index, row in enumerate(rows):
             if row.source == "pending":
-                values, ask = before.get(row.name, ({}, ""))
+                values, ask = before.get(row.name, ({}, "")) if row.cell.key not in failed else ({}, "")
                 if all(column in values for column, _type in job.shape.columns):
                     row = dataclasses.replace(row, source="stale", values=values, ask=ask)
-                else:  # e.g. a new row, or the answer type changed
+                else:  # e.g. a new row, a failed one, or the answer type changed
                     row = dataclasses.replace(row, values=self.neutral(job, index), ask="")
             out.append(row)
         return out

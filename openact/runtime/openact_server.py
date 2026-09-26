@@ -713,7 +713,8 @@ def main(argv=None):
     TOKEN = os.environ.get("OPENACT_TOKEN", "")
     if not TOKEN and args.backend != "fake":
         log("OPENACT_TOKEN is not set: the model server runs only with the launch token its Blender passes "
-            "(--backend fake, for tests, may run without)")
+            "(--backend fake, for tests, may run without). To run it by hand, e.g. to debug it, set OPENACT_TOKEN "
+            "yourself: Blender can't use such a server (its requests get 403) until it can read the server's token")
         return 3
     ENGINE = Engine(args, FakeBackend(args) if args.backend == "fake" else SemIfTorchBackend(args))
     try:

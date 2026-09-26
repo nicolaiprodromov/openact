@@ -1,22 +1,25 @@
 """The decision pipeline (§5.5, §10.3, §10.5) in a headless Blender, against the fake model server that the add-on
 starts itself (OPENACT_BACKEND=fake), whose --record log holds every request it gets:
 - the launch token: in the server's environment, never in its argv; the server this Blender started refuses a request
-  without it or with a wrong one; every request the add-on sends carries it; a 403 fails the chunk's cells with the
-  token message (the 403 path);
-- chunks of at most 32 questions and 64 scored rows (a 40-label tournament costs 8 rows a question); a list of 300
-  items, above the server's 256 questions per request, answered correctly in chunks; the server's per-question cache
-  (cached_questions);
+  without it or with a wrong one; every request the add-on sends carries it; the 403 path, with a server another
+  Blender started: its refusal lasts while it runs (refresh, Stop Model), nothing fails, and once it has gone the
+  pass starts this Blender's own server and asks again;
+- chunks sized from /v1/capabilities before the first send, of at most 32 questions and 64 scored rows (a 40-label
+  tournament costs 8 rows a question); a list of 300 items, above the server's 256 questions per request, answered
+  correctly in chunks; the server's per-question cache (cached_questions);
 - priorities: a P0 job overtakes a P2 fill after the chunk in flight; the jobs of one class take turns; the pass's
   classes;
-- cancellation: queued chunks go and the one in flight completes; a node's new words drop its old queued chunks;
+- cancellation: queued chunks go and the one in flight completes; a node's new words drop its old queued chunks; so
+  do deleting the node and opening another file;
 - 422 isolation: the question the server names fails alone, else the chunk is halved until it travels alone;
 - the render pause (no new chunk) and the playback pause (the worker finishes, no pass writes a table), driven by the
   render_running and playing events tick() publishes; the worker never touches bpy;
 - stale-while-refilling: carried rows keep their answers, an edited row shows its old one (stale) and a new row its
   neutral value (pending), and the status record counts them with the ETA of pipeline.progress(); a new table with
-  no row known yet stores nothing;
+  no row known yet stores nothing; a row whose question failed shows its neutral value, not its old answer;
 - a simulated 5 s cold load: a P0 job queued after a P2 chunk (503 loading) is answered first once the model is ready;
   a failed load (503 error) fails the cells without requeueing them;
+- unregistering and registering again mid-fill (disable and enable, Reload Scripts): the fill completes;
 - entry validity (§5.4), from the --record log: a template bump and a Balance Option Order toggle send 0 requests;
   after a text edit only the row whose wkey changed is asked, with the node's current options.debias; Ask Again
   re-asks with it; two nodes with different toggles send their own debias;
@@ -29,8 +32,10 @@ import contextlib
 import http.client
 import json
 import os
+import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -57,7 +62,7 @@ from openact.specs.base import Spec  # noqa: E402
 ASK, MATCH = SPECS["GeometryNodeOpenActAsk"], SPECS["GeometryNodeOpenActMatch"]
 CLASSIFY, DIALS, RULES = (SPECS[f"GeometryNodeOpenAct{name}"] for name in ("Classify", "Dials", "Rules"))
 POINTS = 5
-REFUSED = 3  # the 403s this suite causes on purpose: 2 requests sent straight to the server, 1 with a wrong token
+REFUSED = 2  # the 403s this suite causes on purpose in the log: 2 requests sent straight to the server
 LONG = "x " * 20000  # far above the fake model's 4096-token limit, like a prompt too long for SemIf
 
 
@@ -217,6 +222,31 @@ def entry_of(node):
     return next((entry for entry in S.load(node).entries if entry.gn == gn), None)
 
 
+def whole(node, rows):
+    """True once the node's table of `rows` rows is stored, every row answered by the model."""
+    entry = entry_of(node)
+    return entry is not None and entry.rows.src == "m" * rows
+
+
+def answers_health(port):
+    """True while a server answers /health on the port."""
+    try:
+        return server.http("GET", "/health", port=port, timeout=1.0)[0] == 200
+    except OSError:
+        return False
+
+
+def foreign_server():
+    """A fake server another Blender started, on a port of its own, with a launch token this Blender hasn't got:
+    (port, process)."""
+    port = free_port()
+    env = dict(server._child_env(), OPENACT_TOKEN=secrets.token_hex(32))
+    process = subprocess.Popen([sys.executable, server.SERVER_SCRIPT, "--port", str(port), "--backend", "fake",
+                                "--parent-pid", str(os.getpid())], env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return port, process
+
+
 # ------------------------------------------------------------------------------ the token
 
 def phase_token():
@@ -232,27 +262,53 @@ def phase_token():
 
 
 def phase_refused():
-    """The 403 path: a chunk the server refuses for its token fails, the status says why, and nothing is retried."""
-    job = match_job("refused", "A locked room.", 3)
-    saved, server.STATE.token = server.STATE.token, "f" * 64
-    start = len(TAP.log)
+    """The 403 path (§10.5): a server another Blender started holds the port. Its refusal lasts while it runs: the
+    status stays an error that says what to do, Stop Model can't stop it and says so, and nothing fails. Once it has
+    gone, the pass starts this Blender's own server, and the node is answered with no Ask Again."""
+    port, foreign = foreign_server()
+    message = server.TOKEN_REFUSED.format(port)
+    server.stop()
+    P._Defaults.port = port
     try:
-        pipeline.submit(job, cells(job), 0)
-        settle()
+        up = drive(engine, lambda: answers_health(port), 15)
+        _tree, (node,), _obj = match_tree("Foreign", ("Is it foreign?", "coin, stamp, flag"))
+        start = len(TAP.log)
+        engine.run_pass()  # auto-start attaches to that server, and the next pass asks it
+        refused = drive(engine, lambda: engine.STATUS.get(node.uid) == ('ERROR', message), 15)
+        keys = [cell.key for cell in cells(engine._jobs(node)[0][1])]
+        got = (server.status(), [code for _body, code, _reply in TAP.since(start)],
+               [key for key in keys if key in pipeline.FAILED or key in pipeline.PENDING])
+        check("403: a server another Blender started refuses this Blender's token: the status and the node show an "
+              "error that says what to do, after one request, and its cells neither fail nor stay pending",
+              up and refused and got == (("error", message), [403], []), got)
+        server.refresh()
+        drive(engine, lambda: False, 1.5)  # the probe, and 1.5 s of passes
+        check("403: while it runs, a refresh keeps the error (its pid is remembered), and nothing is asked again",
+              server.status() == ("error", message) and len(TAP.log) == start + 1,
+              (server.status(), len(TAP.log) - start))
+        server.stop()
+        check("403: Stop Model can't stop it (/shutdown needs its token): the status keeps the error, and it runs on",
+              server.status() == ("error", message) and answers_health(port), server.status())
+        foreign.terminate()
+        foreign.wait(10)
+        server.refresh()  # as tick() does every 5 s
+        done = drive(engine, lambda: whole(node, 3), 30)
+        check("403: once it has gone, the pass starts this Blender's own server and the node is answered, with no Ask "
+              "Again", done and server.STATE.process is not None and engine.STATUS[node.uid][0] == 'CHECKMARK',
+              (server.status(), engine.STATUS.get(node.uid)))
     finally:
-        server.STATE.token = saved
-    failed = {pipeline.FAILED.get(cell.key) for cell in cells(job)}
-    check("403: the chunk's cells fail with the token message, the status shows it, and nothing is retried",
-          failed == {server.TOKEN_REFUSED} and server.status() == ("error", server.TOKEN_REFUSED)
-          and [code for _body, code, _reply in TAP.since(start)] == [403], (failed, server.status()))
-    pipeline.forget(cell.key for cell in cells(job))
-    server.refresh()
-    check("403: with its own token the server is ready again", drive(engine, server.is_ready, 10), server.status())
+        if foreign.poll() is None:
+            foreign.kill()
+        server.stop()
+        P._Defaults.port = PORT
+    server.start()
+    check("403: this Blender's server is ready again on its own port", drive(engine, server.is_ready, 30),
+          server.status())
 
 
 def phase_token_audit():
     statuses = Counter(record["status"] for record in records())
-    check("token: every request the add-on sent carried the token: the only 403s are the 3 this suite caused",
+    check(f"token: every request the add-on sent carried the token: the only 403s are the {REFUSED} this suite caused",
           statuses[403] == REFUSED, statuses)
 
 
@@ -260,6 +316,13 @@ def phase_token_audit():
 
 def phase_chunks():
     """The chunk limits (§5.5), and a list of 300 items where a request may hold 256 questions (§10.4)."""
+    pipeline.LIMITS = (4, 8)  # not the server's: the worker must size the chunks before its first send to it
+    server.worker().sized = None  # as for a server process it hasn't sent to yet
+    sized = match_job("sized", "A measured room.", 3)
+    pipeline.submit(sized, cells(sized), 0)
+    settle()
+    check("chunks: before its first send to a server, the worker sizes the chunks from its /v1/capabilities (32 "
+          "questions and 2 x 32 rows)", pipeline.LIMITS == (32, 64), pipeline.LIMITS)
     big = match_job("three hundred", "A long list of things.", 300)
     labels = csvfmt.parse_inline_set("; ".join(f"label {i}" for i in range(40)), "one_of")
     tournament = CLASSIFY.job(("", "A shelf of things.", "", "", "", ""), [lists.Item(f"thing {i}") for i in range(20)],
@@ -404,8 +467,8 @@ def phase_isolation():
 
 def phase_pauses():
     worker = (server.Worker.run, server.Worker.send, server.Worker.wait, server.Worker.size, TAP.http, server.post,
-              server._offline, server._State.set, pipeline.take, pipeline.requeue, pipeline.build_request,
-              pipeline.size_chunks)
+              server._offline, server._State.set, server._refused_by, pipeline.take, pipeline.requeue,
+              pipeline.build_request, pipeline.size_chunks)
     check("pauses: the worker never touches bpy (neither its code nor what it calls names it); tick() publishes what "
           "it reads", not [fn.__name__ for fn in worker if "bpy" in fn.__code__.co_names])
     job, start = match_job("render", "A render farm.", 4), len(records())
@@ -468,6 +531,29 @@ def phase_stale():
           entry is not None and entry.rows.src == "mmmmm" and pipeline.progress(node.uid) is None and sent == [
               ("Item: chair — a steel chair\nIs it made of metal?", True), ("Item: rug\nIs it made of metal?", True)],
           (entry and entry.rows.src, sent))
+
+
+def phase_failed():
+    """A row whose new question failed shows its neutral value, not its old meaning's answer: nothing refills it
+    (§5.4, §6.0)."""
+    items = "spoon; chair; lamp"
+    _tree, (node,), obj = match_tree("Failed", ("Is it made of glass?", items))
+    settle()
+    first, error = read(obj), "The model refused: simulated model failure"
+    TAP.rewrite = lambda code, reply: (500, {"error": "simulated model failure"}) if code == 200 else (code, reply)
+    try:
+        node.inputs["Items"].default_value = items.replace("lamp", "lamp: a glass lamp")
+        engine.run_pass()
+        failed = drive(engine, lambda: engine.STATUS.get(node.uid) == ('ERROR', error) and not pipeline.PENDING, 15)
+    finally:
+        TAP.rewrite = None
+    entry, got, status = entry_of(node), read(obj), engine.STATUS[node.uid]
+    counts = (status.rows, status.answered, status.stale, status.pending)
+    check("failed row: once its question failed, the row shows its neutral value, pending, not its old meaning's "
+          "answer; the status shows the failure, and the fill is over", failed and entry is not None
+          and entry.rows.src == "mmp" and first[2] != 0.0 and got == first[:2] + [0.0] + first[3:]
+          and counts == (3, 2, 0, 1) and pipeline.progress(node.uid) is None,
+          (entry and entry.rows.src, first, got, counts))
 
 
 # ------------------------------------------------------------------------------ entry validity (§5.4)
@@ -556,6 +642,88 @@ def phase_cold_load():
     pipeline.forget(cell.key for cell in cells(job))
     restart()
     check("cold load: the server starts again", drive(engine, server.is_ready, 30), server.status())
+
+
+# ------------------------------------------------------------------------------ leaving a fill
+
+def phase_reregister():
+    """Disabling and enabling the add-on, or Reload Scripts, mid-fill: the add-on's modules stay loaded. Unregistering
+    stops the worker and drops the queued chunks (the one it held may come back to the queue); after registering, the
+    next pass starts a worker again, which completes the fill."""
+    job = match_job("restart", "A silent room.", 40)
+    with paused():
+        pipeline.submit(job, cells(job), 2)
+        server.worker().stopped = True  # gone, as after an unregister, with its chunks still queued
+        server._worker = None
+        pipeline.submit(job, cells(job), 2)  # every cell is pending already
+        restarted = server._worker is not None and server._worker.is_alive()
+    server.worker()  # so that a failed check leaves no work behind
+    settle()
+    check("reregister: a submit whose cells are all pending already starts a worker when none runs",
+          restarted and all(pipeline.cached(cell.key) for cell in cells(job)))
+
+    _tree, (node,), _obj = match_tree("Reregister", ("Is it loud?", ", ".join(f"bell {i}" for i in range(100))))
+    TAP.delay = 2.0
+    TAP.started.clear()
+    try:
+        engine.run_pass()  # 4 chunks: the worker holds the first
+        TAP.started.wait(10)
+        asked = cells(engine._jobs(node)[0][1])
+        held, dropped = {cell.key for cell in asked[:32]}, {cell.key for cell in asked[32:]}
+        engine.unregister()  # what the add-on's unregister() does to the engine and the server
+        server.shutdown_owned()
+        left = {cell.key for chunk in queued(node.uid) for cell in chunk.cells}
+    finally:
+        TAP.delay = 0.0
+    check("reregister: unregistering drops the queued chunks, whose cells stop being pending; only the chunk the "
+          "worker held may stay", not dropped & set(pipeline.PENDING) and left <= held,
+          (len(dropped & set(pipeline.PENDING)), len(left)))
+    engine.register()
+    server.refresh()
+    start = len(records())
+    done = drive(engine, lambda: whole(node, 100) and not pipeline.PENDING, 30)
+    sent = Counter(text for text, _debias in questions(start))
+    check("reregister: after registering, the next pass starts a worker, and the fill completes with no bell asked "
+          "twice", done and max(sent.values(), default=0) == 1, (done, len(sent), max(sent.values(), default=0)))
+
+
+def fill_then(name, question, leave):
+    """Start a 100-item fill of a new node, and leave(tree, obj) it while the worker holds the first chunk: (its cells,
+    the chunks still queued for it, the requests the fake server answered about it since)."""
+    tree, (node,), obj = match_tree(name, (question, ", ".join(f"{name.lower()} {i}" for i in range(100))))
+    start = len(records())
+    TAP.delay = 2.0
+    TAP.started.clear()
+    try:
+        engine.run_pass()  # 4 chunks
+        TAP.started.wait(10)
+        asked, uid = cells(engine._jobs(node)[0][1]), node.uid
+        leave(tree, obj)
+        left = queued(uid)
+    finally:
+        TAP.delay = 0.0
+    settle()
+    sent = [record for record in records(start) if record["request"] and any(
+        one["instructions"].endswith(f"\n{question}") for one in record["request"]["questions"].values())]
+    return asked, left, sent
+
+
+def phase_gone():
+    """The queued chunks of a deleted node, and of a closed file, go (§5.5): the chunk in flight completes into MEMORY,
+    and nothing more is sent for them."""
+    def delete(tree, obj):
+        bpy.data.objects.remove(obj)
+        bpy.data.node_groups.remove(tree)
+        engine.run_pass()
+
+    for what, name, question, leave in (
+            ("a deleted node: the next pass drops its queued chunks", "Ghost", "Is it a ghost?", delete),
+            ("another file opened: every queued chunk of the closed one goes", "Door", "Is it a door?",
+             lambda _tree, _obj: bpy.ops.wm.read_homefile(use_empty=True))):
+        asked, left, sent = fill_then(name, question, leave)
+        check(f"{what}; the chunk in flight completes into MEMORY, and no other request is sent about it",
+              not left and len(sent) == 1 and all(pipeline.cached(cell.key) for cell in asked[:32])
+              and not any(pipeline.cached(cell.key) for cell in asked[32:]), (len(left), len(sent)))
 
 
 # ------------------------------------------------------------------------------ the plan cache
@@ -660,8 +828,11 @@ def main():
         phase_isolation()
         phase_pauses()
         phase_stale()
+        phase_failed()
         phase_validity()
         phase_cold_load()
+        phase_reregister()
+        phase_gone()
         phase_token_audit()
         phase_timing()
     except Exception:

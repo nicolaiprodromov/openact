@@ -232,6 +232,8 @@ def run_pass(everything=True):
     _has_nodes = bool(nodes)
     _group_count = -1 if nodes else len(bpy.data.node_groups)
     if not nodes:
+        for uid in LIVE:  # the nodes are gone: their queued chunks too
+            pipeline.cancel(uid, below=math.inf)
         PLANS.clear()
         LAST_SHOWN.clear()
         LIVE.clear()
@@ -261,8 +263,9 @@ def run_pass(everything=True):
     for cache in (PLANS, LAST_SHOWN):  # contexts that disappeared, and nodes that did
         for key in [key for key in cache if key[1] not in contexts.get(key[0], ())]:
             del cache[key]
-    for uid in [uid for uid in LIVE if uid not in contexts]:
+    for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
         del LIVE[uid]
+        pipeline.cancel(uid, below=math.inf)
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
     redraw()
 
@@ -280,8 +283,9 @@ def _process(tree, node, contexts):
     entries = node_store.entries
     contexts = contexts or [Ctx(None, None, (), tree)]
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
-    hidden = {}  # (gn, words key) of stored entries whose words mean something else now, kept for their rows -> the
-    instead = {}  # partial table shown in their place, or None; and (uid, ctx key) -> that table's words key
+    # Stored entries whose words mean something else now stay stored for their rows, but leave the graph (§5.4):
+    hidden = {}  # their (gn, words key) -> the partial table shown in their place, or None while nothing is known
+    instead = {}  # (uid, ctx key) -> the words key of the partial table that context shows in a hidden entry's place
     problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
     # §6.0: the sockets follow the live jobs (Rules, Classify). Jobs that disagree answer nothing, so the last good
@@ -572,6 +576,7 @@ def on_depsgraph_update(scene, depsgraph):
 
 @persistent
 def on_load_post(*_args):
+    pipeline.cancel_all()  # asked for the file just closed; the chunk in flight still lands in MEMORY
     STATUS.clear()
     pipeline.FAILED.clear()
     PLANS.clear()
