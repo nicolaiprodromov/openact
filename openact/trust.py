@@ -57,6 +57,8 @@ def _auto_run(path):
 def is_trusted() -> bool:
     """Whether this .blend may read files outside its own folder tree."""
     path = bpy.data.filepath
+    if TRUST["opened"] is None and not path:  # enabled on an unsaved file: it was created in this session
+        TRUST["opened"] = ""
     if TRUST["opened"] == "" or not path:  # created in this session, saved since or not
         return True
     if _auto_run(path):
@@ -98,9 +100,7 @@ def on_load_post(*_args):
     TRUST["opened"] = bpy.data.filepath
 
 
-def register():
-    if not bpy.data.filepath:  # the add-on starts on an unsaved file: it was created in this session
-        TRUST["opened"] = ""
+def register():  # bpy.data is off limits while add-ons register: is_trusted() looks at the file later
     if on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load_post)
 

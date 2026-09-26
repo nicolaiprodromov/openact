@@ -439,6 +439,8 @@ bpy.ops.wm.open_mainfile(filepath=blend)
 reader = bpy.data.node_groups["Trust"].nodes["Reader"]
 ctx = evaluator.Ctx(None, None, (), reader.id_data)
 check("trust: an opened file without Auto Run is not trusted", not trust.is_trusted() and trust.TRUST["opened"])
+check("watch: its load_post handler survives opening a file, and cleared the watcher",
+      watch.on_load_post in bpy.app.handlers.load_post and not watch.WATCH.files)
 opened = []
 real_open = builtins.open
 
