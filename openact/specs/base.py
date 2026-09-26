@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import time
 
 from .. import pipeline, store
@@ -21,9 +22,16 @@ SOURCES = {"lock": "l", "code": "c", "model": "m", "pending": "p", "stale": "s",
 
 
 def option_text(option) -> str:
-    """An option (name, when) as the model reads it: "name: when", or the name alone."""
-    name, when = option
+    """An option as the model reads it: "name: when", or the name alone. The one definition (sources.py
+    re-exports it): takes a csvfmt.Option or lists.Item, or a (name, when) pair."""
+    name, when = (option.name, option.when) if hasattr(option, "name") else option
     return f"{name}: {when}" if when else name
+
+
+def warnings(problems) -> tuple[str, ...]:
+    """The warnings among csvfmt Problems (ItemList.problems, AnswerSet.problems) as status texts."""
+    return tuple(f"{os.path.basename(p.file)} line {p.line}: {p.message}" if p.file and p.line else p.message
+                 for p in problems if p.severity == "warning")
 
 
 def state_text(context: str, empty: str = NO_CONTEXT) -> str:

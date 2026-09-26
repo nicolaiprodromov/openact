@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 
 from . import csvfmt
 from .csvfmt import AnswerSet, Option
+from .specs.base import option_text  # noqa: F401  (the one definition; callers import it from either module)
 
 try:
     import bpy
@@ -113,11 +114,6 @@ def answer_set(node, ctx, socket, kind: str, spec: str = "", empty_hint: str = "
         return csvfmt.parse_inline_set(text, kind)
     except csvfmt.CsvError as error:
         raise Unresolvable(f"{name}: {error}") from None
-
-
-def option_text(option) -> str:
-    """'name: when', or the name alone (design 10.2)."""
-    return f"{option.name}: {option.when}" if option.when else option.name
 
 
 def criteria(answers: AnswerSet, kind: str):

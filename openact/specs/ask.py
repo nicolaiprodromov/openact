@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from .. import pipeline
-from .base import Spec, confidence, state_text
+from .base import KEY, Spec, confidence, state_text, warnings
 
-AMOUNT_LEVELS = ("Not at all", "Slightly", "Moderately", "Very", "Extremely")
-YES_NO = (("yes", ""), ("no", ""))  # without Answers the server offers "Yes." and "No."
+ANSWERS = ("Optional answer set. Yes / No: 'yes: <when>; no: <when>'. Amount: 2-16 levels, lowest first, e.g. "
+           "'none; dusting; patchy; thick; buried'. Or a .csv path. Empty: Yes / No, or Not at all ... Extremely")
 
 
 class AskSpec(Spec):
@@ -25,36 +25,62 @@ class AskSpec(Spec):
     FALLBACK = {"Answer": 0.0, "Yes": False, "Confidence": 0.0}
     empty_hint = "Type a question"
 
+    def interface(self, node):
+        from ..inner import SocketDef  # imports bpy
+        from ..sources import csv_inputs
+
+        return [*(SocketDef(*args) for args in self.SOCKETS), *csv_inputs("Answers", ANSWERS), SocketDef(*KEY)]
+
+    def answers(self, node, ctx):
+        from .. import sources  # imports bpy
+
+        return sources.answer_set(node, ctx, "Answers", sources.KINDS[node.answer_type], spec="ask")
+
+    def listed(self, node, ctx):
+        from .. import lists  # imports bpy
+
+        source = lists.csv_source(node, "Answers", ctx)  # an inline set is in gn already
+        if source is None:
+            return None
+        doc = lists.load_csv(node, source)
+        return doc.path, source.delimiter, doc.stamp
+
     def plan(self, node, ctx):
         from ..evaluator import Hint  # imports bpy
 
         gn = self.gn(node, ctx)
         if not gn[0].strip():
             raise Hint(self.empty_hint)
-        return self.job(gn, node.answer_type, node.balance_order, node.uid)
+        answers = self.answers(node, ctx)
+        job = self.job(gn, node.answer_type, node.balance_order, node.uid, answers)
+        job.problems = warnings(answers.problems)
+        return job
 
-    def job(self, gn, answer_type, debias, uid=""):
-        """The Job for these words. Pure, so the pure suites plan exactly like the pass."""
+    def job(self, gn, answer_type, debias, uid="", answers=None):
+        """The Job for these words and answer set (csvfmt.AnswerSet; None: the default Yes / No or five levels).
+        Pure, so the pure suites plan exactly like the pass."""
+        from .. import sources  # pure without bpy
+
+        kind = sources.KINDS[answer_type]
+        answers = answers or sources.default_set(kind)
         question, context = gn[0].strip(), gn[1].strip()
-        if answer_type == 'AMOUNT':
-            options = tuple((level, "") for level in AMOUNT_LEVELS)
-            asked = {"type": "score", "instructions": question, "criteria": list(AMOUNT_LEVELS)}
-            columns = (("amount", "FLOAT"), ("c", "FLOAT"))
-        else:
-            options = YES_NO
-            asked = {"type": "noul", "instructions": question}
-            columns = (("p", "FLOAT"), ("c", "FLOAT"))
+        options = tuple((option.name, option.when) for option in answers.options)
+        asked = sources.question(kind, question, answers)
+        columns = (("amount", "FLOAT"), ("c", "FLOAT")) if kind == "amount" else (("p", "FLOAT"), ("c", "FLOAT"))
         state = state_text(context)
-        cell = pipeline.Cell(pipeline.cell_key(asked["type"], state, question, asked.get("criteria"), debias), state,
-                             asked, pipeline.cost(len(options), debias))
+        criteria = asked["criteria"]
+        ordered = list(criteria.items()) if isinstance(criteria, dict) else criteria  # the cell key keeps the order
+        cell = pipeline.Cell(pipeline.cell_key(asked["type"], state, question, ordered, debias), state, asked,
+                             pipeline.cost(len(options), debias))
         row = pipeline.Row(question, pipeline.wkey(self.name, answer_type, [question, context], [], options),
                            cell=cell)
         shape = pipeline.TableShape(1, columns)
-        return pipeline.Job(uid, tuple(gn), pipeline.words_key(gn, [], answer_type, shape.digest(), [row.wkey]),
+        csv = [answers.doc.text_hash] if answers.doc is not None else []
+        return pipeline.Job(uid, tuple(gn), pipeline.words_key(gn, csv, answer_type, shape.digest(), [row.wkey]),
                             shape, [row], answer_type=answer_type, debias=debias)
 
     def values(self, index, answer):
-        if "amount" in answer:
+        if "amount" in answer:  # parse() gave score / (L - 1), as sources.amount_value() does for custom levels
             return {"amount": answer["amount"], "c": confidence('AMOUNT', answer["probabilities"])}
         return {"p": answer["p"], "c": confidence('YES_NO', (answer["p"], 1.0 - answer["p"]))}
 
@@ -70,6 +96,6 @@ class AskSpec(Spec):
         return f"{'Yes' if p >= 0.5 else 'No'}  ({p * 100:.0f}% yes)"
 
     def build(self, b, gi, go, entries):
-        index = b.match_chain(self.word_sockets(gi), [e.gn for e in entries])
+        index = b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
         for name, data_type, y in (("Answer", 'FLOAT', 200), ("Yes", 'BOOLEAN', 0), ("Confidence", 'FLOAT', -200)):
             b.lookup(index, data_type, self.FALLBACK[name], [e.single[name] for e in entries], go.inputs[name], y)

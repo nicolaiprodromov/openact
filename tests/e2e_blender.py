@@ -75,6 +75,7 @@ def build_scene():
     tree.links.new(g_in.outputs["Scene"], group.inputs["Ctx"])
 
     lamp = tree.nodes.new("GeometryNodeOpenActPick")  # collection mode + Instance output
+    lamp.list_source = 'COLLECTION'
     lamp.inputs["Prompt"].default_value = "something that gives light"
     lamp.inputs["Collection"].default_value = props
 

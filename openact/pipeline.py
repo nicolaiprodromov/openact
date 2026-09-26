@@ -74,6 +74,7 @@ class Job:
     generation: int = 0  # bumped when the node's words change, so stale chunks are dropped
     answer_type: str = ""  # 'YES_NO', 'AMOUNT' or 'ONE_OF'
     debias: bool = True  # the node's Balance Option Order: its requests carry it
+    problems: tuple[str, ...] = ()  # warnings of a usable plan (e.g. a CSV's), for the node's status
 
 
 def digest(*parts) -> str:
