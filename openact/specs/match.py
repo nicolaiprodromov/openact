@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, warnings
+from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings, yes_no_text
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
 UNSURE_BELOW = 0.30  # the default of the planned unsure_below preference (4.e)
@@ -124,6 +124,7 @@ class MatchSpec(PerItemSpec):
             SocketDef('OUTPUT', "Selection", 'NodeSocketBool', "Probability >= Threshold, for an answered item"),
             SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat',
                       "How sure the answer for item ID is (0 = no idea, 1 = certain)"),
+            *overrides_inputs(),
             SocketDef(*KEY),
         ]
 
@@ -141,14 +142,22 @@ class MatchSpec(PerItemSpec):
         items, answers = self.resolved(node, ctx)
         job = self.job(gn, node.answer_type, items, answers, node.balance_order, node.uid)
         job.problems = warnings(items.problems + answers.problems)  # the pass shows them (§17.1)
-        return job
+        return self.locked(node, ctx, job)  # after the warnings: locked() appends its own
 
     def job(self, gn, answer_type, items, answers, debias, uid=""):
         """The Job for these words, items (an ItemList or its items) and answer set. Pure, like Ask's and Pick's."""
         from .. import sources
 
         cells = sources.per_item_cells(self.name, answer_type, items, answers, gn[0], gn[1], debias)
-        return self.table(gn, answer_type, cells, (getattr(items, "doc", None), answers.doc), debias, uid)
+        return self.table(gn, answer_type, cells, (getattr(items, "doc", None), answers.doc), debias, uid,
+                          options=tuple(option.name for option in answers.options))
+
+    def lock_values(self, job, rows, answer):
+        value = lock_answer(job.answer_type, answer, job.options)
+        return value if isinstance(value, str) else [{"p": value, "c": 1.0}]
+
+    def answer_text(self, job, index, values):
+        return number_text(values["p"]) if job.answer_type == 'AMOUNT' else yes_no_text(values["p"])
 
     def values(self, index, answer):
         if "amount" in answer:

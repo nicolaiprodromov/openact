@@ -13,6 +13,7 @@ import dataclasses
 
 from .. import csvfmt, pipeline
 from .base import KEY, Spec, confidence, option_text, warnings
+from .base import named, number_text, overrides_inputs, parse_number, yes_no_text  # PR-21: the Overrides CSV
 
 SOCKETS = {"yes_no": 'NodeSocketBool', "amount": 'NodeSocketFloat', "one_of": 'NodeSocketInt'}
 KINDS = {socket: kind for kind, socket in SOCKETS.items()}
@@ -69,6 +70,7 @@ class DialsSpec(Spec):
                                     ".csv path with columns setting, type, question, answers, min, max"),
             *(SocketDef('OUTPUT', name, SOCKETS[kind], TIPS[kind]) for name, kind in outputs),
             SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat', "The lowest confidence among the settings (0-1)"),
+            *overrides_inputs(),
             SocketDef(*KEY),
         ]
 
@@ -119,7 +121,7 @@ class DialsSpec(Spec):
             raise Hint("Type a prompt")
         job = self.job(gn, settings, node.balance_order, node.uid, hashes)
         job.problems = problems
-        return job
+        return self.locked(node, ctx, job)  # after the warnings: locked() appends its own
 
     def job(self, gn, settings, debias, uid="", csv_hashes=()):
         """The Job for these words and settings: one row per setting, every question about the Prompt, so one request.
@@ -137,7 +139,8 @@ class DialsSpec(Spec):
             rows.append(pipeline.Row(setting.name, wkey, cell=cell))
         shape = DialsShape(len(rows), COLUMNS, tuple((s.name, s.type, s.min, s.max) for s in settings))
         words_key = pipeline.words_key(gn, list(csv_hashes), "", shape.digest(), [row.wkey for row in rows])
-        return pipeline.Job(uid, tuple(gn), words_key, shape, rows, debias=debias)
+        return pipeline.Job(uid, tuple(gn), words_key, shape, rows, debias=debias,
+                            options=tuple(tuple(name for name, _when in s.answers) for s in settings))
 
     @staticmethod
     def question(setting) -> dict:
@@ -292,3 +295,29 @@ class DialsSpec(Spec):
                 value = entry.rows.v["value"][i]
                 return (mapped(kind, value) if kind != "amount" else float(value)), setting["min"], setting["max"]
         return FALLBACK[kind], 0.0, 1.0
+
+    # ------------------------------------------------------------------ PR-21: the Overrides CSV (§7.6)
+
+    OVERRIDE_KEYS = ("setting",)
+
+    def lock_values(self, job, rows, answer):
+        _name, kind, low, high = job.shape.settings[rows[0]]
+        if kind == "yes_no":
+            value = 1.0 if answer.casefold() == "yes" else 0.0 if answer.casefold() == "no" else None
+            return f"'{answer}' is not yes or no" if value is None else [{"value": value, "c": 1.0}]
+        if kind == "amount":  # in output units, mapped back to 0-1
+            number = parse_number(answer)
+            if number is None or not min(low, high) <= number <= max(low, high):
+                return f"'{answer}' is not a number from {low:g} to {high:g}"
+            return [{"value": (number - low) / (high - low) if high != low else 0.0, "c": 1.0}]
+        chosen = named(answer, job.options[rows[0]])
+        return f"'{answer}' is not one of the answers" if chosen is None else [{"value": float(chosen), "c": 1.0}]
+
+    def answer_text(self, job, index, values):
+        _name, kind, low, high = job.shape.settings[index]
+        if kind == "yes_no":
+            return yes_no_text(values["value"])
+        if kind == "amount":
+            return number_text(mapped(kind, values["value"], low, high))
+        options, chosen = job.options[index], int(round(values["value"]))
+        return options[chosen] if 0 <= chosen < len(options) else ""

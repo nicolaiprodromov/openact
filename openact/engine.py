@@ -31,6 +31,7 @@ from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
+from .specs.base import orphaned
 from .specs.pick import PickSpec
 from .watch import WATCH
 
@@ -315,6 +316,7 @@ def _process(tree, node, contexts):
             problems.append(str(error))
             changed = rows = False
             node_store = store.load(node)
+    warnings += orphaned([job for job, _ctx in jobs.values()])  # PR-21: locks no context's rows use (§7.6)
     last = [LAST_SHOWN.get((node.uid, ctx.key())) for ctx in contexts]
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     if not inner.update_values(node, node_store, live, default, rows=rows):  # values only when it can (§8.8)

@@ -12,13 +12,16 @@ import math
 import os
 import time
 
-from .. import pipeline, store
+from .. import csvfmt, pipeline, store
 
 NO_CONTEXT = "No additional context."
 KEY = ('INPUT', "Key", 'NodeSocketString',
        "Tells apart objects that share every other word, e.g. typed per object on the modifier. Compared, never "
        "sent to the model", "word", True)  # the last word of every node (§6.0), hidden until Ctrl H
 SOURCES = {"lock": "l", "code": "c", "model": "m", "pending": "p", "stale": "s", "error": "e"}  # Row.source -> src
+OVERRIDES = ("Optional Overrides CSV (.csv path). Rows with lock = 1 replace the model's answer and are never asked. "
+             "Write Overrides CSV (sidebar) starts one from the current answers")
+UNSURE_BELOW = 0.30  # 4.e: the exported unsure column
 
 
 def option_text(option) -> str:
@@ -60,6 +63,63 @@ def confidence(answer_type: str, distribution) -> float:
         top, runner_up = sorted(probabilities, reverse=True)[:2]
         value = top - runner_up
     return round(min(max(value, 0.0), 1.0), 12)  # rounded, so a uniform answer gives exactly 0
+
+
+def overrides_inputs() -> list:
+    """The Overrides word and its CSV companion, hidden like Key (§6.0)."""
+    from ..sources import csv_inputs  # imports bpy
+
+    return csv_inputs("Overrides", OVERRIDES, hidden=True)
+
+
+def named(answer: str, names) -> int | None:
+    """The position of answer among names, ignoring case; None when absent."""
+    folded = [name.casefold() for name in names]
+    return folded.index(answer.casefold()) if answer.casefold() in folded else None
+
+
+def parse_number(text):
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def lock_answer(answer_type: str, answer: str, levels=()):
+    """A Yes/No lock's p (yes, no or a probability 0-1) or an Amount lock's 0-1 (a number 0-1 or a level name,
+    at its position / (L - 1)); else why the answer names nothing valid (str)."""
+    number = parse_number(answer)
+    if answer_type == 'AMOUNT':
+        at = named(answer, levels) if number is None else None
+        if number is not None and 0.0 <= number <= 1.0:
+            return number
+        if at is not None and len(levels) > 1:
+            return at / (len(levels) - 1)
+        return f"'{answer}' is not a number from 0 to 1 or a level name"
+    if answer.casefold() in ("yes", "no"):
+        return float(answer.casefold() == "yes")
+    if number is not None and 0.0 <= number <= 1.0:
+        return number
+    return f"'{answer}' is not yes, no or a number from 0 to 1"
+
+
+def number_text(value: float) -> str:
+    """0.625 -> "0.625", 1.0 -> "1": how exported numbers read."""
+    return f"{value:.3f}".rstrip("0").rstrip(".") or "0"
+
+
+def yes_no_text(p: float) -> str:
+    return "yes" if p >= 0.5 else "no"
+
+
+def orphaned(jobs) -> list[str]:
+    """The orphaned-lock warnings of a node's jobs: locks that no context's rows use (§7.6)."""
+    locks = {}
+    for job in jobs:
+        for lock, warning in job.locks.items():
+            locks[lock] = "" if locks.get(lock) == "" or not warning else warning
+    return [warning for warning in locks.values() if warning]
 
 
 def stored_rows(entry) -> list[pipeline.Row]:
@@ -107,7 +167,7 @@ class Spec:
     def fingerprint(self, node, ctx) -> str:
         """Everything plan() reads, hashed: while it is unchanged, the Job planned from it still holds (§5.3)."""
         return pipeline.digest(self.name, self.PROMPT_VERSION, self.gn(node, ctx), getattr(node, "answer_type", ""),
-                               node.balance_order, self.listed(node, ctx))
+                               node.balance_order, self.listed(node, ctx), self.overrides_stamp(node, ctx))
 
     def plan(self, node, ctx) -> pipeline.Job:
         """The node's Job in ctx. Raises Hint, Pending or Unresolvable."""
@@ -154,7 +214,7 @@ class Spec:
                 carried.setdefault(row.wkey, row)
         rows, answers, missing, failed = [], {}, {}, {}
         for row in job.rows:
-            old = carried.get(row.wkey)
+            old = carried.get(row.wkey) if row.source != "lock" else None  # a lock wins over any stored answer
             if old is not None:
                 row = dataclasses.replace(row, source=old.source, values=old.values, ask=old.ask)
             elif row.cell is not None:
@@ -186,6 +246,98 @@ class Spec:
                             ask=[asks.index(row.ask) for row in rows], src="".join(SOURCES[row.source] for row in rows),
                             v={column: [row.values[column] for row in rows] for column, _type in job.shape.columns}),
             single=self.single(rows))
+
+    # ------------------------------------------------------------------ the Overrides CSV (§7.6)
+
+    OVERRIDE_KEYS: tuple[str, ...] = ("item",)  # the Overrides CSV's key columns
+
+    def override_keys(self, job) -> list[str]:
+        return list(self.OVERRIDE_KEYS)
+
+    def override_units(self, job) -> list:
+        """(key cells, row indices) of each lockable unit of the table: by default each named row, by its name."""
+        return [((row.name,), (i,)) for i, row in enumerate(job.rows) if row.name]
+
+    def lock_values(self, job, rows, answer: str):
+        """The values a lock with this answer gives the unit's rows (one dict per row), or why the answer names
+        nothing valid (str)."""
+        raise NotImplementedError
+
+    def answer_text(self, job, index: int, values: dict) -> str:
+        """Row `index`'s answer as the Overrides CSV writes it: what lock_values() reads back."""
+        raise NotImplementedError
+
+    def export_unit(self, job, rows, table) -> tuple[str, float | None, str]:
+        """(answer, confidence, source) of a unit for the Overrides CSV; table: (source, values) of every row."""
+        source, values = table[rows[0]]
+        if not values:  # pending: nothing to write yet
+            return "", None, source
+        return self.answer_text(job, rows[0], values), values.get("c"), source
+
+    def overrides(self, node, ctx):
+        """The Overrides CSV of ctx: (CsvSource, CsvDoc), or None when the node has none. Raises Hint or
+        Unresolvable."""
+        from .. import lists  # imports bpy
+
+        source = lists.csv_source(node, "Overrides", ctx)
+        return None if source is None else (source, lists.load_csv(node, source))
+
+    def overrides_stamp(self, node, ctx):
+        """The Overrides CSV in the fingerprint, so an edit plans again: (path, delimiter, stamp)."""
+        from ..evaluator import Hint, Pending, Unresolvable  # imports bpy
+
+        try:
+            found = self.overrides(node, ctx)
+        except (Hint, Pending, Unresolvable) as error:  # plan() raises it again, and the plan cache keeps it
+            return f"{type(error).__name__}: {error}"
+        return None if found is None else [found[1].path, found[0].delimiter, list(found[1].stamp)]
+
+    def locked(self, node, ctx, job):
+        """The job with the node's Overrides CSV applied (lock()). Raises FileError for a file with errors."""
+        from .. import lists  # imports bpy
+
+        found = self.overrides(node, ctx)
+        if found is None:
+            return job
+        source, doc = found
+        try:
+            locks = csvfmt.parse_overrides(doc, self.override_keys(job))
+        except csvfmt.CsvError as error:
+            raise lists.file_error(doc, error) from None
+        job = self.lock(job, locks, doc.path)
+        if source.warning:
+            job.problems += (source.warning,)
+        return job
+
+    def lock(self, job, locks: dict, path: str = ""):
+        """Apply csvfmt.parse_overrides() locks to the job. A valid lock makes its rows lock rows (c = 1, never
+        asked) and enters the words key through lock_digest; an invalid answer is an error on its row, whose model
+        answer stays. job.locks maps each lock to "" when a row uses it, else to its orphaned-lock warning. Pure."""
+        name = os.path.basename(path) or "Overrides"
+        rows, errors, used = list(job.rows), [], set()
+        for cells, indices in self.override_units(job):
+            key = csvfmt.KEY_SEP.join(cell.strip().casefold() for cell in cells)
+            lock = locks.get(key)
+            if lock is None:
+                continue
+            used.add(key)
+            answer = lock.answer.strip()
+            values = self.lock_values(job, indices, answer) if answer else "the answer is empty"
+            if isinstance(values, str):
+                errors.append(f"{name} line {lock.line}: {values}; the model's answer stays")
+                continue
+            for i, value in zip(indices, values):
+                rows[i] = dataclasses.replace(rows[i], source="lock", values=value, ask="", cell=None)
+        locked = [[i, row.values] for i, row in enumerate(rows) if row.source == "lock"]
+        words_key = job.words_key
+        if locked:  # the unlocked words key stands in for the CSV hashes it already covers
+            words_key = pipeline.words_key(job.gn, [job.words_key], job.answer_type, job.shape.digest(),
+                                           [row.wkey for row in rows], pipeline.digest("locks", locked))
+        marks = {f"{path}{csvfmt.KEY_SEP}{key}": "" if key in used else
+                 f"{name} line {lock.line}: orphaned lock '{key.replace(csvfmt.KEY_SEP, ', ')}' matches no row"
+                 for key, lock in locks.items()}
+        return dataclasses.replace(job, rows=rows, words_key=words_key, problems=(*errors, *job.problems),
+                                   locks=marks)
 
     def output(self, entry, name: str):
         """A single-value output's value in a stored entry, for chaining. KeyError: not a single value."""

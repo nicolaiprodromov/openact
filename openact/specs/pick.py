@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, option_text, state_text, warnings
+from .base import KEY, Spec, confidence, named, option_text, overrides_inputs, state_text, warnings
 
 PICK_STATE = "Choose one of the listed items."
 
@@ -59,7 +59,7 @@ class PickSpec(Spec):
         source = getattr(node, "list_source", 'TEXT')
         extra = (self.EXTRA[source],) if source in self.EXTRA else ()
         return [*(SocketDef(*args) for args in self.INPUTS), *list_inputs(source), SocketDef(*self.ID),
-                *(SocketDef(*args) for args in (*self.OUTPUTS, *extra)), SocketDef(*KEY)]
+                *(SocketDef(*args) for args in (*self.OUTPUTS, *extra)), *overrides_inputs(), SocketDef(*KEY)]
 
     def items(self, node, ctx):
         from ..lists import resolve_items  # imports bpy
@@ -80,7 +80,7 @@ class PickSpec(Spec):
         job = self.job(gn, items.items, node.balance_order, node.uid, items.source,
                        [items.doc.text_hash] if items.doc is not None else [])
         job.problems = warnings(items.problems)
-        return job
+        return self.locked(node, ctx, job)
 
     def job(self, gn, items, debias, uid="", source='TEXT', csv_hashes=()):
         """The Job for these words and items (lists.Item, or names). Pure, so the pure suites plan exactly like the
@@ -121,6 +121,25 @@ class PickSpec(Spec):
                                           ask=self.ask_key(job.debias, answer["model"]))
             rows.append(row)
         return rows
+
+    OVERRIDE_KEYS = ("prompt",)
+
+    def override_units(self, job):
+        """One unit per prompt: a lock forces the picked item (§7.6)."""
+        return [((job.gn[0].strip(),), tuple(range(len(job.rows))))] if job.rows else []
+
+    def lock_values(self, job, rows, answer):
+        chosen = named(answer, [row.name for row in job.rows])  # an empty material slot has no name to match
+        if chosen is None:
+            return f"'{answer}' is not an item of the list"
+        return [{"prob": float(i == chosen)} for i in rows]
+
+    def export_unit(self, job, rows, table):
+        if not all(table[i][1] for i in rows):
+            return "", None, "pending"
+        probabilities = [table[i][1]["prob"] for i in rows]
+        best = max(range(len(rows)), key=probabilities.__getitem__)
+        return job.rows[rows[best]].name, confidence('ONE_OF', probabilities), table[rows[best]][0]
 
     def single(self, rows):
         probabilities = [row.values["prob"] for row in rows]

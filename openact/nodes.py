@@ -134,6 +134,7 @@ class _OpenActNode:
         row = layout.row()
         row.enabled = self.id_data.library is None  # a linked node's answers come from its library file
         row.operator("openact.reask", icon='FILE_REFRESH').uid = self.uid
+        row.operator("openact.write_overrides", icon='EXPORT').uid = self.uid
 
 
 class GeometryNodeOpenActAsk(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
