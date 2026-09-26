@@ -39,32 +39,44 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     Write-Host "=== $Suite ($Where)" -ForegroundColor Cyan
     $start = [Diagnostics.ProcessStartInfo]::new($Exe, ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join " ")
     $start.UseShellExecute = $false
+    $start.WorkingDirectory = Split-Path $PSScriptRoot  # the repository root, like the README's per-suite commands
     $start.RedirectStandardOutput = $start.RedirectStandardError = $true
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"  # else CPython writes the ANSI code page into the pipe
     $start.EnvironmentVariables["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so the server's --gpu is the card nvidia-smi -i reads
     $pass = $fail = 0
     $result = $null
-    $timedOut = $true
+    $timedOut = $false
+    $exitedAt = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $process = [Diagnostics.Process]::Start($start)
     $errors = $process.StandardError.ReadToEndAsync()  # drained alongside, so a full stderr pipe cannot stall the suite
     $next = $process.StandardOutput.ReadLineAsync()
-    while ($clock.Elapsed.TotalMinutes -lt $Minutes) {
-        if (-not $next.Wait(1000)) { continue }
-        $line = $next.Result
-        if ($null -eq $line) { $timedOut = $false; break }
-        $next = $process.StandardOutput.ReadLineAsync()
-        Write-Host $line
-        if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ }
-        if ($line -match '^(?:BLENDER (.+)|PYTHON \S+) RESULT (OK|FAILED: .*)$') {
-            $result = $Matches[2]
-            if ($Matches[1]) { $Where = "Blender " + $Matches[1] }
+    while ($true) {
+        if ($next.Wait(1000)) {
+            $line = $next.Result
+            if ($null -eq $line) {
+                if ($process.WaitForExit(1000)) { break }
+            } else {
+                $next = $process.StandardOutput.ReadLineAsync()
+                Write-Host $line
+                if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ }
+                if ($line -match '^(?:BLENDER (.+)|PYTHON \S+) RESULT (OK|FAILED: .*)$') {
+                    $result = $Matches[2]
+                    if ($Matches[1]) { $Where = "Blender " + $Matches[1] }
+                }
+            }
+        }
+        if ($process.HasExited) {
+            # Descendants that inherited the pipes can hold them open: 10 s grace, then judge the child's output.
+            if ($null -eq $exitedAt) { $exitedAt = $clock.Elapsed.TotalSeconds }
+            elseif ($clock.Elapsed.TotalSeconds - $exitedAt -ge 10) { break }
+        } elseif (-not $timedOut -and $clock.Elapsed.TotalMinutes -ge $Minutes) {
+            $timedOut = $true
+            taskkill.exe /PID $process.Id /T /F | Write-Host  # the whole tree, while the child can still name it
         }
     }
-    if ($timedOut -and -not $process.HasExited) { $process.Kill() }  # a model server exits when its Blender is gone
-    $process.WaitForExit()
-    if ($errors.Result.Trim()) { Write-Host $errors.Result.TrimEnd() }
+    if ($errors.Wait(10000) -and $errors.Result.Trim()) { Write-Host $errors.Result.TrimEnd() }
     $code = $process.ExitCode
     $ok = -not $timedOut -and $result -eq "OK" -and $code -eq 0
     $detail = if ($ok) { "" } elseif ($timedOut) { "timeout after $Minutes min" } elseif (-not $result) { "no RESULT line (exit code $code)" } elseif ($result -eq "OK") { "exit code $code" } else { $result }
@@ -118,12 +130,11 @@ try {
         if (-not $Model) { continue }
         # The build starts a model server: it must not attach to (and later shut down) a server already on the
         # port, and it needs 9 GB on a GPU that other jobs may be using.
-        $busy = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)[0]
-        $free = $null
-        for ($waited = 0; -not $busy; $waited += 30) {
+        for ($waited = 0; ; $waited += 30) {
+            $busy = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)[0]
             $read = try { "$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i $Gpu 2>$null)" } catch { "" }
             $free = if ($read -match '^\s*(\d+)\s*$') { [int]$Matches[1] }
-            if ($null -eq $free -or $free -ge 9216 -or $waited -ge 1800) { break }
+            if ($busy -or $null -eq $free -or $free -ge 9216 -or $waited -ge 1800) { break }
             Write-Host ("GPU {0}: {1:N1} GB free, waiting for 9 GB" -f $Gpu, ($free / 1024))
             Start-Sleep -Seconds 30
         }
