@@ -200,6 +200,8 @@ def _known(cls, data):
 def _from_v010(item):
     """A v0.1.0 entry {"key", "gn", "a", "t"}, in schema 2. Its words go to their positions in the
     fixed word tuples; the old key is dropped."""
+    if not _list_of(item["gn"], str):  # else a string or an object would unpack into wrong words
+        raise TypeError("gn must be a list of strings")
     first, second = item["gn"]
     answer = item["a"]
     entry = Entry(asks=[V010], pv=0, t=float(item.get("t", 0.0)), legacy=True, model=V010)
@@ -210,13 +212,15 @@ def _from_v010(item):
         entry.shape = {"rows": 0, "columns": {}}
         entry.single = {"Answer": value, "Yes": value >= 0.5, "Confidence": float(answer["confidence"])}
     else:  # Pick: (Prompt, Items) -> Prompt, Context, Items, Overrides, Key
-        names = answer["items"]
+        names, prob = answer["items"], answer["probabilities"]
+        if not _list_of(prob, int, float):  # else a string or an object would iterate into wrong numbers
+            raise TypeError("probabilities must be a list of numbers")
         # v0.1.0 ignored the Items text when a collection was set, and a live COLLECTION Pick has "" there
         entry.gn = (first, "", "" if answer.get("collection") else second, "", "")
         entry.kind, entry.answer_type = "pick", "ONE_OF"
         entry.shape = {"rows": len(names), "columns": {"prob": "FLOAT"}}
         entry.rows = Rows(name=names, wkey=[""] * len(names), ask=[0] * len(names), src="m" * len(names),
-                          v={"prob": [float(p) for p in answer["probabilities"]]})
+                          v={"prob": prob})
         entry.single = {"Index": int(answer["index"]), "Item": str(answer["item"]),
                         "Confidence": float(answer["confidence"])}
     return entry

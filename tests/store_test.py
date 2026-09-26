@@ -326,10 +326,14 @@ def phase_damaged():
                dict(old_pick, a=dict(old_pick["a"], probabilities=[1.0])),
                dict(old_pick, a=dict(old_pick["a"], index="1e400")), dict(old_pick, t=10 ** 400),
                dict(old_pick, t=float("nan")), dict(old_ask, a=dict(old_ask["a"], value=10 ** 400)),
-               dict(old_ask, a=dict(old_ask["a"], mode=None))]
+               dict(old_ask, a=dict(old_ask["a"], mode=None)),
+               # shapes that would unpack or iterate into well-typed but wrong words and numbers
+               dict(old_pick, gn="pq"), dict(old_ask, gn={"Question": 1, "Context": 2}),
+               dict(old_pick, a=dict(old_pick["a"], probabilities="12345")),
+               dict(old_pick, a=dict(old_pick["a"], probabilities={str(i): 0.2 for i in range(5)}))]
     text = json.dumps([old_ask, *damaged, old_pick]).replace('"1e400"', "1e400")
     loaded = loading(text)
-    check("damaged: v0.1.0 skips only the damaged entries, overflowing numbers included",
+    check("damaged: v0.1.0 skips only the damaged entries, including overflowing numbers and non-list shapes",
           loaded == words([ask, pick]) and store.load(Node(text)).entries == [ask, pick], loaded)
 
     for label, bad in (
