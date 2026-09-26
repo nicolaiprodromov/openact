@@ -187,7 +187,7 @@ def phase_cell_index():
     inner.build(rules, S.load(rules))
     engine.run_pass()  # plans with the files missing: an error, and the last good table stays
     check("rebuild with every CSV file deleted leaves the outputs unchanged (shape suffices)",
-          read(obj, ["Outcome", "Confidence"]) == before and engine.STATUS[rules.uid][0] == 'ERROR',
+          read(obj, ["Outcome", "Confidence"]) == before and engine.STATUS[rules.uid].icon == 'CANCEL',
           engine.STATUS.get(rules.uid))
 
 
@@ -311,7 +311,8 @@ def phase_life():
           [int(t in ("Birth", "Survives")) for t in reference], entries and entries[0].rows.payload)
     check("life: the node shows its sockets and '18 cells · 0 unsure'",
           all(name in rules.inputs for name in ("state", "neighbours")) and "alive" in rules.outputs
-          and engine.STATUS.get(rules.uid) == ('CHECKMARK', "18 cells · 0 unsure"), engine.STATUS.get(rules.uid))
+          and (engine.STATUS[rules.uid].icon, engine.STATUS[rules.uid].text) == ('CHECKMARK', "18 cells · 0 unsure"),
+          engine.STATUS.get(rules.uid))
     life_zone(tree, rules, gi, go)
     scene_ = bpy.context.scene
     scene_.frame_start, scene_.frame_end = 1, 40
@@ -493,7 +494,8 @@ def phase_model(port, gpu):
                 print(f"  ... {server.status()} {engine.STATUS.get(rules.uid)} pending {len(pipeline.PENDING)}",
                       flush=True)
             entries = [e for e in S.load(rules).entries if e.gn[3] == path]
-            return bool(entries) and not pipeline.PENDING and engine.STATUS.get(rules.uid, ("",))[0] == 'CHECKMARK'
+            return bool(entries) and not pipeline.PENDING and getattr(engine.STATUS.get(rules.uid), "icon", "") == \
+                'CHECKMARK'
 
         answered = drive(engine, done, timeout=600)
         entry = next((e for e in S.load(rules).entries if e.gn[3] == path), None)

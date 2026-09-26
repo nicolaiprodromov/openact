@@ -110,7 +110,8 @@ def entry_of(node):
 
 
 def status(node):
-    return engine.STATUS.get(node.uid, ("", ""))
+    found = engine.STATUS.get(node.uid)
+    return (found.icon, found.text) if found else ("", "")
 
 
 # ------------------------------------------------------------------------------ sockets

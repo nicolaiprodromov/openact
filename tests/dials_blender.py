@@ -194,15 +194,16 @@ def phase_nomodel():
           table is not None and len(table.data.vertices) == 1 and not table.users_collection and names == sorted(
               ["oa_conf", "oa_v0", "oa_v1", "oa_min1", "oa_max1", "oa_v2", "oa_v3", "oa_v4", "oa_min4", "oa_max4"]),
           names)
-    check("status: the node sums up its settings", engine.STATUS[node.uid] == (
-        'CHECKMARK', "5 settings · lowest confidence 0.50"), engine.STATUS.get(node.uid))
+    status = engine.STATUS[node.uid]
+    check("status: the node sums up its settings", (status.icon, status.text) == (
+        'CHECKMARK', "5 settings · lowest confidence 0.50"), status)
     weather("a.csv", ("\nFog,", "\n\nFog,"))  # a blank line between rows: a warning, the settings still usable
     with asking(calls):
         settle()
-    icon, text = engine.STATUS[node.uid]
-    check("status: a Settings CSV warning shows before the summary, and nothing is asked",
-          icon == 'ERROR' and text.startswith("a.csv line 6: Line 6 is blank")
-          and text.endswith("(5 settings · lowest confidence 0.50)") and not calls, (icon, text, len(calls)))
+    icon, text = engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text
+    check("status: a Settings CSV warning shows after the summary, and nothing is asked",
+          icon == 'ERROR' and text.startswith("5 settings · lowest confidence 0.50 · 1 warning: a.csv line 6: Line 6 "
+                                              "is blank") and not calls, (icon, text, len(calls)))
 
     # a min/max edit: the rows carry over (their wkeys hold no min/max), the shape changes, the graph doesn't
     before, rebuilt = pointers(node), []
@@ -233,16 +234,16 @@ def phase_nomodel():
     weather("b.csv", ("Wind speed,amount", "Gust,amount"))
     with asking(calls):
         settle()
-    icon, text = engine.STATUS[node.uid]
+    icon, text = engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text
     check("shape agreement: different setting names give the error", (icon, text) == (
-        'ERROR', "Dials: contexts use different settings ('Wind speed' (amount) vs 'Gust' (amount)); setting names "
-                 "and types must agree"), (icon, text))
+        'CANCEL', "Dials: contexts use different settings ('Wind speed' (amount) vs 'Gust' (amount)); setting names "
+                  "and types must agree"), (icon, text))
     check("shape agreement: the agreeing context keeps its values", read(users["A"])["Wind speed"] == 40.0)
     weather("b.csv", (",0,30", ",0,100"))
     with asking(calls):
         settle()
     check("shape agreement: agreeing again clears the error, with 0 requests",
-          engine.STATUS[node.uid][0] == 'CHECKMARK' and not calls and read(users["B"])["Wind speed"] == 75.0,
+          engine.STATUS[node.uid].icon == 'CHECKMARK' and not calls and read(users["B"])["Wind speed"] == 75.0,
           (engine.STATUS[node.uid], len(calls)))
 
     # with two entries too: the pass replaces the entry in place, so the graph's entry order holds
@@ -267,6 +268,10 @@ def phase_nomodel():
     check("rename: the node warns once, and the renamed setting gets a new socket",
           dials.WARNINGS.get(node.uid) == "Setting 'Fog' renamed or retyped: reconnect its output"
           and "Mist" in names and "Fog" not in names and not calls, (dials.WARNINGS.get(node.uid), names, len(calls)))
+    status = engine.STATUS[node.uid]
+    check("rename: the warning is in the node's status record",
+          status.state == "warning" and "Setting 'Fog' renamed or retyped: reconnect its output"
+          in [problem.message for problem in status.problems], (status.text, status.problems))
     phase_inline()
 
 
@@ -333,7 +338,7 @@ def phase_model(port, gpu):
     started = time.time()
 
     def shown(prompt):
-        return engine.STATUS.get(node.uid, ("",))[0] == 'CHECKMARK' and not pipeline.PENDING and any(
+        return getattr(engine.STATUS.get(node.uid), "icon", "") == 'CHECKMARK' and not pipeline.PENDING and any(
             entry.gn[0] == prompt for entry in S.load(node).entries) and len(node.outputs) == len(OUTPUTS)
 
     engine.schedule(immediate=True)

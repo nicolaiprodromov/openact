@@ -350,6 +350,10 @@ class Spec:
         """The answer in a few words, for the status line and the sidebar."""
         raise NotImplementedError
 
+    def node_warnings(self, node) -> tuple[str, ...]:
+        """Warnings about the node itself once it is built, for its status."""
+        return ()
+
     def word_sockets(self, gi) -> list:
         """The inner group's input of each word, None for a word the node has no socket for."""
         return [gi.outputs.get(name) for name in self.WORDS]

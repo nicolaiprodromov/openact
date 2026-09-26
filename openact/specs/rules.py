@@ -13,7 +13,7 @@ import itertools
 import os
 
 from .. import csvfmt, pipeline, rules_core
-from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, yes_no_text
+from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, warnings, yes_no_text
 
 FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
 OUTCOMES_HINT = "Add outcomes"
@@ -172,6 +172,8 @@ class RulesSpec(Spec):
             if answers.doc is None:
                 raise Unresolvable(f"Outcomes: {error}") from None
             raise lists.file_error(answers.doc, error) from None
+        job.problems = (warnings(doc.problems + answers.problems) + ((source.warning,) if source.warning else ())
+                        + job.problems)  # the CSVs' warnings, then the table's
         self._declare(node, factors, answers)
         return self.locked(node, ctx, job)
 
@@ -204,7 +206,8 @@ class RulesSpec(Spec):
         shape = RulesShape(len(rows), columns, tuple(declare(f) for f in factors), payload)
         words_key = pipeline.words_key(gn, list(hashes), answer_type, shape.digest(), [row.wkey for row in rows])
         return pipeline.Job(uid, tuple(gn), words_key, shape, rows, answer_type=answer_type, debias=debias,
-                            options=tuple(option.name for option in options))
+                            options=tuple(option.name for option in options), problems=warnings(planned.warnings),
+                            errors=(planned.error,) if planned.error else ())
 
     # ------------------------------------------------------------------ the Overrides CSV (§7.6)
 

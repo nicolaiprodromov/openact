@@ -151,7 +151,7 @@ def all_answered(engine):
     if not nodes or pipeline.PENDING:
         return False
     for tree, node in nodes:
-        icon = engine.STATUS.get(node.uid, ('', ''))[0]
+        icon = getattr(engine.STATUS.get(node.uid), "icon", "")
         allowed = ('CHECKMARK',) if tree.name in ("OpenActTest", "OpenActNested") else ('CHECKMARK', 'INFO')
         if icon not in allowed:
             return False

@@ -75,6 +75,7 @@ class Job:
     answer_type: str = ""  # 'YES_NO', 'AMOUNT' or 'ONE_OF'
     debias: bool = True  # the node's Balance Option Order: its requests carry it
     problems: tuple[str, ...] = ()  # warnings of a usable plan (e.g. a CSV's), for the node's status
+    errors: tuple[str, ...] = ()  # rows in error in a usable plan (e.g. Rules cells no outcome applies to): an error
     options: tuple = ()  # the answer names rows choose among (Dials: per row), which Overrides answers name (§7.6)
     locks: dict = field(default_factory=dict)  # Overrides lock -> "" when a row uses it, else its orphan warning
 

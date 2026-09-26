@@ -1,5 +1,5 @@
-"""Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; open
-files; trust a .blend's file reads."""
+"""Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; show
+what a row asks; open files; trust a .blend's file reads."""
 
 from __future__ import annotations
 
@@ -10,13 +10,16 @@ import sys
 
 import bpy
 
-from . import csvfmt, engine, lists, server, store, trust
+from . import csvfmt, engine, lists, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Hint, Pending, Unresolvable
 from .specs.base import SOURCES, UNSURE_BELOW
 
 PERMISSION = "Close the file in the other program (e.g. Excel) and try again."
 EXPORTED = ("answer", "lock", "model_answer", "confidence", "unsure", "source")  # after the key columns (§7.6)
+NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
+              "code": "Decided by code (one option applies): never sent to the model",
+              "error": "No outcome applies to this cell: never sent to the model"}
 
 
 class OverridesError(Exception):
@@ -166,6 +169,145 @@ class OPENACT_OT_allow_file(bpy.types.Operator):
     def execute(self, context):
         trust.allow(bpy.data.filepath)
         engine.schedule(immediate=True)  # the reads that were blocked
+        return {'FINISHED'}
+
+
+class OPENACT_OT_trust_folder(bpy.types.Operator):
+    bl_idname = "openact.trust_folder"
+    bl_label = "Trust This Folder"
+    bl_description = ("Let every .blend file in this file's folder and its subfolders, now and in the future, read CSV "
+                      "and text files outside its own folder")
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def execute(self, context):
+        trust.allow(bpy.data.filepath, folder=True)
+        engine.schedule(immediate=True)  # the reads that were blocked
+        return {'FINISHED'}
+
+
+class OPENACT_OT_open_file(bpy.types.Operator):
+    bl_idname = "openact.open_file"
+    bl_label = "Open File"
+    bl_description = "Open this CSV file in the program your system opens CSV files with"
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH', options={'HIDDEN', 'SKIP_SAVE'})
+
+    def execute(self, context):
+        path = os.path.normpath(bpy.path.abspath(self.filepath))
+        if not lists.is_csv_path(path):  # the system would run anything else it can open
+            self.report({'ERROR'}, f"Only CSV files open from here, not {path}")
+            return {'CANCELLED'}
+        if not os.path.isfile(path):
+            self.report({'ERROR'}, f"Can't find {path}")
+            return {'CANCELLED'}
+        _open_path(path)
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------------------------ sidebar inspection (§17.2)
+
+def row_question(node, context=0, row=0) -> dict:
+    """What row `row` of the node's context `context` asks the model, from the plan its last pass cached: its source
+    ("lock", "code" and "error" rows are never sent), the state, question type, instructions, options in the order
+    sent and debias, as sent or as they would be sent, the cell key, and the ask key it was answered with ("" when not
+    answered). Asks nothing. Raises ValueError when there is no such row."""
+    uses = engine.answers_for(node)
+    if not 0 <= context < len(uses):
+        raise ValueError("This context has no table yet")
+    _label, job, entry = uses[context]
+    if not 0 <= row < len(job.rows):
+        raise ValueError(f"The table has no row {row + 1}")
+    planned, source, ask = job.rows[row], job.rows[row].source, ""
+    if entry is not None and len(entry.rows.name) == len(job.rows):
+        source = {src: name for name, src in SOURCES.items()}.get(entry.rows.src[row], source)
+        ask = entry.asks[entry.rows.ask[row]] if source == "model" else ""
+    cell = planned.cell
+    return {"name": planned.name, "source": source, "debias": job.debias, "ask": ask,
+            "state": cell and cell.state, "type": cell and cell.question["type"],
+            "instructions": cell and cell.question["instructions"], "options": cell and cell.question.get("criteria"),
+            "key": cell and cell.key}
+
+
+def question_text(found) -> str:
+    """row_question() as the Show Question popup writes it: every text exactly as sent."""
+    lines = [f"Row: {found['name']}"]
+    if found["state"] is None:
+        return "\n".join([*lines, NEVER_SENT.get(found["source"], "Never sent to the model")])
+    lines += [f"State: {found['state']}", f"Question ({found['type']}): {found['instructions']}"]
+    options = found["options"]
+    if options is None:  # a Yes/No question without whens: the server offers these
+        lines.append("Options: Yes. / No.")
+    else:
+        pairs = options.items() if isinstance(options, dict) else enumerate(options)
+        lines += ["Options, in the order sent:", *(f"  {key}: {text}" for key, text in pairs)]
+    lines.append("Balance Option Order: " + ("on (asked in both option orders)" if found["debias"] else "off"))
+    lines.append(f"Answered with ask key {found['ask'][:12]}" if found["ask"] else
+                 "Not answered yet: this is what would be sent")
+    return "\n".join(lines)
+
+
+class OPENACT_OT_show_question(bpy.types.Operator):
+    bl_idname = "openact.show_question"
+    bl_label = "Show Question"
+    bl_description = "Show exactly what this row asks the model: the state, the question and its options. Asks nothing"
+    bl_options = {'INTERNAL'}
+
+    uid: bpy.props.StringProperty(options={'HIDDEN'})
+    context_index: bpy.props.IntProperty(options={'HIDDEN'})
+    row: bpy.props.IntProperty(options={'HIDDEN'})
+    copy: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    text: bpy.props.StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def question(self):
+        _tree, node = engine.find_node(self.uid)
+        if node is None:
+            raise ValueError("The node is gone")
+        return question_text(row_question(node, self.context_index, self.row))
+
+    def invoke(self, context, event):
+        try:
+            self.text = self.question()
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        return context.window_manager.invoke_popup(self, width=600)
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        for line in self.text.splitlines():
+            ui.wrap(col, line, width=96)
+        row = self.layout.row()
+        row.operator_context = 'EXEC_DEFAULT'
+        op = row.operator(self.bl_idname, text="Copy", icon='COPYDOWN')
+        op.uid, op.context_index, op.row, op.copy = self.uid, self.context_index, self.row, True
+
+    def execute(self, context):
+        try:
+            text = self.question()
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        if self.copy:
+            context.window_manager.clipboard = text
+        self.report({'INFO'}, "Copied the question" if self.copy else text.replace("\n", " | "))
+        return {'FINISHED'}
+
+
+class OPENACT_OT_table_view(bpy.types.Operator):
+    bl_idname = "openact.table_view"
+    bl_label = "Show Table"
+    bl_description = "Show this context's table, or another page of it"
+    bl_options = {'INTERNAL'}  # no undo step: which table shows is UI state
+
+    context_index: bpy.props.IntProperty(min=0, options={'HIDDEN'})
+    page: bpy.props.IntProperty(min=0, options={'HIDDEN'})
+
+    def execute(self, context):
+        wm = context.window_manager
+        wm.openact_context, wm.openact_page = self.context_index, self.page
         return {'FINISHED'}
 
 
@@ -349,6 +491,7 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
 
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
+           OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
            OPENACT_OT_write_overrides)
 
 

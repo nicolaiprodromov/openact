@@ -20,6 +20,7 @@ import math
 import time
 import traceback
 import uuid
+from dataclasses import dataclass, field
 
 import bpy
 from bpy.app.handlers import persistent
@@ -27,11 +28,12 @@ from bpy.app.handlers import persistent
 from . import evaluator, inner, pipeline, server, store
 from . import prefs as P
 from . import tables
+from .csvfmt import ERROR, WARNING, Problem
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
-from .specs.base import orphaned
+from .specs.base import UNSURE_BELOW, orphaned
 from .specs.pick import PickSpec
 from .watch import WATCH
 
@@ -41,8 +43,12 @@ DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
+OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
+ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
+         "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
+MS_PER_ROW = 21.0  # the ETA's rate until the server has measured one: a two-option row on an RTX 3090 (§5.4)
 
-STATUS = {}  # node uid -> (icon, text)
+STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
 LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last
 LIVE = {}  # node uid -> words keys of the entries its contexts showed at its last pass
@@ -56,6 +62,44 @@ _last_pass = 0.0
 _has_nodes = False
 _group_count = -1  # number of node groups at the last pass that found no OpenAct nodes
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
+passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
+
+
+@dataclass
+class NodeStatus:
+    """What a node shows (§17.1): its body the icon and text, the sidebar all of it."""
+
+    state: str  # a key of ICONS
+    text: str  # one line, e.g. "Filling 12/50 · ~2 s"
+    rows: int = 0
+    answered: int = 0
+    pending: int = 0
+    stale: int = 0
+    unsure: int = 0
+    locked: int = 0
+    code: int = 0
+    errors: int = 0
+    eta_s: float | None = None  # remaining scored rows × ms_per_row
+    contexts: int = 0  # distinct live word sets; above inner.MATERIALISED_MAX the node shows the over-cap error (§8.1)
+    problems: list = field(default_factory=list)  # csvfmt.Problem records: the errors, then the warnings
+    uses: list = field(default_factory=list)  # (context label, Job, entry shown or None) of each planned context
+
+    @property
+    def icon(self) -> str:
+        return ICONS[self.state]
+
+
+def _problem(severity, text):
+    return Problem(severity, "", 0, "", text)
+
+
+def _error(text):
+    return NodeStatus("error", text, problems=[_problem(ERROR, text)])
+
+
+def eta_text(seconds: float) -> str:
+    """"~2 s" or "~3 min", as status lines write an ETA."""
+    return f"~{max(math.ceil(seconds), 1)} s" if seconds < 60 else f"~{math.ceil(seconds / 60)} min"
 
 
 # ----------------------------------------------------------------------------- plans
@@ -187,7 +231,7 @@ def schedule(immediate=False, node=None):
 def run_pass(everything=True):
     """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. Main thread
     only."""
-    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count
+    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, passes
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
@@ -197,6 +241,7 @@ def run_pass(everything=True):
         dirty.add(uid)
     _dirty = _dirty_all = False
     _last_pass = time.monotonic()
+    passes += 1
     nodes = list(iter_nodes())
     _has_nodes = bool(nodes)
     _group_count = -1 if nodes else len(bpy.data.node_groups)
@@ -220,7 +265,7 @@ def run_pass(everything=True):
                 stored |= _process(tree, node, uses.get(tree.as_pointer()))
             except Exception as error:
                 traceback.print_exc()
-                STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
+                STATUS[node.uid] = _error(f"Internal error: {error}")
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
     if stored or _plans_made != plans_made:
@@ -237,19 +282,21 @@ def run_pass(everything=True):
 
 
 def _process(tree, node, contexts):
-    """Plan and answer the node's contexts, store new answers and rebuild its group. True if it stored any."""
+    """Plan and answer the node's contexts, store new answers, rebuild its group and set its status. True if it stored
+    any."""
     if tree.library is not None:  # read-only: the library file holds this node's answers
-        STATUS[node.uid] = ('LINKED', f"Linked from {tree.library.name}: answers come from that file")
+        STATUS[node.uid] = NodeStatus("linked", f"Linked from {tree.library.name}: answers come from that file")
         return False
     node_store = store.load(node)
     if node_store.schema > store.SCHEMA:  # save() would refuse any answer, and the group holds the newer ones
-        STATUS[node.uid] = ('ERROR', store.newer_message(node_store))
+        STATUS[node.uid] = _error(store.newer_message(node_store))
         return False
     spec = SPECS[node.bl_idname]
     entries = node_store.entries
     contexts = contexts or [Ctx(None, None, (), tree)]
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
     problems, warnings, hints, failed = [], [], [], []
+    planned, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells asked
     upstream = waiting = changed = False
     for ctx in contexts:
         key = (node.uid, ctx.key())
@@ -265,7 +312,9 @@ def _process(tree, node, contexts):
             problems.append(str(error))
             _live(live, spec, node, ctx)
             continue
+        planned.append((ctx.label(), job))
         warnings += job.problems
+        problems += job.errors  # rows in error in a table that still shows, e.g. cells no outcome applies to
         if job.gn not in live:
             live.append(job.gn)
         other = jobs.setdefault(job.gn, (job, ctx))
@@ -280,6 +329,7 @@ def _process(tree, node, contexts):
         if entry is not None:
             LAST_SHOWN[key] = entry.words_key
             shown.append(entry)
+            resolved[job.gn] = entry
             if entry is not found:
                 if found is not None:  # in place: the graph keeps its entry order, so values only (§8.8)
                     entries[entries.index(found)] = entry
@@ -296,7 +346,10 @@ def _process(tree, node, contexts):
         failed += errors
         if missing:
             waiting = True
+            asked.update(cell.key for cell in missing)
             _submit(job, missing)
+    if len(live) > inner.MATERIALISED_MAX:  # the first contexts stay materialised, the others show neutral values
+        problems.append(OVER_CAP.format(len(live), inner.MATERIALISED_MAX))
     rows = changed  # entries were added, replaced or dropped: the table object's rows change too
     showing = {entry.words_key for entry in shown}
     left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
@@ -321,7 +374,13 @@ def _process(tree, node, contexts):
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     if not inner.update_values(node, node_store, live, default, rows=rows):  # values only when it can (§8.8)
         inner.build(node, node_store, live, default)
-    STATUS[node.uid] = _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings)
+    warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
+    faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
+    state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
+    STATUS[node.uid] = NodeStatus(
+        state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in planned],
+        problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings],
+        **_counts(jobs, resolved, asked))
     return changed
 
 
@@ -344,42 +403,81 @@ def _submit(job, missing):
         server.start()  # asked by the pass that runs when the server is ready
 
 
-def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings=()):
-    if problems:
-        return ('ERROR', problems[0])
-    if failed:
-        return ('ERROR', failed[0])
+def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
+    """(state, text, ETA in seconds or None) of the node's status line (§17.1)."""
+    if faults:
+        return "error", faults[0], None
     if waiting or upstream:
         state, message = server.status()
         if state == "not_installed":
-            return ('ERROR', "Model not installed: open the OpenAct tab in the sidebar")
+            return "error", "Model not installed: open the OpenAct tab in the sidebar", None
         if state == "installing":
-            return ('SORTTIME', "Installing the model...")
+            return "starting", "Installing the model...", None
         if state == "error":
-            return ('ERROR', message or "Model server error")
+            return "error", message or "Model server error", None
         if state == "starting":
-            return ('SORTTIME', "Starting the model...")
+            return "starting", "Starting the model...", None
+        if message == server.CHECKING:  # a start waits for the runtime probe
+            return "starting", message, None
         if state in ("stopped", "unknown") and not P.get_prefs().auto_start:
-            return ('PAUSE', "Model server is stopped (OpenAct tab)")
+            return "paused", "Model server is stopped (OpenAct tab)", None
         if upstream and not waiting:
-            return ('SORTTIME', "Waiting for another OpenAct node...")
-        return ('SORTTIME', "Asking...")
+            return "waiting", "Waiting for another OpenAct node...", None
+        return ("filling", *_filling(uid))
     if not jobs:
-        return ('INFO', hints[0] if hints else spec.empty_hint)
+        return "hint", hints[0] if hints else spec.empty_hint, None
     text = spec.summary(shown[0])
+    locked = shown[0].rows.src.count("l")
+    if locked:
+        text += f" · {locked} locked"
     if len(jobs) > 1:
         text += f"   +{len(jobs) - 1} more"
-    if warnings:  # a usable list or answer set that has a warning (§17.1)
-        return ('ERROR', f"{warnings[0]}   ({text})")
-    return ('CHECKMARK', text)
+    if warnings:  # a usable table whose lists, answer sets or locks have warnings
+        return "warning", f"{text} · {len(warnings)} warning{'s' if len(warnings) > 1 else ''}: {warnings[0]}", None
+    return "complete", text, None
+
+
+def _filling(uid):
+    """The filling line and its ETA: n/N once the decision worker reports the node's progress, else "Asking..."."""
+    progress = getattr(pipeline, "progress", None)
+    found = progress(uid) if progress is not None else None
+    if not found or not found[1]:
+        return "Asking...", None
+    done, total, ms_per_row = found
+    eta = max(total - done, 0) * (ms_per_row or server.STATE.health.get("ms_per_row") or MS_PER_ROW) / 1000
+    return f"Filling {done}/{total} · {eta_text(eta)}", eta
+
+
+def _counts(jobs, resolved, asked):
+    """The row counts of the node's tables (§17.1): by the source of each row of the entry a table shows, else of its
+    plan's rows, whose cells are asked (pending), failed (errors) or answered this session."""
+    counts = dict.fromkeys(("rows", "answered", "pending", "stale", "unsure", "locked", "code", "errors"), 0)
+    letters = {"m": "answered", "p": "pending", "s": "stale", "l": "locked", "c": "code", "e": "errors"}
+    for gn, (job, _ctx) in jobs.items():
+        counts["rows"] += len(job.rows)
+        entry = resolved.get(gn)
+        if entry is not None:
+            for letter in entry.rows.src:
+                counts[letters.get(letter, "answered")] += 1
+            confidences = entry.rows.v.get("c") or ()
+            counts["unsure"] += sum(src == "m" and c < UNSURE_BELOW for src, c in zip(entry.rows.src, confidences))
+            continue
+        for row in job.rows:
+            if row.cell is None:
+                name = {"lock": "locked", "error": "errors"}.get(row.source, "code")
+            elif row.cell.key in asked:
+                name = "pending"
+            else:
+                name = "errors" if row.cell.key in pipeline.FAILED else "answered"
+            counts[name] += 1
+    return counts
 
 
 def answers_for(node):
-    """(context label, entry or None) for the node's current uses, for the sidebar."""
-    spec = SPECS[node.bl_idname]
-    entries = store.load(node).entries
-    return [(ctx.label(), spec.resolve(job, entries, LAST_SHOWN.get((node.uid, ctx.key()), ""))[0])
-            for ctx, job in _jobs(node)]
+    """(context label, Job, entry shown or None) of each context the node's last pass planned, for the sidebar. Drawing
+    reads them and plans nothing: planning may rebuild the node, which Blender refuses while drawing."""
+    status = STATUS.get(node.uid)
+    return status.uses if status is not None else []
 
 
 def older_settings(node, entry):

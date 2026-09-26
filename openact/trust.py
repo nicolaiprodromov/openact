@@ -19,6 +19,7 @@ from bpy.app.handlers import persistent
 from . import prefs as P
 
 TRUST = {"opened": None}  # the .blend as load_post saw it: "" for a file created in this session; None: not seen
+BLOCKED = "Blocked reading"  # how a blocked read's message starts, which the sidebar's trust banner looks for
 
 
 def ident(path: str) -> str:
@@ -76,21 +77,25 @@ def blocked(path: str) -> str:
     if is_trusted() or _inside(ident(path), ident(os.path.dirname(bpy.data.filepath))):
         return ""
     # normpath: Blender 5 saves file paths relative, so '//../x' arrives as '<folder>/../x'
-    return (f"Blocked reading {os.path.normpath(path)}: outside this file's folder. Allow this file (or trust its "
+    return (f"{BLOCKED} {os.path.normpath(path)}: outside this file's folder. Allow this file (or trust its "
             f"folder) to read it")
 
 
-def allow(path: str | None = None) -> bool:
-    """Allow this file: trust one .blend, by path. False when it was trusted already."""
+def allow(path: str | None = None, folder: bool = False) -> bool:
+    """Allow this file: trust one .blend, by path. With folder, trust this folder: the .blend's folder and every
+    subfolder. False when it was trusted already."""
     path = os.path.normpath(path or bpy.data.filepath)
+    name = "trusted_folders" if folder else "trusted_files"
+    if folder:
+        path = os.path.dirname(path)
     prefs = P.get_prefs()
-    if any(p and ident(p) == ident(path) for p in _paths(prefs, "trusted_files")):
+    if any(p and ident(p) == ident(path) for p in _paths(prefs, name)):
         return False
-    files = prefs.trusted_files
-    if isinstance(files, list):  # prefs._Defaults: the add-on is not enabled
-        files.append(path)
+    paths = getattr(prefs, name)
+    if isinstance(paths, list):  # prefs._Defaults: the add-on is not enabled
+        paths.append(path)
     else:
-        files.add().path = path
+        paths.add().path = path
         bpy.context.preferences.is_dirty = True  # saved with the other preferences
     return True
 

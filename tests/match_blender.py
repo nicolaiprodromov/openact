@@ -268,9 +268,9 @@ def phase_limits():
          Labels="; ".join(f"label {i}" for i in range(255)), Shift=0)
     with Capture() as capture:
         engine.run_pass()
-    status = engine.STATUS.get(node.uid, ("", ""))
-    check("limits: the node shows the error before anything is sent",
-          not capture.keys(node) and not capture.requests and status[0] == 'ERROR' and "8 500" in status[1], status)
+    status = engine.STATUS.get(node.uid)
+    check("limits: the node shows the error before anything is sent", not capture.keys(node) and not capture.requests
+          and status is not None and status.icon == 'CANCEL' and "8 500" in status.text, status)
 
     def costs(count, debias, n=3):
         return [row.cell.cost for row in CLASSIFY.job(gn, items[:n], labels_of(count), debias).rows]
@@ -322,8 +322,9 @@ def phase_pass_classify():
               and stored[0].shape["payload"] == [["roughness", "FLOAT"], ["metallic", "INT"]]
               and stored[0].shape["labels"] == ["metal", "wood", "stone", "fabric"],
               stored and (stored[0].rows.payload, stored[0].shape))
-        check("pass: the status summarises the table", engine.STATUS.get(node.uid) == (
-            'CHECKMARK', "4 items · 4 labels used · 0 unsure"), engine.STATUS.get(node.uid))
+        status = engine.STATUS[node.uid]
+        check("pass: the status summarises the table", (status.icon, status.text) == (
+            'CHECKMARK', "4 items · 4 labels used · 0 unsure"), status)
         words_key = stored[0].words_key
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
@@ -340,10 +341,11 @@ def phase_pass_classify():
             handle.write(text.replace("0.35", "0.355").replace("\nfabric,", "\n\nfabric,"))
         with Capture() as capture:
             engine.run_pass()
-        icon, status = engine.STATUS.get(node.uid, ("", ""))
-        check("pass: a Labels CSV warning (a blank line) shows before the summary, and asks nothing",
-              icon == 'ERROR' and status.startswith("families.csv line 5: Line 5 is blank")
-              and status.endswith("(4 items · 4 labels used · 0 unsure)") and not capture.keys(node), (icon, status))
+        icon, status = engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text
+        check("pass: a Labels CSV warning (a blank line) shows after the summary, and asks nothing",
+              icon == 'ERROR' and status.startswith("4 items · 4 labels used · 0 unsure · 1 warning: families.csv "
+                                                    "line 5: Line 5 is blank") and not capture.keys(node),
+              (icon, status))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -376,8 +378,9 @@ def phase_pass_match():
     check("pass: ID = material index; the empty slot reads the fallbacks and Selection uses Threshold 0.5",
           got == {"Probability": [0.9, 0.0, 0.1, 0.0, 0.0, 0.0], "Selection": [True] + [False] * 5,
                   "Confidence": [0.8, 0.0, 0.8, 0.0, 0.0, 0.0]} and not capture.keys(node), got)
-    check("pass: the status counts the materials only", engine.STATUS.get(node.uid) == (
-        'CHECKMARK', "1 of 2 yes · 0 unsure"), engine.STATUS.get(node.uid))
+    status = engine.STATUS[node.uid]
+    check("pass: the status counts the materials only", (status.icon, status.text) == (
+        'CHECKMARK', "1 of 2 yes · 0 unsure"), status)
 
 
 # ------------------------------------------------------------------------------ the real model
@@ -406,7 +409,7 @@ def phase_model(port, gpu):
     engine.schedule(immediate=True)
     started = time.time()
     finished = drive(engine, lambda: not pipeline.PENDING and all(
-        engine.STATUS.get(n.uid, ("",))[0] == 'CHECKMARK' for n in (match, classify)), timeout=300)
+        getattr(engine.STATUS.get(n.uid), "icon", "") == 'CHECKMARK' for n in (match, classify)), timeout=300)
     for n in (match, classify):
         print(f"  {n.name}: {engine.STATUS.get(n.uid)}", flush=True)
     check("model: both nodes answered", finished, f"{time.time() - started:.1f}s, server {server.status()}")

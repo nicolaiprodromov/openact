@@ -478,12 +478,12 @@ def linked_library():
     check("linked: the tree and its hidden group are linked",
           linked.library is not None and linked_inner is not None and linked_inner.library is not None)
     status = engine.STATUS.get(node.uid)
-    check("linked: the node says where its answers come from",
-          status == ('LINKED', f"Linked from {linked.library.name}: answers come from that file"), status)
+    check("linked: the node says where its answers come from", status is not None and (status.icon, status.text) == (
+        'LINKED', f"Linked from {linked.library.name}: answers come from that file"), status)
     check("linked: a pass writes nothing", after == before, (before, after))
     local_status = engine.STATUS.get(local_node.uid)
     check("append then link: the local copy gets its own uid and status",
-          shared and local_node.uid != node.uid and local_status is not None and local_status[0] != 'LINKED',
+          shared and local_node.uid != node.uid and local_status is not None and local_status.icon != 'LINKED',
           (shared, local_node.uid, node.uid, local_status))
     check("append then link: each uid finds its own node, so Ask Again can't clear the wrong one",
           engine.find_node(node.uid)[1] == node and engine.find_node(local_node.uid)[1] == local_node)

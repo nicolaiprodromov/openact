@@ -41,10 +41,17 @@ class _File:
     reads: dict = field(default_factory=dict)  # (schema, delimiter) -> the last good CsvDoc, None before one
     owners: set = field(default_factory=set)
     problem: str = ""  # the current error or "missing" message
+    doc: csvfmt.CsvDoc | None = None  # the latest read, problems included, for the sidebar's Files panel
+    read: float = 0.0  # when it was read (time.time())
 
 
 def _errors(doc):
     return [p.message for p in doc.problems if p.severity == csvfmt.ERROR]
+
+
+def _latest(watched, doc):
+    if doc is not watched.doc:  # the parse cache hands out one CsvDoc per read
+        watched.doc, watched.read = doc, time.time()
 
 
 class Watcher:
@@ -63,6 +70,7 @@ class Watcher:
             watched = self.files[ident] = _File(doc.path, None)
         watched.owners.add(owner)
         watched.stamp = doc.stamp if doc.stamp != (0, 0) else None
+        _latest(watched, doc)
         key = (doc.schema, delimiter)
         errors = _errors(doc)
         if errors:
@@ -139,6 +147,7 @@ class Watcher:
         broken, kinds, problem = bool(watched.problem), set(), ""
         for (schema, delimiter), good in list(watched.reads.items()):
             doc = csvfmt.load(watched.path, delimiter, schema)
+            _latest(watched, doc)
             errors = _errors(doc)
             if errors:
                 problem = problem or errors[0]
