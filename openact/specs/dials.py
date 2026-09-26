@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import csvfmt, pipeline
-from .base import KEY, Spec, confidence, option_text, warnings
+from .base import KEY, Spec, confidence, warnings
 from .base import named, number_text, overrides_inputs, parse_number, yes_no_text  # PR-21: the Overrides CSV
 
 SOCKETS = {"yes_no": 'NodeSocketBool', "amount": 'NodeSocketFloat', "one_of": 'NodeSocketInt'}
@@ -23,8 +23,10 @@ TYPES = {"yes_no": "yes/no", "amount": "amount", "one_of": "one-of"}  # as the S
 TIPS = {"yes_no": "True when the answer is yes", "amount": "How much, mapped from 0-1 into the setting's min-max",
         "one_of": "Position of the chosen answer, -1 until answered"}
 COLUMNS = (("value", "FLOAT"), ("c", "FLOAT"))  # value: p (yes/no), 0-1 (amount) or the chosen index (one-of)
-WARNINGS = {}  # node uid -> the rename warning, shown on the node until its settings change again
-FACE = "openact dials outputs"  # evaluator.MEMO key: the outputs the pass's first context of a node wants
+WARNINGS = {}  # node uid -> the warning under its status: its contexts disagree, else a setting lost its link
+RENAMED = {}  # node uid -> (the linked setting that went, the settings that came with it): what ends its warning
+FACES = {}  # node uid -> (outputs, context) of the first context its last pass resolved, which the others must match
+FACE, DIFFER = "openact dials outputs", "openact dials differ"  # evaluator.MEMO keys of one pass, with the node uid
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,9 +40,24 @@ class DialsShape(pipeline.TableShape):
                                                  for name, kind, low, high in self.settings])
 
 
-def outputs_of(entry) -> list[tuple[str, str]]:
-    """(name, type) of each setting of a stored entry, in output order."""
-    return [(s["name"], s["type"]) for s in entry.shape.get("settings", ())]
+@dataclasses.dataclass
+class DialsJob(pipeline.Job):
+    """A Dials Job, with the label of the context it was planned in, which a disagreement names (§6.0)."""
+
+    context: str = ""
+
+
+def differ(first_label, first, label, wanted) -> str:
+    """The warning for two contexts whose (name, type) lists differ (§6.0): what only one of them has."""
+    ours, theirs = ([f"'{name}' ({TYPES[kind]})" for name, kind in a if (name, kind) not in b]
+                    for a, b in ((first, wanted), (wanted, first)))
+    if ours and theirs:
+        what = f"{', '.join(ours)} vs {', '.join(theirs)}"
+    elif ours or theirs:
+        what = f"only '{first_label if ours else label}' has {', '.join(ours or theirs)}"
+    else:
+        what = "the same settings in another order"
+    return f"Dials: '{first_label}' and '{label}' use different settings ({what}); setting names and types must agree"
 
 
 def mapped(kind, value, low=0.0, high=1.0):
@@ -82,7 +99,13 @@ class DialsSpec(Spec):
                 and item.in_out == 'OUTPUT' and item.name != "Confidence" and item.socket_type in KINDS]
 
     def fallback(self, name):
-        return 0.0 if name == "Confidence" else None
+        """What an output gives a node that reads it as a word while this node shows a hint: Confidence 0.0 (§6.0).
+        A setting's type can't be told from its name, so its reader waits, as it does before the first answer."""
+        from ..evaluator import Pending  # imports bpy
+
+        if name == "Confidence":
+            return 0.0
+        raise Pending()
 
     # ------------------------------------------------------------------------------------------ planning
 
@@ -120,58 +143,47 @@ class DialsSpec(Spec):
         if not gn[0].strip():
             raise Hint("Type a prompt")
         job = self.job(gn, settings, node.balance_order, node.uid, hashes)
-        job.problems = problems
+        job.problems, job.context = problems, ctx.label()
         return self.locked(node, ctx, job)  # after the warnings: locked() appends its own
 
     def job(self, gn, settings, debias, uid="", csv_hashes=()):
         """The Job for these words and settings: one row per setting, every question about the Prompt, so one request.
-        Pure, so the pure suites plan exactly like the pass. min/max enter only the shape, never a wkey."""
+        Each setting is asked as Ask asks its answer set (§10.2). Pure, so the pure suites plan exactly like the pass.
+        min/max enter only the shape, never a wkey."""
+        from .. import sources  # pure without bpy
+
         prompt = gn[0].strip()
         rows = []
         for setting in settings:
-            question = self.question(setting)
-            criteria = question.get("criteria")
-            ordered = list(criteria.items()) if isinstance(criteria, dict) else criteria
-            options = 2 if criteria is None or setting.type == "yes_no" else len(criteria)
-            cell = pipeline.Cell(pipeline.cell_key(question["type"], prompt, setting.question, ordered, debias),
-                                 prompt, question, pipeline.cost(options, debias))
+            answers = (csvfmt.AnswerSet(tuple(csvfmt.Option(name, when, "", {}) for name, when in setting.answers), None)
+                       if setting.answers else sources.default_set(setting.type))  # one-of always has answers
+            question = sources.question(setting.type, setting.question, answers)
+            criteria = question["criteria"]
+            cell = pipeline.Cell(pipeline.cell_key(question["type"], prompt, setting.question, criteria, debias),
+                                 prompt, question, pipeline.cost(len(criteria), debias))
             wkey = pipeline.wkey(self.name, setting.type, [prompt], [setting.question], list(setting.answers))
             rows.append(pipeline.Row(setting.name, wkey, cell=cell))
         shape = DialsShape(len(rows), COLUMNS, tuple((s.name, s.type, s.min, s.max) for s in settings))
         words_key = pipeline.words_key(gn, list(csv_hashes), "", shape.digest(), [row.wkey for row in rows])
-        return pipeline.Job(uid, tuple(gn), words_key, shape, rows, debias=debias,
-                            options=tuple(tuple(name for name, _when in s.answers) for s in settings))
-
-    @staticmethod
-    def question(setting) -> dict:
-        """§10.2: the setting's question; yes/no -> noul, amount -> score over its levels, one-of -> choice."""
-        if setting.type == "yes_no":
-            asked = {"type": "noul", "instructions": setting.question}
-            if setting.answers:  # without whens the server offers "Yes." and "No.", as for Ask
-                whens = {name.casefold(): when for name, when in setting.answers}
-                asked["criteria"] = {"true": whens.get("yes") or "Yes.", "false": whens.get("no") or "No."}
-            return asked
-        if setting.type == "amount":
-            from ..sources import AMOUNT_LEVELS  # not at module level: specs load while inner is importing
-
-            levels = [option_text(option) for option in setting.answers] or list(AMOUNT_LEVELS)
-            return {"type": "score", "instructions": setting.question, "criteria": levels}
-        return {"type": "choice", "instructions": setting.question,
-                "criteria": {str(i): option_text(option) for i, option in enumerate(setting.answers)}}
+        return DialsJob(uid, tuple(gn), words_key, shape, rows, debias=debias,
+                        options=tuple(tuple(name for name, _when in s.answers) for s in settings))
 
     def resolve(self, job, entries, last_shown="", partial=False):
+        """Spec.resolve() for a job with the settings of the first context a pass resolves, which the outputs follow
+        (sync(), §6.0). A context with other settings keeps the entry stored for its words, its last good table, and
+        asks nothing, while the node warns. Outside a pass (the sidebar), the last pass's first context counts."""
         from .. import evaluator  # imports bpy
 
-        if evaluator.MEMO is not None:  # in a pass: every live context must agree on the outputs (§6.0)
-            wanted = [(name, kind) for name, kind, _low, _high in job.shape.settings]
-            first = evaluator.MEMO.setdefault((FACE, job.uid), wanted)
-            if first != wanted:
-                one, other = ([f"'{name}' ({TYPES[kind]})" for name, kind in a if (name, kind) not in b]
-                              for a, b in ((first, wanted), (wanted, first)))
-                what = f"{', '.join(one) or '-'} vs {', '.join(other) or '-'}" if one or other else "another order"
-                return None, [], [f"Dials: contexts use different settings ({what}); setting names and types must "
-                                  f"agree"]
-        return super().resolve(job, entries, last_shown, partial)
+        wanted = [(name, kind) for name, kind, _low, _high in job.shape.settings]
+        memo = evaluator.MEMO
+        if memo is not None and (FACE, job.uid) not in memo:
+            memo[(FACE, job.uid)] = FACES[job.uid] = (wanted, job.context)
+        first, where = FACES.get(job.uid, (wanted, job.context))
+        if wanted == first:
+            return super().resolve(job, entries, last_shown, partial)
+        if memo is not None:
+            memo.setdefault((DIFFER, job.uid), differ(where, first, job.context, wanted))
+        return next((entry for entry in entries if entry.gn == job.gn), None), [], []
 
     def neutral(self, job, index):
         _name, kind, _low, _high = job.shape.settings[index]
@@ -235,24 +247,39 @@ class DialsSpec(Spec):
             b.link(value, sock(switch.inputs, "True"))
             b.link(switch.outputs[0], go.inputs[name])
 
-    def sync(self, node, entries):
-        """Give the node the outputs of the newest entry its contexts show, as the pass passes them (§6.0); while none
-        shows, the node keeps its outputs and the links to them. Matched by name and type, so a renamed or retyped
-        setting replaces its socket, and a link to it is dropped with a warning. Returns the outputs."""
-        from ..inner import sync_interface  # imports bpy
+    def layout(self, node, entries):
+        """What build() bakes besides the entries' words (inner._built()): output j reads table column j, so a
+        Settings CSV whose rows only move needs a new graph, while a min/max edit stays values only."""
+        return self.outputs(node)
 
-        have = self.outputs(node)
-        newest = max(entries, key=lambda entry: entry.t, default=None)
-        wanted = have if newest is None else outputs_of(newest)
+    def sync(self, node, _entries):
+        """Give the node the outputs of the settings the first context of its pass plans (resolve()), so they exist
+        before the first answer (§6.0); while no context plans, it keeps its outputs and their links. Matched by name
+        and type: a renamed or retyped setting replaces its socket, and its dropped link warns until the setting is
+        back (undo, File > Revert), a socket that came with it is linked, or the outputs change again. Contexts that
+        disagree warn instead."""
+        from .. import evaluator  # imports bpy
+        from ..inner import sync_interface
+
+        memo, uid, have = evaluator.MEMO or {}, node.uid, self.outputs(node)
+        wanted = memo[(FACE, uid)][0] if (FACE, uid) in memo else have
         if wanted != have:
             linked = {socket.name for socket in node.outputs if socket.is_linked}
-            gone = [name for name, kind in have if (name, kind) not in wanted and name in linked]
+            gone = [(name, kind) for name, kind in have if (name, kind) not in wanted and name in linked]
             sync_interface(node, self.interface(node, wanted))
+            RENAMED.pop(uid, None)
             if gone:
-                WARNINGS[node.uid] = f"Setting '{gone[0]}' renamed or retyped: reconnect its output"
-            else:
-                WARNINGS.pop(node.uid, None)
-        return wanted
+                RENAMED[uid] = (gone[0], [pair for pair in wanted if pair not in have])
+        gone, came = RENAMED.get(uid, (None, ()))
+        if gone in wanted or any(name in node.outputs and node.outputs[name].is_linked for name, _kind in came):
+            del RENAMED[uid]
+        warning = memo.get((DIFFER, uid))
+        if warning is None and uid in RENAMED:
+            warning = f"Setting '{gone[0]}' renamed or retyped: reconnect its output"
+        if warning:
+            WARNINGS[uid] = warning
+        else:
+            WARNINGS.pop(uid, None)
 
     def entry_table(self, node, entries):
         """The one-row-per-entry table (§8.4): row e holds materialised entry e's value of each output setting (its

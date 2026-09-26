@@ -172,27 +172,14 @@ def _word(node, name, ctx):
 
 
 def _text_items(node, ctx, spec):
+    from . import sources  # sources imports this module
+
     raw = as_text(_word(node, "Items", ctx))
-    source = csv_source(node, "Items", ctx)
-    if source is not None:
-        doc = load_csv(node, source)
-        try:
-            answers = csvfmt.parse_answer_set(doc, "items", spec)
-        except csvfmt.CsvError as error:
-            raise file_error(doc, error) from None
-        problems = answers.problems
-        if source.warning:
-            problems += (csvfmt.Problem(csvfmt.WARNING, doc.path, 0, "", source.warning),)
-        items = tuple(Item(o.name, o.when, dict(o.payload)) for o in answers.options)
-        return ItemList("TEXT", items, raw, doc, source, None, ("TEXT", raw, doc.path, source.delimiter, doc.stamp),
-                        problems)
-    if not raw.strip():
-        raise Hint("Type items separated by commas, or a .csv path")
-    try:
-        answers = csvfmt.parse_inline_set(raw, "items")
-    except csvfmt.CsvError as error:
-        raise Unresolvable(f"Items: {error}") from None
-    return ItemList("TEXT", tuple(Item(o.name, o.when) for o in answers.options), raw, fingerprint=("TEXT", raw))
+    answers = sources.answer_set(node, ctx, "Items", "items", spec, "Type items separated by commas, or a .csv path")
+    doc, source = answers.doc, answers.source
+    items = tuple(Item(o.name, o.when, dict(o.payload)) for o in answers.options)
+    fingerprint = ("TEXT", raw) + ((doc.path, source.delimiter, doc.stamp) if doc is not None else ())
+    return ItemList("TEXT", items, raw, doc, source, None, fingerprint, answers.problems)
 
 
 def _collection_items(node, ctx):

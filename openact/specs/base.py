@@ -175,9 +175,13 @@ class Spec:
         return None
 
     def fingerprint(self, node, ctx) -> str:
-        """Everything plan() reads, hashed: while it is unchanged, the Job planned from it still holds (§5.3)."""
+        """Everything plan() reads, hashed: while it is unchanged, the Job planned from it still holds (§5.3). The
+        trust state is part of it, as it decides which files plan() may read (§16.1)."""
+        from .. import trust  # imports bpy
+
         return pipeline.digest(self.name, self.PROMPT_VERSION, self.gn(node, ctx), getattr(node, "answer_type", ""),
-                               node.balance_order, self.listed(node, ctx), self.overrides_stamp(node, ctx))
+                               node.balance_order, self.listed(node, ctx), self.overrides_stamp(node, ctx),
+                               trust.is_trusted())
 
     def plan(self, node, ctx) -> pipeline.Job:
         """The node's Job in ctx. Raises Hint, Pending or Unresolvable."""
@@ -391,10 +395,6 @@ class Spec:
     def summary(self, entry) -> str:
         """The answer in a few words, for the status line and the sidebar."""
         raise NotImplementedError
-
-    def word_sockets(self, gi) -> list:
-        """The inner group's input of each word, None for a word the node has no socket for."""
-        return [gi.outputs.get(name) for name in self.WORDS]
 
     def build(self, b, gi, go, entries) -> None:
         """Lay out the inner group's nodes for these entries (inner.build())."""

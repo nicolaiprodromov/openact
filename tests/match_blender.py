@@ -7,7 +7,9 @@
   re-bakes it and asks nothing), and an empty material slot that is never asked;
 - a draw (the sidebar's answers_for(), where Blender refuses ID writes) never writes a Classify node: after a Labels
   CSV path is typed, a header renamed or a column removed, the next pass syncs the payload outputs, also after an undo
-  that keeps the plans.
+  that keeps the plans;
+- two contexts must agree on their Labels CSVs' payload headers and types (§6.0): other ones give the error, and the
+  outputs, their links and the last good table stay, also while a CSV has an error.
 With -- --model PORT GPU, also a spot check with the real model on that port and GPU: pan = yes and sofa = no for
 "Would you find it in a kitchen?"; "steel" -> metal and "oak planks" -> wood.
 
@@ -473,6 +475,82 @@ def phase_draw_classify():
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def phase_agree_classify():
+    """§6.0: the contexts of one Classify must read the same payload headers and types. Labels CSVs that share them
+    with other values each show their own. Other headers or types give the error naming both contexts, and nothing
+    is asked, stored or rebuilt: the outputs, the links to them and the last good table stay, also while either
+    CSV has an error (§7.8)."""
+    folder = tempfile.mkdtemp(prefix="openact-agree-")
+    try:
+        with open(FAMILIES, encoding="utf-8") as handle:
+            text = handle.read()
+        paths = [os.path.join(folder, name) for name in ("a.csv", "b.csv")]
+        bodies = dict(zip(paths, (text, text.replace("0.35,1", "0.4,1"))))  # the same headers, other values
+        for path, body in bodies.items():
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(body)
+        tree, node = make_tree("ClassifyAgree", ClassifySpec.idname, ("Labels",))
+        node.inputs["Items"].default_value = "steel, oak planks, marble, silk"
+        objs = [user(name, tree, Labels=path, Shift=0) for name, path in zip(("CGA", "CGB"), paths)]
+        uses = evaluator.find_uses()[tree.as_pointer()]
+        with Capture():
+            engine.run_pass()
+        for ctx in uses:
+            for row in CLASSIFY.plan(node, ctx).rows:
+                pipeline.remember(row.cell.key, {"probabilities": FAMILY_ANSWERS[row.name], "model": "fake"})
+        with Capture():
+            engine.run_pass()
+        store_outputs(tree, node, {"Label": 'INT', "roughness": 'FLOAT', "metallic": 'INT'})
+        names, summary = ("Label", "roughness", "metallic"), "4 items · 4 labels used · 0 unsure   +1 more"
+        before = [read(obj, names) for obj in objs]
+        check("agreement: two contexts whose Labels CSVs share the payload headers, with other values, each read "
+              "their own payload", before == [{"Label": [0, 1, 2, 3, -1, -1], "metallic": [1, 0, 0, 0, 0, 0],
+                                               "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0]},
+                                              {"Label": [0, 1, 2, 3, -1, -1], "metallic": [1, 0, 0, 0, 0, 0],
+                                               "roughness": [0.4, 0.6, 0.8, 0.9, 0.0, 0.0]}]
+              and engine.STATUS.get(node.uid) == ('CHECKMARK', summary), (before, engine.STATUS.get(node.uid)))
+        first, second = (CLASSIFY.gn(node, ctx)[3] for ctx in uses)  # first-wins would follow the first's CSV
+        stored, shown = [(entry.gn, entry.words_key) for entry in S.load(node).entries], face(node)
+
+        def edited(path, body):
+            """Write a context's CSV and run a pass: (status, cells asked, whether the entries, the outputs, their
+            links and the group stayed, whether both objects read what they did)."""
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(body)
+            with Capture() as capture:
+                engine.run_pass()
+            kept = [(entry.gn, entry.words_key) for entry in S.load(node).entries] == stored and face(node) == shown
+            return (engine.STATUS.get(node.uid), len(capture.keys(node)), kept,
+                    [read(obj, names) for obj in objs] == before)
+
+        def broken(path):
+            return ('ERROR', f"{os.path.basename(path)}: Two columns are named 'Answer'"), 0, True, True
+
+        labels = [ctx.label() for ctx in uses]
+        conflict = "Classify: '{}' and '{}' use Labels CSVs with different payload columns ({})".format
+        headers = ('ERROR', conflict(*labels, "'hardness' (INT) vs 'roughness' (FLOAT), 'metallic' (INT)")), 0, True, True
+        hardness = "answer,when,hardness\n" + "".join(f"{line.rsplit(',', 2)[0]},{value}\n" for line, value
+                                                      in zip(text.splitlines()[1:], (9, 3, 7, 1)))
+        got = edited(first, hardness)
+        check("agreement: a Labels CSV with other payload columns gives the error naming both contexts; nothing is "
+              "asked, stored or rebuilt, and the outputs, their links and both objects' values stay", got == headers,
+              got)
+        got = edited(second, "answer,Answer\nx,y\n"), edited(second, bodies[second])
+        check("agreement: while the CSV whose columns the outputs show has an error, the outputs, their links and both "
+              "objects' values stay; readable again, the error is back", got == (broken(second), headers), got)
+        got = edited(first, "answer,Answer\nx,y\n")
+        check("agreement: while the other CSV has an error, the outputs, their links and both objects' values stay",
+              got == broken(first), got)
+        got = edited(first, text.replace("0.35,1", "0.35,1.5"))
+        check("agreement: readable again, with a payload column of another type: the error names it",
+              got == (('ERROR', conflict(*labels, "'metallic' (FLOAT) vs 'metallic' (INT)")), 0, True, True), got)
+        got = edited(first, bodies[first])
+        check("agreement: once both agree again, each object reads its own payload with its links, 0 requests",
+              got == (('CHECKMARK', summary), 0, True, True), got)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def phase_pass_match():
     palette = bpy.data.objects.new("Palette", bpy.data.meshes.new("Palette"))
     for name in ("Steel", None, "Oak"):
@@ -554,6 +632,7 @@ def main():
     phase_limits()
     phase_pass_classify()
     phase_draw_classify()
+    phase_agree_classify()
     phase_pass_match()
     if MODEL is not None:
         phase_model(*MODEL)

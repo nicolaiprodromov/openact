@@ -131,12 +131,12 @@ def _bump(uid):
     pipeline.cancel(uid, below=GENERATIONS[uid])
 
 
-def _jobs(node):
-    """(ctx, Job) for each use of the node that has a question."""
+def _jobs(node, contexts=None):
+    """(ctx, Job) for each of the contexts, by default every use of the node, that has a question."""
     tree = node.id_data
     spec = SPECS[node.bl_idname]
     jobs = []
-    for ctx in find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
+    for ctx in contexts or find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
         try:
             jobs.append((ctx, _plan(spec, node, ctx)))
         except (Hint, Pending, Unresolvable):
@@ -284,6 +284,12 @@ def _process(tree, node, contexts):
     instead = {}  # partial table shown in their place, or None; and (uid, ctx key) -> that table's words key
     problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
+    # §6.0: the sockets follow the live jobs (Rules, Classify). Jobs that disagree answer nothing, so the last good
+    # table stays, as it does while a context's CSV has errors (§7.8): that context still shows its last table
+    held = hasattr(spec, "agree") and _csv_error(spec, node, contexts)
+    conflict = spec.agree(node, _jobs(node, contexts)) if hasattr(spec, "agree") and not held else ""
+    if conflict:
+        problems.append(conflict)
     for ctx in contexts:
         key = (node.uid, ctx.key())
         try:
@@ -304,6 +310,8 @@ def _process(tree, node, contexts):
         warnings += job.problems
         if job.gn not in live:
             live.append(job.gn)
+        if conflict or held:
+            continue
         other = jobs.setdefault(job.gn, (job, ctx))
         if other[0] is not job and other[0].words_key != job.words_key:
             problems.append(CLASH.format(other[1].label(), ctx.label()))
@@ -395,6 +403,18 @@ def _live(live, spec, node, ctx):
         return
     if gn not in live:
         live.append(gn)
+
+
+def _csv_error(spec, node, contexts):
+    """True when a context reads a CSV with errors (evaluator.FileError)."""
+    for ctx in contexts:
+        try:
+            _plan(spec, node, ctx)
+        except evaluator.FileError:
+            return True
+        except (Hint, Pending, Unresolvable):
+            continue
+    return False
 
 
 def _submit(job, missing):

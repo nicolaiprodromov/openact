@@ -10,20 +10,16 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-import os
 
 from .. import csvfmt, pipeline, rules_core
-from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, yes_no_text
+from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, named, number_text, overrides_inputs, warnings
+from .base import yes_no_text
 
 FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
 OUTCOMES_HINT = "Add outcomes"
-UNSURE_BELOW = 0.30  # 4.e; the preference arrives with PR-22
 PAYLOAD = "pl_"  # table column prefix of a payload output, followed by its position
-HEAD = ("Question", "Context", "Factors", "Factors CSV", "Outcomes", "Outcomes CSV", "Overrides", "Overrides CSV",
-        "Dither", "Seed", "Key")  # inputs that are not factors
 SOCKETS = {"amount": 'NodeSocketFloat', "category": 'NodeSocketInt', "flag": 'NodeSocketBool'}
 MODES = {"Outcome": 'ONE_OF', "Probability": 'YES_NO', "Amount": 'AMOUNT'}  # the output that tells the mode
-DECLARED = {}  # node uid -> (factors ((name, kind), ...), payload ((name, type), ...)) of its last plan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,10 +28,19 @@ class RulesShape(pipeline.TableShape):
 
     factors: tuple = ()  # declare() of each factor
     payload: tuple = ()  # One-of: (name, "INT" | "FLOAT", value per outcome row)
+    outcomes: tuple = ()  # One-of: the outcome names, in the row order the "outcome" column counts in
 
     def as_dict(self):
-        return {**super().as_dict(), "factors": [dict(f) for f in self.factors],
-                "payload": [[name, kind, list(values)] for name, kind, values in self.payload]}
+        shape = {**super().as_dict(), "factors": [dict(f) for f in self.factors],
+                 "payload": [[name, kind, list(values)] for name, kind, values in self.payload]}
+        if self.outcomes:
+            shape["outcomes"] = list(self.outcomes)
+        return shape
+
+    def digest(self):
+        """Without the outcome names: the Outcomes text enters the words key already, and entries stored without
+        the names stay valid."""
+        return pipeline.digest("shape", {key: value for key, value in self.as_dict().items() if key != "outcomes"})
 
 
 def declare(factor) -> dict:
@@ -56,30 +61,23 @@ def factor_of(data) -> csvfmt.Factor:
 
 class RulesSpec(Spec):
     name, idname, label = "rules", "GeometryNodeOpenActRules", "Rules"
+    PROMPT_VERSION = rules_core.PROMPT_VERSION  # the §9.5 templates live in rules_core
     WORDS = ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
     empty_hint = FACTORS_HINT
 
     # ------------------------------------------------------------------ sockets
 
-    def declared(self, node):
-        """(factors, payload) the interface shows: the last plan's, else the newest stored entry's."""
-        found = DECLARED.get(node.uid)
-        if found is not None:
-            return found
-        from .. import store
-
-        entries = [entry for entry in store.load(node).entries if entry.shape.get("factors")]
-        if not entries:
-            return (), ()
-        shape = max(entries, key=lambda entry: entry.t).shape
-        return (tuple((f["name"], f["kind"]) for f in shape["factors"]),
-                tuple((p[0], p[1]) for p in shape.get("payload") or ()))
-
-    def interface(self, node):
+    def interface(self, node, factors=None, payload=None):
+        """The sockets for these factors ((name, kind), ...) and One-of payload outputs ((name, type), ...); by
+        default the ones the node has, which the pass keeps in step with its live jobs (agree())."""
         from .. import sources
         from ..inner import SocketDef
 
-        factors, payload = self.declared(node)
+        tree = node.node_tree
+        if factors is None:
+            factors = _factor_sockets(tree) if tree is not None else []
+        if payload is None:
+            payload = _payload_outputs(tree) if tree is not None else []
         mode = node.answer_type
         defs = [
             SocketDef('INPUT', "Question", 'NodeSocketString',
@@ -109,44 +107,48 @@ class RulesSpec(Spec):
         defs += [SocketDef('OUTPUT', name, socket_type, description) for name, socket_type, description in outputs]
         return defs + [SocketDef(*KEY)]
 
-    def _declare(self, node, factors, answers):
-        """Remember what this plan declares; when the interface differs, sync it and rebuild (§6.0)."""
-        from .. import inner, store
-        from ..evaluator import Pending
+    def agree(self, node, jobs):
+        """§6.0, once per pass before any context is answered: every live context must bake the same graph. Jobs that
+        agree give the node the sockets they declare, and "" is returned. Otherwise the error naming the first two
+        contexts that differ is returned, and the node, its entries and its graph stay as they are.
 
-        payload = ()
-        if node.answer_type == 'ONE_OF' and answers.doc is not None:
-            payload = tuple(answers.doc.num_cols.items())
-        DECLARED[node.uid] = (tuple((f.name, f.kind) for f in factors), payload)
-        wanted = self.interface(node)
-        expected = [(d.in_out, d.name, d.socket_type) for d in sorted(wanted, key=lambda d: d.in_out != 'OUTPUT')]
-        if node.node_tree is None or _face(node.node_tree) == expected:
-            return
-        try:
-            inner.sync_interface(node, wanted)
-            inner.build(node, store.load(node))
-        except (AttributeError, RuntimeError) as error:  # a draw callback may not write: the pass will
-            raise Pending() from error
+        jobs: (ctx, Job) of each live context. Only level names and whens, and payload values, may differ."""
+        from .. import inner  # imports bpy
+
+        if not jobs:
+            return ""
+        (first_ctx, first), *others = jobs
+        for ctx, job in others:
+            if _layout(job.shape.factors) != _layout(first.shape.factors):
+                return f"Rules: '{first_ctx.label()}' and '{ctx.label()}' use Factors CSVs with different factors"
+            if _columns(job.shape.payload) != _columns(first.shape.payload):
+                return (f"Rules: '{first_ctx.label()}' and '{ctx.label()}' use Outcomes CSVs with different payload "
+                        f"columns")
+        if node.node_tree is not None:
+            factors = [(f["name"], f["kind"]) for f in first.shape.factors]
+            inner.sync_interface(node, self.interface(node, factors, _columns(first.shape.payload)))
+        return ""
 
     # ------------------------------------------------------------------ planning
 
     def listed(self, node, ctx):
-        """The CSV files plan() reads, by path and stamp, so an edit plans again (§5.3)."""
+        """The CSV files plan() reads, by path and stamp as read, so an edit plans again (§5.3), and so does a file
+        that becomes readable or is no longer blocked."""
         from .. import lists
         from ..evaluator import Hint, Pending, Unresolvable
 
         seen = []
-        for name in ("Factors", "Outcomes"):
+        for name, schema in (("Factors", "factors"), ("Outcomes", "answer_set")):
             try:
                 source = lists.csv_source(node, name, ctx)
-                path = lists.resolve_path(source.path, node) if source is not None else ""
-                stat = os.stat(path) if path else None
-                seen.append([path, source and source.delimiter, stat and stat.st_mtime_ns, stat and stat.st_size])
-            except (Hint, Pending, Unresolvable, OSError) as error:
+                doc = lists.load_csv(node, source, schema) if source is not None else None
+                seen.append(doc and [doc.path, source.delimiter, list(doc.stamp)])
+            except (Hint, Pending, Unresolvable) as error:
                 seen.append(str(error))
         return seen
 
     def plan(self, node, ctx):
+        """The node's Job in ctx. Writes nothing: the sockets follow the Job in the pass (agree())."""
         from .. import lists, sources
         from ..evaluator import Hint, Unresolvable
 
@@ -162,8 +164,11 @@ class RulesSpec(Spec):
         kind = sources.KINDS[node.answer_type]
         answers = sources.answer_set(node, ctx, "Outcomes", kind, spec="rules", empty_hint=OUTCOMES_HINT)
         hashes = [doc.text_hash] + ([answers.doc.text_hash] if answers.doc is not None else [])
+        problems = doc.problems
+        if source.warning:  # as answer_set() reports the Outcomes one
+            problems += (csvfmt.Problem(csvfmt.WARNING, doc.path, 0, "", source.warning),)
         try:
-            job = self.job(gn, factors, answers, node.answer_type, node.balance_order, hashes, node.uid)
+            job = self.job(gn, factors, answers, node.answer_type, node.balance_order, hashes, node.uid, problems)
         except rules_core.RulesHint as hint:
             raise Hint(str(hint)) from None
         except rules_core.RulesError as error:
@@ -172,15 +177,16 @@ class RulesSpec(Spec):
             if answers.doc is None:
                 raise Unresolvable(f"Outcomes: {error}") from None
             raise lists.file_error(answers.doc, error) from None
-        self._declare(node, factors, answers)
-        return self.locked(node, ctx, job)
+        return self.locked(node, ctx, job)  # after the problems: locked() adds its own
 
-    def job(self, gn, factors, answers, answer_type, debias, hashes=(), uid=""):
-        """The Job for these words, factors and outcomes (None: the default Yes/No or Amount levels). Pure, so the
-        pure suites plan exactly like the pass. Raises RulesHint, RulesError or CsvError."""
+    def job(self, gn, factors, answers, answer_type, debias, hashes=(), uid="", problems=()):
+        """The Job for these words, factors and outcomes (an AnswerSet: sources.default_set() for an empty Yes/No or
+        Amount input). Pure, so the pure suites plan exactly like the pass. Its problems, which the pass shows: the
+        cells no outcome applies to, then the warnings of the Factors CSV (`problems`), of the Outcomes and of the
+        plan. Raises RulesHint, RulesError or CsvError."""
         question, context = gn[0].strip(), gn[1].strip()
         planned = rules_core.plan_table(factors, answer_type, answers, question, context, debias)
-        options = answers.options if answers is not None else rules_core.default_options(answer_type)
+        options = answers.options
         rows = []
         for cell in planned.cells:
             facts = [[f.name, f.levels[b].name, f.levels[b].when] for f, b in zip(factors, cell.levels)]
@@ -193,18 +199,21 @@ class RulesSpec(Spec):
             ordered = list(asked["criteria"].items()) if isinstance(asked["criteria"], dict) else asked["criteria"]
             key = pipeline.cell_key(asked["type"], planned.state, asked["instructions"], ordered, debias)
             rows.append(pipeline.Row(cell.name, wkey, cell=pipeline.Cell(key, planned.state, asked, cell.cost)))
+        payload, outcomes = (), ()
         if answer_type == 'ONE_OF':
             columns = (("outcome", "INT"), ("c", "FLOAT"))
+            outcomes = tuple(option.name for option in options)
+            if answers.doc is not None:
+                payload = tuple((name, kind, tuple(option.payload.get(name, 0) for option in options))
+                                for name, kind in answers.doc.num_cols.items())
         else:
             columns = ((rules_core.value_column(answer_type), "FLOAT"), ("c", "FLOAT"), ("ok", "FLOAT"))
-        payload = ()
-        if answer_type == 'ONE_OF' and answers is not None and answers.doc is not None:
-            payload = tuple((name, kind, tuple(option.payload.get(name, 0) for option in options))
-                            for name, kind in answers.doc.num_cols.items())
-        shape = RulesShape(len(rows), columns, tuple(declare(f) for f in factors), payload)
+        shape = RulesShape(len(rows), columns, tuple(declare(f) for f in factors), payload, outcomes)
         words_key = pipeline.words_key(gn, list(hashes), answer_type, shape.digest(), [row.wkey for row in rows])
+        shown = ((planned.error,) if planned.error else ()) + warnings((*problems, *answers.problems,
+                                                                       *planned.warnings))
         return pipeline.Job(uid, tuple(gn), words_key, shape, rows, answer_type=answer_type, debias=debias,
-                            options=tuple(option.name for option in options))
+                            problems=shown, options=tuple(option.name for option in options))
 
     # ------------------------------------------------------------------ the Overrides CSV (§7.6)
 
@@ -232,6 +241,23 @@ class RulesSpec(Spec):
 
     # ------------------------------------------------------------------ answers
 
+    def resolve(self, job, entries, last_shown="", partial=False):
+        """Spec.resolve(). A One-of row stores its outcome as a row of the Outcomes, while its wkey holds only the
+        names and whens of the outcomes it offers (§5.4). So a row carried from an entry that lists its outcomes in
+        another order takes its outcome's row in the job, by name: moving, inserting or deleting an Outcomes row never
+        relabels a carried row, and asks only the cells whose offered outcomes changed. The entry that holds gets the
+        outcome names if it was stored without them."""
+        if job.answer_type != 'ONE_OF':
+            return super().resolve(job, entries, last_shown, partial)
+        outcomes = list(job.shape.outcomes)
+        entries = [_renumbered(entry, outcomes) if entry.words_key != job.words_key
+                   and (entry.gn == job.gn or (last_shown and entry.words_key == last_shown)) else entry
+                   for entry in entries]  # only the entries Spec.resolve() carries rows from (stale rows too)
+        entry, missing, failed = super().resolve(job, entries, last_shown, partial)
+        if entry is not None and entry.shape.get("outcomes") != outcomes:
+            entry = dataclasses.replace(entry, shape=dict(entry.shape, outcomes=outcomes))
+        return entry, missing, failed
+
     def rows(self, job, answers):
         """As Spec.rows(); a One-of answer's winner is mapped back to its outcome row through the criteria keys."""
         out = []
@@ -255,14 +281,12 @@ class RulesSpec(Spec):
 
     def entry(self, job, rows, model=""):
         """Spec.entry(), plus One-of's payload denormalised per cell from its outcome (rows.payload)."""
-        asked = next((row.ask for row in rows if row.ask), "")  # code and error rows were asked nothing
-        rows = [row if row.ask is not None else dataclasses.replace(row, ask=asked) for row in rows]
         entry = super().entry(job, rows, model)
         outcomes = entry.rows.v.get("outcome")
         if outcomes is not None:
             entry.rows.payload = {
                 name: [values[o] if 0 <= o < len(values) else (-1 if kind == "INT" else 0.0) for o in outcomes]
-                for name, kind, values in getattr(job.shape, "payload", ())}
+                for name, kind, values in job.shape.payload}
         return entry
 
     def single(self, rows):
@@ -319,7 +343,7 @@ class RulesSpec(Spec):
     # ------------------------------------------------------------------ the graph
 
     def build(self, b, gi, go, entries):
-        b.match_chain(self.word_sockets(gi), [e.gn for e in entries])
+        b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
         mode = _mode(b.tree)
         reference = _reference(b.tree, entries, mode)
         if reference is None:
@@ -336,24 +360,53 @@ class RulesSpec(Spec):
 # ---------------------------------------------------------------------- the interface and the reference entry
 
 
-def _face(tree):
-    return [(i.in_out, i.name, i.socket_type) for i in tree.interface.items_tree if i.item_type == 'SOCKET']
-
-
 def _mode(tree):
     names = {i.name for i in tree.interface.items_tree if i.item_type == 'SOCKET' and i.in_out == 'OUTPUT'}
     return next((mode for name, mode in MODES.items() if name in names), None)
 
 
 def _factor_sockets(tree):
+    """(name, kind) of the factor inputs: the Int, Float and Bool inputs that are not the node's own (§6.5)."""
     kinds = {socket: kind for kind, socket in SOCKETS.items()}
-    return [(i.name, kinds[i.socket_type]) for i in tree.interface.items_tree
-            if i.item_type == 'SOCKET' and i.in_out == 'INPUT' and i.name not in HEAD and i.socket_type in kinds]
+    return [(i.name, kinds[i.socket_type]) for i in tree.interface.items_tree if i.item_type == 'SOCKET'
+            and i.in_out == 'INPUT' and i.socket_type in kinds and i.name.casefold() not in csvfmt.RULES_INPUTS]
+
+
+def _payload_outputs(tree):
+    """(name, type) of the One-of payload outputs: the Int and Float outputs besides Outcome and Confidence."""
+    types = {'NodeSocketInt': "INT", 'NodeSocketFloat': "FLOAT"}
+    return [(i.name, types[i.socket_type]) for i in tree.interface.items_tree if i.item_type == 'SOCKET'
+            and i.in_out == 'OUTPUT' and i.socket_type in types and i.name not in MODES and i.name != "Confidence"]
+
+
+def _layout(factors):
+    """What the graph bakes of each factor (declare()), without the level names and whens, which are words (§6.0)."""
+    return [(f["name"], f["kind"], len(f["levels"]), f["values"], f["edges"]) for f in factors]
+
+
+def _columns(payload):
+    """(name, type) of each payload column (RulesShape.payload): its values are per-entry data."""
+    return [(name, kind) for name, kind, _values in payload]
+
+
+def _renumbered(entry, outcomes):
+    """A stored One-of entry with each row's outcome renumbered to its row in `outcomes`, by name. A row whose
+    outcome has no row there, and every row of an entry stored without its outcome names, loses its wkey, so no
+    job carries it."""
+    stored, chosen = entry.shape.get("outcomes"), entry.rows.v.get("outcome")
+    if chosen is None or stored == outcomes:
+        return entry
+    rows = {name: r for r, name in enumerate(outcomes)}
+    renumbered = [rows.get(stored[o], -1) if stored and 0 <= o < len(stored) else -1 for o in chosen]
+    wkeys = [wkey if o >= 0 else "" for wkey, o in zip(entry.rows.wkey, renumbered)]
+    return dataclasses.replace(entry, rows=dataclasses.replace(entry.rows, wkey=wkeys,
+                                                               v=dict(entry.rows.v, outcome=renumbered)))
 
 
 def _reference(tree, entries, mode):
     """The entry whose shape the graph bakes: the newest one of the node's answer type whose factors are the
-    interface's. Entries of other shapes stay in the match chain but read misaddressed rows (§6.0 is left)."""
+    interface's. The entries of the live contexts share its layout (agree()); a warm entry of another layout is read
+    through it too."""
     face = _factor_sockets(tree)
     fitting = [e for e in entries if e.answer_type == mode and e.shape.get("factors")
                and [(f["name"], f["kind"]) for f in e.shape["factors"]] == face]
@@ -451,19 +504,11 @@ class _Graph:
                 at += len(rows)
         self.clamped = {}
 
-    def value(self, j):
-        """Factor j's socket, or its default when the interface lacks it."""
-        socket = self.sockets[j]
-        if socket is not None:
-            return socket
-        return {"amount": 0.0, "category": 0, "flag": False}[self.factors[j].kind]
-
     def x(self, j):
         """x = clamp(v, 0, 1) of Amount factor j."""
         if j not in self.clamped:
             node = _node(self.b, "ShaderNodeClamp", -700, -300 * j)
-            node.inputs["Value"].default_value = 0.0
-            _feed(self.b, node.inputs["Value"], self.value(j))
+            self.b.link(self.sockets[j], node.inputs["Value"])
             self.clamped[j] = node.outputs[0]
         return self.clamped[j]
 
@@ -482,7 +527,7 @@ class _Graph:
 
     def level(self, j):
         """(b, valid) of factor j, undithered; valid None when always valid (§9.2)."""
-        b, factor, value, y = self.b, self.factors[j], self.value(j), -300 * j
+        b, factor, value, y = self.b, self.factors[j], self.sockets[j], -300 * j
         if factor.kind == "flag":
             zero = next(i for i, level in enumerate(factor.levels) if level.value == 0)
             return _switch(b, 'INT', value, zero, 1 - zero, -500, y), None
@@ -501,9 +546,9 @@ class _Graph:
             return level, _cmp(b, 'INT', 'GREATER_EQUAL', level, 0, -50, y)
         return self.band(factor, self.x(j), -550, y), None
 
-    def cell(self, levels, start=0):
-        """§9.3: start + the sum of b_j * stride_j; -1 unless every factor is valid (start = 0 only)."""
-        b, acc, valid = self.b, start, None
+    def cell(self, levels):
+        """§9.3: the sum of b_j * stride_j; -1 unless every factor is valid."""
+        b, acc, valid = self.b, 0, None
         for j, ((level, ok), step) in enumerate(zip(levels, self.steps)):
             acc = _int(b, 'MULTIPLY_ADD', 0, -300 * j, level, step, acc)
             valid = _and(b, valid, ok, 0, -300 * j - 100)
@@ -515,7 +560,7 @@ class _Graph:
         """The One-of cell (§9.3), each Amount coordinate jittered by (r - 0.5) Dither widths of its band (§9.7).
         The Random Value branch is always built: Dither 0 multiplies it away."""
         b = self.b
-        seed, dither = self.gi.outputs.get("Seed"), self.gi.outputs.get("Dither")
+        seed, dither = self.gi.outputs["Seed"], self.gi.outputs["Dither"]
         levels = []
         for j, factor in enumerate(self.factors):
             if factor.kind != "amount":
@@ -523,10 +568,9 @@ class _Graph:
                 continue
             x, y = self.x(j), -300 * j
             random = _node(b, "FunctionNodeRandomValue", -700, y - 150, data_type='FLOAT')
-            b.link(_int(b, 'ADD', -850, y - 150, seed if seed is not None else 0,
-                        rules_core.DITHER_SEED_STEP * j), random.inputs["Seed"])
+            b.link(_int(b, 'ADD', -850, y - 150, seed, rules_core.DITHER_SEED_STEP * j), random.inputs["Seed"])
             offset = _math(b, 'SUBTRACT', -550, y - 150, _enabled(random.outputs, "Value"), 0.5)
-            jitter = _math(b, 'MULTIPLY', -400, y - 150, offset, dither if dither is not None else 0.0)
+            jitter = _math(b, 'MULTIPLY', -400, y - 150, offset, dither)
             moved = _node(b, "ShaderNodeMath", -250, y - 100, operation='MULTIPLY_ADD', use_clamp=True)
             b.link(jitter, moved.inputs[0])
             b.link(x, moved.inputs[2])

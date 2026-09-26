@@ -2,7 +2,9 @@
 through the real pass (the Game of Life, in a Simulation Zone, against a Python B3/S23 reference) or straight into
 the store (the cell index for every combination, interpolation, renormalisation and dithering against rules_core's
 references), and a rebuild with the CSV files deleted must leave every output unchanged. A Factors CSV edit that
-keeps every row rebuilds the graph for the new factors, and a payload header of any length builds.
+keeps every row rebuilds the graph for the new factors, and a payload header of any length builds. Outcomes edits
+keep the table (§5.4), the status shows the plan's problems (§17.1), contexts must agree on the factors (§6.0), and
+only the pass writes the interface: not a draw, and again after an undo.
 
 With -- --model PORT GPU, the real model answers the Game of Life rule sets (18/18 exact, 0 unsure each).
 
@@ -82,15 +84,20 @@ def scene(name, factors, outcomes, values, answer_type='ONE_OF', question="", co
     return tree, rules, obj, gi, go
 
 
-def wire(tree, rules, gi, go, outputs, geometry=None):
-    """Factor sockets <- Named Attribute in_<factor>; each output -> Store Named Attribute out_<output>."""
+def wire_inputs(tree, rules):
+    """Factor sockets <- Named Attribute in_<factor>."""
     for socket in rules.inputs:
-        if socket.name in R.HEAD or socket.type not in TYPES or socket.is_linked:
+        if socket.name.casefold() in csvfmt.RULES_INPUTS or socket.type not in TYPES or socket.is_linked:
             continue
         attribute = tree.nodes.new("GeometryNodeInputNamedAttribute")
         attribute.data_type = TYPES[socket.type]
         attribute.inputs["Name"].default_value = "in_" + socket.name
         tree.links.new(enabled(attribute.outputs, "Attribute"), socket)
+
+
+def wire(tree, rules, gi, go, outputs, geometry=None):
+    """Factor sockets <- Named Attribute in_<factor>; each output -> Store Named Attribute out_<output>."""
+    wire_inputs(tree, rules)
     geometry = geometry or gi.outputs["Geometry"]
     for name in outputs:
         geometry = store(tree, geometry, rules.outputs[name], "out_" + name, TYPES[rules.outputs[name].type])
@@ -114,8 +121,11 @@ def context(rules, obj):
 
 
 def synthetic(rules, obj, values):
-    """Plan in obj's context (which syncs the sockets), store the table values(i, row) gives, rebuild."""
-    job = SPEC.plan(rules, context(rules, obj))
+    """Plan in obj's context, give the node the sockets the Job declares (as the pass does), store the table
+    values(i, row) gives, rebuild."""
+    ctx = context(rules, obj)
+    job = SPEC.plan(rules, ctx)
+    SPEC.agree(rules, [(ctx, job)])
     rows = []
     for i, row in enumerate(job.rows):
         given = values(i, row)
@@ -542,6 +552,268 @@ def phase_long_header():
           and read(obj, [header])[header] == [2, 2], (status, names))
 
 
+# --------------------------------------------------------------------------- Outcomes edits, status, agreement, writes
+
+CELLS = [(state, n) for state in (False, True) for n in range(9)]  # one element per Game of Life cell, in cell order
+
+
+def passed(rules):
+    """Run a pass: (Job, missing cells) of each context of this node that asks the model; nothing reaches a server."""
+    asked = []
+    submit = engine._submit
+    engine._submit = lambda job, missing: asked.append((job, list(missing))) if job.uid == rules.uid else None
+    try:
+        engine.run_pass()
+    finally:
+        engine._submit = submit
+    return asked
+
+
+def factor_names(rules):
+    return [name for name, _kind in R._factor_sockets(rules.node_tree)]
+
+
+def phase_outcome_edits():
+    """Moving, inserting or deleting an Outcomes row keeps the Seeds table (B2/S) through the pass: a carried row's
+    outcome is renumbered by name (§5.4), so no output names another outcome, and only the cells whose offered
+    outcomes changed are asked."""
+    with open(os.path.join(FIXTURES, "seeds_outcomes.csv"), encoding="utf-8") as handle:
+        header, birth, empty, dies = handle.read().splitlines()
+    explodes = "Explodes,A live cell with eight live neighbours explodes.,state=alive;neighbours=8,0"
+    path = write("seeds_edit.csv", "\n".join((header, birth, empty, dies)) + "\n")
+    columns = {"in_state": ('BOOLEAN', [s for s, _n in CELLS]), "in_neighbours": ('INT', [n for _s, n in CELLS])}
+    tree, rules, obj, gi, go = scene("SeedsEdit", os.path.join(FIXTURES, "life_factors.csv"), path, columns,
+                                     question=GOL_QUESTION, context="Seeds on a square grid.")  # not phase_life's cells
+    reference = [outcome_name(s, n, {2}, set()) for s, n in CELLS]
+    alive = [int(name == "Birth") for name in reference]
+
+    def settle(lines, first=False):
+        """Write the Outcomes rows, run the pass, answer what it asks (B2/S), run it again: (cells asked, each
+        element's outcome by name, its alive output, the status)."""
+        write("seeds_edit.csv", "\n".join((header, *lines)) + "\n")
+        csvfmt.clear_cache()
+        names = [line.split(",")[0] for line in lines]
+        asked = passed(rules)
+        for job, _missing in asked:
+            gol_answers(job, {2}, set(), names)
+        passed(rules)
+        if first:
+            wire(tree, rules, gi, go, ["Outcome", "alive"])
+            passed(rules)
+        got = read(obj, ["Outcome", "alive"])
+        outcomes = [names[o] if 0 <= o < len(names) else o for o in got["Outcome"]]
+        return sum(len(missing) for _job, missing in asked), outcomes, got["alive"], engine.STATUS.get(rules.uid)
+
+    got = settle((birth, empty, dies), first=True)
+    check("outcome edits: Seeds answered through the pass (9 cells asked)",
+          got == (9, reference, alive, ('CHECKMARK', "18 cells · 0 unsure")), got)
+    for label, lines, want in (("Dies moved to the top", (dies, birth, empty), 0),
+                               ("Explodes inserted on top, which alive|8 offers", (explodes, dies, birth, empty), 1),
+                               ("Explodes deleted again", (dies, birth, empty), 0)):
+        got = settle(lines)
+        check(f"outcome edits: {label}: {want} cells asked, and the outputs keep B2/S",
+              got == (want, reference, alive, ('CHECKMARK', "18 cells · 0 unsure")), got)
+
+
+def phase_status():
+    """The status shows the plan's problems once the table is complete (§17.1): the cells no outcome applies to
+    (§9.4), then the Factors CSV's warnings (a linked Import CSV wins over the typed path), the Outcomes CSV's (a
+    number-like payload column gives no output) and the plan's (an outcome never offered)."""
+    factors = os.path.join(FIXTURES, "life_factors.csv")
+    outcomes = write("status_outcomes.csv", 'answer,when,if,scale\n'
+                                            'Birth,comes to life,state=dead;neighbours=3,"1,5"\n'
+                                            'Survives,stays alive,state=alive;neighbours=2|3,2\n'
+                                            'Dies,dies,state=alive;neighbours!=2|3,3\n'
+                                            'Ghost,never,state=dead;state=alive,4\n')
+    tree, rules, obj, gi, go = scene("Status", factors, outcomes,
+                                     {"in_state": ('BOOLEAN', [False]), "in_neighbours": ('INT', [3])},
+                                     question="What happens?")
+    reader = tree.nodes.new("GeometryNodeImportCSV")
+    reader.inputs["Path"].default_value = factors
+    tree.links.new(reader.outputs[0], rules.inputs["Factors CSV"])
+    asked = passed(rules)
+    job = engine._jobs(rules)[0][1]
+    want = ("No outcome applies to state=dead, neighbours=0; state=dead, neighbours=1; state=dead, neighbours=2 and "
+            "5 more cells",
+            "Factors: using the linked Import CSV; the typed path is ignored",
+            "status_outcomes.csv line 2: Column 'scale' has '1,5' in line 2; treated as text, no output",
+            "status_outcomes.csv line 5: 'Ghost' is never offered: its 'if' matches no cell")
+    status = engine.STATUS.get(rules.uid)
+    check("status: nothing is asked, and the status shows the cells without an outcome first; the Job holds the "
+          "Factors, Outcomes and plan warnings after it",
+          not asked and job.problems == want and "scale" not in rules.outputs
+          and status == ('ERROR', f"{want[0]}   (18 cells · 0 unsure · 8 with no outcome)"),
+          (len(asked), job.problems, status))
+
+
+def shared_scene(name, words, values):
+    """A tree whose Rules node takes these words from the modifier (word -> one text per object), used by one
+    object per item of values (its point attributes)."""
+    tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    for word in words:
+        tree.interface.new_socket(word, in_out='INPUT', socket_type='NodeSocketString')
+    tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi, go = tree.nodes.new("NodeGroupInput"), tree.nodes.new("NodeGroupOutput")
+    rules = tree.nodes.new(R.RulesSpec.idname)
+    rules.inputs["Question"].default_value = "Which one?"
+    for word in words:
+        tree.links.new(gi.outputs[word], rules.inputs[word])
+    objs = []
+    for k, columns in enumerate(values):
+        count = len(next(iter(columns.values()))[1])
+        mesh = bpy.data.meshes.new(f"{name}{k}")
+        mesh.from_pydata([(i * 0.01, 0.0, 0.0) for i in range(count)], [], [])
+        for attribute, (kind, data) in columns.items():
+            mesh.attributes.new(attribute, kind, 'POINT').data.foreach_set("value", data)
+        obj = bpy.data.objects.new(f"{name}{k}", mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        modifier = obj.modifiers.new("Rules", 'NODES')
+        modifier.node_group = tree
+        for word, texts in words.items():
+            modifier[tree.interface.items_tree[word].identifier] = texts[k]
+        obj.update_tag()
+        objs.append(obj)
+    return tree, rules, objs, gi, go
+
+
+def phase_agreement():
+    """§6.0: the contexts of one node must agree on what the graph bakes. Factors CSVs that differ only in their
+    band edges, or Outcomes CSVs whose payload columns differ, give the error naming both contexts; nothing is
+    asked, stored or rebuilt, so the last good table stays. Payload values and texts may differ."""
+    a, b = write("agree_a.csv", EDGES.format("0.5")), write("agree_b.csv", EDGES.format("0.5"))
+    sizes = "answer,when,size\nA,the first,{0}\nB,the second,{1}\n"
+    oa, ob = write("agree_oa.csv", sizes.format(1, 2)), write("agree_ob.csv", sizes.format(3, 4))
+    heat = [0.1, 0.3, 0.6, 0.9]
+    tree, rules, objs, gi, go = shared_scene("Agree", {"Factors": [a, b], "Outcomes": [oa, ob]},
+                                             [{"in_heat": ('FLOAT', heat)}] * 2)
+    answer_cells(planned(rules), lambda name: 0 if name == "cold" else 1)
+    wire(tree, rules, gi, go, ["Outcome", "size"])
+    planned(rules)
+    labels = [ctx.label() for ctx in evaluator.find_uses()[tree.as_pointer()]]
+    before = [read(obj, ["Outcome", "size"]) for obj in objs]
+    check("agreement: two contexts with the same factors, and a payload column in both Outcomes CSVs, each show "
+          "their own table", before == [{"Outcome": [0, 0, 1, 1], "size": [1, 1, 2, 2]},
+                                        {"Outcome": [0, 0, 1, 1], "size": [3, 3, 4, 4]}]
+          and engine.STATUS[rules.uid][0] == 'CHECKMARK', (before, engine.STATUS.get(rules.uid)))
+
+    build, builds = inner.build, []
+
+    def edited(name, text, what):
+        """Write one CSV, run a pass: (the status is the conflict, cells asked, builds, whether the entries and the
+        outputs stayed)."""
+        stored = [(entry.gn, entry.words_key) for entry in S.load(rules).entries]
+        write(name, text)
+        csvfmt.clear_cache()
+        builds.clear()
+        inner.build = lambda node_, *args: (builds.append(node_ == rules), build(node_, *args))[1]
+        try:
+            asked = planned(rules)
+        finally:
+            inner.build = build
+        message = f"Rules: '{labels[0]}' and '{labels[1]}' use {what}"
+        kept = [(entry.gn, entry.words_key) for entry in S.load(rules).entries] == stored
+        return (engine.STATUS.get(rules.uid) == ('ERROR', message), len(asked), any(builds), kept,
+                [read(obj, ["Outcome", "size"]) for obj in objs] == before)
+
+    got = edited("agree_b.csv", EDGES.format("0.2"), "Factors CSVs with different factors")
+    check("agreement: Factors CSVs that differ only in their band edges give the error; nothing is asked, stored or "
+          "rebuilt, and both objects keep the last good table", got == (True, 0, False, True, True),
+          (got, engine.STATUS.get(rules.uid)))
+    write("agree_a.csv", EDGES.format("0.2"))
+    csvfmt.clear_cache()
+    asked = planned(rules)
+    got = [read(obj, ["Outcome"])["Outcome"] for obj in objs]
+    check("agreement: once both use the new edges the rows carry over (0 requests) and the graph follows them",
+          not asked and got == [[0, 1, 1, 1]] * 2 and engine.STATUS[rules.uid][0] == 'CHECKMARK',
+          (len(asked), got, engine.STATUS.get(rules.uid)))
+    before = [read(obj, ["Outcome", "size"]) for obj in objs]
+    got = edited("agree_ob.csv", sizes.format(3.5, 4), "Outcomes CSVs with different payload columns")
+    check("agreement: an Outcomes CSV whose payload column changes its type gives the error, and the last good table "
+          "stays", got == (True, 0, False, True, True), (got, engine.STATUS.get(rules.uid)))
+
+
+class _PollProbe(bpy.types.Operator):
+    """Runs a function from poll(), where Blender refuses ID writes as in a draw callback."""
+
+    bl_idname = "openact_test.poll_probe"
+    bl_label = "Poll probe"
+    run = None
+    result = None
+
+    @classmethod
+    def poll(cls, context):
+        if cls.run is not None:
+            try:
+                cls.result = ("ok", cls.run())
+            except Exception as error:  # noqa: BLE001 - the check reports it
+                cls.result = (type(error).__name__, str(error))
+        return False
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+def in_poll(function):
+    _PollProbe.run, _PollProbe.result = function, None
+    bpy.ops.openact_test.poll_probe.poll()
+    _PollProbe.run = None
+    return _PollProbe.result
+
+
+ONE = "factor,kind,level,value,when\nheat,amount,cold,,Cold.\nheat,amount,hot,,Hot.\n"
+TWO_FACTORS = ONE + "wind,flag,calm,0,Calm.\nwind,flag,windy,1,Windy.\n"
+
+
+def phase_writes():
+    """Only the pass writes the node (§5.3): planning from a draw, here Operator.poll(), changes nothing, and after an
+    undo, which restores the interface, the entries and the group but not the plans, the next pass gives the node
+    the sockets of its Job again, so the outputs come back."""
+    bpy.utils.register_class(_PollProbe)
+    points = {"in_heat": ('FLOAT', [0.1, 0.9]), "in_wind": ('BOOLEAN', [False, True])}
+    path = write("draw_factors.csv", TWO_FACTORS)
+    tree, rules, obj, gi, go = scene("Draw", path, write("draw_two.csv", TWO), points, question="Which one?")
+    answer_cells(planned(rules), lambda name: 0 if name.startswith("cold") else 1)
+    wire(tree, rules, gi, go, ["Outcome", "Confidence"])
+    planned(rules)
+
+    def state():
+        return (factor_names(rules), len(rules.node_tree.nodes), inner.BUILT in rules.node_tree,
+                read(obj, ["Outcome", "Confidence"]))
+
+    before = state()
+    write("draw_factors.csv", ONE)  # a factor removed on disk, planned first by a draw
+    csvfmt.clear_cache()
+    result = in_poll(lambda: len(engine.answers_for(rules)))
+    after = state()
+    check("writes: planning from Operator.poll() leaves the sockets, the graph and the outputs as they are",
+          result == ("ok", 1) and after == before and before[0] == ["heat", "wind"], (result, before, after))
+    planned(rules)
+    check("writes: the next pass gives the node its Job's sockets", factor_names(rules) == ["heat"],
+          factor_names(rules))
+
+    path = write("undo_factors.csv", ONE)
+    tree, rules, obj, gi, go = scene("Undo", path, write("undo_two.csv", TWO), points, question="Which one?")
+    answer_cells(planned(rules), lambda name: 0 if name.startswith("cold") else 1)
+    wire(tree, rules, gi, go, ["Outcome"])
+    planned(rules)
+    old_defs, old_entries = SPEC.interface(rules), rules.entries
+    write("undo_factors.csv", TWO_FACTORS)
+    csvfmt.clear_cache()
+    answer_cells(planned(rules), lambda name: 0 if name.startswith("cold") else 1)
+    wire_inputs(tree, rules)  # the new wind socket
+    planned(rules)
+    two = (factor_names(rules), read(obj, ["Outcome"])["Outcome"])
+    inner.sync_interface(rules, old_defs)  # what an undo restores; the plans are Python state and stay
+    rules.entries = old_entries
+    inner.build(rules, S.load(rules))
+    asked = planned(rules)
+    got = (factor_names(rules), read(obj, ["Outcome"])["Outcome"])
+    check("writes: after an undo the next pass gives the node its sockets back and the outputs return, 0 requests",
+          two == (["heat", "wind"], [0, 1]) and not asked and got == two, (two, len(asked), got))
+    bpy.utils.unregister_class(_PollProbe)
+
+
 # --------------------------------------------------------------------------- the real model
 
 def phase_model(port, gpu):
@@ -590,6 +862,10 @@ try:
         phase_dither()
         phase_layout_edit()
         phase_long_header()
+        phase_outcome_edits()
+        phase_status()
+        phase_agreement()
+        phase_writes()
 except Exception:
     import traceback
 
