@@ -229,6 +229,8 @@ class RulesSpec(Spec):
 
     def entry(self, job, rows, model=""):
         """Spec.entry(), plus One-of's payload denormalised per cell from its outcome (rows.payload)."""
+        asked = next((row.ask for row in rows if row.ask), "")  # code and error rows were asked nothing
+        rows = [row if row.ask is not None else dataclasses.replace(row, ask=asked) for row in rows]
         entry = super().entry(job, rows, model)
         outcomes = entry.rows.v.get("outcome")
         if outcomes is not None:

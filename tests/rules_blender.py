@@ -331,6 +331,26 @@ def phase_life():
     check(f"life: {frames} frames in a Simulation Zone equal the Python B3/S23 reference (toroidal)", not bad,
           f"bad frames {bad}; the zone's first frame steps {offset}")
     scene_.frame_set(1)
+
+    # Seeds: every live cell has one outcome ("Dies"), decided by code and never asked
+    path = os.path.join(FIXTURES, "seeds_outcomes.csv")
+    rules.inputs["Outcomes"].default_value = path
+    jobs.clear()
+    submit, engine._submit = engine._submit, lambda job, missing: jobs.append((job, missing))
+    try:
+        engine.run_pass()
+        names = [o.name for o in csvfmt.parse_answer_set(csvfmt.read_csv(path), "one_of", "rules").options]
+        asked = len(jobs[0][1]) if jobs else 0
+        if jobs:
+            gol_answers(jobs[0][0], {2}, set(), names)
+        engine.run_pass()
+    finally:
+        engine._submit = submit
+    entry = next((e for e in S.load(rules).entries if e.gn[3] == path), None)
+    table = [names[o] for o in entry.rows.v["outcome"]] if entry else []
+    check("life: Seeds asks only the 9 dead cells; its 9 code rows are stored with the answers (B2/S)",
+          asked == 9 and table == [outcome_name(s, n, {2}, set()) for s in (0, 1) for n in range(9)]
+          and entry.rows.src == "m" * 9 + "c" * 9, (asked, table, engine.STATUS.get(rules.uid)))
     return tree, rules, obj
 
 
@@ -465,7 +485,13 @@ def phase_model(port, gpu):
         engine.schedule(immediate=True)
         t0 = time.time()
 
+        shown = [0.0]
+
         def done(path=path):
+            if time.time() - shown[0] > 15:
+                shown[0] = time.time()
+                print(f"  ... {server.status()} {engine.STATUS.get(rules.uid)} pending {len(pipeline.PENDING)}",
+                      flush=True)
             entries = [e for e in S.load(rules).entries if e.gn[3] == path]
             return bool(entries) and not pipeline.PENDING and engine.STATUS.get(rules.uid, ("",))[0] == 'CHECKMARK'
 
