@@ -1846,10 +1846,15 @@ alive,2,Survives,0,Survives,1.00,0,model
 - **Inline or path.** `lists.is_csv_path(text)` is true when the stripped value is a single line
   ending in `.csv`, in any case. Anything else is inline text (§6.0).
 - **Resolution.**
-  - `bpy.path.abspath(text, library=node.id_data.library)`, then `os.path.normpath`. `//` is
-    relative to the .blend, or to the library file for linked node groups.
+  - A typed path: `bpy.path.abspath(text, library=node.id_data.library)`, then
+    `os.path.normpath`. `//`, like any relative path, is relative to the .blend, or to the library
+    file for linked node groups.
+  - An Import CSV node's Path, like an Import Text Path, resolves as Geometry Nodes resolves it
+    (`evaluator.import_path()`), so OpenAct reads the file that node reads. `//` is relative to the
+    file that holds the Import node's tree: the .blend, or the library of a linked group. Any other
+    relative path is relative to Blender's working folder.
   - A relative path in an unsaved file gives the hint "Save the .blend: '//' paths are relative to
-    it". Absolute paths always work.
+    it" (for an Import node, a `//` path). Absolute paths always work.
 - **Identity.** The file watcher and the parse cache key files by
   `os.path.normcase(os.path.realpath(p))`. Each file is parsed once per change, and the result is
   shared by every node that uses it.
@@ -1892,6 +1897,8 @@ The watcher (`engine.WATCH: {path_id: (stamp, CsvDoc)}`) behaves as follows:
 - It polls from `tick()` at most every 0.5 s, and only files referenced by the last pass.
 - Each `os.stat` costs about 20 µs. Above 32 files it checks 32 per tick, round-robin.
 - A parse error keeps the previous `CsvDoc`, so a half-saved file never blanks a table.
+- A file it can stat but not read (held open by another program) is reported when its stamp
+  changes, not on every poll. Once it is let go, the 2 s safety pass reads it again.
 - **Background and render mode.** When `bpy.app.background` is set, or a render job runs, OpenAct
   neither re-plans nor re-bakes from files. A farm renders exactly the saved answers and payload.
   If a referenced CSV's `text_hash` or `num_hash` differs from the stored ones, it prints once per
@@ -2453,7 +2460,8 @@ that matched the known current state turned 3 wrong cells into an exact table.
 
 All cells of a Rules context share **one state**. Each cell's facts go into its instructions.
 That gives maximal batching (§5.5), and editing one level's `when` changes only the keys of the
-cells that include it (§5.4). Templates live in `specs/rules.py` (`PROMPT_VERSION = 1`).
+cells that include it (§5.4). Templates live in `rules_core.py`, which `specs/rules.py` builds on
+(`PROMPT_VERSION = 2`).
 
 **State** (shared by every cell):
 ```
@@ -2461,7 +2469,18 @@ cells that include it (§5.4). Templates live in `specs/rules.py` (`PROMPT_VERSI
 Each question describes one situation with these facts:
 - state: dead | alive
 - neighbours: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
+Each option is an outcome and when it applies.
+Decide only by the conditions the options state, not by outside knowledge.
+Choose the outcome whose condition this situation meets.
 ```
+
+- **The last three lines** (the conditions lines) are added only in One-of mode, and only when
+  at least one outcome has a `when`. They make the outcomes' conditions decide the answer, not
+  what the model knows about the subject (4.c). With `PROMPT_VERSION = 1`, which lacked them, the
+  model followed Conway's rules over the Seeds outcomes: a dead cell with two neighbours stayed
+  empty instead of being born. It was also unsure on three Day & Night cells.
+- Yes/No and Amount states end after the facts, and so do One-of states whose outcomes are bare
+  names: those answers need what the model knows.
 
 **Instructions** (one per cell, here cell 12):
 ```
@@ -2488,8 +2507,9 @@ What happens to this cell in the next generation?
   - Yes/No and Amount show the hint "Type a question", because a scale without a question is
     meaningless.
 - **Acceptance.** Template changes must keep all four Game of Life rule sets at 18/18 exact with 0
-  unsure cells in the e2e suite (§18). `PROMPT_VERSION` is stored per entry but never forces a
-  re-ask (§5.4).
+  unsure cells in the e2e suite (§18). Measured with `PROMPT_VERSION = 2`: all four at 18/18 with
+  0 unsure; the lowest confidence is 0.44 (Day & Night, a live cell with three neighbours).
+  `PROMPT_VERSION` is stored per entry but never forces a re-ask (§5.4).
 
 **Cost.** Each cell with 2–16 options is 2 scored rows with debias. A cell with *m* > 16 options is
 a tournament of `2 × (ceil(m / 16) + 1)` rows.
@@ -3621,19 +3641,25 @@ updates for everything per element.
 
 **Trust rule for opened files** (`engine.TRUST`, computed on `load_post`).
 - **A file is trusted** when any of these holds:
-  1. it was created in this session (it is unsaved);
-  2. Blender's *Auto Run Python Scripts* is enabled and the file is not under one of Blender's
-     excluded paths. That is Blender's own trust decision, and a user who lets files run Python
-     already accepts a far larger risk;
-  3. the file's path is in `trusted_files`, which **Allow this file** (`openact.allow_file`) adds
+  1. it was created in this session (it is unsaved). A file opened while OpenAct was disabled is
+     judged by 2 and 3 once OpenAct is enabled again;
+  2. the file's path is in `trusted_files`, which **Allow this file** (`openact.allow_file`) adds
      to. This is per file, so allowing one download does not trust the rest of a Downloads folder;
-  4. the file's folder, or a parent folder, is in `trusted_folders`, which **Trust this folder**
+  3. the file's folder, or a parent folder, is in `trusted_folders`, which **Trust this folder**
      (`openact.trust_folder`) adds to. The button says it covers every subfolder and every future
      file there.
+- **Blender's *Auto Run Python Scripts* does not make a file trusted.** Blender can refuse it for
+  one file (*Trusted Source* unchecked in File > Open). An add-on can't see that refusal for a file
+  without scripts, so following the preference would let a file that Blender refused read outside
+  its folder.
+- **A trust change plans every node again** (either button, or an edit of the trusted lists): the
+  trust state is part of each plan's fingerprint (§5.3).
 - **In an untrusted file:**
   - Every file read, for CSVs and for the Import Text word source, is confined to the .blend's own
-    folder tree (`realpath`, §7.7). Files shipped next to a downloaded demo therefore still work,
-    while nothing outside can be read into the file.
+    folder tree (§7.7). Files shipped next to a downloaded demo therefore still work, while nothing
+    outside can be read into the file. A path outside the tree is blocked without being touched,
+    so a UNC path contacts no server. A path inside is also compared by `realpath`, so a symlink
+    cannot escape.
   - Stored answers keep evaluating as usual; Geometry Nodes needs no Python.
   - A blocked read makes the node show the blocked path, and the sidebar shows the banner with
     *Allow this file* and *Trust this folder*.
@@ -3645,7 +3671,7 @@ updates for everything per element.
 - **Test.** `tests/pipeline_blender.py` opens an untrusted file with an absolute Import Text path
   and a CSV path outside its folder. It asserts that neither file is read, that nothing from them
   appears in `entries` or the inner group, and that a CSV next to the file *is* read. After
-  `openact.allow_file`, both are read.
+  `openact.allow_file`, both are read, and so are a Rules node's CSVs in the next pass.
 
 ### 16.2 Supply chain (installer)
 

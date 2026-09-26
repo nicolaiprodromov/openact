@@ -101,7 +101,7 @@ class CsvSource:
     """Where a node's CSV comes from (design 7.7): a typed path, or the Import CSV node plugged into the
     companion '<Input> CSV' socket."""
 
-    path: str  # as written: the String word, or the Import CSV node's Path
+    path: str  # the String word as written, or the absolute file the Import CSV node reads (evaluator.import_path())
     delimiter: str | None = None  # the Import CSV node's Delimiter; None sniffs it (a typed path)
     via: tuple[str, ...] = ()  # node names from the companion socket to the Import CSV node, which comes last
     warning: str = ""  # "Items: using the linked Import CSV; the typed path is ignored"

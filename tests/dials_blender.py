@@ -1,11 +1,14 @@
 """Dials (§6.6) in a headless Blender.
 
-Without arguments no model is needed: fake answers stand in for it. The weather settings plan into one request; the
-one-row-per-entry table object gives each output its setting's answer, Amount mapped into min-max; a min/max edit is
-a values-only update with 0 requests; two contexts with different ranges each get their own values; different setting
-names give the shape-agreement error; an output drives Grid's Vertices X through a valid link; renaming a setting warns
-(in the CSV or inline), and renaming it back brings its output back; after Ask Again, or while an edited question is
-asked again, the outputs and their links stay.
+Without arguments no model is needed: fake answers stand in for it. The weather settings plan into one request, and
+their outputs exist before the first answer, showing their fallbacks; the one-row-per-entry table object gives each
+output its setting's answer, Amount mapped into min-max; a min/max edit is a values-only update with 0 requests; two
+contexts with different ranges each get their own values; a context with other setting names keeps its last good
+table while the node warns, naming both; an output drives Grid's Vertices X through a valid link; renaming a setting
+warns (in the CSV or inline) until its new socket is linked, it comes back, or File > Revert restores it; after Ask
+Again, or while an edited question is asked again, the outputs and their links stay; a CSV whose rows only move keeps
+each output on its own setting; a new setting gets its output before its answer; a node reading a setting as a word
+waits while Dials shows a hint.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -46,6 +49,8 @@ FAKE = {  # instructions -> what the fake model answers, parsed as pipeline.pars
 }
 # Confidence = the lowest: Fog's 1 - sigma / sigma_u = 1 - sqrt(0.5 / 2) = 0.5
 EXPECTED = {"Rain": True, "Wind speed": 22.5, "Time of day": 3, "Street lights": False, "Fog": 0.5, "Confidence": 0.5}
+FALLBACKS = {"Rain": False, "Wind speed": 0.0, "Time of day": -1, "Street lights": False, "Fog": 0.0, "Confidence": 0.0}
+ASK = "GeometryNodeOpenActAsk"
 
 nodes.register()
 ops.register()
@@ -64,6 +69,14 @@ def weather(name, edit=None):
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
     return path
+
+
+def rewrite(path, lines):
+    """Write the lines over the file with a later mtime: rows that only move keep its size, so its stamp could stay."""
+    later = os.stat(path).st_mtime_ns + 10**9
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+    os.utime(path, ns=(later, later))
 
 
 def scene(name, users):
@@ -177,15 +190,18 @@ def phase_nomodel():
     check("plan: 5 settings travel in 1 request, sharing the Prompt as state",
           len(mine) == 1 and kinds == ["choice", "noul", "noul", "score", "score"]
           and {cell.state for cell in mine[0][1]} == {STORM}, (len(mine), kinds))
-    check("plan: before the first answer the node has only Confidence",
-          [s.name for s in node.outputs] == ["Confidence"], [s.name for s in node.outputs])
+    got = [(s.name, s.type) for s in node.outputs]
+    check("plan: before the first answer the node has one output per setting, then Confidence (§6.0)",
+          got == OUTPUTS, got)
+    wire(tree, node)
+    got = read(users["A"])
+    check("plan: until then each output shows its fallback: False, 0.0 or -1", got == FALLBACKS, got)
     answer(mine[0][1] if mine else [])
     calls.clear()
     with asking(calls):
         settle()
     got = [(s.name, s.type) for s in node.outputs]
     check("answers: one output per setting, by name and type, in list order, then Confidence", got == OUTPUTS, got)
-    wire(tree, node)
     got = read(users["A"])
     check("answers: each output shows its setting's answer, Amount mapped into min-max; Confidence is the lowest",
           got == EXPECTED, got)
@@ -231,21 +247,29 @@ def phase_nomodel():
           a == dict(EXPECTED, **{"Wind speed": 40.0}) and b == dict(EXPECTED, **{"Wind speed": 75.0})
           and len(tables.find(node).data.vertices) == 2, (a, b))
 
-    # contexts must agree on the setting names and types
+    # contexts must agree on the setting names and types (§6.0): one that differs keeps its last good table
+    good_b, before, rebuilt = read(users["B"]), pointers(node), []
     weather("b.csv", ("Wind speed,amount", "Gust,amount"))
-    with asking(calls):
+    calls.clear()
+    with asking(calls), rebuilds(rebuilt):
         settle()
-    icon, text = engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text
-    check("shape agreement: different setting names give the error", (icon, text) == (
-        'CANCEL', "Dials: contexts use different settings ('Wind speed' (amount) vs 'Gust' (amount)); setting names "
-                  "and types must agree"), (icon, text))
-    check("shape agreement: the agreeing context keeps its values", read(users["A"])["Wind speed"] == 40.0)
+    status = engine.STATUS[node.uid]
+    check("shape agreement: different setting names warn, naming both contexts, and the status line shows it",
+          dials.WARNINGS.get(node.uid) == (
+              "Dials: 'A > Dials' and 'B > Dials' use different settings ('Wind speed' (amount) vs 'Gust' (amount)); "
+              "setting names and types must agree") and status.icon == 'ERROR'
+          and status.text.endswith(f"1 warning: {dials.WARNINGS.get(node.uid)}"), (dials.WARNINGS.get(node.uid), status))
+    got = (read(users["A"])["Wind speed"], read(users["B"]))
+    check("shape agreement: A keeps its values and B its last good table, with no rebuild and 0 requests",
+          got == (40.0, good_b) and not rebuilt and pointers(node) == before and not calls, (got, rebuilt, len(calls)))
+    shown = [entry and entry.shape["settings"][1]["name"] for _label, _job, entry in engine.answers_for(node)]
+    check("shape agreement: the sidebar shows B's last good table too", shown == ["Wind speed", "Wind speed"], shown)
     weather("b.csv", (",0,30", ",0,100"))
     with asking(calls):
         settle()
-    check("shape agreement: agreeing again clears the error, with 0 requests",
-          engine.STATUS[node.uid].icon == 'CHECKMARK' and not calls and read(users["B"])["Wind speed"] == 75.0,
-          (engine.STATUS[node.uid], len(calls)))
+    check("shape agreement: agreeing again ends the warning, with 0 requests",
+          engine.STATUS[node.uid].icon == 'CHECKMARK' and not dials.WARNINGS.get(node.uid) and not calls
+          and read(users["B"])["Wind speed"] == 75.0, (engine.STATUS[node.uid], dials.WARNINGS.get(node.uid), len(calls)))
 
     # with two entries too: the pass replaces the entry in place, so the graph's entry order holds
     before, rebuilt = pointers(node), []
@@ -277,8 +301,8 @@ def phase_nomodel():
 
 
 def phase_inline():
-    """An inline rename changes the words: the new entry is appended while the old one stays, just left. Both get the
-    pass's t stamp, so the outputs must follow the one that shows (a tie once picked the old one)."""
+    """An inline rename changes the words: the new entry is appended while the old one stays, just left. The outputs
+    follow the settings, and the warning about the dropped link ends once the new socket is linked (§6.6)."""
     inline = "Rain (yes/no): Is it raining?; {} (amount): How foggy is it?"
     tree, node, users = scene("DialsInline", [("I", STORM, inline.format("Fog"))])
     calls = []
@@ -289,16 +313,25 @@ def phase_inline():
     with asking(calls):
         settle()
     names = [s.name for s in node.outputs]
-    check("inline rename: the outputs follow the entry that shows, and the node warns",
+    check("inline rename: the outputs follow the settings, and the node warns",
           names == ["Rain", "Mist", "Confidence"] and len(S.load(node).entries) == 2 and not calls
           and dials.WARNINGS.get(node.uid) == "Setting 'Fog' renamed or retyped: reconnect its output",
           (names, dials.WARNINGS.get(node.uid), len(calls)))
+    orphan = next(n for n in tree.nodes if n.bl_idname == "GeometryNodeStoreNamedAttribute"
+                  and n.inputs["Name"].default_value == "Fog")
+    tree.links.new(node.outputs["Mist"], next(s for s in orphan.inputs if s.name == "Value" and s.enabled))
+    with asking(calls):
+        settle()
+    check("inline rename: once the socket that replaced Fog is linked, the warning ends",
+          dials.WARNINGS.get(node.uid) is None, dials.WARNINGS.get(node.uid))
     words(users["I"], Settings=inline.format("Fog"))  # back to the stored entry: the store itself doesn't change
     with asking(calls):
         settle()
     names = [s.name for s in node.outputs]
-    check("inline rename back: the stored entry's outputs return, with 0 requests",
-          names == ["Rain", "Fog", "Confidence"] and not calls, (names, len(calls)))
+    check("inline rename back: the stored entry's outputs return, with 0 requests, and the linked Mist warns",
+          names == ["Rain", "Fog", "Confidence"] and not calls
+          and dials.WARNINGS.get(node.uid) == "Setting 'Mist' renamed or retyped: reconnect its output",
+          (names, len(calls), dials.WARNINGS.get(node.uid)))
     phase_live_outputs()
 
 
@@ -318,9 +351,9 @@ def settle_answered(calls):
 
 
 def phase_live_outputs():
-    """The outputs follow the entries the node's contexts show, and stay while none does (§6.0): after Ask Again, or
-    while a question edited in the Settings CSV (the same words) is asked again, an older stored entry with other
-    settings never takes them over, so the links to them survive."""
+    """The outputs follow the settings the node's contexts plan (§6.0): after Ask Again, or while a question edited in
+    the Settings CSV (the same words) is asked again, an older stored entry with other settings never takes them over,
+    so the links to them survive."""
     tree, node, users = scene("DialsReask", [("R", CALM, "Fog (amount): How foggy is the bay?")])
     calls = []
     settle_answered(calls)
@@ -358,6 +391,127 @@ def phase_live_outputs():
     check("Settings CSV edit: while its question is asked again, and after, the outputs and their links stay",
           asked == {"How misty is the pier right now?"} and meanwhile == got == ["Mist", "Confidence"]
           and not dials.WARNINGS.get(node.uid), (asked, meanwhile, got, dials.WARNINGS.get(node.uid)))
+    phase_new_setting()
+
+
+def phase_new_setting():
+    """§6.0: a setting added to the Settings gets its output at once, before its first answer, and the other outputs
+    keep their links."""
+    inline = "Fog (amount): How foggy is the harbour?"
+    tree, node, users = scene("DialsAdd", [("N", CALM, inline)])
+    calls = []
+    settle_answered(calls)
+    wire(tree, node)
+    words(users["N"], Settings=inline + "; Snow (yes/no): Is it snowing in the harbour?")
+    calls.clear()
+    with asking(calls):
+        settle()
+    asked = {cell.question["instructions"] for _job, missing in calls for cell in missing}
+    got = [(s.name, s.type, s.is_linked) for s in node.outputs]
+    check("new setting: its output comes before its answer, and the other outputs keep their links",
+          asked == {"Is it snowing in the harbour?"}
+          and got == [("Fog", 'VALUE', True), ("Snow", 'BOOLEAN', False), ("Confidence", 'VALUE', True)], (asked, got))
+    phase_reorder()
+
+
+def phase_reorder():
+    """A Settings CSV edit that only moves rows (§5.4): every row carries over by wkey, with 0 requests, and the graph,
+    whose output j reads table column j, is laid out again once, so each output keeps its own setting's value."""
+    path = weather("reorder.csv")
+    tree, node, users = scene("DialsReorder", [("R", STORM, path)])
+    calls = []
+    with asking(calls):
+        settle()  # the weather cells are cached
+    wire(tree, node)
+    with open(path, encoding="utf-8") as handle:
+        header, rain, wind, time_, street, fog = handle.read().split("\n")[:6]
+    for label, order in (("Fog moved up", [rain, fog, wind, time_, street]),
+                         ("Wind speed and Fog swapped", [rain, fog, time_, street, wind])):
+        rewrite(path, [header] + order)
+        calls.clear()
+        rebuilt = []
+        with asking(calls), rebuilds(rebuilt):
+            settle()
+        names, got = [s.name for s in node.outputs], read(users["R"])
+        asked = [job for job, _missing in calls if job.uid == node.uid]  # the new setting's Snow is still unanswered
+        check(f"reorder ({label}): each output keeps its own setting's value, with 0 requests and one rebuild",
+              got == EXPECTED and names == [row.split(",")[0] for row in order] + ["Confidence"] and not asked
+              and len(rebuilt) == 1, (got, names, len(asked), rebuilt))
+    phase_chained_hint()
+
+
+def phase_chained_hint():
+    """§6.0: while Dials shows a hint (here: no Prompt), a node that reads a setting as a word waits, as it does before
+    the first answer. An Amount read through Value to String gave it an internal error, and a One-of read through an
+    Index Switch read item 0, where Geometry Nodes gives -1."""
+    tree = bpy.data.node_groups.new("DialsChain", 'GeometryNodeTree')
+    tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    dial = tree.nodes.new(DIALS)
+    dial.inputs["Prompt"].default_value = STORM
+    dial.inputs["Settings"].default_value = weather("chain.csv")
+    calls = []
+    with asking(calls):
+        settle()  # the weather cells are cached
+    text = tree.nodes.new("FunctionNodeValueToString")
+    tree.links.new(dial.outputs["Fog"], text.inputs["Value"])
+    amount = tree.nodes.new(ASK)
+    tree.links.new(text.outputs["String"], amount.inputs["Question"])
+    switch = tree.nodes.new("GeometryNodeIndexSwitch")
+    switch.data_type = 'STRING'
+    while len(switch.index_switch_items) < 4:
+        switch.index_switch_items.new()
+    items = [s for s in switch.inputs if s.identifier not in ("Index", "__extend__")]
+    for item, question in zip(items, ("Is it dawn?", "Is it day?", "Is it dusk?", "Is it night?")):
+        item.default_value = question
+    tree.links.new(dial.outputs["Time of day"], switch.inputs["Index"])
+    one_of = tree.nodes.new(ASK)
+    tree.links.new(switch.outputs[0], one_of.inputs["Question"])
+    calls.clear()
+    with asking(calls):
+        settle()
+    planned = {job.uid: job.rows[0].name for job, _missing in calls if job.uid in (amount.uid, one_of.uid)}
+    check("chained: while Dials is answered, both readers plan from its values",
+          planned.get(one_of.uid) == "Is it night?" and amount.uid in planned, planned)
+    dial.inputs["Prompt"].default_value = ""
+    calls.clear()
+    with asking(calls):
+        settle()
+    status = engine.STATUS.get(amount.uid)
+    check("chained hint: an Amount read through Value to String waits, with no internal error",
+          status is not None and status.icon in ('PAUSE', 'SORTTIME') and "Internal error" not in status.text, status)
+    asked = [job.rows[0].name for job, _missing in calls if job.uid == one_of.uid]
+    check("chained hint: a One-of read through an Index Switch waits too, instead of asking about item 0",
+          not asked and engine.STATUS[one_of.uid].icon in ('PAUSE', 'SORTTIME'), (asked, engine.STATUS[one_of.uid]))
+    phase_revert()
+
+
+def phase_revert():
+    """§6.6: File > Revert to the file saved before a rename brings the setting back with its link, as undo does, and
+    the rename warning ends. It opens a file, so it runs last."""
+    inline = "Rain (yes/no): Is it raining?; {} (amount): How foggy is it?"
+    tree, node, users = scene("DialsRevert", [("V", STORM, inline.format("Fog"))])
+    calls = []
+    with asking(calls):
+        settle()  # the cells are the CSV's: cached
+    wire(tree, node)
+    path = os.path.join(TMP, "revert.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path)
+    words(users["V"], Settings=inline.format("Mist"))
+    with asking(calls):
+        settle()
+    uid, warned = node.uid, dials.WARNINGS.get(node.uid)
+    bpy.ops.wm.open_mainfile(filepath=path)
+    engine.on_load_post()
+    calls.clear()
+    with asking(calls):
+        settle()
+    node = next(n for n in bpy.data.node_groups["DialsRevert"].nodes if n.bl_idname == DIALS)
+    fog = node.outputs.get("Fog")
+    check("revert: Fog is back with its link, and its rename warning ends, with 0 requests",
+          warned == "Setting 'Fog' renamed or retyped: reconnect its output" and node.uid == uid
+          and fog is not None and fog.is_linked and dials.WARNINGS.get(uid) is None
+          and not [job for job, _missing in calls if job.uid == uid],
+          (warned, node.uid == uid, fog is not None and fog.is_linked, dials.WARNINGS.get(uid)))
 
 
 def phase_grid(csv):

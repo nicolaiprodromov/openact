@@ -4,7 +4,9 @@ A group node with the list-source and CSV sockets stands in for the OpenAct node
 PR-09). Checks that a collection's entries come in Collection Info's instance order, that an empty material slot
 keeps its index, that the Attributes source reads original data, that trace_csv_source() follows Reroutes, nested
 groups and selectors to an Import CSV node and names what is in the way otherwise, that its Delimiter is used, that
-an untrusted file reads nothing outside its folder until Allow This File, and that the watcher sees edits.
+Import CSV and Import Text Paths resolve as Geometry Nodes resolves them, that an untrusted file reads nothing
+outside its folder (whatever Auto Run says, and after the add-on is enabled again) until Allow This File, which the
+pass sees for Rules too, and that the watcher sees edits but doesn't report a file it can't read on every poll.
 
 Run:  blender -b --factory-startup --python tests/sources_blender.py
 """
@@ -31,7 +33,10 @@ P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 trust.register()
 watch.register()
+bpy.app.handlers.load_post.append(engine.on_load_post)  # the pass's caches start afresh with each file
 bpy.utils.register_class(ops.OPENACT_OT_allow_file)
+real_open = builtins.open
+QUESTION = "What happens to this cell in the next generation?"
 
 
 def write(name, text, folder=TMP):
@@ -343,6 +348,48 @@ check("hand-off: the Import CSV node's ';' Delimiter is used, not sniffed",
 check("hand-off: sniffing would have split that header at the comma",
       csvfmt.read_csv(semi).header == ('answer;when;"size', 'cm"'), csvfmt.read_csv(semi).header)
 
+# ------------------------------------------ Import CSV and Import Text Paths, resolved as Geometry Nodes does
+lib_dir = os.path.join(TMP, "lib")
+os.makedirs(lib_dir)
+write("data.csv", "answer\nlib1\nlib2\nlib3\n", lib_dir)
+write("notes.txt", "library notes", lib_dir)
+lib_group = bpy.data.node_groups.new("Library Sources", 'GeometryNodeTree')
+lib_group.interface.new_socket("Points", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+lib_group.interface.new_socket("Text", in_out='OUTPUT', socket_type='NodeSocketString')
+lib_import, lib_text = lib_group.nodes.new("GeometryNodeImportCSV"), lib_group.nodes.new("GeometryNodeImportText")
+lib_import.inputs["Path"].default_value = "//data.csv"
+lib_text.inputs["Path"].default_value = "//notes.txt"
+lib_out = lib_group.nodes.new("NodeGroupOutput")
+lib_group.links.new(lib_import.outputs[0], lib_out.inputs["Points"])
+lib_group.links.new(lib_text.outputs[0], lib_out.inputs["Text"])
+bpy.data.libraries.write(os.path.join(lib_dir, "lib.blend"), {lib_group})
+bpy.data.node_groups.remove(lib_group)
+with bpy.data.libraries.load(os.path.join(lib_dir, "lib.blend"), link=True) as (_found, linked):
+    linked.node_groups = ["Library Sources"]
+lib_node = N.new("GeometryNodeGroup")
+lib_node.node_tree = linked.node_groups[0]
+plug(lib_node.outputs["Points"], stand.inputs["Items CSV"])
+plug(lib_node.outputs["Text"], stand.inputs["Answers"])
+got = outcome(lambda: lists.resolve_items(stand, ctx, source='TEXT'))
+check("paths: a linked group's Import CSV reads '//' next to its library file, as Geometry Nodes does",
+      isinstance(got, lists.ItemList) and got.names == ("lib1", "lib2", "lib3"), got)
+got = outcome(lambda: evaluator.eval_input(stand.inputs["Answers"], ctx))
+check("paths: and its Import Text too", got == "library notes", got)
+local_text = N.new("GeometryNodeImportText")
+local_text.inputs["Path"].default_value = "//notes.txt"
+plug(local_text.outputs[0], stand.inputs["Answers"])
+got = outcome(lambda: evaluator.eval_input(stand.inputs["Answers"], ctx))
+check("paths: Import Text's '//' in an unsaved file is a hint (Geometry Nodes reads nothing), not the working folder",
+      got == "<Hint: Save the .blend: '//' paths are relative to it>", got)
+plug(None, stand.inputs["Answers"])
+bare = N.new("GeometryNodeImportCSV")
+bare.inputs["Path"].default_value = "data.csv"
+plug(bare.outputs[0], stand.inputs["Items CSV"])
+got = outcome(lambda: lists.csv_source(stand, "Items", ctx))
+check("paths: an Import CSV Path without '//' is in Blender's working folder, where Import CSV reads it",
+      got == csvfmt.CsvSource(os.path.abspath("data.csv"), ",", (bare.name,)), got)
+plug(None, stand.inputs["Items CSV"])
+
 # ---------------------------------------------------------------------- answer sets
 plug(None, stand.inputs["Answers CSV"])
 stand.inputs["Answers"].default_value = "yes: it is cold, wet or windy; no: warm and calm"
@@ -416,6 +463,54 @@ check("watch: 32 files per poll, round-robin", first == [] and [c.owners for c i
       (first, second))
 many.retain({"n1"})
 check("watch: retain() drops the files nobody reads", list(many.files) == [csvfmt.identity(paths[1])])
+folder = os.path.join(TMP, "folder.csv")  # can be stat'ed but not read, like a file another program holds open
+os.mkdir(folder)
+unread, polls = watch.Watcher(), []
+for _ in range(3):  # tick() polls, then the pass reads the file again for its node (load_csv())
+    unread.use("node", csvfmt.load(folder))
+    polls.append([c.kind for c in unread.poll(force=True)])
+os.rmdir(folder)
+polls.append([c.kind for c in unread.poll(force=True)])
+check("watch: a file it can't read is reported when it changes, not on every poll", polls == [[], [], [], ["missing"]],
+      polls)
+
+# ------------------------------------------------------------------------- the watcher in the pass
+held_tree = bpy.data.node_groups.new("Held", 'GeometryNodeTree')
+held_tree.use_fake_user = True
+held = held_tree.nodes.new("GeometryNodeOpenActRules")
+held.answer_type = 'ONE_OF'
+held.inputs["Question"].default_value = QUESTION
+held_factors = shutil.copy(os.path.join(FIXTURES, "life_factors.csv"), TMP)
+held.inputs["Factors"].default_value = held_factors
+held.inputs["Outcomes"].default_value = os.path.join(FIXTURES, "life_outcomes.csv")
+engine.run_pass()
+planned = engine.STATUS.get(held.uid)
+
+
+def holding(file, *args, **kwargs):
+    """open() while another program holds held_factors open without sharing, as Excel does."""
+    if isinstance(file, str) and os.path.normcase(os.path.abspath(file)) == os.path.normcase(held_factors):
+        raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+    return real_open(file, *args, **kwargs)
+
+
+bump(held_factors)  # saved in the other program, which keeps it open
+builtins.open = holding
+try:
+    made = []
+    for _ in range(4):  # tick(): a poll, then a pass over the nodes whose files changed
+        plans = engine._plans_made
+        if watch.WATCH.poll(force=True):
+            engine.run_pass(everything=False)
+        made.append(engine._plans_made - plans)
+    during = engine.STATUS.get(held.uid)
+finally:
+    builtins.open = real_open
+engine.run_pass()  # the safety pass
+check("watch: a CSV another program holds open is planned once, not again on every poll",
+      made == [1, 0, 0, 0] and during.text.startswith("Can't read"), (made, during))
+check("watch: let go, the safety pass reads it again, a Rules node's too",
+      planned.icon == engine.STATUS[held.uid].icon == 'PAUSE', (planned, engine.STATUS.get(held.uid)))
 
 # ------------------------------------------------------------------------ the trust rule
 proj, outside = os.path.join(TMP, "proj"), os.path.join(TMP, "outside")
@@ -432,17 +527,35 @@ text_node = trust_tree.nodes.new("GeometryNodeImportText")
 text_node.inputs["Path"].default_value = far_text
 trust_tree.links.new(text_node.outputs[0], reader.inputs["Answers"])
 text_name = text_node.name  # the node itself is gone once the file is opened again
+rules = trust_tree.nodes.new("GeometryNodeOpenActRules")
+rules.name, rules.answer_type = "Rules", 'ONE_OF'
+rules.inputs["Question"].default_value = QUESTION
+far_rules = [shutil.copy(os.path.join(FIXTURES, f"life_{word}.csv"), outside) for word in ("factors", "outcomes")]
+rules.inputs["Factors"].default_value, rules.inputs["Outcomes"].default_value = far_rules
+for name, items in (("Far", far), ("Near", "//near.csv")):
+    picker = trust_tree.nodes.new(engine.PICK_ID)
+    picker.name = name
+    picker.inputs["Prompt"].default_value = "Something to sit on"
+    picker.inputs["Items"].default_value = items
 blend = os.path.join(proj, "scene.blend")
 check("trust: a file created in this session is trusted", trust.is_trusted())
 bpy.ops.wm.save_as_mainfile(filepath=blend)
 bpy.ops.wm.open_mainfile(filepath=blend)
-reader = bpy.data.node_groups["Trust"].nodes["Reader"]
-ctx = evaluator.Ctx(None, None, (), reader.id_data)
-check("trust: an opened file without Auto Run is not trusted", not trust.is_trusted() and trust.TRUST["opened"])
+check("trust: an opened file is not trusted", not trust.is_trusted() and trust.TRUST["opened"])
+bpy.context.preferences.filepaths.use_scripts_auto_execute = True
+refused = []
+for use_scripts in (False, True):  # Trusted Source unchecked in File > Open refuses Auto Run for this file only
+    bpy.ops.wm.open_mainfile(filepath=blend, use_scripts=use_scripts)
+    refused.append(trust.is_trusted())
+bpy.context.preferences.filepaths.use_scripts_auto_execute = False
+check("trust: Auto Run trusts no file, as an add-on can't see Trusted Source unchecked", refused == [False, False],
+      refused)
+trust_tree = bpy.data.node_groups["Trust"]
+reader, rules, far_pick, near_pick = (trust_tree.nodes[name] for name in ("Reader", "Rules", "Far", "Near"))
+ctx = evaluator.Ctx(None, None, (), trust_tree)
 check("watch: its load_post handler survives opening a file, and cleared the watcher",
       watch.on_load_post in bpy.app.handlers.load_post and not watch.WATCH.files)
 opened = []
-real_open = builtins.open
 
 
 def spy(file, *args, **kwargs):
@@ -455,6 +568,7 @@ try:
     reader.inputs["Items"].default_value = far
     blocked_csv = outcome(lambda: lists.resolve_items(reader, ctx, source='TEXT'))
     blocked_text = outcome(lambda: evaluator.eval_input(reader.inputs["Answers"], ctx))
+    engine.run_pass()
 finally:
     builtins.open = real_open
 message = f"Blocked reading {far}: outside this file's folder. Allow this file (or trust its folder) to read it"
@@ -462,9 +576,32 @@ check("trust: a CSV outside the file's folder is blocked", blocked_csv == f"<Unr
 check("trust: Import Text outside the folder is blocked",
       blocked_text == f"<Unresolvable: Answers ← {text_name}: Blocked reading {far_text}: outside this file's "
       "folder. Allow this file (or trust its folder) to read it>", blocked_text)
-check("trust: blocked files are never opened",
-      not {os.path.normcase(far), os.path.normcase(far_text)} & set(opened), opened)
+statuses = [getattr(engine.STATUS.get(node.uid), "text", "") for node in (rules, far_pick)]
+check("trust: the pass blocks them for a Rules node and a Pick node",
+      statuses[0].startswith(f"Blocked reading {far_rules[0]}:") and statuses[1] == message, statuses)
+check("trust: blocked files are never opened, by the pass neither",
+      not {os.path.normcase(p) for p in (far, far_text, *far_rules)} & set(opened), opened)
 check("trust: nor cached", csvfmt.identity(far) not in {key[0] for key in csvfmt._DOCS})
+touched, real_realpath = [], os.path.realpath
+
+
+def realpath_spy(path, *args, **kwargs):
+    touched.append(str(path))
+    return path if str(path).startswith("\\\\") else real_realpath(path, *args, **kwargs)
+
+
+os.path.realpath = realpath_spy
+try:
+    got = trust.blocked("\\\\openact-test-host\\share\\secret.csv")
+finally:
+    os.path.realpath = real_realpath
+check("trust: a path outside the folder is blocked without touching it (a UNC path would contact its server)",
+      got.startswith("Blocked reading") and not any(p.startswith("\\\\openact-test-host") for p in touched), touched)
+trust_tree.nodes[text_name].inputs["Path"].default_value = "far.txt"
+got = outcome(lambda: evaluator.eval_input(reader.inputs["Answers"], ctx))
+check("trust: the blocked message names the file a relative path reads",
+      f"Blocked reading {os.path.abspath('far.txt')}:" in got, got)
+trust_tree.nodes[text_name].inputs["Path"].default_value = far_text
 reader.inputs["Items"].default_value = "//near.csv"
 got = outcome(lambda: lists.resolve_items(reader, ctx, source='TEXT'))
 check("trust: a CSV next to the file is read", isinstance(got, lists.ItemList) and got.names == ("near item",), got)
@@ -474,8 +611,17 @@ check("trust: '..' does not escape", outcome(lambda: lists.resolve_items(reader,
 P._Defaults.trusted_folders.append(TMP)
 check("trust: a trusted parent folder trusts the file", trust.is_trusted())
 P._Defaults.trusted_folders.clear()
+near_spec = engine.SPECS[near_pick.bl_idname]
+before = near_spec.fingerprint(near_pick, ctx)
 check("trust: Allow This File", bpy.ops.openact.allow_file() == {'FINISHED'} and trust.is_trusted()
       and P._Defaults.trusted_files == [os.path.normpath(blend)], P._Defaults.trusted_files)
+check("trust: a trust change is in every plan's fingerprint, also where no read was blocked",
+      near_spec.fingerprint(near_pick, ctx) != before)
+engine.run_pass()
+statuses = [(getattr(engine.STATUS.get(node.uid), "icon", ""), getattr(engine.STATUS.get(node.uid), "text", ""))
+            for node in (rules, far_pick)]
+check("trust: after Allow This File the pass reads them, for the Rules node too (its plan cache sees the change)",
+      statuses[0][0] == 'PAUSE' and statuses[1][1].startswith("secret item"), statuses)  # one item: decided by code
 reader.inputs["Items"].default_value = far
 got = outcome(lambda: lists.resolve_items(reader, ctx, source='TEXT'))
 check("trust: after Allow This File the CSV is read", isinstance(got, lists.ItemList)
@@ -483,6 +629,14 @@ check("trust: after Allow This File the CSV is read", isinstance(got, lists.Item
 got = outcome(lambda: evaluator.eval_input(reader.inputs["Answers"], ctx))
 check("trust: and Import Text too", got == "secret words", got)
 check("trust: allowing twice adds nothing", not trust.allow(blend) and len(P._Defaults.trusted_files) == 1)
+P._Defaults.trusted_files.clear()
+bpy.ops.wm.read_homefile(use_empty=True)  # File > New
+created = trust.is_trusted()
+trust.unregister()  # OpenAct is disabled; its modules stay loaded...
+bpy.ops.wm.open_mainfile(filepath=blend)  # ...while a file received from someone else is opened
+trust.register()  # ...and enabled again
+check("trust: a file opened while OpenAct was disabled is judged on its own merits once it is enabled again",
+      created and not trust.is_trusted() and trust.blocked(far).startswith("Blocked reading"), trust.TRUST)
 for cls in P.classes:  # the preferences register, with the trusted lists as collections
     bpy.utils.register_class(cls)
 check("prefs: trusted_folders and trusted_files are path collections",

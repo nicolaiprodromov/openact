@@ -10,10 +10,13 @@ outputs of OpenAct nodes, through the handler the engine registers.
 Anything that needs geometry or fields raises Unresolvable, with a breadcrumb from the socket that
 was read to the node that failed: "Context ← Join Strings ← Named Attribute: fields can't be words".
 The one geometry link followed is a CSV socket's, by trace_csv_source(), and only to read the Path
-and Delimiter of the Import CSV node at its end. Import Text obeys the file trust rule (trust.py).
+and Delimiter of the Import CSV node at its end. Import CSV and Import Text Paths resolve as Geometry
+Nodes resolves them (import_path()), and Import Text obeys the file trust rule (trust.py).
 """
 
 from __future__ import annotations
+
+import os
 
 import bpy
 
@@ -323,11 +326,21 @@ def _h_menu_switch(node, out, ctx, depth):
     raise Unresolvable(f"'{node.name}' has no item '{as_text(name)}'")
 
 
+def import_path(path: str, node) -> str:
+    """The file an Import CSV or Import Text node reads for this Path, as Geometry Nodes resolves it: '//' is relative
+    to the file that holds the node's tree (the .blend, or a linked library), and any other relative path to Blender's
+    working folder. Raises Hint for '//' in an unsaved .blend, where Geometry Nodes reads nothing."""
+    library = node.id_data.library
+    if path.startswith("//") and library is None and not bpy.data.filepath:
+        raise Hint("Save the .blend: '//' paths are relative to it")
+    return os.path.abspath(bpy.path.abspath(path, library=library))
+
+
 def _h_import_text(node, out, ctx, depth):
     path = as_text(eval_input(_in(node, "Path"), ctx, depth))
     if not path:
         return ""
-    full = bpy.path.abspath(path)
+    full = import_path(path, node)
     message = trust.blocked(full)  # before open(): blocked text is never read
     if message:
         raise Unresolvable(message)
@@ -390,8 +403,9 @@ def trace_csv_source(node, csv_socket, ctx) -> CsvSource:
     """The Import CSV node plugged into a node's '<Input> CSV' socket, with its Path and Delimiter in this context.
 
     Follows geometry links upstream through Reroutes, muted nodes, nested group boundaries, and Switch, Index Switch
-    and Menu Switch nodes whose selector is read statically. The Import CSV geometry itself is never used. Raises
-    Unresolvable when the trace ends anywhere but at an Import CSV node, and Hint when that node has no Path.
+    and Menu Switch nodes whose selector is read statically. The Import CSV geometry itself is never used, and the
+    path is the file that node reads (import_path()). Raises Unresolvable when the trace ends anywhere but at an Import
+    CSV node, and Hint when that node has no Path.
     """
     label = csv_socket.name
     via = []
@@ -414,7 +428,7 @@ def trace_csv_source(node, csv_socket, ctx) -> CsvSource:
             if not path:
                 raise Hint(f"{label}: type a Path on '{up.name}'")
             delimiter = as_text(_read(_by_id(up, "Delimiter"), ctx, up, label))
-            return CsvSource(path, delimiter, tuple(via + [up.name]))
+            return CsvSource(import_path(path, up), delimiter, tuple(via + [up.name]))
         if kind == "NodeReroute":
             sock = up.inputs[0]
         elif kind == "NodeGroupInput":

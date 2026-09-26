@@ -54,6 +54,15 @@ def _latest(watched, doc):
         watched.doc, watched.read = doc, time.time()
 
 
+def _stamp(path):
+    """(st_mtime_ns, st_size), or None when the file can't be stat'ed."""
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return status.st_mtime_ns, status.st_size
+
+
 class Watcher:
     def __init__(self):
         self.files = {}  # csvfmt.identity() -> _File
@@ -69,7 +78,9 @@ class Watcher:
         if watched is None:
             watched = self.files[ident] = _File(doc.path, None)
         watched.owners.add(owner)
-        watched.stamp = doc.stamp if doc.stamp != (0, 0) else None
+        # A file it could not read (held open by another program, a folder) has a stamp all the same: poll() then
+        # reports it when it changes, not on every poll
+        watched.stamp = doc.stamp if doc.stamp != (0, 0) else _stamp(doc.path)
         _latest(watched, doc)
         key = (doc.schema, delimiter)
         errors = _errors(doc)
@@ -132,11 +143,7 @@ class Watcher:
         return changes
 
     def _check(self, watched):
-        try:
-            status = os.stat(watched.path)
-            stamp = (status.st_mtime_ns, status.st_size)
-        except OSError:
-            stamp = None
+        stamp = _stamp(watched.path)
         if stamp == watched.stamp:
             return None
         watched.stamp = stamp

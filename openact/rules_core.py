@@ -1,9 +1,9 @@
 """The Rules engine in pure Python (design 6.5 and 9): cells, `if` restrictions, the question for one cell, the limits,
 and the references for interpolation and dithering that the inner graph must match within 1e-5.
 
-Only the standard library and csvfmt are imported, so the unit tests also run under plain CPython. specs/rules.py
-builds the Rules Spec on it. Model rows take their confidence from specs/base.py's confidence() (4.e); this module
-only sets it for rows that code decides (1) and blends it like the value (9.6).
+Only the standard library, csvfmt and pipeline are imported, so the unit tests also run under plain CPython.
+specs/rules.py builds the Rules Spec on it. Model rows take their confidence from specs/base.py's confidence() (4.e);
+this module only sets it for rows that code decides (1) and blends it like the value (9.6).
 """
 
 from __future__ import annotations
@@ -13,22 +13,22 @@ import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from . import csvfmt
-from .csvfmt import ERROR, WARNING, CsvError, Option, Problem
+from . import csvfmt, pipeline
+from .csvfmt import ERROR, WARNING, CsvError, Problem
 
-PROMPT_VERSION = 1  # stored per entry as "pv"; never part of a key (5.4)
-ANSWER_TYPES = ("ONE_OF", "YES_NO", "AMOUNT")  # the node's answer_type
+PROMPT_VERSION = 2  # RulesSpec's: stored per entry as "pv"; part of the ask key, never of a words key (5.4)
 QUESTION_TYPES = {"ONE_OF": "choice", "YES_NO": "noul", "AMOUNT": "score"}
 NO_CONTEXT = "No additional context."
 FACTS_INTRO = "Each question describes one situation with these facts:"
+CONDITIONS = (  # the state's last lines when One-of outcomes have `when` texts: the options' conditions decide (4.c)
+    "Each option is an outcome and when it applies.",
+    "Decide only by the conditions the options state, not by outside knowledge.",
+    "Choose the outcome whose condition this situation meets.",
+)
 SITUATION = "Situation:"
 DEFAULT_QUESTION = "Which outcome applies in this situation?"  # One-of only
 QUESTION_HINT = "Type a question"  # Yes/No and Amount: a scale without a question is meaningless
-AMOUNT_LEVELS = ("Not at all", "Slightly", "Moderately", "Very", "Extremely")  # as engine.AMOUNT_LEVELS
-SLOTS = 16  # options scored in one row; more make a tournament (10.3)
-MAX_CELLS = csvfmt.MAX_CELLS
 MAX_SCORED_ROWS = 8192  # per context, before any request (5.4)
-ETA_ROWS = 1024  # above this many scored rows the status shows an ETA
 MAX_INTERPOLATED = 3  # Amount factors that Yes/No and Amount interpolate over; later ones use the nearest band
 BLEND_EPSILON = 1e-6  # a blend whose answered corners weigh no more than this gives the fallbacks
 DITHER_SEED_STEP = 7919  # factor j's Random Value uses Seed + 7919 * j (j in factor order)
@@ -54,7 +54,6 @@ class Clause(NamedTuple):
 
 @dataclass(frozen=True)
 class CellPlan:
-    index: int  # flat cell index, which is also the table row
     levels: tuple[int, ...]  # level index per factor, in factor order
     name: str  # row identity (Row.name): level names joined by "|", e.g. "alive|3"
     allowed: tuple[int, ...]  # option rows offered to the cell, in row order (Amount: every level)
@@ -67,10 +66,10 @@ class CellPlan:
 @dataclass(frozen=True)
 class RulesPlan:
     state: str  # shared by every cell of the context
-    cells: tuple[CellPlan, ...]  # one per table row, in cell order
+    cells: tuple[CellPlan, ...]  # one per table row, in cell order: cell r is table row r
     rows: int  # estimated scored rows: the sum of the cells' costs
     error: str  # "" or the status for cells no outcome applies to (9.4); their rows are error rows
-    warnings: tuple[Problem, ...]  # the table is used; the status shows the first once it is complete
+    warnings: tuple[Problem, ...]  # the table is used; the status shows them after the error, once it is complete
 
 
 # ------------------------------------------------------------------------ cells (9.3)
@@ -251,19 +250,12 @@ def allowed_sets(clauses, counts) -> list[tuple[int, ...]]:
 # ------------------------------------------------------------------------ the question for one cell (9.5)
 
 
-def default_options(answer_type: str) -> tuple[Option, ...]:
-    """The rows used when Outcomes is empty: Yes/No asks yes or no without whens, Amount the five AMOUNT_LEVELS."""
-    if answer_type == "YES_NO":
-        return (Option("yes", "", "", {}), Option("no", "", "", {}))
-    if answer_type == "AMOUNT":
-        return tuple(Option(name, "", "", {}) for name in AMOUNT_LEVELS)
-    raise ValueError("One-of needs Outcomes")
-
-
-def state_text(context: str, factors) -> str:
+def state_text(context: str, factors, conditions: bool = False) -> str:
+    """The state every cell shares: the Context, the facts and their levels, then CONDITIONS when conditions is set
+    (One-of outcomes with `when` texts, see plan_table)."""
     lines = [context.strip() or NO_CONTEXT, FACTS_INTRO]
     lines += [f"- {factor.name}: " + " | ".join(level.name for level in factor.levels) for factor in factors]
-    return "\n".join(lines)
+    return "\n".join(lines + list(CONDITIONS if conditions else ()))
 
 
 def instructions(factors, levels, question: str) -> str:
@@ -283,51 +275,22 @@ def criteria(answer_type: str, options, allowed):
     return [_option_text(option) for option in options]
 
 
-# ------------------------------------------------------------------------ limits and costs (9.8)
-
-
-def cell_cost(options: int, debias: bool = True) -> int:
-    """Scored rows for one question over this many options: 0 when code decides it, a tournament above 16."""
-    if options <= 1:
-        return 0
-    groups = math.ceil(options / SLOTS)
-    return (2 if debias else 1) * (groups + (1 if options > SLOTS else 0))
-
-
-def cells_error(counts) -> str:
-    count = math.prod(counts)
-    if count <= MAX_CELLS:
-        return ""
-    return f"Rules has {csvfmt._n(count)} cells (limit {csvfmt._n(MAX_CELLS)}): use fewer bands"
-
-
-def rows_error(rows: int) -> str:
-    if rows <= MAX_SCORED_ROWS:
-        return ""
-    limit = f"(limit {csvfmt._n(MAX_SCORED_ROWS)})"
-    return f"Rules needs {csvfmt._n(rows)} scored rows {limit}: offer at most 16 outcomes per cell, or use fewer bands"
-
-
 # ------------------------------------------------------------------------ planning (9.1, steps 2-4)
 
 
 def plan_table(factors, answer_type: str, answers, question: str, context: str, debias: bool = True) -> RulesPlan:
     """Every cell of one context: decided by code, an error row, or a question for the model.
 
-    factors: csvfmt.parse_factors(). answers: the Outcomes AnswerSet, or None when Outcomes is empty (not allowed for
-    One-of). question, context: the words as evaluated. debias: the node's balance_order. Raises RulesHint (empty
-    Question for Yes/No or Amount), CsvError (a bad `if`, naming its line) or RulesError (a limit).
+    factors: csvfmt.parse_factors(), which keeps the cells within csvfmt.MAX_CELLS. answers: the Outcomes AnswerSet
+    (sources.answer_set(), whose default sets stand in for an empty Yes/No or Amount input). question, context: the
+    words as evaluated. debias: the node's balance_order. Raises RulesHint (empty Question for Yes/No or Amount),
+    CsvError (a bad `if`, naming its line) or RulesError (over MAX_SCORED_ROWS).
     """
-    if answer_type not in ANSWER_TYPES:
-        raise ValueError(f"unknown answer type {answer_type!r}")
     counts = level_counts(factors)
-    if cells_error(counts):
-        raise RulesError(cells_error(counts))
     text = question.strip() or (DEFAULT_QUESTION if answer_type == "ONE_OF" else "")
     if not text:
         raise RulesHint(QUESTION_HINT)
-    options = answers.options if answers is not None else default_options(answer_type)
-    doc = answers.doc if answers is not None else None
+    options, doc = answers.options, answers.doc
     warnings = []
     if answer_type == "AMOUNT":
         clauses = [()] * len(options)
@@ -335,7 +298,7 @@ def plan_table(factors, answer_type: str, answers, question: str, context: str, 
         if used:
             warnings.append(_problem(WARNING, doc, used[0], "'if' is not used for Amount answers"))
     else:
-        clauses = restrictions(answers, factors) if answers is not None else [()] * len(options)
+        clauses = restrictions(answers, factors)
     allowed = allowed_sets(clauses, counts)
     offered = set().union(*allowed)
     for r, option in enumerate(options):
@@ -345,19 +308,21 @@ def plan_table(factors, answer_type: str, answers, question: str, context: str, 
         for factor in [factor for factor in factors if factor.kind == "amount"][MAX_INTERPOLATED:]:
             message = f"interpolating over {MAX_INTERPOLATED} Amount factors; '{factor.name}' uses its nearest band"
             warnings.append(Problem(WARNING, "", 0, "", message))
-    rows = sum(cell_cost(len(a), debias) for a in allowed if len(a) > 1)
-    if rows_error(rows):
-        raise RulesError(rows_error(rows))
+    rows = sum(pipeline.cost(len(a), debias) for a in allowed if len(a) > 1)
+    if rows > MAX_SCORED_ROWS:
+        limit = f"(limit {csvfmt._n(MAX_SCORED_ROWS)})"
+        raise RulesError(f"Rules needs {csvfmt._n(rows)} scored rows {limit}: offer at most 16 outcomes per cell, "
+                         f"or use fewer bands")
 
     cells, empty, shared = [], [], {}  # shared: one criteria object per allowed set (never mutated)
-    for index, (levels, offer) in enumerate(zip(cell_rows(counts), allowed)):
+    for levels, offer in zip(cell_rows(counts), allowed):
         name = row_name(factors, levels)
         if len(offer) == 1:
             values = _code_values(answer_type, options, offer[0])
-            cells.append(CellPlan(index, levels, name, offer, "code", values, None, 0))
+            cells.append(CellPlan(levels, name, offer, "code", values, None, 0))
         elif not offer:
             empty.append(levels)
-            cells.append(CellPlan(index, levels, name, offer, "error", _error_values(answer_type), None, 0))
+            cells.append(CellPlan(levels, name, offer, "error", _error_values(answer_type), None, 0))
         else:
             if offer not in shared:
                 shared[offer] = criteria(answer_type, options, offer)
@@ -366,20 +331,15 @@ def plan_table(factors, answer_type: str, answers, question: str, context: str, 
                 "instructions": instructions(factors, levels, text),
                 "criteria": shared[offer],
             }
-            cells.append(CellPlan(index, levels, name, offer, "model", None, asked, cell_cost(len(offer), debias)))
+            cells.append(CellPlan(levels, name, offer, "model", None, asked, pipeline.cost(len(offer), debias)))
     error = ""
     if empty:
         shown = [", ".join(f"{f.name}={f.levels[b].name}" for f, b in zip(factors, levels)) for levels in empty[:3]]
         more = len(empty) - len(shown)
         error = "No outcome applies to " + "; ".join(shown)
         error += f" and {more} more cell{'s' if more > 1 else ''}" if more else ""
-    return RulesPlan(state_text(context, factors), tuple(cells), rows, error, tuple(warnings))
-
-
-def ok_value(source: str) -> float:
-    """The `ok` column of Yes/No and Amount rows (9.6): 0 for rows that hold the fallbacks (pending, error), else 1.
-    A stale row copies the values of the row it stands in for, ok included."""
-    return 0.0 if source in ("pending", "error") else 1.0
+    conditions = answer_type == "ONE_OF" and any(option.when for option in options)
+    return RulesPlan(state_text(context, factors, conditions), tuple(cells), rows, error, tuple(warnings))
 
 
 # ------------------------------------------------------------------------ interpolation (9.6)
@@ -403,11 +363,11 @@ def axis(factor, value) -> tuple[int, float]:
     return b0, min(max((x - centres[b0]) / (centres[b0 + 1] - centres[b0]), 0.0), 1.0)
 
 
-def corners(factors, values, interpolate=None) -> list[tuple[int, float]]:
+def corners(factors, values) -> list[tuple[int, float]]:
     """(cell, weight) of the 2^Ka corners, s in itertools.product((0, 1), repeat=Ka) order, bit j for the j-th
-    interpolated factor. The other factors take their level (Amount: nearest band). [] when a category value matches
-    no level. interpolate: the interpolated factors' indices; interpolated_factors() by default."""
-    interpolate = interpolated_factors(factors) if interpolate is None else interpolate
+    interpolated factor (interpolated_factors()). The other factors take their level (Amount: nearest band). [] when a
+    category value matches no level."""
+    interpolate = interpolated_factors(factors)
     steps = strides(level_counts(factors))
     exact, axes = 0, []
     for j, (factor, value) in enumerate(zip(factors, values)):
@@ -428,7 +388,7 @@ def corners(factors, values, interpolate=None) -> list[tuple[int, float]]:
     return out
 
 
-def blend(factors, values, table, interpolate=None) -> tuple[float, float, bool]:
+def blend(factors, values, table) -> tuple[float, float, bool]:
     """(value, confidence, valid) of one element: the corner rows blended with weight w * ok, renormalised.
 
     table[cell] = (v, c, ok), v being p (Yes/No) or amount. Renormalising stops a pending corner from dragging the
@@ -436,7 +396,7 @@ def blend(factors, values, table, interpolate=None) -> tuple[float, float, bool]
     answered corners weigh no more than BLEND_EPSILON. Yes = value >= 0.5 is decided after the blend.
     """
     total = value = confidence = 0.0
-    for cell, weight in corners(factors, values, interpolate):
+    for cell, weight in corners(factors, values):
         v, c, ok = table[cell]
         total += weight * ok
         value += weight * ok * v
