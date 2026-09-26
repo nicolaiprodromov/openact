@@ -344,6 +344,25 @@ got = (read(near.inputs["Delimiter"]), read(far.inputs["Delimiter"]))
 evaluator.MEMO = None
 check("memo: a nearer read doesn't carry a deeper one past MAX_DEPTH",
       got == ("deep", alone) and "too deep" in alone, (got, alone))
+source = string("old")
+readers = []
+for hops in (0, 2, 1):  # each reader through its own Reroutes
+    socket = source
+    for _ in range(hops):
+        hop = N.new("NodeReroute")
+        L.new(socket, hop.inputs[0])
+        socket = hop.outputs[0]
+    reader = join([])
+    L.new(socket, reader.inputs["Delimiter"])
+    readers.append(reader.inputs["Delimiter"])
+evaluator.MEMO = {}
+got = [read(readers[0])]
+source.node.string = "new"  # only a read that misses the memo sees an edit
+got.append(read(readers[1]))
+source.node.string = "newer"
+got.append(read(readers[2]))
+evaluator.MEMO = None
+check("memo: the deepest read's entry serves the shallower reads after it", got == ["old", "new", "new"], got)
 
 # a red (invalid) link must be reported, not silently read
 bad = N.new("GeometryNodeStringJoin")
@@ -480,7 +499,38 @@ def linked_library():
           node.node_tree is not linked_inner and node.node_tree.library is None
           and node.node_tree.name == engine.inner_name(node) and len(linked_inner.nodes) == before[4],
           (node.node_tree.name, node.node_tree.library, local.library))
+    bpy.data.objects.remove(user)  # its tree has no Group Output, which later scene updates would report
+
+
+def reappended_asset():
+    """An asset deleted and appended again keeps its node's uid, but its hidden group arrives as '....001'
+    because the old group, now unused, still holds the name. Passes must settle anyway."""
+    asset = bpy.data.node_groups.new("Asset", 'GeometryNodeTree')
+    asset.nodes.new(engine.ASK_ID).inputs["Question"].default_value = "Is it an asset?"
+    path = os.path.join(TMP, "asset.blend")
+    bpy.data.libraries.write(path, {asset})
+    bpy.data.node_groups.remove(asset)  # its hidden group stays behind, unused
+    with bpy.data.libraries.load(path) as (_source, target):
+        target.node_groups = ["Asset"]
+    node = next(n for n in target.node_groups[0].nodes if n.bl_idname == engine.ASK_ID)
+    arrived = node.node_tree.name
+    bpy.context.view_layer.update()
+    bpy.app.handlers.depsgraph_update_post.append(engine.on_depsgraph_update)  # what schedules passes live
+    try:
+        engine.run_pass()
+        bpy.context.view_layer.update()
+        before = (sorted(group.name for group in bpy.data.node_groups), node.uid, node.node_tree.name)
+        engine.run_pass()
+        bpy.context.view_layer.update()  # a pass that wrote anything schedules another one here
+        after = (sorted(group.name for group in bpy.data.node_groups), node.uid, node.node_tree.name)
+        scheduled = engine._dirty
+    finally:
+        bpy.app.handlers.depsgraph_update_post.remove(engine.on_depsgraph_update)
+    check("re-appended asset: two passes leave the tree unchanged and schedule no further pass",
+          arrived.endswith(".001") and after == before and not scheduled,
+          (arrived, before[1:], after[1:], scheduled))
 
 
 linked_library()
+reappended_asset()
 finish()

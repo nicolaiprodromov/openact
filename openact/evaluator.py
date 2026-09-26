@@ -17,7 +17,7 @@ import bpy
 
 MAX_CONTEXTS = 64
 MAX_DEPTH = 64
-MEMO = None  # (output socket pointer, Ctx.key()) -> value while engine.run_pass() runs; None otherwise
+MEMO = None  # (output socket pointer, Ctx.key()) -> (value, depth read at) during engine.run_pass(); else None
 
 
 class Unresolvable(Exception):
@@ -163,7 +163,7 @@ def eval_output(node, out, ctx, depth):
     if MEMO is not None:
         key = (out.as_pointer(), ctx.key())
         hit = MEMO.get(key)
-        if hit is not None and depth <= hit[1]:  # reached deeper, the chain might pass MAX_DEPTH
+        if hit is not None and depth <= hit[1]:  # a deeper read might pass MAX_DEPTH, so it reads again
             return hit[0]
     try:
         value = _eval_output(node, out, ctx, depth)
@@ -174,7 +174,7 @@ def eval_output(node, out, ctx, depth):
             error.socket = ""
         raise
     if key is not None:
-        MEMO.setdefault(key, (value, depth))  # a shallower entry serves more readers
+        MEMO[key] = (value, depth)
     return value
 
 

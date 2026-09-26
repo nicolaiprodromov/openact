@@ -413,7 +413,8 @@ def ensure_owned(nodes):
         if node.uid and inner is not None and inner.name == inner_name(node):
             owners.setdefault(inner.as_pointer(), node)
     for _tree, node in nodes:
-        if not node.uid or node.uid in seen:
+        fresh = not node.uid or node.uid in seen
+        if fresh:
             node.uid = new_uid()
         seen.add(node.uid)
         inner = node.node_tree
@@ -423,7 +424,7 @@ def ensure_owned(nodes):
             own = inner.copy()
             own.name = inner_name(node)
             node.node_tree = own
-        elif inner.name != inner_name(node):  # an owner given a new uid frees its old group name
+        elif fresh:  # frees the old uid's group name. Only once: a taken name would be retried every pass
             inner.name = inner_name(node)
 
 
