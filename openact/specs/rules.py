@@ -13,7 +13,6 @@ import itertools
 
 from .. import csvfmt, pipeline, rules_core
 from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, named, number_text, overrides_inputs, warnings
-from .base import yes_no_text
 
 FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
 OUTCOMES_HINT = "Add outcomes"
@@ -177,7 +176,7 @@ class RulesSpec(Spec):
             if answers.doc is None:
                 raise Unresolvable(f"Outcomes: {error}") from None
             raise lists.file_error(answers.doc, error) from None
-        return self.locked(node, ctx, job)  # after the problems: locked() adds its own
+        return job
 
     def job(self, gn, factors, answers, answer_type, debias, hashes=(), uid="", problems=()):
         """The Job for these words, factors and outcomes (an AnswerSet: sources.default_set() for an empty Yes/No or
@@ -236,8 +235,7 @@ class RulesSpec(Spec):
         if job.answer_type == 'ONE_OF':
             outcome = values["outcome"]
             return job.options[outcome] if 0 <= outcome < len(job.options) else ""
-        value = values[rules_core.value_column(job.answer_type)]
-        return number_text(value) if job.answer_type == 'AMOUNT' else yes_no_text(value)
+        return number_text(values[rules_core.value_column(job.answer_type)], job.options)
 
     # ------------------------------------------------------------------ answers
 
