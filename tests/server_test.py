@@ -10,8 +10,9 @@ Each server is openact/runtime/openact_server.py --backend fake, run by this Pyt
 - /v1/capabilities; 422 for 257 questions and for an invalid question or one over the token limit,
   naming it; a 40-option tournament whose 40 probabilities sum to 1, also next to question ids
   that look like the tournament's own keys.
-- Bad requests: a negative or non-numeric Content-Length, deeply nested JSON and lone surrogates
-  all get a reply.
+- Bad requests: a negative or non-numeric Content-Length, a real body over 4 MB, deeply nested JSON
+  and lone surrogates all get a reply. Refused requests with bodies that are slow to parse, sent
+  nonstop, leave /health within the add-on's 1 s probe timeout.
 - --fake-script answers, the --record log of every request (refused ones too), a --record path
   that can't be written, and the same fake answers in every process.
 - Cold loads: during --fake-load-seconds a POST gets an immediate 503 "loading"; after
@@ -29,8 +30,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import FAILURES, ROOT, check, finish  # noqa: E402
@@ -38,6 +41,7 @@ from _harness import FAILURES, ROOT, check, finish  # noqa: E402
 SERVER = os.path.join(ROOT, "openact", "runtime", "openact_server.py")
 TMP = tempfile.mkdtemp(prefix="openact_server_")
 TOKEN = secrets.token_hex(32)
+MAX_BODY = 4 * 1024 * 1024
 SCRIPT = [  # --fake-script: the first matching rule answers
     {"state": "snowy", "question": "Is it night?", "answer": "yes"},
     {"question": "Is it night?", "answer": {"yes": 1, "no": 3}},
@@ -125,9 +129,20 @@ def ask(port, request, token=TOKEN, **headers):
     if token:
         headers["X-OpenAct-Token"] = token
     code, reply = call(port, "POST", "/v1/systemone", request, headers)
-    sent = request.decode("utf-8", "replace") if isinstance(request, bytes) else request
+    if isinstance(request, bytes) or code == 403:  # logged as the body's text: not JSON, or refused unparsed
+        sent = request.decode("utf-8", "replace") if isinstance(request, bytes) else json.dumps(request)
+    else:
+        sent = request
     RECORDED.append((code, sent, reply.get("answers")))
     return code, reply
+
+
+def reply_code(port, body, headers):
+    """The status of a POST /v1/systemone, or the error's name when no reply arrives."""
+    try:
+        return call(port, "POST", "/v1/systemone", body, headers)[0]
+    except OSError as error:
+        return type(error).__name__
 
 
 WINDOW = {"state": "A plain room.", "questions": {"q": noul("Is there a window?")}}
@@ -287,14 +302,16 @@ def phase_limits(port):
     check("422 for 256 options names the question", code == 422 and reply.get("question") == "wide", (code, reply))
     code, reply = ask(port, {"state": "s", "questions": {
         "fine": noul("Is it fine?"), "long": noul("Is it " + "very " * 5000 + "long?")}})
-    check("422 for a question over the token limit names it",
-          code == 422 and reply.get("question") == "long" and "limit" in reply.get("error", ""),
-          (code, reply.get("question"), reply.get("error", "")[:80]))
+    error = reply.get("error", "")
+    check("422 for a question over the token limit names it, in the message too",
+          code == 422 and reply.get("question") == "long" and error.startswith("long: ") and "limit" in error
+          and "Row " not in error, (code, reply.get("question"), error[:80]))
     criteria = dict({str(i): f"option {i}" for i in range(40)}, **{"20": "option " + "x " * 20000})
     code, reply = ask(port, {"state": "s", "questions": {
         "fine": noul("Is it fine?"), "wide": choice("Which?", criteria)}})
     check("422 for a tournament group over the token limit names its question",
-          code == 422 and reply.get("question") == "wide", (code, reply.get("question")))
+          code == 422 and reply.get("question") == "wide" and reply.get("error", "").startswith("wide: "),
+          (code, reply.get("question"), reply.get("error", "")[:80]))
 
 
 def phase_tournament(port):
@@ -350,8 +367,11 @@ def phase_bad_requests(port):
     for length in ("-1", "abc"):
         code, reply = call(port, "POST", "/v1/systemone", None, {"Content-Length": length, "X-OpenAct-Token": TOKEN})
         check(f"Content-Length {length}: 400", code == 400, (code, reply))
-    code, reply = call(port, "POST", "/v1/systemone", None, {"Content-Length": str(5 << 20), "X-OpenAct-Token": TOKEN})
-    check("a Content-Length over 4 MB: 413", code == 413, (code, reply))
+    headers = {"Content-Length": str(100 << 20), "X-OpenAct-Token": TOKEN}
+    code, reply = call(port, "POST", "/v1/systemone", None, headers)
+    check("a Content-Length too large to skip: 413 at once, nothing read", code == 413, (code, reply))
+    code = reply_code(port, b"x" * (MAX_BODY + 1), {"X-OpenAct-Token": TOKEN})
+    check("a real body over 4 MB gets its 413, not a reset connection", code == 413, code)
     check("the server keeps serving after bad lengths", call(port, "GET", "/health")[0] == 200)
     code, reply = ask(port, b"[" * 100000 + b"]" * 100000)
     check("deeply nested JSON: 422, not a dropped connection",
@@ -378,6 +398,42 @@ def phase_shutdown(port, process):
     check("the refused /shutdown leaves the server running", call(port, "GET", "/health")[0] == 200)
     code, reply = call(port, "POST", "/shutdown", {}, {"X-OpenAct-Token": TOKEN})
     check("/shutdown with the token stops the server", code == 200 and exited(process, 10), (code, reply))
+
+
+def phase_hostile():
+    """A web page can't pass the checks, but it can send refused requests nonstop: refusing must stay cheap."""
+    port, _process = launch("hostile", token=TOKEN)
+    body = b"[" + b"{}," * 1398000 + b"{}]"  # just under 4 MB of tiny objects: slow to parse
+    until = time.time() + 2.5
+    codes = []
+
+    def flood(headers):
+        while time.time() < until:
+            codes.append(reply_code(port, body, headers))
+
+    floods = [threading.Thread(target=flood, args=(headers,), daemon=True)
+              for headers in [{"Origin": "http://evil.example"}] * 3 + [{}] * 3]
+    for thread in floods:
+        thread.start()
+    time.sleep(0.3)
+    seconds = []
+    while time.time() < until:
+        started = time.perf_counter()
+        try:
+            answered = call(port, "GET", "/health")[0] == 200
+        except OSError:
+            answered = False
+        seconds.append(time.perf_counter() - started if answered else float("inf"))
+        time.sleep(0.1)
+    for thread in floods:
+        thread.join(30)
+    seconds.sort()
+    median = seconds[len(seconds) // 2] if seconds else float("inf")
+    check("refused requests sent nonstop: every /health probe answers within the add-on's 1 s timeout",
+          seconds and seconds[-1] < 1.0, [round(value, 3) for value in seconds])
+    check("refused requests sent nonstop: /health stays fast (median under 0.2 s)", median < 0.2, round(median, 3))
+    check("refused requests sent nonstop: each gets its 403, its body skipped rather than the connection reset",
+          codes and set(codes) == {403}, Counter(codes))
 
 
 def phase_open_mode(port, process, window):
@@ -413,6 +469,7 @@ def main():
         phase_bad_requests(port)
         phase_record(record)
         phase_shutdown(port, process)
+        phase_hostile()
         phase_open_mode(loading, loading_process, window)
     except Exception:
         check("no unexpected error", False, traceback.format_exc())

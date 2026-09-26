@@ -29,6 +29,7 @@ import hmac
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -50,6 +51,7 @@ MAX_TOKENS = 4096  # SemIf's prompt limit per row
 BATCH_ROWS = 32
 CACHE_SIZE = 65536  # questions
 MAX_BODY = 4 * 1024 * 1024
+MAX_DRAIN = 4 * MAX_BODY  # a refused or oversized body up to this size is read and dropped, so its reply arrives
 EMA_ALPHA = 2 / (64 + 1)  # ms_per_row: an EMA spanning about the last 64 scoring calls
 NO_CUDA = "CUDA is not available to PyTorch (is the NVIDIA driver too old for cu128?)"
 
@@ -129,6 +131,20 @@ class SemIfTorchBackend(Backend):
         if device == "auto":
             device = "cuda"  # never a silent CPU load: 16 GB of RAM and far too slow
         if device == "cuda" and not torch.cuda.is_available():
+            if torch.version.cuda is None:
+                raise RuntimeError("The runtime's PyTorch has no CUDA support (a CPU-only build): "
+                                   "reinstall the runtime")
+            gpus = None  # how many GPUs the driver lists: --gpu (CUDA_VISIBLE_DEVICES) hides the others from CUDA
+            try:
+                listed = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if listed.returncode == 0:
+                    gpus = sum(line.startswith("GPU ") for line in listed.stdout.splitlines())
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if gpus is not None and self.args.gpu is not None and self.args.gpu >= gpus:
+                raise RuntimeError(f"GPU {self.args.gpu} not found: this machine has {gpus} NVIDIA GPU(s). "
+                                   "Pick another GPU in the preferences")
             raise RuntimeError(NO_CUDA)
         if device == "cpu" and dtype == "bfloat16":
             dtype = "float32"  # SemIf's documented CPU reference path
@@ -296,8 +312,8 @@ class Engine:
         }
 
     def record(self, code, request, answers):
-        """--record: one JSON line per /v1/systemone request whose body was read, refused ones too:
-        its status, the request (the body's text when it is not JSON) and its answers (null unless 200)."""
+        """--record: one JSON line per /v1/systemone request whose body was read, refused ones too: its
+        status, the request (the body's text if it was refused or is not JSON) and its answers (null unless 200)."""
         if not self.args.record:
             return
         try:
@@ -339,10 +355,13 @@ class Engine:
         try:
             scored = dict(zip(owners, self._score_rows(rows)))
         except ValueError as error:
-            if getattr(error, "row", None) is not None:
-                key, _tag = owners[int(error.row)]
-                error.question = key[0]
-            raise
+            if getattr(error, "row", None) is None:
+                raise
+            key, _tag = owners[int(error.row)]
+            # SemIf's message starts with the internal row id: name the question instead
+            refusal = RequestError(f"{key[0]}: " + str(error).removeprefix(f"Row {error.row}: "))
+            refusal.question = key[0]
+            raise refusal from error
         tokens = sum(result["input_tokens"] for result in scored.values())
         out = {}
         for key in tasks:
@@ -571,35 +590,51 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = -1
-        if not 0 <= length <= MAX_BODY:
-            self.close_connection = True  # the body stays unread and must not be taken for the next request
-            code, error = (413, "request too large") if length > MAX_BODY else (400, "invalid Content-Length")
-            self._send(code, {"error": error})
+        if length < 0:
+            self.close_connection = True  # where the body ends is unknown, so it can't be skipped
+            self._send(400, {"error": "invalid Content-Length"})
             return
-        raw = self.rfile.read(length) if length else b""  # before any reply: an unread body resets the connection
-        refused = self._refused()
+        refused = self._refused()  # headers only: refusing must stay cheap, whatever the body holds
         if refused is None and TOKEN and not hmac.compare_digest(
                 self.headers.get("X-OpenAct-Token", "").encode(), TOKEN.encode()):
             refused = "missing or wrong X-OpenAct-Token"
-        if self.path == "/v1/systemone":
-            self._send(*self._systemone(raw, refused))
-        elif refused:
+        keep = not refused or (ENGINE.args.record and self.path == "/v1/systemone")  # tests log refused bodies
+        if length > MAX_BODY or not keep:
+            self._skip(length)
+            code, error = (403, refused) if refused else (413, "request too large")
+            self._send(code, {"error": error})
+            return
+        raw = self.rfile.read(length) if length else b""
+        if refused:  # --record logs a refused body as it came, unparsed
+            ENGINE.record(403, raw.decode("utf-8", "replace"), None)
             self._send(403, {"error": refused})
+        elif self.path == "/v1/systemone":
+            self._send(*self._systemone(raw))
         elif self.path == "/shutdown":
             self._send(200, {"ok": True})
             threading.Thread(target=SERVER.shutdown, daemon=True).start()
         else:
             self._send(404, {"error": "not found"})
 
-    def _systemone(self, raw, refused):
+    def _skip(self, length):
+        """Read and drop a body in chunks: replying and closing on unread data resets the connection,
+        and the reply is lost."""
+        if length > MAX_DRAIN:
+            self.close_connection = True  # too large to be worth reading
+            return
+        while length > 0:
+            chunk = self.rfile.read(min(length, 1 << 16))
+            if not chunk:
+                return
+            length -= len(chunk)
+
+    def _systemone(self, raw):
         try:
             request, readable = json.loads(raw.decode("utf-8") or "null"), True
         except (ValueError, RecursionError):  # deep nesting raises RecursionError
             request, readable = raw.decode("utf-8", "replace"), False
         status = ENGINE.status  # read once: the load may finish meanwhile
-        if refused:
-            code, payload = 403, {"error": refused}
-        elif not readable:
+        if not readable:
             code, payload = 422, {"error": "body is not valid JSON", "question": None}
         elif status != "ready":  # never block behind a load: the client polls /health
             code, payload = 503, {"status": status}

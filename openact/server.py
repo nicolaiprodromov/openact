@@ -55,6 +55,7 @@ class _State:
         self.install_thread = None
         self.install_step = ""
         self.log_path = ""
+        self.conflict = ""  # the error shown while an OpenAct server with another backend holds the port
 
     def set(self, status, message=""):
         with self.lock:
@@ -194,6 +195,13 @@ def _other_backend(health):
     return None if running == ("fake" if _backend() == "fake" else "semif-torch") else running
 
 
+def _refuse_backend(other):
+    """Treat an OpenAct server with another backend on the port like any other program there."""
+    STATE.conflict = (f"Port {STATE.port} is used by an OpenAct model server with the {other} backend. "
+                      "Stop it or pick another port in the preferences")
+    STATE.set("error", STATE.conflict)
+
+
 def state_dir(root):
     """Writable state such as server.log: OPENACT_STATE_DIR, so the runtime can be shared read-only,
     else the runtime folder."""
@@ -222,12 +230,16 @@ def refresh(prefs=None):
             code, health = 0, {}
             if STATE.status == "ready":
                 STATE.set("stopped", "The model server stopped")
-        if code == 200 and health.get("server") == SERVER_ID and not _other_backend(health):
+        other = _other_backend(health) if code == 200 and health.get("server") == SERVER_ID else None
+        if other:
+            _refuse_backend(other)  # also ends a "ready" left over from the server it replaced
+        elif code == 200 and health.get("server") == SERVER_ID:
             _apply_health(health)
             if health.get("status") == "loading":
                 _start_polling(None)
-        elif health.get("server") != LEGACY_SERVER_ID and status() == ("error", LEGACY_SERVER_MESSAGE):
-            STATE.set("stopped", "")  # the old server has gone or the port changed: auto-start may retry
+        elif health.get("server") != LEGACY_SERVER_ID and status() in (
+                ("error", LEGACY_SERVER_MESSAGE), ("error", STATE.conflict)):
+            STATE.set("stopped", "")  # the refused server has gone, or the port changed: auto-start may retry
 
     executor().submit(probe)
 
@@ -259,8 +271,7 @@ def start(prefs=None):
         if code == 200 and health.get("server") == SERVER_ID:
             other = _other_backend(health)
             if other:
-                STATE.set("error", f"Port {STATE.port} is used by an OpenAct model server with the {other} backend. "
-                                   "Stop it or pick another port in the preferences")
+                _refuse_backend(other)
                 return False
             _apply_health(health)
             if health.get("status") == "loading":
