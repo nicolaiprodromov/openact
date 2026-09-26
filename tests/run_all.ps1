@@ -88,6 +88,9 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"  # else CPython writes the ANSI code page into the pipe
     $start.EnvironmentVariables["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so the server's --gpu is the card nvidia-smi -i reads
+    # Enabling or disabling an add-on re-syncs the extension wheels of Blender's user folder to the session's
+    # enabled extensions (none under --factory-startup), which would delete the user's own extension packages.
+    $start.EnvironmentVariables["BLENDER_USER_RESOURCES"] = Join-Path $userRoot $Where.Replace(" ", "-")
     $pass = $fail = $warn = $leftover = 0
     $result = $endedAt = $null
     $timedOut = $false
@@ -158,7 +161,9 @@ function Get-Blender([string]$Version) {
 
 $saved = [Console]::OutputEncoding
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("openact-e2e-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$userRoot = Join-Path $tmp "blender-user"  # Blender user folders for this run only, removed with $tmp
 try {
+    New-Item -ItemType Directory -Force -Path $userRoot | Out-Null
     try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }  # redirected output keeps the suites' UTF-8; no console, no change
     $e2e = if ($Model) { "e2e with the real model on GPU $Gpu, port $Port" } else { "no e2e (needs -Model)" }
     Write-Host "OpenAct tests: Blender $($Versions -join ', '); $e2e"

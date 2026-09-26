@@ -83,9 +83,9 @@ class ClassifySpec(PerItemSpec):
         """The Job for these words, items (an ItemList or its items) and labels. Pure, like Ask's and Pick's."""
         from .. import sources
 
-        cells = sources.per_item_cells(self.name, 'ONE_OF', items, labels, gn[0], gn[1], debias)
+        rows = sources.per_item_cells(self.name, 'ONE_OF', items, labels, gn[0], gn[1], debias, self.NEUTRAL)
         payload = tuple(labels.doc.num_cols.items()) if labels.doc is not None else ()
-        return self.table(gn, 'ONE_OF', cells, (getattr(items, "doc", None), labels.doc), debias, uid, job=LabelsJob,
+        return self.table(gn, 'ONE_OF', rows, (getattr(items, "doc", None), labels.doc), debias, uid, job=LabelsJob,
                           labels=tuple(option.name for option in labels.options), payload=payload,
                           baked=tuple(tuple(option.payload[header] for header, _type in payload)
                                       for option in labels.options))

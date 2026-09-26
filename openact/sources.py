@@ -1,20 +1,16 @@
 """Planning helpers shared by the node specs (design 4.g, 10.2): CSV companion sockets, list-source sockets, answer
-sets, and the per-item cells of Match and Classify.
+sets, and the per-item rows of Match and Classify.
 
-Their home is specs/base.py (design 13.3), which PR-09 creates; they wait here as functions and data that the specs
-call. Only answer_set() and the socket helpers need Blender, so the pure suites can import this module.
+Only answer_set() and the socket helpers need Blender, so the pure suites can import this module.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
-from . import csvfmt
+from . import csvfmt, pipeline
 from .csvfmt import AnswerSet, Option
-from .specs.base import option_text  # noqa: F401  (the one definition; callers import it from either module)
+from .specs.base import option_text, state_text
 
 try:
     import bpy
@@ -25,12 +21,10 @@ if bpy is not None:
     from .evaluator import Hint, Unresolvable, as_text, eval_input
     from .inner import SocketDef
 
-NO_CONTEXT = "No additional context."
 CLASSIFY_QUESTION = "Which label fits this item best?"
 AMOUNT_LEVELS = ("Not at all", "Slightly", "Moderately", "Very", "Extremely")
 KINDS = {'YES_NO': "yes_no", 'AMOUNT': "amount", 'ONE_OF': "one_of"}  # answer_type -> answer-set kind
 QUESTION_TYPES = {"yes_no": "noul", "amount": "score", "one_of": "choice"}
-GROUP = 16  # options per tournament group: more run as a tournament (design 10.3)
 LIST_SOURCE_ITEMS = (  # the list_source dropdown (design 6.0)
     ('TEXT', "Text or CSV", "Items typed inline, or the rows of a CSV file"),
     ('COLLECTION', "Collection", "The children of a collection, in Collection Info order"),
@@ -142,59 +136,34 @@ def amount_value(score: float, levels: int) -> float:
     return min(max(float(score) / (levels - 1), 0.0), 1.0)
 
 
-def cost(question: dict, debias: bool) -> int:
-    """Scored rows of one question: (2 if debias else 1) * (groups + 1 when it runs as a tournament)."""
-    options = len(question["criteria"])
-    rounds = math.ceil(options / GROUP) + 1 if question["type"] == "choice" and options > GROUP else 1
-    return (2 if debias else 1) * rounds
-
-
-# ---------------------------------------------------------------------- per-item cells
-
-
-@dataclass(frozen=True)
-class ItemCell:
-    """One row of a Match or Classify table and the question it needs: pipeline.Row and Cell (PR-09) in waiting."""
-
-    index: int  # the item's ID
-    name: str  # the row name: the item's name
-    wkey: str  # what the artist said for this row (design 5.4); Key never enters it
-    source: str  # "model" | "code" (a single label) | "fallback" (an empty material slot: never asked or flagged)
-    values: dict  # a code row's answer, {"label": 0, "c": 1.0}; else {}
-    key: str = ""  # the cell key of a model row
-    state: str = ""
-    question: dict | None = None
-    cost: int = 0
-
-
-def _key(*parts):
-    return hashlib.sha1(json.dumps(parts, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+# ---------------------------------------------------------------------- per-item rows
 
 
 def per_item_cells(spec: str, answer_type: str, items, answers: AnswerSet, question_text: str, context: str,
-                   debias: bool) -> list[ItemCell]:
-    """One row per item, all sharing one state (design 6.3, 6.4, 10.2): Match asks a Yes/No or Amount question about
-    each item, Classify a choice among the labels.
+                   debias: bool, neutral: dict | None = None) -> list[pipeline.Row]:
+    """One table row per item, in ID order, all sharing one state (design 6.3, 6.4, 10.2): Match asks a Yes/No or
+    Amount question about each item, Classify a choice among the labels. A single label decides by code (4.d), and an
+    empty material slot is a code row with the `neutral` values, never asked or flagged.
 
     spec: "match" | "classify". answer_type: 'YES_NO' | 'AMOUNT' | 'ONE_OF'. items: a lists.ItemList, or its items.
     question_text and context: the words as given (Classify's empty question takes CLASSIFY_QUESTION)."""
     kind = KINDS[answer_type]
     question_text, context = question_text.strip(), context.strip()
-    state = context or NO_CONTEXT
+    state = state_text(context)
     asked = question_text or (CLASSIFY_QUESTION if spec == "classify" else "")
     offered = [[option.name, option.when] for option in answers.options]
     wanted = criteria(answers, kind)
-    ordered = list(wanted.items()) if isinstance(wanted, dict) else wanted  # the cell key keeps option order
     rows = []
-    for index, item in enumerate(getattr(items, "items", items)):
-        wkey = _key("row", spec, answer_type, [context, question_text], [item.name, item.when], offered)
+    for item in getattr(items, "items", items):
+        wkey = pipeline.wkey(spec, answer_type, [context, question_text], [item.name, item.when], offered)
         if not item.offered:
-            rows.append(ItemCell(index, item.name, wkey, "fallback", {}))
+            rows.append(pipeline.Row(item.name, wkey, "code", dict(neutral or {})))
         elif kind == "one_of" and decided(answers):
-            rows.append(ItemCell(index, item.name, wkey, "code", {"label": 0, "c": 1.0}))
+            rows.append(pipeline.Row(item.name, wkey, "code", {"label": 0, "c": 1.0}))
         else:
             instructions = f"Item: {item.name}" + (f" — {item.when}" if item.when else "") + f"\n{asked}"
-            asks = {"type": QUESTION_TYPES[kind], "instructions": instructions, "criteria": wanted}
-            key = _key("cell", asks["type"], state, instructions, ordered, debias)
-            rows.append(ItemCell(index, item.name, wkey, "model", {}, key, state, asks, cost(asks, debias)))
+            question = {"type": QUESTION_TYPES[kind], "instructions": instructions, "criteria": wanted}
+            cell = pipeline.Cell(pipeline.cell_key(question["type"], state, instructions, wanted, debias), state,
+                                 question, pipeline.cost(len(wanted), debias))
+            rows.append(pipeline.Row(item.name, wkey, cell=cell))
     return rows

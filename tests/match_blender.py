@@ -342,7 +342,7 @@ def phase_pass_classify():
             engine.run_pass()
         icon, status = engine.STATUS.get(node.uid, ("", ""))
         check("pass: a Labels CSV warning (a blank line) shows before the summary, and asks nothing",
-              icon == 'ERROR' and status.startswith("families.csv line 5: Line 5 is blank")
+              icon == 'ERROR' and status.startswith("families.csv: Line 5 is blank")
               and status.endswith("(4 items · 4 labels used · 0 unsure)") and not capture.keys(node), (icon, status))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
