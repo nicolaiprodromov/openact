@@ -212,15 +212,13 @@ def _from_v010(item):
         entry.shape = {"rows": 0, "columns": {}}
         entry.single = {"Answer": value, "Yes": value >= 0.5, "Confidence": float(answer["confidence"])}
     else:  # Pick: (Prompt, Items) -> Prompt, Context, Items, Overrides, Key
-        names, prob = answer["items"], answer["probabilities"]
-        if not _list_of(prob, int, float):  # else a string or an object would iterate into wrong numbers
-            raise TypeError("probabilities must be a list of numbers")
+        names = answer["items"]
         # v0.1.0 ignored the Items text when a collection was set, and a live COLLECTION Pick has "" there
         entry.gn = (first, "", "" if answer.get("collection") else second, "", "")
         entry.kind, entry.answer_type = "pick", "ONE_OF"
         entry.shape = {"rows": len(names), "columns": {"prob": "FLOAT"}}
         entry.rows = Rows(name=names, wkey=[""] * len(names), ask=[0] * len(names), src="m" * len(names),
-                          v={"prob": prob})
+                          v={"prob": answer["probabilities"]})
         entry.single = {"Index": int(answer["index"]), "Item": str(answer["item"]),
                         "Confidence": float(answer["confidence"])}
     return entry
