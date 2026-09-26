@@ -146,15 +146,14 @@ muted_group.node_tree = sub
 L.new(string("through"), muted_group.inputs[0])
 muted_group.mute = True
 cases.append(("muted group passes its input", muted_group.outputs[0]))
-if hasattr(bpy.types, "GeometryNodeImportText"):
-    for label, data in (("crlf", b"table\r\nlamp\r\n"), ("bom", b"\xef\xbb\xbfhi"), ("invalid", b"ok\xffok"),
-                        ("lone cr", b"a\rb")):
-        path = os.path.join(TMP, label.replace(" ", "_") + ".txt")
-        with open(path, "wb") as handle:
-            handle.write(data)
-        it = N.new("GeometryNodeImportText")
-        it.inputs["Path"].default_value = path
-        cases.append((f"import text ({label})", it.outputs[0]))
+for label, data in (("crlf", b"table\r\nlamp\r\n"), ("bom", b"\xef\xbb\xbfhi"), ("invalid", b"ok\xffok"),
+                    ("lone cr", b"a\rb")):
+    path = os.path.join(TMP, label.replace(" ", "_") + ".txt")
+    with open(path, "wb") as handle:
+        handle.write(data)
+    it = N.new("GeometryNodeImportText")
+    it.inputs["Path"].default_value = path
+    cases.append((f"import text ({label})", it.outputs[0]))
 
 # evaluate our side, wire the comparisons
 geometry = g_in.outputs["Geometry"]

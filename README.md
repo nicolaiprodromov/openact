@@ -41,6 +41,7 @@ on your GPU. Nothing leaves your computer.
 
 ```
 blender -b --factory-startup --python tests/evaluator_blender.py
+blender -b --factory-startup --python tests/legacy_blender.py
 blender -b --factory-startup --python tests/e2e_blender.py -- build   <file.blend> [port] [gpu]
 blender -b --factory-startup --python tests/e2e_blender.py -- noaddon <file.blend>
 blender -b --factory-startup --python tests/e2e_blender.py -- reopen  <file.blend>

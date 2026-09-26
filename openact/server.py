@@ -202,13 +202,15 @@ def refresh(prefs=None):
         try:
             code, health = http("GET", "/health", port=port, timeout=1.0)
         except Exception:
+            code, health = 0, {}
             if STATE.status == "ready":
                 STATE.set("stopped", "The model server stopped")
-            return
         if code == 200 and health.get("server") == SERVER_ID:
             _apply_health(health)
             if health.get("status") == "loading":
                 _start_polling(None)
+        elif health.get("server") != LEGACY_SERVER_ID and status() == ("error", LEGACY_SERVER_MESSAGE):
+            STATE.set("stopped", "")  # the old server has gone or the port changed: auto-start may retry
 
     executor().submit(probe)
 
