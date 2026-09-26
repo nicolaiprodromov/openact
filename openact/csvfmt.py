@@ -96,6 +96,17 @@ class CsvDoc:
 
 
 @dataclass(frozen=True)
+class CsvSource:
+    """Where a node's CSV comes from (design 7.7): a typed path, or the Import CSV node plugged into the
+    companion '<Input> CSV' socket."""
+
+    path: str  # as written: the String word, or the Import CSV node's Path
+    delimiter: str | None = None  # the Import CSV node's Delimiter; None sniffs it (a typed path)
+    via: tuple[str, ...] = ()  # node names from the companion socket to the Import CSV node, which comes last
+    warning: str = ""  # "Items: using the linked Import CSV; the typed path is ignored"
+
+
+@dataclass(frozen=True)
 class Option:
     name: str
     when: str
@@ -108,6 +119,7 @@ class AnswerSet:
     options: tuple[Option, ...]
     doc: CsvDoc | None  # None for an inline set
     problems: tuple[Problem, ...] = ()  # warnings and info only: the set is usable
+    source: CsvSource | None = None  # where doc came from; None for an inline or default set
 
 
 @dataclass(frozen=True)
@@ -308,6 +320,46 @@ def read_csv(path: str, delimiter: str | None = None, schema: str = "answer_set"
     )
 
 
+_DOCS = {}  # (identity, schema, delimiter) -> the CsvDoc last read; the schema decides the column classes
+MAX_DOCS = 256
+
+
+def identity(path: str) -> str:
+    """How the parse cache and the file watcher tell files apart: a symlink or '..' spelling is the same file."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def load(path: str, delimiter: str | None = None, schema: str = "answer_set") -> CsvDoc:
+    """read_csv() through the document cache: a file is parsed once per change of its stamp, for each schema and
+    delimiter, and every node reading it shares the CsvDoc. A file that can't be stat'ed is read each time, so its
+    problem stays current."""
+    key = (identity(path), schema, delimiter)
+    try:
+        status = os.stat(path)
+    except OSError:
+        _DOCS.pop(key, None)
+        return read_csv(path, delimiter, schema)
+    doc = _DOCS.get(key)
+    if doc is not None and doc.stamp == (status.st_mtime_ns, status.st_size):
+        return doc
+    doc = read_csv(path, delimiter, schema)
+    _DOCS.pop(key, None)  # re-inserted last: the oldest reads are dropped first
+    _DOCS[key] = doc
+    while len(_DOCS) > MAX_DOCS:
+        del _DOCS[next(iter(_DOCS))]
+    return doc
+
+
+def clear_cache(path: str | None = None) -> None:
+    """Forget the cached reads of one file, or of every file (stamps are not trusted across sessions)."""
+    if path is None:
+        _DOCS.clear()
+        return
+    ident = identity(path)
+    for key in [key for key in _DOCS if key[0] == ident]:
+        del _DOCS[key]
+
+
 def parse_inline(text: str) -> list[tuple[str, str]]:
     """An inline list or answer set as (name, when) pairs.
 
@@ -325,6 +377,29 @@ def parse_inline(text: str) -> list[tuple[str, str]]:
             name, _, when = entry.partition(": ")
             pairs.append((name.strip(), when.strip()))
     return pairs
+
+
+def parse_inline_set(text: str, kind: str) -> AnswerSet:
+    """An answer set typed inline (parse_inline()), checked like a CSV one: unique names of at most MAX_ANSWER
+    characters, whens of at most MAX_CELL, and the rows the kind needs. Inline sets have no 'if' and no payload.
+    Raises CsvError."""
+    if kind not in KINDS:
+        raise ValueError(f"unknown answer-set kind {kind!r}")
+    problems = _Problems("")
+    options, seen = [], set()
+    for number, (name, when) in enumerate(parse_inline(text), start=1):
+        message = _name_problem(name, seen)
+        if message:
+            problems.add(ERROR, 0, "", f"Entry {number}: {message}")
+        if len(when) > MAX_CELL:
+            problems.add(ERROR, 0, "", f"Entry {number}: the description has {_n(len(when))} characters "
+                                       f"(limit {_n(MAX_CELL)})")
+        options.append(Option(name, when, "", {}))
+    message = _count_problem(kind, [option.name for option in options])
+    if message:
+        problems.add(ERROR, 0, "", message)
+    problems.check()
+    return AnswerSet(tuple(options), None)
 
 
 def parse_answer_set(doc: CsvDoc, kind: str, node: str = "") -> AnswerSet:

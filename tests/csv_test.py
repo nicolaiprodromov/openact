@@ -21,7 +21,7 @@ from _harness import ROOT, check, finish  # noqa: E402
 _package = types.ModuleType("openact")
 _package.__path__ = [os.path.join(ROOT, "openact")]
 sys.modules["openact"] = _package
-from openact import csvfmt, lists  # noqa: E402
+from openact import csvfmt, lists, sources  # noqa: E402
 
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
 TMP = tempfile.mkdtemp(prefix="openact_csv_")
@@ -964,6 +964,126 @@ def test_inline():
     check("csv path: anything else is inline text", not any(lists.is_csv_path(text) for text in texts))
 
 
+def test_inline_sets():
+    parse = csvfmt.parse_inline_set
+    answers = parse("yes: it is cold, wet or windy; no: warm and calm", "yes_no")
+    pairs = [(o.name, o.when) for o in answers.options]
+    check("inline set: Yes/No whens", pairs == [("yes", "it is cold, wet or windy"), ("no", "warm and calm")], pairs)
+    check("inline set: no doc, no 'if', no payload", answers.doc is None and answers.options[0] == csvfmt.Option(
+        "yes", "it is cold, wet or windy", "", {}))
+    rubric = "none: bare ground; dusting: a thin white layer; patchy: snow in patches; thick: most ground covered; " \
+             "buried: deep snow everywhere"
+    levels = [o.name for o in parse(rubric, "amount").options]
+    check("inline set: Amount levels, lowest first", levels == ["none", "dusting", "patchy", "thick", "buried"], levels)
+    for text, kind, message in (
+        ("yes: cold; maybe: unsure", "yes_no", "A Yes/No answer set needs rows 'yes' and 'no'"),
+        ("low", "amount", "An Amount answer set needs 2 to 16 levels; this one has 1"),
+        (",".join(f"l{i}" for i in range(17)), "amount", "An Amount answer set needs 2 to 16 levels; this one has 17"),
+        (",".join(f"o{i}" for i in range(256)), "one_of", "A One-of answer set needs 1 to 255 answers; this one has 256"),
+        ("a; b; A", "one_of", "Entry 3: 'A' appears twice"),
+        (": only a description", "one_of", "Entry 1: the name is empty"),
+    ):
+        problems = raised(parse, text, kind)
+        check(f"inline set: {message}", only(problems, "error", 0, message), summary(problems))
+    check("inline set: one option is fine for One-of", len(parse("only", "one_of").options) == 1)
+    items = [o.name for o in parse("chair, table,lamp", "items").options]
+    check("inline set: items", items == ["chair", "table", "lamp"], items)
+
+
+def test_answer_set_helpers():
+    yes_no = csvfmt.parse_inline_set("no: warm and calm; yes: it is cold", "yes_no")
+    got = sources.criteria(yes_no, "yes_no")
+    check("criteria: Yes/No whens become noul true/false", got == {"true": "it is cold", "false": "warm and calm"}, got)
+    got = sources.criteria(sources.default_set("yes_no"), "yes_no")
+    check("criteria: an empty Yes/No set asks 'Yes.'/'No.'", got == {"true": "Yes.", "false": "No."}, got)
+    got = sources.criteria(csvfmt.parse_inline_set("yes: cold; no", "yes_no"), "yes_no")
+    check("criteria: a side without a when says 'No.'", got == {"true": "cold", "false": "No."}, got)
+    levels = csvfmt.parse_inline_set("none: bare ground; dusting; buried: deep snow", "amount")
+    got = sources.question("amount", "How much snow?", levels)
+    check("criteria: Amount levels as 'name: when', lowest first",
+          got == {"type": "score", "instructions": "How much snow?",
+                  "criteria": ["none: bare ground", "dusting", "buried: deep snow"]}, got)
+    got = sources.criteria(sources.default_set("amount"), "amount")
+    check("criteria: an empty Amount set gives the five levels", got == list(sources.AMOUNT_LEVELS), got)
+    labels = csvfmt.parse_answer_set(csvfmt.read_csv(fixture("material_families.csv")), "one_of", node="classify")
+    got = sources.criteria(labels, "one_of")
+    check("criteria: One-of options keyed by row index",
+          list(got) == ["0", "1", "2", "3"] and got["1"] == "wood: planks, bark and furniture timber", got)
+    check("default: One-of has none", sources.default_set("one_of") is None)
+    values = [sources.amount_value(score, levels) for score, levels in ((2, 5), (1, 3), (4, 5), (-0.1, 5), (1, 2))]
+    check("amount: score / (L - 1), clamped", values == [0.5, 0.5, 1.0, 0.0, 1.0], values)
+    check("decided: a single option only", sources.decided(csvfmt.parse_inline_set("only", "one_of"))
+          and not sources.decided(labels))
+    costs = [sources.cost({"type": t, "criteria": list(range(n))}, debias)
+             for t, n, debias in (("noul", 2, True), ("score", 5, False), ("choice", 16, True), ("choice", 17, True),
+                                  ("choice", 20, True), ("choice", 255, True))]
+    check("cost: 2 x (groups + 1) above 16 options", costs == [2, 1, 2, 6, 6, 34], costs)
+
+
+def test_per_item_cells():
+    Item = lists.Item
+    items = [Item("pan", "a flat metal pan"), Item("", offered=False), Item("sofa")]
+    yes_no = sources.default_set("yes_no")
+    rows = sources.per_item_cells("match", 'YES_NO', items, yes_no, " Would you find it in a kitchen? ", "", True)
+    check("cells: one row per item, the empty slot a fallback",
+          [(r.index, r.name, r.source) for r in rows] == [(0, "pan", "model"), (1, "", "fallback"), (2, "sofa", "model")])
+    pan, slot, sofa = rows
+    check("cells: Match template", pan.question == {
+        "type": "noul", "instructions": "Item: pan — a flat metal pan\nWould you find it in a kitchen?",
+        "criteria": {"true": "Yes.", "false": "No."}} and sofa.question["instructions"] == (
+        "Item: sofa\nWould you find it in a kitchen?"), pan.question)
+    check("cells: one shared state", pan.state == sofa.state == sources.NO_CONTEXT, (pan.state, sofa.state))
+    check("cells: a fallback row has no question and costs nothing",
+          slot.question is None and slot.key == "" and slot.cost == 0 and slot.values == {})
+    check("cells: cell keys and wkeys differ per item", pan.key != sofa.key and pan.wkey != sofa.wkey)
+    check("cells: debias doubles the cost", (pan.cost, sofa.cost) == (2, 2), (pan.cost, sofa.cost))
+    edited = sources.per_item_cells("match", 'YES_NO', [Item("pan", "a heavy pan")] + items[1:], yes_no,
+                                    "Would you find it in a kitchen?", "", False)
+    check("cells: editing one item's when changes only its wkey",
+          edited[0].wkey != pan.wkey and edited[2].wkey == sofa.wkey and edited[2].key != sofa.key)
+    labels = csvfmt.parse_inline_set("kitchen: cooking; office: work and paper", "one_of")
+    rows = sources.per_item_cells("classify", 'ONE_OF', items, labels, "", "a house", True)
+    check("cells: Classify's default question and its choice over the labels", rows[0].question == {
+        "type": "choice", "instructions": "Item: pan — a flat metal pan\nWhich label fits this item best?",
+        "criteria": {"0": "kitchen: cooking", "1": "office: work and paper"}} and rows[0].state == "a house",
+        rows[0].question)
+    rows = sources.per_item_cells("classify", 'ONE_OF', items, csvfmt.parse_inline_set("only", "one_of"), "", "", True)
+    check("cells: a single label is decided by code for every item",
+          [(r.source, r.values, r.question) for r in rows] == [("code", {"label": 0, "c": 1.0}, None),
+                                                              ("fallback", {}, None),
+                                                              ("code", {"label": 0, "c": 1.0}, None)])
+    levels = sources.default_set("amount")
+    rows = sources.per_item_cells("match", 'AMOUNT', items[:1], levels, "How heavy?", "", True)
+    check("cells: Amount asks a score over the levels",
+          rows[0].question["type"] == "score" and len(rows[0].question["criteria"]) == len(levels.options))
+
+
+def test_cache():
+    path = write("cached.csv", "answer,when,scale\npan,cooking,1\nsofa,sitting,2\n")
+    first = csvfmt.load(path)
+    check("cache: a second read of an unchanged file is the same document", csvfmt.load(path) is first)
+    spelled = os.path.join(TMP, "..", os.path.basename(TMP), "cached.csv")
+    check("cache: keyed by file identity, not spelling", csvfmt.load(spelled) is first)
+    factors = csvfmt.load(path, schema="factors")
+    check("cache: keyed by schema too", factors is not first and factors.schema == "factors"
+          and first.num_cols == {"scale": "INT"} and factors.num_cols == {}, factors.num_cols)
+    check("cache: each schema keeps its own document", csvfmt.load(path, schema="factors") is factors
+          and csvfmt.load(path) is first)
+    other = csvfmt.load(path, delimiter=";")
+    check("cache: and by delimiter", other is not first and other.header == ("answer,when,scale",), other.header)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("lamp,lighting,3\n")
+    edited = csvfmt.load(path)
+    check("cache: an edit (new stamp) is read again", edited is not first and len(edited.rows) == 3, len(edited.rows))
+    csvfmt.clear_cache(path)
+    check("cache: clear_cache() forgets the file", csvfmt.load(path) is not edited)
+    os.remove(path)
+    gone = csvfmt.load(path)
+    check("cache: a missing file is read each time, with its problem",
+          gone.problems[0].message.startswith("Can't find") and csvfmt.load(path) is not gone, summary(gone.problems))
+    check("identity: normcase(realpath)", csvfmt.identity(spelled) == os.path.normcase(os.path.realpath(path)))
+
+
 test_read()
 test_dialect()
 test_classes()
@@ -975,5 +1095,9 @@ test_settings()
 test_overrides()
 test_hashes()
 test_inline()
+test_inline_sets()
+test_answer_set_helpers()
+test_per_item_cells()
+test_cache()
 shutil.rmtree(TMP, ignore_errors=True)
 finish()

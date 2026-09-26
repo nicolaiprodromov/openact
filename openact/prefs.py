@@ -34,6 +34,8 @@ class _Defaults:
     device = "auto"
     auto_start = True
     debias = True
+    trusted_folders = []  # plain path strings here; PropertyGroups with a path in the preferences
+    trusted_files = []
 
 
 def get_prefs():
@@ -98,6 +100,10 @@ def runtime_installed(root: str) -> bool:
     return complete
 
 
+class OpenActPath(bpy.types.PropertyGroup):
+    path: bpy.props.StringProperty(name="Path", default="")
+
+
 class OpenActPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
@@ -135,8 +141,19 @@ class OpenActPreferences(bpy.types.AddonPreferences):
         description="Ask every question with the options in both orders and average the answers. "
                     "Removes the small model's bias toward early options, at twice the cost",
     )
+    trusted_folders: bpy.props.CollectionProperty(
+        type=OpenActPath, name="Trusted Folders",
+        description="Folders (and their subfolders) whose .blend files may read files outside their own folder",
+    )
+    trusted_files: bpy.props.CollectionProperty(
+        type=OpenActPath, name="Trusted Files",
+        description=".blend files that may read files outside their own folder (Allow this file adds to it)",
+    )
 
     def draw(self, context):
         from . import ui
 
         ui.draw_preferences(self, context, self.layout)
+
+
+classes = (OpenActPath, OpenActPreferences)  # the PropertyGroup first: the preferences use it

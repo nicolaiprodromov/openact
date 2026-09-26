@@ -1,4 +1,4 @@
-"""Operators: install, start and stop the model; re-ask a node; open files."""
+"""Operators: install, start and stop the model; re-ask a node; open files; trust a .blend's file reads."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sys
 
 import bpy
 
-from . import engine, server
+from . import engine, server, trust
 from . import prefs as P
 
 
@@ -118,8 +118,24 @@ class OPENACT_OT_open_runtime_folder(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OPENACT_OT_allow_file(bpy.types.Operator):
+    bl_idname = "openact.allow_file"
+    bl_label = "Allow This File"
+    bl_description = ("Let this .blend file read CSV and text files outside its own folder. Only this file is "
+                      "trusted, not the rest of its folder")
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def execute(self, context):
+        trust.allow(bpy.data.filepath)
+        engine.schedule(immediate=True)  # the reads that were blocked
+        return {'FINISHED'}
+
+
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop, OPENACT_OT_reask,
-           OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder)
+           OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file)
 
 
 def register():
