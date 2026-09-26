@@ -1,7 +1,9 @@
-"""Checks that the add-on's input reader computes the same strings as Geometry Nodes.
+"""Checks that the add-on's input reader computes the same values as Geometry Nodes.
 
-No model needed. Each case wires a string into a Compare node, sets B to the reader's result,
-and lets Geometry Nodes say whether they are equal.
+No model needed. Each case wires a value into a Compare node, sets B to the reader's result,
+and lets Geometry Nodes say whether they are equal. Then the per-pass memo must give the same
+values, errors must name the socket and nodes they come through, and a pass must not write to
+linked data.
 
 Run:  blender -b --factory-startup --python tests/evaluator_blender.py
 """
@@ -14,9 +16,12 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, finish, sock, store  # noqa: E402
-from openact import engine  # noqa: E402  (bpy must be imported first)
+from openact import engine, evaluator, nodes  # noqa: E402  (bpy must be imported first)
+from openact import prefs as P  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="openact_eval_")
+P._Defaults.auto_start = False  # the passes below must never start a model server
+nodes.register()  # OpenAct nodes: their outputs as words, and the linked-library check
 
 
 tree = bpy.data.node_groups.new("Eval", 'GeometryNodeTree')
@@ -25,6 +30,8 @@ tree.interface.new_socket("Word", in_out='INPUT', socket_type='NodeSocketString'
 tree.interface.new_socket("Flag", in_out='INPUT', socket_type='NodeSocketBool')
 tree.interface.new_socket("Pick", in_out='INPUT', socket_type='NodeSocketInt')
 tree.interface.new_socket("Amount", in_out='INPUT', socket_type='NodeSocketFloat')
+for menu in ("Mode", "Level", "Scale", "Nested", "Edited", "Fresh"):
+    tree.interface.new_socket(menu, in_out='INPUT', socket_type='NodeSocketMenu')
 tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
 N, L = tree.nodes, tree.links
 g_in, g_out = N.new("NodeGroupInput"), N.new("NodeGroupOutput")
@@ -39,7 +46,7 @@ mod[ids["Word"]] = "héllo wörld"
 mod[ids["Flag"]] = True
 mod[ids["Pick"]] = 2
 mod[ids["Amount"]] = 0.1 + 0.2
-ctx = engine.Ctx(host, mod, (), tree)
+ctx = evaluator.Ctx(host, mod, (), tree)
 
 
 def string(text):
@@ -72,7 +79,29 @@ def group_passthrough(inner_source=None):
     return sub
 
 
-cases = []  # (name, socket carrying the string)
+def menu_slots(node):
+    return [s for s in node.inputs if s.identifier not in ("Menu", "__extend__")]
+
+
+def menu_switch(data_type, values, tree_nodes=N):
+    """A Menu Switch whose items A, B, C... (identifiers 0, 1, 2...) hold the values."""
+    node = tree_nodes.new("GeometryNodeMenuSwitch")
+    node.data_type = data_type
+    for name in "CDEF"[:len(values) - 2]:
+        node.enum_items.new(name)
+    for slot, value in zip(menu_slots(node), values):
+        slot.default_value = value
+    return node
+
+
+def read(socket, context=ctx):
+    try:
+        return evaluator.eval_input(socket, context)
+    except Exception as error:  # noqa: BLE001
+        return f"<{type(error).__name__}: {error}>"
+
+
+cases = []  # (name, socket carrying the value[, Compare data type, STRING when left out])
 
 cases.append(("join order + delimiter", join([string("a"), string("b"), string("c")]).outputs[0]))
 j = join([string("x"), string("y"), string("z")])
@@ -147,38 +176,266 @@ for label, data in (("crlf", b"table\r\nlamp\r\n"), ("bom", b"\xef\xbb\xbfhi"), 
     it.inputs["Path"].default_value = path
     cases.append((f"import text ({label})", it.outputs[0]))
 
+# Menu Switch: a value typed on the socket is the item's name; a modifier value is the item's identifier
+for data_type, values, item in (('STRING', ("apple", "banana", "cherry"), 'B'), ('INT', (10, 20, 30), 'C'),
+                                ('FLOAT', (0.25, 0.5, 0.75), 'A')):
+    ms = menu_switch(data_type, values)
+    ms.inputs["Menu"].default_value = item
+    cases.append((f"menu switch ({data_type}): socket value by name", ms.outputs[0], data_type))
+for menu, data_type, values, choice in (("Mode", 'STRING', ("one", "two", "three"), 2),
+                                        ("Level", 'INT', (7, 8, 9), 1), ("Scale", 'FLOAT', (1.5, 2.5, 3.5), 2)):
+    ms = menu_switch(data_type, values)
+    L.new(g_in.outputs[menu], ms.inputs["Menu"])
+    mod[ids[menu]] = choice
+    cases.append((f"menu switch ({data_type}): modifier int through id_properties_ui", ms.outputs[0], data_type))
+edited = menu_switch('INT', (10, 20, 30, 40))
+L.new(g_in.outputs["Edited"], edited.inputs["Menu"])
+mod[ids["Edited"]] = 2  # C
+by_name = menu_switch('STRING', ("a", "b", "c", "d"))
+by_name.inputs["Menu"].default_value = 'D'
+for node in (edited, by_name):  # delete A, then move B to the end: C, D, B
+    node.enum_items.remove(node.enum_items[0])
+    node.enum_items.move(0, 2)
+cases.append(("menu switch: modifier int after deleted and reordered items", edited.outputs[0], 'INT'))
+cases.append(("menu switch: socket name after deleted and reordered items", by_name.outputs[0]))
+menu_sub = bpy.data.node_groups.new("MenuSub", 'GeometryNodeTree')
+menu_sub.interface.new_socket("Mode", in_out='INPUT', socket_type='NodeSocketMenu')
+menu_sub.interface.new_socket("S", in_out='OUTPUT', socket_type='NodeSocketString')
+mi, mo = menu_sub.nodes.new("NodeGroupInput"), menu_sub.nodes.new("NodeGroupOutput")
+nested_switch = menu_switch('STRING', ("nested a", "nested b", "nested c"), menu_sub.nodes)
+menu_sub.links.new(mi.outputs[0], nested_switch.inputs["Menu"])
+menu_sub.links.new(nested_switch.outputs[0], mo.inputs[0])
+typed = N.new("GeometryNodeGroup")
+typed.node_tree = menu_sub
+typed.inputs["Mode"].default_value = 'C'
+cases.append(("menu inside a nested group: typed on the group node", typed.outputs[0]))
+exposed = N.new("GeometryNodeGroup")
+exposed.node_tree = menu_sub
+L.new(g_in.outputs["Nested"], exposed.inputs["Mode"])
+mod[ids["Nested"]] = 1  # B
+cases.append(("menu inside a nested group: from the modifier", exposed.outputs[0]))
+fresh = menu_switch('STRING', ("x", "y", "z"))
+L.new(g_in.outputs["Fresh"], fresh.inputs["Menu"])
+next(i for i in tree.interface.items_tree if getattr(i, "name", "") == "Fresh").default_value = 'B'  # mod keeps -1
+
+special = N.new("FunctionNodeInputSpecialCharacters")
+cases.append(("special characters: line break", special.outputs["Line Break"]))
+cases.append(("special characters: tab", special.outputs["Tab"]))
+lines = join([string("table"), string("lamp")], delimiter="")
+L.new(special.outputs["Line Break"], lines.inputs["Delimiter"])
+cases.append(("special characters: multi-line items with Join Strings", lines.outputs[0]))
+for label, source in (("a unicode word from the modifier", g_in.outputs["Word"]),
+                      ("code points", string("\U0001f600e\u0301 \u200d"))):
+    length = N.new("FunctionNodeStringLength")
+    L.new(source, length.inputs["String"])
+    cases.append((f"string length: {label}", length.outputs[0], 'INT'))
+by_length = N.new("GeometryNodeIndexSwitch")
+by_length.data_type = 'STRING'
+by_length.index_switch_items.new()
+for slot, text in zip([s for s in by_length.inputs if s.identifier not in ("Index", "__extend__")],
+                      ("zero", "one", "two")):
+    slot.default_value = text
+length = N.new("FunctionNodeStringLength")
+L.new(string("ab"), length.inputs["String"])
+L.new(length.outputs[0], sock(by_length.inputs, "Index"))
+cases.append(("string length as an index switch index", by_length.outputs[0]))
+
+answered = N.new(engine.ASK_ID)  # an OpenAct single-value output used as a word
+answered.inputs["Question"].default_value = "Is it night?"
+request = engine.SPECS[engine.ASK_ID].request(answered, ctx)
+engine.set_entries(answered, [{"key": request.key, "gn": list(request.gn), "t": 0.0,
+                               "a": {"mode": 'YES_NO', "value": 0.8125, "confidence": 0.625}}])
+engine.build_inner(answered)
+cases.append(("OpenAct Ask answer used as a word", answered.outputs["Answer"], 'FLOAT'))
+
+field_ask = N.new(engine.ASK_ID)  # its Answer made a field, as a per-element output would be
+field_inner = field_ask.node_tree
+field_inner.links.new(field_inner.nodes.new("GeometryNodeInputIndex").outputs[0],
+                      next(n for n in field_inner.nodes if n.bl_idname == "NodeGroupOutput").inputs["Answer"])
+
 # evaluate our side, wire the comparisons
+COMPARE = {'STRING': ("A_STR", "B_STR"), 'INT': ("A_INT", "B_INT"), 'FLOAT': ("A", "B")}
 geometry = g_in.outputs["Geometry"]
-expected = []
-for index, (name, source) in enumerate(cases):
+expected, words = [], []
+for index, (name, source, *kind) in enumerate(cases):
+    data_type = kind[0] if kind else 'STRING'
     compare = N.new("FunctionNodeCompare")
-    compare.data_type = 'STRING'
+    compare.data_type = data_type
     compare.operation = 'EQUAL'
-    L.new(source, sock(compare.inputs, "A_STR"))
-    try:
-        ours = engine.eval_input(sock(compare.inputs, "A_STR"), ctx)
-    except Exception as error:  # noqa: BLE001
-        ours = f"<{type(error).__name__}: {error}>"
-    sock(compare.inputs, "B_STR").default_value = ours if isinstance(ours, str) else str(ours)
-    expected.append((name, ours))
+    word = sock(compare.inputs, COMPARE[data_type][0])
+    L.new(source, word)
+    ours = read(word)
+    theirs = sock(compare.inputs, COMPARE[data_type][1])
+    typed_ok = data_type == 'STRING' or isinstance(ours, (int, float))  # an error text can't go into B
+    if data_type == 'STRING':
+        theirs.default_value = ours if isinstance(ours, str) else str(ours)
+    elif typed_ok:
+        theirs.default_value = ours
+    if data_type == 'FLOAT':
+        sock(compare.inputs, "Epsilon").default_value = 0.0
+    expected.append((name, ours, typed_ok))
+    words.append(word)
     geometry = store(tree, geometry, compare.outputs[0], f"case{index}", 'BOOLEAN')
+fresh_empty = N.new("FunctionNodeCompare")  # Geometry Nodes' own output for a menu at -1
+fresh_empty.data_type = 'STRING'
+fresh_empty.operation = 'EQUAL'
+L.new(fresh.outputs[0], sock(fresh_empty.inputs, "A_STR"))
+geometry = store(tree, geometry, fresh_empty.outputs[0], "fresh_empty", 'BOOLEAN')
 L.new(geometry, g_out.inputs[0])
 
 depsgraph = bpy.context.evaluated_depsgraph_get()
 depsgraph.update()
 evaluated = host.evaluated_get(depsgraph)
 result = evaluated.to_mesh()
-for index, (name, ours) in enumerate(expected):
-    check(name, result.attributes[f"case{index}"].data[0].value, f"reader gives {ours!r}")
+for index, (name, ours, typed_ok) in enumerate(expected):
+    check(name, typed_ok and result.attributes[f"case{index}"].data[0].value, f"reader gives {ours!r}")
+check("menu at -1 (fresh modifier): Geometry Nodes selects no item, even with an interface default",
+      mod[ids["Fresh"]] == -1 and result.attributes["fresh_empty"].data[0].value, mod[ids["Fresh"]])
 evaluated.to_mesh_clear()
+
+# the per-pass memo: identical values, each output read once per context
+evaluator.MEMO = {}
+memo_values = [read(word) for word in words]
+check("memo: every case gives the same value", memo_values == [ours for _, ours, _ in expected],
+      [name for (name, ours, _), got in zip(expected, memo_values) if got != ours])
+check("memo: outputs are remembered", len(evaluator.MEMO) > len(words), len(evaluator.MEMO))
+memo_word = string("before")
+memo_reader = join([])
+L.new(memo_word, memo_reader.inputs["Delimiter"])
+first = read(memo_reader.inputs["Delimiter"])
+memo_word.node.string = "after"
+second = read(memo_reader.inputs["Delimiter"])
+evaluator.MEMO = None
+third = read(memo_reader.inputs["Delimiter"])
+check("memo: an output is read once per pass", (first, second, third) == ("before", "before", "after"),
+      (first, second, third))
+host2 = bpy.data.objects.new("Host 2", mesh)  # the same tree, other modifier values
+bpy.context.scene.collection.objects.link(host2)
+mod2 = host2.modifiers.new("Eval", 'NODES')
+mod2.node_group = tree
+mod2[ids["Word"]] = "second"
+evaluator.MEMO = {}
+per_context = [read(words[[name for name, _, _ in expected].index("reroute chain")], c)
+               for c in (ctx, evaluator.Ctx(host2, mod2, (), tree))]
+evaluator.MEMO = None
+check("memo: contexts keep their own values", per_context == ["héllo wörld", "second"], per_context)
 
 # a red (invalid) link must be reported, not silently read
 bad = N.new("GeometryNodeStringJoin")
 L.new(N.new("ShaderNodeValue").outputs[0], bad.inputs["Strings"])  # float into string: invalid
 try:
-    engine.eval_input(bad.inputs["Strings"], ctx)
+    evaluator.eval_input(bad.inputs["Strings"], ctx)
     check("invalid link is reported", False, "no error")
-except engine.Unresolvable as error:
+except evaluator.Unresolvable as error:
     check("invalid link is reported", True, error)
 
+
+def reader_error(source):
+    """What the reader reports for a socket linked from source."""
+    compare = N.new("FunctionNodeCompare")
+    compare.data_type = {'INT': 'INT', 'VALUE': 'FLOAT'}.get(source.type, 'STRING')
+    word = sock(compare.inputs, COMPARE[compare.data_type][0])
+    L.new(source, word)
+    try:
+        return f"no error, reads {evaluator.eval_input(word, ctx)!r}"
+    except evaluator.Unresolvable as error:
+        return str(error)
+
+
+# breadcrumbs: the socket that was read, then up to two nodes before the one that failed. A field that
+# turns into a string gives a red link, so fields travel on Float sockets here.
+ask = N.new(engine.ASK_ID)
+missing = N.new("GeometryNodeImportText")
+missing.inputs["Path"].default_value = os.path.join(TMP, "missing.txt")
+context = join([missing.outputs[0]])
+L.new(context.outputs[0], ask.inputs["Context"])
+got = read(ask.inputs["Context"])
+check("breadcrumb: from an OpenAct node's word", got == f"<Unresolvable: Context ← {context.name} ← {missing.name}: "
+      f"Can't read the text file '{missing.inputs['Path'].default_value}'>", got)
+attribute = N.new("GeometryNodeInputNamedAttribute")
+chosen = N.new("GeometryNodeSwitch")
+chosen.input_type = 'FLOAT'
+sock(chosen.inputs, "Switch").default_value = True
+through = N.new("NodeReroute")
+L.new(attribute.outputs["Attribute"], through.inputs[0])
+L.new(through.outputs[0], sock(chosen.inputs, "True"))
+got = reader_error(chosen.outputs[0])
+check("breadcrumb: a field, reroutes left out", got == f"A ← {chosen.name} ← {attribute.name}: fields can't be words",
+      got)
+first_item = N.new("GeometryNodeIndexSwitch")
+first_item.data_type = 'FLOAT'
+L.new(chosen.outputs[0], [s for s in first_item.inputs if s.identifier not in ("Index", "__extend__")][0])
+got = reader_error(first_item.outputs[0])
+check("breadcrumb: at most 3 hops", got == f"A ← … ← {chosen.name} ← {attribute.name}: fields can't be words", got)
+math = N.new("ShaderNodeMath")
+math_text = N.new("FunctionNodeValueToString")
+L.new(math.outputs[0], math_text.inputs["Value"])
+got = reader_error(math_text.outputs[0])
+check("breadcrumb: an unsupported node", got == f"A ← {math_text.name} ← {math.name}: Math isn't supported as an "
+      "OpenAct input", got)
+got = reader_error(field_ask.outputs["Answer"])
+check("an OpenAct field output is rejected", got == f"A ← {field_ask.name}: '{field_ask.name}' output 'Answer' is a "
+      "field; words must be single values", got)
+unset = N.new("GeometryNodeMenuSwitch")
+unset.data_type = 'STRING'
+unset.enum_items.clear()  # leaves the Menu socket on no item
+unset.enum_items.new("Q")
+got = reader_error(unset.outputs[0])
+check("menu: an unknown name names the menu", got == f"A ← {unset.name}: '{unset.name}' has no item ''", got)
+got = reader_error(fresh.outputs[0])
+check("menu: -1 (fresh modifier) names the modifier's menu",
+      got == f"A ← {fresh.name} ← {g_in.name}: choose an item for 'Fresh' in the modifier", got)
+mod[ids["Edited"]] = 0  # A, deleted above
+got = reader_error(edited.outputs[0])
+mod[ids["Edited"]] = 2
+check("menu: a deleted item's identifier names the modifier's menu",
+      got == f"A ← {edited.name} ← {g_in.name}: choose an item for 'Edited' in the modifier", got)
+
+
+def linked_library():
+    """A pass reads linked OpenAct nodes but writes nothing into them."""
+    library_tree = bpy.data.node_groups.new("Library Tree", 'GeometryNodeTree')
+    node = library_tree.nodes.new(engine.ASK_ID)
+    node.inputs["Question"].default_value = "Is it linked?"
+    engine.set_entries(node, [{"key": "saved", "gn": ["Is it linked?", ""], "t": 0.0,
+                               "a": {"mode": 'YES_NO', "value": 1.0, "confidence": 1.0}}])
+    engine.build_inner(node)
+    path = os.path.join(TMP, "library.blend")
+    bpy.data.libraries.write(path, {library_tree})
+    inner = node.node_tree
+    bpy.data.node_groups.remove(library_tree)
+    bpy.data.node_groups.remove(inner)
+    with bpy.data.libraries.load(path, link=True) as (_source, target):
+        target.node_groups = ["Library Tree"]
+    linked = target.node_groups[0]
+    user = bpy.data.objects.new("Library User", bpy.data.meshes.new("Library User"))
+    bpy.context.scene.collection.objects.link(user)
+    user_mod = user.modifiers.new("Linked", 'NODES')
+    user_mod.node_group = linked
+    node = next(n for n in linked.nodes if n.bl_idname == engine.ASK_ID)
+    linked_inner = node.node_tree
+    before = (node.uid, node.entries, linked_inner, len(bpy.data.node_groups), len(linked_inner.nodes))
+    engine.run_pass()
+    after = (node.uid, node.entries, node.node_tree, len(bpy.data.node_groups), len(linked_inner.nodes))
+    check("linked: the tree and its hidden group are linked",
+          linked.library is not None and linked_inner is not None and linked_inner.library is not None)
+    status = engine.STATUS.get(node.uid)
+    check("linked: the node says where its answers come from",
+          status == ('LINKED', f"Linked from {linked.library.name}: answers come from that file"), status)
+    check("linked: a pass writes nothing", after == before, (before, after))
+    check("linked: the pass's memo is gone after it", evaluator.MEMO is None, evaluator.MEMO)
+    engine.reask(node)
+    check("linked: Ask Again writes nothing", node.entries == before[1] and len(linked_inner.nodes) == before[4])
+    got = read(node.inputs["Question"], evaluator.Ctx(user, user_mod, (), linked))
+    check("linked: its words are still read", got == "Is it linked?", got)
+    local = linked.make_local()  # the tree alone: its node still points at the linked hidden group
+    node = next(n for n in local.nodes if n.bl_idname == engine.ASK_ID)
+    engine.run_pass()
+    check("made local: the node gets a local hidden group, the linked one is untouched",
+          node.node_tree is not linked_inner and node.node_tree.library is None
+          and node.node_tree.name == engine.inner_name(node) and len(linked_inner.nodes) == before[4],
+          (node.node_tree.name, node.node_tree.library, local.library))
+
+
+linked_library()
 finish()
