@@ -1,11 +1,12 @@
-"""The Ask and Pick nodes."""
+"""The Ask, Pick and Rules nodes."""
 
 from __future__ import annotations
 
 import bpy
 
-from . import engine, inner
+from . import engine, inner, store
 from . import prefs as P
+from .specs.rules import RulesSpec
 
 
 def _changed(self, context):
@@ -137,6 +138,35 @@ class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_label = "Pick"
 
 
+def _rules_mode(self, context):
+    # the outputs, and Dither and Seed, follow the answer type at once; the pass then re-plans
+    inner.sync_interface(self, engine.SPECS[self.bl_idname].interface(self))
+    inner.build(self, store.load(self))
+    engine.schedule(immediate=True, node=self)
+
+
+class GeometryNodeOpenActRules(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
+    """Ask one question per combination of factor levels, then look up each element's cell"""
+
+    bl_idname = RulesSpec.idname
+    bl_label = "Rules"
+
+    answer_type: bpy.props.EnumProperty(
+        name="Answer",
+        items=(
+            ('ONE_OF', "One of", "The outcome that applies to each element's cell"),
+            ('YES_NO', "Yes / No", "Probability of yes, blended across up to 3 Amount factors"),
+            ('AMOUNT', "Amount", "How much (0-1), blended across up to 3 Amount factors"),
+        ),
+        default='ONE_OF',
+        update=_rules_mode,
+    )
+
+    def draw_settings(self, layout):
+        layout.row().prop(self, "answer_type", expand=True)
+        super().draw_settings(layout)
+
+
 class NODE_MT_openact_add(bpy.types.Menu):
     bl_idname = "NODE_MT_openact_add"
     bl_label = "OpenAct"
@@ -144,7 +174,8 @@ class NODE_MT_openact_add(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         for idname, label, icon in ((engine.ASK_ID, "Ask", 'QUESTION'),
-                                    (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF')):
+                                    (engine.PICK_ID, "Pick", 'RESTRICT_SELECT_OFF'),
+                                    (RulesSpec.idname, "Rules", 'PRESET')):
             op = layout.operator("node.add_node", text=label, icon=icon)
             op.type = idname
             op.use_transform = True
@@ -161,7 +192,7 @@ def draw_add_menu(self, context):
     self.layout.menu(NODE_MT_openact_add.bl_idname, icon='NODETREE')
 
 
-classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, NODE_MT_openact_add)
+classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActRules, NODE_MT_openact_add)
 
 
 def register():

@@ -2,5 +2,6 @@
 
 from .ask import AskSpec
 from .pick import PickSpec
+from .rules import RulesSpec
 
-SPECS = {spec.idname: spec for spec in (AskSpec(), PickSpec())}
+SPECS = {spec.idname: spec for spec in (AskSpec(), PickSpec(), RulesSpec())}

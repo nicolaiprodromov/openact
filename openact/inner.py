@@ -39,7 +39,7 @@ class Column:
     """A per-element output, read from the node's table object at base + ID (§8.3). A spec lists its columns
     in the optional `per_element` attribute (a tuple, or a callable taking the node); the default is none."""
 
-    output: str  # the group output it feeds, e.g. "Probability"
+    output: str  # the group output it feeds, e.g. "Probability"; "" writes the table only (Rules reads it)
     name: str  # the entries' rows.v column, stored as the attribute "oa_<name>"
     data_type: str  # 'FLOAT', 'INT' or 'BOOLEAN'
     fallback: object  # §6.0: 0.0, -1 or False, for invalid IDs and unanswered contexts
@@ -86,6 +86,9 @@ class _Builder:
         self.default = default  # k_default: what the match chain yields when no entry matches (§8.2)
         self.per_word = per_word  # a word contains SEP: compare word by word
         self.k = None  # the match chain's output, which the per-element lookup reads
+        self.table = None  # the node's table object, when it has per-element columns (build() sets it)
+        self.index = None  # what per_element() reads at: None for the ID input; Rules sets its cell index
+        self._info = None  # the group's one Object Info, table_geometry()
 
     def new(self, idname, x, y):
         node = self.tree.nodes.new(idname)
@@ -183,8 +186,15 @@ class _Builder:
     def per_element(self, gi, go, entries, columns, table):
         """Per-element outputs (§8.3): each column sampled from the table object at flat = base + ID behind
         valid = 0 <= ID < count, else its fallback. base and count are Index Switches on k, so a no-match
-        (k = 0) and an invalid ID both give the fallbacks. Without an ID input, the element index is used."""
-        ident = next((s for s in gi.outputs if s.name == "ID"), None)
+        (k = 0) and an invalid ID both give the fallbacks. Without an ID input, the element index is used;
+        a spec may set self.index to read elsewhere (Rules: its cell index, -1 when invalid). Columns
+        without an output are only written to the table: the spec reads them itself."""
+        columns = [column for column in columns if column.output]
+        if not columns:
+            return
+        ident = self.index
+        if ident is None:
+            ident = next((s for s in gi.outputs if s.name == "ID"), None)
         if ident is None:
             ident = self.new("GeometryNodeInputIndex", -900, -700).outputs[0]
         counts = [row_count(entry) for entry in entries]
@@ -196,25 +206,47 @@ class _Builder:
         below = self._compare('LESS_THAN', ident, None, 300, -750)
         self.lookup(self.k, 'INT', 0, counts, sock(below.node.inputs, "B_INT"), -750).node.name = COUNT
         valid = self._and(self._compare('GREATER_EQUAL', ident, 0, 300, -900), below, 450, -800)
-        info = self.new("GeometryNodeObjectInfo", 300, -1050)
-        info.name = tables.NODE
-        info.inputs["Object"].default_value = table
+        geometry = self.table_geometry(table)
         for j, column in enumerate(columns):
             y = -1050 - 150 * j
-            attribute = self.new("GeometryNodeInputNamedAttribute", 450, y)
-            attribute.data_type = column.data_type
-            attribute.inputs["Name"].default_value = tables.ATTR + column.name
-            sampled = self.new("GeometryNodeSampleIndex", 600, y)
-            sampled.data_type = column.data_type
-            self.link(info.outputs["Geometry"], sampled.inputs["Geometry"])
-            self.link(_enabled(attribute.outputs, "Attribute"), _enabled(sampled.inputs, "Value"))
-            self.link(flat.outputs[0], sampled.inputs["Index"])
+            value = self.sample(geometry, column.name, column.data_type, flat.outputs[0], 450, y)
             switch = self.new("GeometryNodeSwitch", 750, y)
             switch.input_type = column.data_type
             self.link(valid, sock(switch.inputs, "Switch"))
             sock(switch.inputs, "False").default_value = column.fallback
-            self.link(_enabled(sampled.outputs, "Value"), sock(switch.inputs, "True"))
+            self.link(value, sock(switch.inputs, "True"))
             self.link(switch.outputs[0], go.inputs[column.output])
+
+    # -- table primitives, shared by per_element() and the specs that sample the table themselves (Rules)
+
+    def table_geometry(self, table=None):
+        """The table object's geometry, from the group's one Object Info, named tables.NODE."""
+        if self._info is None:
+            self._info = self.new("GeometryNodeObjectInfo", 300, -1050)
+            self._info.name = tables.NODE
+            self._info.inputs["Object"].default_value = self.table if table is None else table
+        return self._info.outputs["Geometry"]
+
+    def sample(self, geometry, name, data_type, index, x, y, attribute=None):
+        """Column "oa_<name>" of the table object at `index` (§8.3): Named Attribute, Sample Index (POINT).
+        attribute: a Named Attribute output to share between lookups of the same column."""
+        if attribute is None:
+            attribute = self.attribute(name, data_type, x, y)
+        sampled = self.new("GeometryNodeSampleIndex", x + 150, y)
+        sampled.data_type = data_type
+        self.link(geometry, sampled.inputs["Geometry"])
+        self.link(attribute, _enabled(sampled.inputs, "Value"))
+        if isinstance(index, int):
+            sampled.inputs["Index"].default_value = index
+        else:
+            self.link(index, sampled.inputs["Index"])
+        return _enabled(sampled.outputs, "Value")
+
+    def attribute(self, name, data_type, x, y):
+        node = self.new("GeometryNodeInputNamedAttribute", x, y)
+        node.data_type = data_type
+        node.inputs["Name"].default_value = tables.ATTR + name
+        return _enabled(node.outputs, "Attribute")
 
     def selection(self, ident, picked, target):
         """Pick's Selection = (ID == Index) AND (Index >= 0) (§8.3): `picked` is the entry-level Index."""
@@ -275,6 +307,7 @@ def build(node, store, live=None, default=None):
     tree.nodes.clear()
     split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
     builder = _Builder(tree, _k(entries, default), split)
+    builder.table = table
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
     SPECS[node.bl_idname].build(builder, group_in, group_out, entries)
@@ -282,7 +315,7 @@ def build(node, store, live=None, default=None):
         builder.per_element(group_in, group_out, entries, columns, table)
     builder.finish()
     if columns:
-        tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
+        tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
     tree[BUILT] = _built(node, entries, columns, split)
 
 
@@ -314,7 +347,7 @@ def update_values(node, store, live=None, default=None, rows=True):
     if end is not None:
         _write([sock(end.inputs, "False")], [_k(entries, default)])
     if rows and columns:
-        tables.write_rows(node, flat_rows(entries, columns), {c.name: c.data_type for c in columns})
+        tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
     return True
 
 
@@ -391,7 +424,14 @@ def _columns(node):
     if callable(wanted):
         wanted = wanted(node)
     outputs = {socket.name: socket for socket in node.outputs}
-    return [c for c in wanted if c.output in outputs and (outputs[c.output].is_linked or not c.linked_only)]
+    return [c for c in wanted if not c.output  # table only: the spec reads it itself
+            or (c.output in outputs and (outputs[c.output].is_linked or not c.linked_only))]
+
+
+def _table_rows(node, entries, columns):
+    """The table object's columns: flat_rows(), or the spec's own table_rows(node, entries, columns) (Rules)."""
+    own = getattr(SPECS[node.bl_idname], "table_rows", None)
+    return flat_rows(entries, columns) if own is None else own(node, entries, columns)
 
 
 def _k(entries, default):

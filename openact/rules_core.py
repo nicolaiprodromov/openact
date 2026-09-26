@@ -527,14 +527,23 @@ def _option_text(option):
     return f"{option.name}: {option.when}" if option.when else option.name
 
 
+def value_column(answer_type: str) -> str:
+    """The value column of a Yes/No or Amount table (9.6); One-of's is "outcome"."""
+    return {"ONE_OF": "outcome", "YES_NO": "p", "AMOUNT": "amount"}[answer_type]
+
+
 def _code_values(answer_type, options, r):
     if answer_type == "ONE_OF":
         return {"outcome": r, "c": 1.0}
+    if answer_type == "AMOUNT":  # a single level: its position is 0
+        return {"amount": 0.0, "c": 1.0, "ok": 1.0}
     return {"p": 1.0 if options[r].name.casefold() == "yes" else 0.0, "c": 1.0, "ok": 1.0}
 
 
 def _error_values(answer_type):
-    return {"outcome": -1, "c": 0.0} if answer_type == "ONE_OF" else {"p": 0.0, "c": 0.0, "ok": 0.0}
+    if answer_type == "ONE_OF":
+        return {"outcome": -1, "c": 0.0}
+    return {value_column(answer_type): 0.0, "c": 0.0, "ok": 0.0}
 
 
 def _problem(severity, doc, r, message, prefix=False):
