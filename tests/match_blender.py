@@ -4,7 +4,10 @@
 - the planned jobs: 40 items sharing one state, with the §10.2 template text; 255 labels x 250 items refused by the
   8192-row estimate before anything is sent; the tournament cost of 20 labels;
 - the pass from plan to table with cached answers: a Labels CSV's payload denormalised per row (a numbers-only edit
-  re-bakes it and asks nothing), and an empty material slot that is never asked.
+  re-bakes it and asks nothing), and an empty material slot that is never asked;
+- a draw (the sidebar's answers_for(), where Blender refuses ID writes) never writes a Classify node: after a Labels
+  CSV path is typed, a header renamed or a column removed, the next pass syncs the payload outputs, also after an undo
+  that keeps the plans.
 With -- --model PORT GPU, also a spot check with the real model on that port and GPU: pan = yes and sofa = no for
 "Would you find it in a kitchen?"; "steel" -> metal and "oak planks" -> wood.
 
@@ -45,6 +48,8 @@ FAMILIES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", 
 KITCHEN = "Would you find it in a kitchen?"
 POINTS = 6
 PAYLOAD = [("roughness", 'FLOAT'), ("metallic", 'INT')]  # the numeric columns of material_families.csv
+FAMILY_ANSWERS = {"steel": [0.9, 0.05, 0.03, 0.02], "oak planks": [0.1, 0.8, 0.05, 0.05],  # over its 4 labels
+                  "marble": [0.05, 0.05, 0.85, 0.05], "silk": [0.1, 0.1, 0.1, 0.7]}
 
 
 # ------------------------------------------------------------------------------ scenes
@@ -131,6 +136,43 @@ class Capture:
 
     def keys(self, node):
         return {cell.key for uid, cell in self.cells if uid == node.uid}
+
+
+DRAWN = {}  # what drawn() runs, and what came of it
+
+
+class OPENACT_TEST_OT_drawn(bpy.types.Operator):
+    """Runs DRAWN["fn"] in poll(), where Blender refuses ID writes as it does in a panel's draw()."""
+
+    bl_idname = "openact_test.drawn"
+    bl_label = "Drawn"
+
+    @classmethod
+    def poll(cls, context):
+        try:
+            DRAWN["result"] = ("ok", DRAWN["fn"]())
+        except Exception as error:  # noqa: BLE001 - in a real draw, the sidebar would lose its answers and buttons
+            DRAWN["result"] = (type(error).__name__, str(error))
+        return False
+
+
+bpy.utils.register_class(OPENACT_TEST_OT_drawn)
+
+
+def drawn(fn):
+    """fn() as a draw callback runs it: ("ok", its value), or (the error's type, its message)."""
+    DRAWN.update(fn=fn, result=None)
+    bpy.ops.openact_test.drawn.poll()
+    return DRAWN["result"]
+
+
+def face(node):
+    """What a write to the node would change: its outputs (name, type, tooltip), the links from them, its group."""
+    group = node.node_tree
+    outputs = [(i.name, i.socket_type, i.description) for i in group.interface.items_tree
+               if i.item_type == 'SOCKET' and i.in_out == 'OUTPUT']
+    links = sorted(link.from_socket.name for link in node.id_data.links if link.from_node == node)
+    return outputs, links, len(group.nodes), group.get(inner.BUILT)
 
 
 # ------------------------------------------------------------------------------ synthetic tables
@@ -300,10 +342,8 @@ def phase_pass_classify():
         check("pass: one choice question per item over the 4 labels, all 4 missing cells asked in one job",
               capture.keys(node) == {row.cell.key for row in job.rows} and len(job.rows) == 4
               and all(len(row.cell.question["criteria"]) == 4 for row in job.rows), len(capture.keys(node)))
-        answers = {"steel": [0.9, 0.05, 0.03, 0.02], "oak planks": [0.1, 0.8, 0.05, 0.05],
-                   "marble": [0.05, 0.05, 0.85, 0.05], "silk": [0.1, 0.1, 0.1, 0.7]}
         for row in job.rows:
-            pipeline.remember(row.cell.key, {"probabilities": answers[row.name], "model": "fake"})
+            pipeline.remember(row.cell.key, {"probabilities": FAMILY_ANSWERS[row.name], "model": "fake"})
         with Capture() as capture:
             engine.run_pass()
         names = ("Label", "Confidence", "roughness", "metallic")
@@ -338,8 +378,97 @@ def phase_pass_classify():
             engine.run_pass()
         icon, status = engine.STATUS.get(node.uid, ("", ""))
         check("pass: a Labels CSV warning (a blank line) shows before the summary, and asks nothing",
-              icon == 'ERROR' and status.startswith("families.csv line 5: Line 5 is blank")
+              icon == 'ERROR' and status.startswith("families.csv: Line 5 is blank")
               and status.endswith("(4 items · 4 labels used · 0 unsure)") and not capture.keys(node), (icon, status))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def rewire(tree, node, outputs):
+    """store_outputs() for these outputs, in place of the Store Named Attribute chain the tree has."""
+    for old in [n for n in tree.nodes if n.bl_idname in ("GeometryNodeStoreNamedAttribute", "NodeGroupOutput")]:
+        tree.nodes.remove(old)
+    store_outputs(tree, node, outputs)
+
+
+def phase_draw_classify():
+    """The sidebar plans too (answers_for()), from a draw: that may never write the node. The pass syncs the payload
+    outputs on its next visit, whether it plans then or the draw already did."""
+    folder = tempfile.mkdtemp(prefix="openact-draw-")
+    try:
+        path = os.path.join(folder, "families.csv")
+        shutil.copyfile(FAMILIES, path)
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        tree, node = make_tree("ClassifyDraw", ClassifySpec.idname)
+        node.inputs["Items"].default_value = "steel, oak planks, marble, silk"
+        node.inputs["Labels"].default_value = "metal; wood; stone; fabric"
+        obj = user("CD", tree, Shift=0)
+        with Capture():
+            engine.run_pass()
+        check("draw: the stand-in draw refuses ID writes, as Blender's draw callbacks do",
+              drawn(lambda: setattr(node, "label", "drawn"))[0] == "AttributeError" and node.label == "", node.label)
+
+        node.inputs["Labels"].default_value = path  # typed: the sidebar may draw before the debounced pass
+        before = face(node)
+        got = drawn(lambda: engine.answers_for(node))
+        check("draw: typing a Labels CSV path, then a draw: answers_for() raises nothing and writes nothing",
+              got[0] == "ok" and face(node) == before, (got[0], face(node)[0]))
+        with Capture():
+            engine.run_pass()
+        check("draw: the next pass adds the payload outputs, with the plan the draw made",
+              face(node)[0][2:] == [("roughness", 'NodeSocketFloat', "The Labels CSV's 'roughness' of the chosen label"),
+                                    ("metallic", 'NodeSocketInt', "The Labels CSV's 'metallic' of the chosen label")],
+              face(node)[0])
+        store_outputs(tree, node, {"Label": 'INT', "roughness": 'FLOAT', "metallic": 'INT'})
+        for row in CLASSIFY.plan(node, evaluator.find_uses()[tree.as_pointer()][0]).rows:
+            pipeline.remember(row.cell.key, {"probabilities": FAMILY_ANSWERS[row.name], "model": "fake"})
+        with Capture():
+            engine.run_pass()
+        snapshot = node.entries  # what an undo to before the edits below restores
+
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text.replace("roughness,metallic", "roughness,metalness"))
+        before = face(node)
+        got = drawn(lambda: engine.answers_for(node))
+        check("draw: after a Labels CSV header rename, a draw shows the answers and leaves the outputs, their links "
+              "and the group as they were", got[0] == "ok" and got[1] and got[1][0][1] is not None
+              and face(node) == before, (got[0], face(node)[:2]))
+        with Capture() as capture:
+            engine.run_pass()
+        tips = {name: tip for name, _type, tip in face(node)[0]}
+        rewire(tree, node, {"Label": 'INT', "roughness": 'FLOAT', "metalness": 'INT'})
+        got = read(obj, ("Label", "roughness", "metalness"))
+        check("draw: the next pass renames the payload output, with its tooltip, and asks nothing",
+              [s.name for s in node.outputs] == ["Label", "Confidence", "roughness", "metalness"]
+              and tips.get("metalness") == "The Labels CSV's 'metalness' of the chosen label"
+              and got == {"Label": [0, 1, 2, 3, -1, -1], "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0],
+                          "metalness": [1, 0, 0, 0, 0, 0]} and not capture.keys(node), (tips, got))
+
+        with open(path, "w", encoding="utf-8", newline="") as handle:  # the last column removed
+            handle.write("\n".join(line.rsplit(",", 1)[0] for line in text.splitlines()) + "\n")
+        before = face(node)
+        got = drawn(lambda: engine.answers_for(node))
+        check("draw: after a Labels CSV column is removed, a draw writes nothing either",
+              got[0] == "ok" and face(node) == before, (got[0], face(node)[:2]))
+        with Capture() as capture:
+            engine.run_pass()
+        got = read(obj, ("Label", "roughness"))
+        check("draw: the next pass drops the payload output and rebuilds the group: each element reads its own label",
+              [s.name for s in node.outputs] == ["Label", "Confidence", "roughness"]
+              and got == {"Label": [0, 1, 2, 3, -1, -1], "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0]}
+              and not capture.keys(node), got)
+
+        node.entries = snapshot  # undo: the node and its group as they were; the file and the plans stay
+        inner.sync_interface(node, CLASSIFY.interface(node, PAYLOAD))
+        inner.build(node, S.load(node))
+        with Capture():
+            engine.run_pass()
+        got = read(obj, ("Label", "roughness"))
+        check("draw: after an undo that keeps the plans, the next pass syncs the payload outputs to the file again",
+              [s.name for s in node.outputs] == ["Label", "Confidence", "roughness"]
+              and got == {"Label": [0, 1, 2, 3, -1, -1], "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0]},
+              ([s.name for s in node.outputs], got))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -424,6 +553,7 @@ def main():
     phase_jobs()
     phase_limits()
     phase_pass_classify()
+    phase_draw_classify()
     phase_pass_match()
     if MODEL is not None:
         phase_model(*MODEL)

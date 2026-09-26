@@ -32,9 +32,17 @@ def option_text(option) -> str:
 
 
 def warnings(problems) -> tuple[str, ...]:
-    """The warnings among csvfmt Problems (ItemList.problems, AnswerSet.problems) as status texts."""
-    return tuple(f"{os.path.basename(p.file)} line {p.line}: {p.message}" if p.file and p.line else p.message
-                 for p in problems if p.severity == "warning")
+    """The warnings among csvfmt Problems (ItemList.problems, AnswerSet.problems) as status texts, after the file's
+    name and line: only its name when the message starts with the line."""
+    texts = []
+    for p in problems:
+        if p.severity != "warning":
+            continue
+        where = os.path.basename(p.file) if p.file and p.line else ""
+        if where and not p.message.startswith(f"Line {p.line}"):
+            where += f" line {p.line}"
+        texts.append(f"{where}: {p.message}" if where else p.message)
+    return tuple(texts)
 
 
 def state_text(context: str, empty: str = NO_CONTEXT) -> str:
@@ -144,7 +152,6 @@ class Spec:
     label = ""  # the node's label, also in its inner group's name
     PROMPT_VERSION = 1  # the templates: stored per entry as pv, part of the ask key and never of a words key
     WORDS: tuple[str, ...] = ()  # the fixed word tuple, in match-chain order, Key last (§8.2)
-    SOCKETS: tuple = ()  # SocketDef arguments of the node's sockets, but Key
     FALLBACK: dict = {}  # single-value output -> its value before the first answer (§6.0)
     empty_hint = ""
 
@@ -154,9 +161,7 @@ class Spec:
 
     def interface(self, node) -> list:
         """The sockets the node should have: SocketDefs for inner.sync_interface()."""
-        from ..inner import SocketDef  # imports bpy
-
-        return [SocketDef(*args) for args in (*self.SOCKETS, KEY)]
+        raise NotImplementedError
 
     def gn(self, node, ctx) -> tuple[str, ...]:
         """The raw words in ctx, as the match chain compares them: "" for a word the node has no socket for."""
@@ -272,13 +277,15 @@ class Spec:
         return {column: -1 if kind == "INT" else 0.0 for column, kind in job.shape.columns}
 
     def entry(self, job: pipeline.Job, rows: list[pipeline.Row], model: str = "") -> store.Entry:
-        """An answered table as the entry the node stores (§14.2): columnar rows and the ask keys behind them."""
-        asks = list(dict.fromkeys(row.ask for row in rows))
+        """An answered table as the entry the node stores (§14.2): columnar rows and the ask keys behind them. A row
+        that asked nothing (a lock or code row) has the ask key ""."""
+        asks = list(dict.fromkeys(row.ask or "" for row in rows))
         return store.Entry(
             words_key=job.words_key, asks=asks, pv=self.PROMPT_VERSION, t=time.time(), gn=job.gn, model=model,
             kind=self.name, answer_type=job.answer_type, shape=job.shape.as_dict(),
             rows=store.Rows(name=[row.name for row in rows], wkey=[row.wkey for row in rows],
-                            ask=[asks.index(row.ask) for row in rows], src="".join(SOURCES[row.source] for row in rows),
+                            ask=[asks.index(row.ask or "") for row in rows],
+                            src="".join(SOURCES[row.source] for row in rows),
                             v={column: [row.values[column] for row in rows] for column, _type in job.shape.columns}),
             single=self.single(rows))
 

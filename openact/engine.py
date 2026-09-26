@@ -44,6 +44,7 @@ CLASH = ("'{}' and '{}' share every word but not their list (a collection, objec
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
 P0_CELLS = 8
+PARTIAL = "openact_partial"  # ID property of the inner group: its table object holds an unstored partial table's rows
 
 STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
@@ -87,7 +88,10 @@ def _openact_output(node, out, ctx, depth):
         job = _plan(spec, node, ctx)
     except Hint:
         return spec.fallback(out.name)
-    entry, _missing, _failed = spec.resolve(job, store.load(node).entries, LAST_SHOWN.get((node.uid, ctx.key()), ""))
+    node_store = store.load(node)
+    if node_store.schema > store.SCHEMA:  # its answers can't be read, so they never arrive
+        raise Unresolvable(f"'{node.name}': {store.newer_message(node_store)}")
+    entry, _missing, _failed = spec.resolve(job, node_store.entries, LAST_SHOWN.get((node.uid, ctx.key()), ""))
     if entry is None:
         raise Pending()
     try:
@@ -276,14 +280,19 @@ def _process(tree, node, contexts):
     entries = node_store.entries
     contexts = contexts or [Ctx(None, None, (), tree)]
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
+    hidden = {}  # (gn, words key) of stored entries whose words mean something else now, kept for their rows -> the
+    instead = {}  # partial table shown in their place, or None; and (uid, ctx key) -> that table's words key
     problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
     for ctx in contexts:
         key = (node.uid, ctx.key())
         try:
             job = _plan(spec, node, ctx)
-        except Pending:
+        except Pending:  # its words wait for another node's answer: the entry it showed last stays in the graph
             upstream = True
+            last = next((entry for entry in entries if entry.words_key == LAST_SHOWN.get(key)), None)
+            if last is not None and last.gn not in live:
+                live.append(last.gn)
             continue
         except Hint as hint:
             hints.append(str(hint))
@@ -296,21 +305,33 @@ def _process(tree, node, contexts):
         if job.gn not in live:
             live.append(job.gn)
         other = jobs.setdefault(job.gn, (job, ctx))
-        if other[0] is not job:
-            if other[0].words_key != job.words_key:
-                problems.append(CLASH.format(other[1].label(), ctx.label()))
+        if other[0] is not job and other[0].words_key != job.words_key:
+            problems.append(CLASH.format(other[1].label(), ctx.label()))
             continue
         found = next((entry for entry in entries if entry.gn == job.gn), None)
-        if found is not None:
-            LAST_SHOWN.setdefault(key, found.words_key)  # after a load, a context shows its stored entry
-        # A converted v0.1.0 answer has no words key to judge it by: it stays until the new answer replaces it.
+        if found is not None and found.words_key:  # after a load, a context shows its stored entry
+            LAST_SHOWN.setdefault(key, found.words_key)  # (a converted one has no words key to name it by)
+        if other[0] is not job:  # the same words and meaning as an earlier context: the graph shows it that entry
+            if any(entry is found for entry in shown):
+                LAST_SHOWN[key] = found.words_key
+            continue
+        # A converted v0.1.0 answer has no words key to judge it by: it shows until the new answer replaces it.
         legacy = found is not None and found.legacy and found.answer_type == job.answer_type
-        # While cells are missing, the table so far is stored: stale-while-refilling (§5.4)
+        # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
         entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=not legacy)
         if entry is not None and found is not None and entry is not found and dataclasses.replace(
                 entry, t=found.t) == found:
             entry = found  # the partial table as stored already
-        if entry is not None:
+        # Words that mean something else now never show the old answer, but its rows carry over until the new table is
+        # whole, also after a reload: the old entry stays stored, and the partial table shows in its place unstored.
+        # LAST_SHOWN keeps naming the stored entry its stale rows come from.
+        if found is not None and found.words_key != job.words_key and not legacy and (
+                entry is None or missing or errors):
+            hidden[(found.gn, found.words_key)] = entry
+            if entry is not None:
+                shown.append(entry)
+                instead[key] = entry.words_key
+        elif entry is not None:
             LAST_SHOWN[key] = entry.words_key
             shown.append(entry)
             if entry is not found:
@@ -319,38 +340,48 @@ def _process(tree, node, contexts):
                 else:
                     entries.append(entry)
                 changed = True
-        elif found is not None and found.words_key != job.words_key and not legacy:
-            entries.remove(found)  # words that mean something else now never show the old answer
-            changed = True
         failed += errors
         if missing:
             waiting = True
             _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
                                         generation=GENERATIONS.get(node.uid, 0)), missing)
-    rows = changed  # entries were added, replaced or dropped: the table object's rows change too
+    rows = changed  # entries were added or replaced: the table object's rows change too
     showing = {entry.words_key for entry in shown}
     left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
     LIVE[node.uid] = showing
     if changed or left:  # warm order and eviction go by last use (§8.1): stamp what was just in use
         now = time.time()
         for entry in entries:
-            if entry.words_key in showing:  # one step after the ones just left: the newest is a shown entry (Dials)
+            if entry.words_key in showing:  # one step after the ones just left: the newest is a shown entry
                 entry.t = math.nextafter(now, math.inf)
             elif entry.words_key in left:
                 entry.t = now
         changed = True
     if changed:
         try:
-            store.save(node, node_store, frozenset(jobs))  # live contexts are never evicted
+            store.save(node, node_store, frozenset(live))  # live contexts are never evicted
         except ValueError as error:  # a damaged or too large entry: the node keeps what it has
             problems.append(str(error))
             changed = rows = False
             node_store = store.load(node)
-    warnings += orphaned([job for job, _ctx in jobs.values()])  # PR-21: locks no context's rows use (§7.6)
-    last = [LAST_SHOWN.get((node.uid, ctx.key())) for ctx in contexts]
+    warnings += orphaned([job for job, _ctx in jobs.values()])  # locks no context's rows use (§7.6)
+    if hasattr(spec, "sync"):  # outputs that follow the entries shown, kept while none is (Dials, §6.0)
+        spec.sync(node, shown)
+    keys = [(node.uid, ctx.key()) for ctx in contexts]
+    last = [instead.get(key, LAST_SHOWN.get(key)) for key in keys]  # a no-match shows what the graph showed last
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
-    if not inner.update_values(node, node_store, live, default, rows=rows):  # values only when it can (§8.8)
-        inner.build(node, node_store, live, default)
+    graph = node_store
+    if hidden:  # a hidden entry leaves the graph, or leaves its place to the partial table shown instead
+        graph = store.NodeStore([entry for entry in (hidden.get((stored.gn, stored.words_key), stored)
+                                                     for stored in node_store.entries) if entry is not None])
+    # An unstored partial table has the gn, so the place in the graph, of the entry it shows instead of: while it shows,
+    # and once after (also in a reopened file), the table object's rows are rewritten.
+    filling = any(entry is not None for entry in hidden.values())
+    marked = node.node_tree is not None and bool(node.node_tree.get(PARTIAL))
+    if not inner.update_values(node, graph, live, default, rows=rows or filling or marked):  # values only (§8.8)
+        inner.build(node, graph, live, default)
+    if filling != marked:  # the table object holds the rows of the graph just laid out
+        node.node_tree[PARTIAL] = filling
     STATUS[node.uid] = NodeStatus(*_status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings),
                                   shown, pipeline.progress(node.uid))
     return changed
@@ -420,10 +451,13 @@ def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warni
 
 
 def answers_for(node):
-    """(context label, entry or None) for the node's current uses, for the sidebar."""
+    """(context label, entry or None) for the node's current uses, for the sidebar. Nothing for a newer OpenAct's
+    answers, which can't be read: the node's status says why."""
     spec = SPECS[node.bl_idname]
-    entries = store.load(node).entries
-    return [(ctx.label(), spec.resolve(job, entries, LAST_SHOWN.get((node.uid, ctx.key()), ""))[0])
+    node_store = store.load(node)
+    if node_store.schema > store.SCHEMA:
+        return []
+    return [(ctx.label(), spec.resolve(job, node_store.entries, LAST_SHOWN.get((node.uid, ctx.key()), ""))[0])
             for ctx, job in _jobs(node)]
 
 
@@ -449,7 +483,8 @@ def reask(node):
     pipeline.forget(row.cell.key for job in jobs for row in job.rows if row.cell is not None)
     for key in [key for key in LAST_SHOWN if key[0] == node.uid]:
         del LAST_SHOWN[key]
-    inner.build(node, node_store)
+    # as the next pass lays it out: the live set, and no default now that nothing was shown
+    inner.build(node, node_store, list(dict.fromkeys(job.gn for job in jobs)), None)
     schedule(immediate=True)
 
 

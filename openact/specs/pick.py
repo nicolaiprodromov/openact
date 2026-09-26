@@ -15,13 +15,6 @@ class PickJob(pipeline.Job):
     list_source: str = 'TEXT'  # under MATERIALS the entry also stores the picked material's name (§8.6)
 
 
-@dataclasses.dataclass(frozen=True)
-class _Named:  # an item given by name only (the pure suites plan from names)
-    name: str
-    when: str = ""
-    offered: bool = True
-
-
 class PickSpec(Spec):
     name, idname, label = "pick", "GeometryNodeOpenActPick", "Pick"
     WORDS = ("Prompt", "Context", "Items", "Overrides", "Key")
@@ -67,7 +60,12 @@ class PickSpec(Spec):
         return resolve_items(node, ctx, spec="pick")
 
     def listed(self, node, ctx):
-        return self.items(node, ctx).fingerprint
+        from ..evaluator import Hint, Unresolvable  # imports bpy
+
+        try:
+            return self.items(node, ctx).fingerprint
+        except (Hint, Unresolvable) as error:  # plan() raises it again after its own checks; the plan cache keeps it
+            return f"{type(error).__name__}: {error}"
 
     def plan(self, node, ctx):
         from ..evaluator import Hint  # imports bpy
@@ -86,7 +84,9 @@ class PickSpec(Spec):
         """The Job for these words and items (lists.Item, or names). Pure, so the pure suites plan exactly like the
         pass. Entries that can't be offered (an empty material slot) keep their ID with probability 0; a list with
         one offered entry is decided by code and never sent (4.d)."""
-        items = [_Named(item) if isinstance(item, str) else item for item in items]
+        from ..lists import Item  # pure without bpy
+
+        items = [Item(item) if isinstance(item, str) else item for item in items]
         prompt, context = gn[0].strip(), gn[1].strip()
         offered = [(i, item) for i, item in enumerate(items) if item.offered]
         options = tuple((item.name, item.when) for _i, item in offered)
@@ -95,7 +95,7 @@ class PickSpec(Spec):
         state = state_text(context, PICK_STATE)
         cell = None
         if len(offered) > 1:
-            cell = pipeline.Cell(pipeline.cell_key("choice", state, instructions, list(criteria.items()), debias),
+            cell = pipeline.Cell(pipeline.cell_key("choice", state, instructions, criteria, debias),
                                  state, {"type": "choice", "instructions": instructions, "criteria": criteria},
                                  pipeline.cost(len(options), debias))
         rows = []

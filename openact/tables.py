@@ -61,6 +61,8 @@ def write_rows(node, flat_columns, types=None):
     for name, values in flat_columns.items():
         kind = kinds[ATTR + name]
         attribute = mesh.attributes.get(ATTR + name) or mesh.attributes.new(ATTR + name, kind, 'POINT')
+        if attribute is None:  # Blender 4.5 refuses names of 68 bytes or more
+            raise ValueError(f"the table column '{ATTR + name}' can't be created")
         try:
             attribute.data.foreach_set("value", values)
         except TypeError:  # e.g. floats such as 1.0 in an INT column

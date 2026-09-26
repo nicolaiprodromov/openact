@@ -6,17 +6,11 @@ PerItemSpec holds what Match and Classify share: the list source and the answer 
 
 from __future__ import annotations
 
-import dataclasses
-
 from .. import pipeline
-from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings, yes_no_text
+from ..csvfmt import _n
+from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings, yes_no_text
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
-UNSURE_BELOW = 0.30  # the default of the planned unsure_below preference (4.e)
-
-
-def _n(number):
-    return f"{number:,}".replace(",", " ")  # 8500 -> "8 500", as the messages write numbers
 
 
 class PerItemSpec(Spec):
@@ -65,13 +59,9 @@ class PerItemSpec(Spec):
         doc = answers.doc
         return items.fingerprint, doc and (doc.path, getattr(answers.source, "delimiter", None), doc.stamp)
 
-    def table(self, gn, answer_type, cells, docs, debias, uid="", job=pipeline.Job, **extra):
-        """The Job of these per-item cells: a model row asking its cell per offered item; a code row where a single
-        label decides (4.d), or with the neutral values for an empty material slot. docs: the CSVs read, whose text
-        enters the words key. Raises Unresolvable above ROW_LIMIT estimated scored rows."""
-        rows = [pipeline.Row(c.name, c.wkey, cell=pipeline.Cell(c.key, c.state, c.question, c.cost))
-                if c.source == "model" else pipeline.Row(c.name, c.wkey, "code", dict(c.values or self.NEUTRAL))
-                for c in cells]
+    def table(self, gn, answer_type, rows, docs, debias, uid="", job=pipeline.Job, **extra):
+        """The Job of these per-item rows (sources.per_item_cells()). docs: the CSVs read, whose text enters the words
+        key. Raises Unresolvable above ROW_LIMIT estimated scored rows."""
         total = sum(row.cell.cost for row in rows if row.cell is not None)
         if total > ROW_LIMIT:
             from ..evaluator import Unresolvable  # imports bpy
@@ -82,12 +72,6 @@ class PerItemSpec(Spec):
         hashes = [doc.text_hash for doc in docs if doc is not None]
         words_key = pipeline.words_key(gn, hashes, answer_type, shape.digest(), [row.wkey for row in rows])
         return job(uid, tuple(gn), words_key, shape, rows, answer_type=answer_type, debias=debias, **extra)
-
-    def entry(self, job, rows, model=""):
-        # code rows were never asked: they take the ask key of the model rows beside them
-        asked = next((row.ask for row in rows if row.ask is not None), "")
-        return super().entry(job, [row if row.ask is not None else dataclasses.replace(row, ask=asked) for row in rows],
-                             model)
 
     def offered(self, entry, column):
         """(name, value) of the rows that are items, without empty material slots."""
@@ -148,8 +132,8 @@ class MatchSpec(PerItemSpec):
         """The Job for these words, items (an ItemList or its items) and answer set. Pure, like Ask's and Pick's."""
         from .. import sources
 
-        cells = sources.per_item_cells(self.name, answer_type, items, answers, gn[0], gn[1], debias)
-        return self.table(gn, answer_type, cells, (getattr(items, "doc", None), answers.doc), debias, uid,
+        rows = sources.per_item_cells(self.name, answer_type, items, answers, gn[0], gn[1], debias, self.NEUTRAL)
+        return self.table(gn, answer_type, rows, (getattr(items, "doc", None), answers.doc), debias, uid,
                           options=tuple(option.name for option in answers.options))
 
     def lock_values(self, job, rows, answer):
