@@ -198,8 +198,7 @@ class DialsSpec(Spec):
     # ------------------------------------------------------------------------------- the inner group
 
     def build(self, b, gi, go, entries):
-        from .. import tables  # imports bpy
-        from ..inner import sock
+        from ..inner import sock  # imports bpy
 
         node = b.node
         outputs = self.sync(node, entries)
@@ -208,25 +207,22 @@ class DialsSpec(Spec):
             zero = b.new("FunctionNodeInputInt", -200, 400)
             zero.integer = 0
             k = zero.outputs[0]
-        info = b.new("GeometryNodeObjectInfo", -200, -200)
-        info.name = tables.NODE
-        info.inputs["Object"].default_value = b.table
         row = b.new("FunctionNodeIntegerMath", -200, 200)
         row.operation = 'SUBTRACT'
         b.link(k, row.inputs[0])
         row.inputs[1].default_value = 1
         live = b._compare('GREATER_THAN', k, 0, -200, 100)
-        geometry, index = info.outputs["Geometry"], row.outputs[0]
+        geometry, index = b.table_geometry(), row.outputs[0]  # a single-value index gives single values (§8.4)
         for j, (name, kind) in enumerate([*outputs, ("Confidence", "conf")]):
             y = 300 - 250 * j
             column, data_type = ("conf", 'FLOAT') if kind == "conf" else (f"v{j}", DATA[kind])
-            value = self._sample(b, geometry, column, data_type, index, 0, y)
+            value = b.sample(geometry, column, data_type, index, 0, y)
             if kind == "amount":
                 scale = b.new("ShaderNodeMapRange", 350, y)
                 scale.data_type, scale.interpolation_type, scale.clamp = 'FLOAT', 'LINEAR', False
                 b.link(value, scale.inputs["Value"])
-                b.link(self._sample(b, geometry, f"min{j}", 'FLOAT', index, 0, y - 80), scale.inputs["To Min"])
-                b.link(self._sample(b, geometry, f"max{j}", 'FLOAT', index, 0, y - 160), scale.inputs["To Max"])
+                b.link(b.sample(geometry, f"min{j}", 'FLOAT', index, 0, y - 80), scale.inputs["To Min"])
+                b.link(b.sample(geometry, f"max{j}", 'FLOAT', index, 0, y - 160), scale.inputs["To Max"])
                 value = scale.outputs["Result"]
             switch = b.new("GeometryNodeSwitch", 550, y)
             switch.input_type = data_type
@@ -234,22 +230,6 @@ class DialsSpec(Spec):
             sock(switch.inputs, "False").default_value = 0.0 if kind == "conf" else FALLBACK[kind]
             b.link(value, sock(switch.inputs, "True"))
             b.link(switch.outputs[0], go.inputs[name])
-
-    @staticmethod
-    def _sample(b, geometry, column, data_type, index, x, y):
-        """One value of the table object's row `index`: Named Attribute and Sample Index (a single value, §8.4)."""
-        from .. import tables  # imports bpy
-        from ..inner import _enabled
-
-        attribute = b.new("GeometryNodeInputNamedAttribute", x, y)
-        attribute.data_type = data_type
-        attribute.inputs["Name"].default_value = tables.ATTR + column
-        sampled = b.new("GeometryNodeSampleIndex", x + 170, y)
-        sampled.data_type = data_type
-        b.link(geometry, sampled.inputs["Geometry"])
-        b.link(_enabled(attribute.outputs, "Attribute"), _enabled(sampled.inputs, "Value"))
-        b.link(index, sampled.inputs["Index"])
-        return _enabled(sampled.outputs, "Value")
 
     def sync(self, node, entries):
         """Give the node the outputs of its newest entry (§6.0): matched by name and type, so a renamed or retyped

@@ -26,6 +26,7 @@ from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
 BUILT = "openact_built"  # ID property of the group: what build() laid out, for update_values()
+LAYOUT = 1  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
 SEP = "\x1f"  # joins a word tuple into one key (§8.2)
 MATERIALISED_MAX = 16  # entries in the graph and table object, pinned included (§8.1)
 WARM_TOTAL = 4  # warm entries are materialised only while the total is below this
@@ -89,7 +90,7 @@ class _Builder:
         self.k = None  # the match chain's output, which the per-element lookup reads
         self.after_elements = []  # a spec's callables (valid, {output: value}), run once per_element() built them
         self.node = None  # the OpenAct node, for a spec that samples its own table object (entry_table, below)
-        self.table = None  # the node's table object, when it has per-element columns (build() sets it)
+        self.table = None  # the node's table object, when it has one (build() sets it)
         self.index = None  # what per_element() reads at: None for the ID input; Rules sets its cell index
         self._info = None  # the group's one Object Info, table_geometry()
 
@@ -108,11 +109,9 @@ class _Builder:
 
     def match_chain(self, sockets, keys):
         """Integer socket k: 1 + index of the entry whose words equal the live words, else k_default; None
-        when no entry can match. `sockets` has one item per word position, None for an absent socket.
-
-        One Join Strings joins the live words with SEP, and each entry costs a Compare with its stored
-        SEP.join(gn) and a Switch (§8.2). A key of another length (converted from schema 1) never matches:
-        its words sit at other positions."""
+        when no entry can match. `sockets` has one item per word position, None for an absent socket (§8.2).
+        A key of another length (saved before the fixed word tuples) never matches: its words sit at other
+        positions."""
         keys = [tuple(key) for key in keys]
         self.k = None
         if not any(len(key) == len(sockets) for key in keys):
@@ -186,7 +185,7 @@ class _Builder:
         self.link(b, both.inputs[1])
         return both.outputs[0]
 
-    def per_element(self, gi, go, entries, columns, table):
+    def per_element(self, gi, go, entries, columns):
         """Per-element outputs (§8.3): each column sampled from the table object at flat = base + ID behind
         valid = 0 <= ID < count, else its fallback. base and count are Index Switches on k, so a no-match
         (k = 0) and an invalid ID both give the fallbacks. Without an ID input, the element index is used;
@@ -209,7 +208,7 @@ class _Builder:
         below = self._compare('LESS_THAN', ident, None, 300, -750)
         self.lookup(self.k, 'INT', 0, counts, sock(below.node.inputs, "B_INT"), -750).node.name = COUNT
         valid = self._and(self._compare('GREATER_EQUAL', ident, 0, 300, -900), below, 450, -800)
-        geometry = self.table_geometry(table)
+        geometry = self.table_geometry()
         values = {}
         for j, column in enumerate(columns):
             y = -1050 - 150 * j
@@ -226,27 +225,24 @@ class _Builder:
 
     # -- table primitives, shared by per_element() and the specs that sample the table themselves (Rules)
 
-    def table_geometry(self, table=None):
+    def table_geometry(self):
         """The table object's geometry, from the group's one Object Info, named tables.NODE."""
         if self._info is None:
             self._info = self.new("GeometryNodeObjectInfo", 300, -1050)
             self._info.name = tables.NODE
-            self._info.inputs["Object"].default_value = self.table if table is None else table
+            self._info.inputs["Object"].default_value = self.table
         return self._info.outputs["Geometry"]
 
     def sample(self, geometry, name, data_type, index, x, y, attribute=None):
-        """Column "oa_<name>" of the table object at `index` (§8.3): Named Attribute, Sample Index (POINT).
-        attribute: a Named Attribute output to share between lookups of the same column."""
+        """Column "oa_<name>" of the table object at the `index` socket (§8.3): Named Attribute, Sample Index
+        (POINT). attribute: a Named Attribute output to share between lookups of the same column."""
         if attribute is None:
             attribute = self.attribute(name, data_type, x, y)
         sampled = self.new("GeometryNodeSampleIndex", x + 150, y)
         sampled.data_type = data_type
         self.link(geometry, sampled.inputs["Geometry"])
         self.link(attribute, _enabled(sampled.inputs, "Value"))
-        if isinstance(index, int):
-            sampled.inputs["Index"].default_value = index
-        else:
-            self.link(index, sampled.inputs["Index"])
+        self.link(index, sampled.inputs["Index"])
         return _enabled(sampled.outputs, "Value")
 
     def attribute(self, name, data_type, x, y):
@@ -302,8 +298,8 @@ def build(node, store, live=None, default=None):
     """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept.
 
     live: the gn tuples of the node's live contexts, in context order (§8.1). None means unknown: every
-    stored entry is laid out, in store order, as before the materialised set existed; only the pass knows
-    the live set. default: the words_key of the entry a no-match shows (k_default_key(), §8.2)."""
+    stored entry is laid out, in store order; only the pass knows the live set. default: the words_key of
+    the entry a no-match shows (k_default_key(), §8.2)."""
     tree = node.node_tree
     if tree is None:
         create_inner(node, store)
@@ -319,9 +315,11 @@ def build(node, store, live=None, default=None):
     builder.node, builder.table = node, table
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
+    if table is not None:  # the table's only user, and how find() sees it, even while nothing samples it yet
+        builder.table_geometry()
     SPECS[node.bl_idname].build(builder, group_in, group_out, entries)
     if columns:
-        builder.per_element(group_in, group_out, entries, columns, table)
+        builder.per_element(group_in, group_out, entries, columns)
     builder.finish()
     if columns:
         tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
@@ -388,15 +386,13 @@ def materialised(entries, live=None, default=None):
     live=None (unknown) gives every stored entry. Pass live as a list: a set has no context order."""
     if live is None:
         return list(entries)
-    ordered, live = isinstance(live, (list, tuple)), [tuple(gn) for gn in live]
-    alive = set(live)
-    rank = {gn: i for i, gn in reversed(list(enumerate(live)))} if ordered else {}
-    chosen = sorted((e for e in entries if e.gn in alive), key=lambda e: rank.get(e.gn, 0))[:MATERIALISED_MAX]
-    pins = sorted((e for e in entries if e.pinned and e.gn not in alive), key=_pin_order)
+    rank = {tuple(gn): i for i, gn in reversed(list(enumerate(live)))}  # a gn's first context wins
+    chosen = sorted((e for e in entries if e.gn in rank), key=lambda e: rank[e.gn])[:MATERIALISED_MAX]
+    pins = sorted((e for e in entries if e.pinned and e.gn not in rank), key=_pin_order)
     chosen += pins[:MATERIALISED_MAX - len(chosen)]
     total = sum(row_count(e) for e in chosen)
-    for entry in sorted((e for e in entries if not e.pinned and e.gn not in alive),
-                        key=lambda e: (default is None or e.words_key != default, -e.t)):
+    for entry in sorted((e for e in entries if not e.pinned and e.gn not in rank),
+                        key=lambda e: (not default or e.words_key != default, -e.t)):  # "" names no entry (_k())
         if len(chosen) >= WARM_TOTAL:
             break
         if total + row_count(entry) <= ROW_BUDGET:
@@ -420,7 +416,7 @@ def k_default_key(last_shown, blocked=False):
 
 def per_word(gns):
     """True when a word contains SEP: its joined key could equal another tuple's, so the node compares word
-    by word (§8.2). The pass can show it in the node's status."""
+    by word (§8.2)."""
     return any(SEP in word for gn in gns for word in gn)
 
 
@@ -459,17 +455,21 @@ def _table_rows(node, entries, columns):
 
 
 def _k(entries, default):
-    """k of the entry with words_key `default`, 0 when there is none: k_default (§8.2)."""
-    return next((k for k, entry in enumerate(entries, start=1) if default is not None and entry.words_key == default), 0)
+    """k of the entry with words_key `default`, 0 when there is none: k_default (§8.2). The words key "" names
+    no entry: every entry converted from v0.1.0 has it, so it can't tell which one a context showed."""
+    return next((k for k, entry in enumerate(entries, start=1) if default and entry.words_key == default), 0)
 
 
 def _built(node, entries, columns, split):
-    """What the graph build() lays out depends on: the node type, the materialised entries' words in order,
-    the per-element columns, per-word compares, and the interface (an absent word is joined as "")."""
+    """What the graph build() lays out depends on: LAYOUT, the node type, the materialised entries' words in
+    order, the per-element columns, per-word compares, the interface (an absent word is joined as ""), and
+    what the spec bakes from the entries besides, its optional layout(node, entries) (Rules: the factors)."""
     face = sorted((i.in_out, i.name, i.socket_type) for i in node.node_tree.interface.items_tree
                   if i.item_type == 'SOCKET')
-    text = json.dumps([node.bl_idname, [entry.gn for entry in entries],
-                       [(c.output, c.name, c.data_type) for c in columns], split, face], ensure_ascii=False)
+    layout = getattr(SPECS[node.bl_idname], "layout", None)
+    text = json.dumps([LAYOUT, node.bl_idname, [entry.gn for entry in entries],
+                       [(c.output, c.name, c.data_type) for c in columns], split, face,
+                       layout and layout(node, entries)], ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 

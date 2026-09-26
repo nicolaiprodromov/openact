@@ -1,7 +1,8 @@
 """The Rules node (§6.5, §9) in a headless Blender. Without arguments no model is used: synthetic answers go
 through the real pass (the Game of Life, in a Simulation Zone, against a Python B3/S23 reference) or straight into
 the store (the cell index for every combination, interpolation, renormalisation and dithering against rules_core's
-references), and a rebuild with the CSV files deleted must leave every output unchanged.
+references), and a rebuild with the CSV files deleted must leave every output unchanged. A Factors CSV edit that
+keeps every row rebuilds the graph for the new factors, and a payload header of any length builds.
 
 With -- --model PORT GPU, the real model answers the Game of Life rule sets (18/18 exact, 0 unsure each).
 
@@ -32,7 +33,7 @@ else:
 
     P._Defaults.auto_start = False  # nothing here may start a model server
     nodes.register()
-from openact import csvfmt, evaluator, inner, pipeline  # noqa: E402
+from openact import csvfmt, evaluator, inner, pipeline, tables  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
 from openact import store as S  # noqa: E402
 from openact.specs import rules as R  # noqa: E402
@@ -472,6 +473,75 @@ def phase_dither():
     rules.inputs["Dither"].default_value = 0.0
 
 
+# --------------------------------------------------------------------------- layout edits and payload names
+
+EDGES = "factor,kind,level,when,from,to\nheat,amount,cold,Cold weather.,0,{0}\nheat,amount,hot,Hot weather.,{0},1\n"
+LEVELS = "factor,kind,level,when\nheat,amount,cold,Cold.\n{mild}heat,amount,hot,Hot.\n"
+
+
+def planned(rules):
+    """Run a pass and return the Jobs it asks for this node; nothing reaches a server."""
+    jobs = []
+    submit = engine._submit
+    engine._submit = lambda job, missing: jobs.append(job) if job.uid == rules.uid else None
+    try:
+        engine.run_pass()
+    finally:
+        engine._submit = submit
+    return jobs
+
+
+def answer_cells(jobs, outcome):
+    """Remember an answer for every cell the jobs ask: outcome(row name) is the row of the outcome that wins."""
+    for job in jobs:
+        for row in job.rows:
+            if row.cell is not None:
+                pipeline.remember(row.cell.key, {"model": "fake", "probabilities": [
+                    0.9 if int(key) == outcome(row.name) else 0.1 for key in row.cell.question["criteria"]]})
+
+
+def phase_layout_edit():
+    """A Factors CSV edit that keeps every row (band edges moved, a level removed) replaces the entry in place with 0
+    requests. The graph bakes the factors, so the pass rebuilds it, and the outputs follow the new layout (§8.8)."""
+    cases = (("Edges", EDGES.format("0.5"), EDGES.format("0.2"), {"cold": 0, "hot": 1}, [0.1, 0.3, 0.6, 0.9],
+              [0, 0, 1, 1], [0, 1, 1, 1]),
+             ("Levels", LEVELS.format(mild="heat,amount,mild,Mild.\n"), LEVELS.format(mild=""),
+              {"cold": 0, "mild": 1, "hot": 0}, [0.1, 0.5, 0.9], [0, 1, 0], [0, 0, 0]))
+    for name, factors, edited, table, heat, first, then in cases:
+        path = write(f"{name}_factors.csv", factors)
+        tree, rules, obj, gi, go = scene(name, path, write(f"{name}_outcomes.csv", TWO), {"in_heat": ('FLOAT', heat)},
+                                         question="Which one?")
+        answer_cells(planned(rules), table.__getitem__)  # the first pass plans, and the heat socket appears
+        wire(tree, rules, gi, go, ["Outcome"])
+        planned(rules)
+        before = read(obj, ["Outcome"])["Outcome"]
+        write(f"{name}_factors.csv", edited)
+        csvfmt.clear_cache()
+        asked = planned(rules)
+        got = read(obj, ["Outcome"])["Outcome"]
+        check(f"layout edit ({name.lower()}): 0 requests, and the rebuilt graph follows the new factors",
+              before == first and not asked and got == then, (before, len(asked), got))
+
+
+def phase_long_header():
+    """A payload header of 62 bytes: as oa_pl_<header> its table column would need 68 bytes, which Blender 4.5 refuses,
+    so it is named by position (§8.5). The node builds, and its payload output reads the baked value."""
+    header = "h" * 62
+    factors = write("long_factors.csv", "factor,kind,level,when\nheat,amount,cold,Cold.\nheat,amount,hot,Hot.\n")
+    outcomes = write("long_outcomes.csv", f"answer,when,{header}\nA,the first,1\nB,the second,2\n")
+    tree, rules, obj, gi, go = scene("LongHeader", factors, outcomes, {"in_heat": ('FLOAT', [0.1, 0.9])},
+                                     question="Which payload?")
+    answer_cells(planned(rules), lambda _name: 1)  # B, whose payload is 2, everywhere
+    wire(tree, rules, gi, go, [header])
+    planned(rules)
+    table = tables.find(rules)
+    names = sorted(a.name for a in table.data.attributes if a.name.startswith(tables.ATTR)) if table else []
+    status = engine.STATUS.get(rules.uid)
+    check("payload: a 62-byte header builds, its table column is named by position (oa_pl_0), and its output reads "
+          "it", status is not None and status[0] == 'CHECKMARK' and "oa_pl_0" in names
+          and read(obj, [header])[header] == [2, 2], (status, names))
+
+
 # --------------------------------------------------------------------------- the real model
 
 def phase_model(port, gpu):
@@ -518,6 +588,8 @@ try:
         phase_life()
         phase_interpolation()
         phase_dither()
+        phase_layout_edit()
+        phase_long_header()
 except Exception:
     import traceback
 
