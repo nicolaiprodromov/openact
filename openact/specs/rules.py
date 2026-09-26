@@ -13,7 +13,7 @@ import itertools
 import os
 
 from .. import csvfmt, pipeline, rules_core
-from .base import KEY, Spec, confidence
+from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, yes_no_text
 
 FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
 OUTCOMES_HINT = "Add outcomes"
@@ -88,6 +88,7 @@ class RulesSpec(Spec):
             SocketDef('INPUT', "Context", 'NodeSocketString', "The situation every cell shares", kind="word"),
             *sources.csv_inputs("Factors", "A Factors CSV: factor,kind,level,when,value,from,to"),
             *sources.csv_inputs("Outcomes", "The outcomes: inline, or a CSV with answer,when[,if][,payload...]"),
+            *overrides_inputs(),
         ]
         defs += [SocketDef('INPUT', name, SOCKETS[kind], f"Factor '{name}' ({kind}), per element", kind="field")
                  for name, kind in factors]
@@ -172,7 +173,7 @@ class RulesSpec(Spec):
                 raise Unresolvable(f"Outcomes: {error}") from None
             raise lists.file_error(answers.doc, error) from None
         self._declare(node, factors, answers)
-        return job
+        return self.locked(node, ctx, job)
 
     def job(self, gn, factors, answers, answer_type, debias, hashes=(), uid=""):
         """The Job for these words, factors and outcomes (None: the default Yes/No or Amount levels). Pure, so the
@@ -202,7 +203,32 @@ class RulesSpec(Spec):
                             for name, kind in answers.doc.num_cols.items())
         shape = RulesShape(len(rows), columns, tuple(declare(f) for f in factors), payload)
         words_key = pipeline.words_key(gn, list(hashes), answer_type, shape.digest(), [row.wkey for row in rows])
-        return pipeline.Job(uid, tuple(gn), words_key, shape, rows, answer_type=answer_type, debias=debias)
+        return pipeline.Job(uid, tuple(gn), words_key, shape, rows, answer_type=answer_type, debias=debias,
+                            options=tuple(option.name for option in options))
+
+    # ------------------------------------------------------------------ the Overrides CSV (§7.6)
+
+    def override_keys(self, job):
+        return [f["name"] for f in job.shape.factors]  # one column per factor, holding level names
+
+    def override_units(self, job):
+        levels = itertools.product(*(f["levels"] for f in job.shape.factors))  # row order is cell order
+        return [(cells, (i,)) for i, cells in enumerate(levels)]
+
+    def lock_values(self, job, rows, answer):
+        if job.answer_type == 'ONE_OF':
+            outcome = named(answer, job.options)
+            return f"'{answer}' is not an outcome" if outcome is None else [{"outcome": outcome, "c": 1.0}]
+        value = lock_answer(job.answer_type, answer, job.options)
+        return value if isinstance(value, str) else [{rules_core.value_column(job.answer_type): value, "c": 1.0,
+                                                      "ok": 1.0}]
+
+    def answer_text(self, job, index, values):
+        if job.answer_type == 'ONE_OF':
+            outcome = values["outcome"]
+            return job.options[outcome] if 0 <= outcome < len(job.options) else ""
+        value = values[rules_core.value_column(job.answer_type)]
+        return number_text(value) if job.answer_type == 'AMOUNT' else yes_no_text(value)
 
     # ------------------------------------------------------------------ answers
 

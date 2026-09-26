@@ -74,17 +74,18 @@ def items(node):
 
 
 def phase_sync():
-    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # Question, Context, Answer, Yes, Confidence, Answers (+CSV), Key
+    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # Question, Context, outputs, Answers, Overrides (+CSV), Key
     by = {d.name: d for d in spec}
     kept = {s.name: s.identifier for s in (*ask.inputs, *ask.outputs)}
     tag = SocketDef('INPUT', "Tag", 'NodeSocketString', "Compared, never sent to the model", kind="word", hidden=True)
     extra = SocketDef('OUTPUT', "Extra", 'NodeSocketInt', "An extra output")
-    wanted = [by["Context"], by["Question"], by["Answers"], by["Answers CSV"], tag, by["Key"], by["Confidence"],
-              by["Answer"], by["Yes"], extra]  # Context first, Confidence first
-    inputs = ("Question", "Context", "Answers", "Answers CSV", "Key")
+    wanted = [by["Context"], by["Question"], by["Answers"], by["Answers CSV"], by["Overrides"], by["Overrides CSV"], tag,
+              by["Key"], by["Confidence"], by["Answer"], by["Yes"], extra]  # Context first, Confidence first
+    inputs = ("Question", "Context", "Answers", "Answers CSV", "Overrides", "Overrides CSV", "Key")
     inner.sync_interface(ask, wanted)
     check("sync: new sockets reach the node, in the wanted order",
-          names(ask.inputs) == ["Context", "Question", "Answers", "Answers CSV", "Tag", "Key"]
+          names(ask.inputs) == ["Context", "Question", "Answers", "Answers CSV", "Overrides", "Overrides CSV", "Tag",
+                                "Key"]
           and names(ask.outputs) == ["Confidence", "Answer", "Yes", "Extra"], (names(ask.inputs), names(ask.outputs)))
     check("sync: matched sockets keep their identifiers (the interface is never cleared)",
           all(sock(ask.inputs if name in inputs else ask.outputs, identifier).name == name
@@ -115,7 +116,7 @@ def phase_sync():
 
     inner.sync_interface(ask, spec)
     check("sync: obsolete sockets are removed and the order restored",
-          names(ask.inputs) == ["Question", "Context", "Answers", "Answers CSV", "Key"]
+          names(ask.inputs) == ["Question", "Context", "Answers", "Answers CSV", "Overrides", "Overrides CSV", "Key"]
           and names(ask.outputs) == ["Answer", "Yes", "Confidence"], (names(ask.inputs), names(ask.outputs)))
     check("sync: kept sockets and links are untouched by the removals",
           all(sock((*ask.inputs, *ask.outputs), identifier).name == name for name, identifier in kept.items())

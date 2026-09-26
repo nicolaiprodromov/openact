@@ -6,7 +6,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline, store
-from .base import KEY, confidence
+from .base import KEY, confidence, named, overrides_inputs
 from .match import PerItemSpec
 
 
@@ -54,6 +54,7 @@ class ClassifySpec(PerItemSpec):
             SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat', "How clearly the label wins over the runner-up (0-1)"),
             *(SocketDef('OUTPUT', header, 'NodeSocketInt' if kind == 'INT' else 'NodeSocketFloat',
                         f"The Labels CSV's '{header}' of the chosen label") for header, kind in payload),
+            *overrides_inputs(),
             SocketDef(*KEY),
         ]
 
@@ -74,7 +75,7 @@ class ClassifySpec(PerItemSpec):
             # the payload outputs follow the Labels CSV; the rebuild lays their columns out at once
             inner.sync_interface(node, self.interface(node, payload))
             inner.build(node, store.load(node))
-        return self.job(gn, items, labels, node.balance_order, node.uid)
+        return self.locked(node, ctx, self.job(gn, items, labels, node.balance_order, node.uid))
 
     def job(self, gn, items, labels, debias, uid=""):
         """The Job for these words, items (an ItemList or its items) and labels. Pure, like Ask's and Pick's."""
@@ -91,6 +92,14 @@ class ClassifySpec(PerItemSpec):
         probabilities = answer["probabilities"]
         label = max(range(len(probabilities)), key=probabilities.__getitem__)  # the first of equal ones, as the server
         return {"label": label, "c": confidence('ONE_OF', probabilities)}
+
+    def lock_values(self, job, rows, answer):
+        label = named(answer, job.labels)
+        return f"'{answer}' is not one of the labels" if label is None else [{"label": label, "c": 1.0}]
+
+    def answer_text(self, job, index, values):
+        label = values["label"]
+        return job.labels[label] if 0 <= label < len(job.labels) else ""
 
     def resolve(self, job, entries, last_shown=""):
         """Spec.resolve(), with each row's payload baked from its label (denormalised, §8.1). A numbers-only edit of

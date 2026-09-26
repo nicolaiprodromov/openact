@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, state_text, warnings
+from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, state_text, warnings, yes_no_text
 
 ANSWERS = ("Optional answer set. Yes / No: 'yes: <when>; no: <when>'. Amount: 2-16 levels, lowest first, e.g. "
            "'none; dusting; patchy; thick; buried'. Or a .csv path. Empty: Yes / No, or Not at all ... Extremely")
@@ -29,7 +29,8 @@ class AskSpec(Spec):
         from ..inner import SocketDef  # imports bpy
         from ..sources import csv_inputs
 
-        return [*(SocketDef(*args) for args in self.SOCKETS), *csv_inputs("Answers", ANSWERS), SocketDef(*KEY)]
+        return [*(SocketDef(*args) for args in self.SOCKETS), *csv_inputs("Answers", ANSWERS), *overrides_inputs(),
+                SocketDef(*KEY)]
 
     def answers(self, node, ctx):
         from .. import sources  # imports bpy
@@ -54,7 +55,7 @@ class AskSpec(Spec):
         answers = self.answers(node, ctx)
         job = self.job(gn, node.answer_type, node.balance_order, node.uid, answers)
         job.problems = warnings(answers.problems)
-        return job
+        return self.locked(node, ctx, job)
 
     def job(self, gn, answer_type, debias, uid="", answers=None):
         """The Job for these words and answer set (csvfmt.AnswerSet; None: the default Yes / No or five levels).
@@ -77,12 +78,23 @@ class AskSpec(Spec):
         shape = pipeline.TableShape(1, columns)
         csv = [answers.doc.text_hash] if answers.doc is not None else []
         return pipeline.Job(uid, tuple(gn), pipeline.words_key(gn, csv, answer_type, shape.digest(), [row.wkey]),
-                            shape, [row], answer_type=answer_type, debias=debias)
+                            shape, [row], answer_type=answer_type, debias=debias,
+                            options=tuple(option.name for option in answers.options))
 
     def values(self, index, answer):
         if "amount" in answer:  # parse() gave score / (L - 1), as sources.amount_value() does for custom levels
             return {"amount": answer["amount"], "c": confidence('AMOUNT', answer["probabilities"])}
         return {"p": answer["p"], "c": confidence('YES_NO', (answer["p"], 1.0 - answer["p"]))}
+
+    OVERRIDE_KEYS = ("question",)
+
+    def lock_values(self, job, rows, answer):
+        value = lock_answer(job.answer_type, answer, job.options)
+        column = "amount" if job.answer_type == 'AMOUNT' else "p"
+        return value if isinstance(value, str) else [{column: value, "c": 1.0}]
+
+    def answer_text(self, job, index, values):
+        return number_text(values["amount"]) if "amount" in values else yes_no_text(values["p"])
 
     def single(self, rows):
         values = rows[0].values
