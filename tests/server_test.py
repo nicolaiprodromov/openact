@@ -129,10 +129,10 @@ def ask(port, request, token=TOKEN, **headers):
     if token:
         headers["X-OpenAct-Token"] = token
     code, reply = call(port, "POST", "/v1/systemone", request, headers)
-    if isinstance(request, bytes) or code == 403:  # logged as the body's text: not JSON, or refused unparsed
-        sent = request.decode("utf-8", "replace") if isinstance(request, bytes) else json.dumps(request)
+    if code == 403:
+        sent = None  # refused bodies are skipped, never kept
     else:
-        sent = request
+        sent = request.decode("utf-8", "replace") if isinstance(request, bytes) else request
     RECORDED.append((code, sent, reply.get("answers")))
     return code, reply
 
@@ -386,7 +386,7 @@ def phase_bad_requests(port):
 def phase_record(path):
     with open(path, encoding="utf-8") as handle:
         lines = [json.loads(line) for line in handle]
-    check("record: one line per request whose body was read, refused ones too", len(lines) == len(RECORDED),
+    check("record: one line per request, refused ones too", len(lines) == len(RECORDED),
           (len(lines), len(RECORDED)))
     check("record: each line holds the request as sent, its status and its answers",
           [(line.get("status"), line.get("request"), line.get("answers")) for line in lines] == RECORDED)

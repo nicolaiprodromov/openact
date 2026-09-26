@@ -29,7 +29,6 @@ import hmac
 import json
 import math
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -134,18 +133,9 @@ class SemIfTorchBackend(Backend):
             if torch.version.cuda is None:
                 raise RuntimeError("The runtime's PyTorch has no CUDA support (a CPU-only build): "
                                    "reinstall the runtime")
-            gpus = None  # how many GPUs the driver lists: --gpu (CUDA_VISIBLE_DEVICES) hides the others from CUDA
-            try:
-                listed = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20,
-                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                if listed.returncode == 0:
-                    gpus = sum(line.startswith("GPU ") for line in listed.stdout.splitlines())
-            except (OSError, subprocess.SubprocessError):
-                pass
-            if gpus is not None and self.args.gpu is not None and self.args.gpu >= gpus:
-                raise RuntimeError(f"GPU {self.args.gpu} not found: this machine has {gpus} NVIDIA GPU(s). "
-                                   "Pick another GPU in the preferences")
-            raise RuntimeError(NO_CUDA)
+            # --gpu becomes CUDA_VISIBLE_DEVICES, so a GPU index the machine lacks looks the same as an old driver
+            raise RuntimeError(NO_CUDA if self.args.gpu is None else
+                               f"{NO_CUDA} Or does GPU {self.args.gpu} not exist? Pick another GPU in the preferences.")
         if device == "cpu" and dtype == "bfloat16":
             dtype = "float32"  # SemIf's documented CPU reference path
         log(f"loading {self.args.model}@{self.args.revision[:12]} on {device} ({dtype})")
@@ -312,8 +302,8 @@ class Engine:
         }
 
     def record(self, code, request, answers):
-        """--record: one JSON line per /v1/systemone request whose body was read, refused ones too: its
-        status, the request (the body's text if it was refused or is not JSON) and its answers (null unless 200)."""
+        """--record: one JSON line per /v1/systemone request, except a 400 or 413 (its body left unread): its
+        status, the request (null if refused, the body's text if not JSON) and its answers (null unless 200)."""
         if not self.args.record:
             return
         try:
@@ -598,17 +588,15 @@ class Handler(BaseHTTPRequestHandler):
         if refused is None and TOKEN and not hmac.compare_digest(
                 self.headers.get("X-OpenAct-Token", "").encode(), TOKEN.encode()):
             refused = "missing or wrong X-OpenAct-Token"
-        keep = not refused or (ENGINE.args.record and self.path == "/v1/systemone")  # tests log refused bodies
-        if length > MAX_BODY or not keep:
+        if refused or length > MAX_BODY:
             self._skip(length)
+            if refused and self.path == "/v1/systemone":
+                ENGINE.record(403, None, None)  # a refused body is skipped, never kept
             code, error = (403, refused) if refused else (413, "request too large")
             self._send(code, {"error": error})
             return
         raw = self.rfile.read(length) if length else b""
-        if refused:  # --record logs a refused body as it came, unparsed
-            ENGINE.record(403, raw.decode("utf-8", "replace"), None)
-            self._send(403, {"error": refused})
-        elif self.path == "/v1/systemone":
+        if self.path == "/v1/systemone":
             self._send(*self._systemone(raw))
         elif self.path == "/shutdown":
             self._send(200, {"ok": True})
