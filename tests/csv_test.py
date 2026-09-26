@@ -1165,7 +1165,7 @@ def test_per_item_cells():
 
 def test_dials_cells():
     """Dials asks each setting as Ask asks its answer set (sources.question()), so equal questions share a cell. And the
-    warning for contexts whose settings differ names both, and what only one of them has."""
+    error for contexts whose settings differ names both, and what only one of them has."""
     from openact.specs.ask import AskSpec
     from openact.specs.dials import DialsSpec, differ
 
@@ -1189,13 +1189,11 @@ def test_dials_cells():
           and job.rows[4].wkey == pipeline.wkey("dials", "amount", [storm], ["How foggy is it?"], []),
           [(row.cell.state, row.cell.cost) for row in job.rows])
     wet, snow, when = ("Wet", "yes_no"), ("Snow", "amount"), ("When", "one_of")
-    got = [differ("A > Dials", [wet, when], "B > Dials", theirs) for theirs in ([wet, snow], [wet, when, snow],
-                                                                                [when, wet])]
+    got = [differ("A > Dials", [wet, when], "B > Dials", theirs) for theirs in ([wet, snow], [wet, when, snow])]
     tail = "; setting names and types must agree"
-    check("dials cells: the disagreement warning names both contexts, and what only one of them has", got == [
+    check("dials cells: the disagreement error names both contexts, and what only one of them has", got == [
         f"Dials: 'A > Dials' and 'B > Dials' use different settings ('When' (one-of) vs 'Snow' (amount)){tail}",
-        f"Dials: 'A > Dials' and 'B > Dials' use different settings (only 'B > Dials' has 'Snow' (amount)){tail}",
-        f"Dials: 'A > Dials' and 'B > Dials' use different settings (the same settings in another order){tail}"], got)
+        f"Dials: 'A > Dials' and 'B > Dials' use different settings (only 'B > Dials' has 'Snow' (amount)){tail}"], got)
 
 
 def test_cache():

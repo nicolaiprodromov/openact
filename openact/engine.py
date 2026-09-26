@@ -255,8 +255,8 @@ def _process(tree, node, contexts):
     hidden = set()  # (gn, words key) of stored entries whose words mean something else now: kept for their rows
     problems, warnings, hints, failed = [], [], [], []
     upstream = waiting = changed = False
-    # §6.0: the sockets follow the live jobs (Rules, Classify). Jobs that disagree answer nothing, so the last good
-    # table stays, as it does while a context's CSV has errors (§7.8): that context still shows its last table
+    # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
+    # good table stays, as it does while a context's CSV has errors (§7.8): that context still shows its last table
     held = hasattr(spec, "agree") and _csv_error(spec, node, contexts)
     conflict = spec.agree(node, _jobs(node, contexts)) if hasattr(spec, "agree") and not held else ""
     if conflict:
@@ -334,8 +334,6 @@ def _process(tree, node, contexts):
             changed = rows = False
             node_store = store.load(node)
     warnings += orphaned([job for job, _ctx in jobs.values()])  # locks no context's rows use (§7.6)
-    if hasattr(spec, "sync"):  # outputs that follow the entries shown, kept while none is (Dials, §6.0)
-        spec.sync(node, shown)
     last = [LAST_SHOWN.get((node.uid, ctx.key())) for ctx in contexts]
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     graph = node_store
