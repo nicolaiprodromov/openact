@@ -331,8 +331,9 @@ def materialised(entries, live=None, default=None):
     live=None (unknown) gives every stored entry. Pass live as a list: a set has no context order."""
     if live is None:
         return list(entries)
+    ordered, live = isinstance(live, (list, tuple)), [tuple(gn) for gn in live]
     alive = set(live)
-    rank = {gn: i for i, gn in reversed(list(enumerate(live)))} if isinstance(live, (list, tuple)) else {}
+    rank = {gn: i for i, gn in reversed(list(enumerate(live)))} if ordered else {}
     chosen = sorted((e for e in entries if e.gn in alive), key=lambda e: rank.get(e.gn, 0))[:MATERIALISED_MAX]
     pins = sorted((e for e in entries if e.pinned and e.gn not in alive), key=_pin_order)
     chosen += pins[:MATERIALISED_MAX - len(chosen)]

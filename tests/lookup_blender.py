@@ -13,7 +13,9 @@ import contextlib
 import itertools
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 
 import bpy
@@ -776,6 +778,12 @@ def phase_table(tree_, picker, users, idents):
     entries = [table_entry("TA", 1, [0.25, 0.625, 0.125]), table_entry("TB", 3, [0.125, 0.25, 0.125, 0.5]),
                table_entry("TC", 0, [0.75, 0.25])]
     node_store, live = S.NodeStore(entries), [e.gn for e in entries]
+    inner.build(picker, S.NodeStore(), live)  # never answered, Probability linked: an empty table
+    empty = tables.find(picker)
+    check("table: before the first answer, an empty table object and neutral values everywhere",
+          empty is not None and len(empty.data.vertices) == 0 and "oa_prob" in empty.data.attributes
+          and reads(users, [None] * 3)[0] == {key: table_expected(None, TABLE_WORDS[key]["Shift"]) for key in users},
+          reads(users, [None] * 3)[0])
     inner.build(picker, node_store, live)
     table = tables.find(picker)
     column = table and [round(d.value, 6) for d in table.data.attributes["oa_prob"].data]
@@ -913,6 +921,43 @@ def phase_table_copies(tree_, picker, users, node_store, live):
     check("Pick: with Probability unlinked, build() releases the table object and garbage removes it; linked "
           "again, a rebuild brings a new one", refused is False and released and removed == 1 and rebuilt
           and tables.find(picker) is not None and got == want, (refused, released, removed, rebuilt))
+
+
+def phase_save_reload():
+    """Last, because it reloads the file (§8.5): the table object, in no collection, is saved through the Object
+    Info that reads it and survives Purge Unused Data; appending its tree brings a table along, renamed .001, and
+    garbage collection, going by reference, keeps both."""
+    def picker_in(group):
+        return next(n for n in group.nodes if n.bl_idname == engine.PICK_ID)
+
+    folder = tempfile.mkdtemp(prefix="openact-lookup-")
+    path, twin_path = os.path.join(folder, "tables.blend"), os.path.join(folder, "append.blend")
+    try:
+        before = {key: table_read(bpy.data.objects[key]) for key in TABLE_WORDS}
+        name = tables.find(picker_in(bpy.data.node_groups["Table"])).name
+        bpy.ops.wm.save_as_mainfile(filepath=twin_path, copy=True)
+        bpy.ops.wm.save_as_mainfile(filepath=path)
+        bpy.ops.wm.open_mainfile(filepath=path)
+        table = bpy.data.objects.get(name)
+        after = {key: table_read(bpy.data.objects[key]) for key in TABLE_WORDS}
+        bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        purged = {key: table_read(bpy.data.objects[key]) for key in TABLE_WORDS}
+        check("save/reload: the table object, in no collection, is saved with the group that reads it and survives "
+              "Purge Unused Data", table is not None and not table.users_collection and after == before
+              and bpy.data.objects.get(name) is not None and purged == before, (name, after, purged))
+
+        with bpy.data.libraries.load(twin_path) as (_source, target):
+            target.node_groups = ["Table"]
+        appended = picker_in(target.node_groups[0])
+        engine.ensure_owned(list(engine.iter_nodes()))
+        mine, theirs = tables.find(picker_in(bpy.data.node_groups["Table"])), tables.find(appended)
+        removed = tables.collect_garbage(list(engine.iter_nodes()))
+        check("append: the appended tree brings its own table object along, and garbage going by reference keeps both",
+              theirs is not None and theirs != mine and theirs.name.startswith(name) and removed == 0
+              and [d.value for d in theirs.data.attributes["oa_prob"].data]
+              == [d.value for d in mine.data.attributes["oa_prob"].data], (theirs and theirs.name, removed))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def phase_tables():
@@ -1060,4 +1105,5 @@ phase_tables()
 if "--bench" in ARGS:
     chosen = os.environ.get("OPENACT_BENCH_SHAPE", "")
     phase_bench({chosen} if chosen in ("demo", "worst") else {"demo", "worst"})
+phase_save_reload()  # last: it reloads the file
 finish()
