@@ -188,6 +188,18 @@ def _backend():
     return "fake" if os.environ.get("OPENACT_BACKEND") == "fake" else "semif"
 
 
+def _other_backend(health):
+    """The backend of the OpenAct server that sent this /health, if it is not the one this session uses."""
+    running = health.get("backend", "semif-torch")  # servers before 1.0.0 only ran SemIf
+    return None if running == ("fake" if _backend() == "fake" else "semif-torch") else running
+
+
+def state_dir(root):
+    """Writable state such as server.log: OPENACT_STATE_DIR, so the runtime can be shared read-only,
+    else the runtime folder."""
+    return os.environ.get("OPENACT_STATE_DIR") or root
+
+
 def refresh(prefs=None):
     """Update the status from the file system and a quick /health probe (non-blocking)."""
     prefs = prefs or P.get_prefs()
@@ -210,7 +222,7 @@ def refresh(prefs=None):
             code, health = 0, {}
             if STATE.status == "ready":
                 STATE.set("stopped", "The model server stopped")
-        if code == 200 and health.get("server") == SERVER_ID:
+        if code == 200 and health.get("server") == SERVER_ID and not _other_backend(health):
             _apply_health(health)
             if health.get("status") == "loading":
                 _start_polling(None)
@@ -245,6 +257,11 @@ def start(prefs=None):
     try:
         code, health = http("GET", "/health", timeout=0.5)
         if code == 200 and health.get("server") == SERVER_ID:
+            other = _other_backend(health)
+            if other:
+                STATE.set("error", f"Port {STATE.port} is used by an OpenAct model server with the {other} backend. "
+                                   "Stop it or pick another port in the preferences")
+                return False
             _apply_health(health)
             if health.get("status") == "loading":
                 _start_polling(None)
@@ -258,11 +275,12 @@ def start(prefs=None):
         pass  # nothing is listening: start our own
 
     python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
-    state_dir = os.environ.get("OPENACT_STATE_DIR") or root  # writable state; the runtime may be shared read-only
-    STATE.log_path = os.path.join(state_dir, "server.log")
+    folder = state_dir(root)
+    STATE.log_path = os.path.join(folder, "server.log")
     env = dict(os.environ)
     for key in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
+    env.pop("OPENACT_TOKEN", None)  # this add-on sends no X-OpenAct-Token, so its server must not require one
     env.update({
         "HF_HOME": P.hf_home(root),
         "HF_HUB_OFFLINE": "1",
@@ -275,12 +293,12 @@ def start(prefs=None):
     if prefs.device != "cpu":
         args += ["--gpu", str(prefs.gpu)]
     try:
-        os.makedirs(state_dir, exist_ok=True)
+        os.makedirs(folder, exist_ok=True)
         log = open(STATE.log_path, "w", encoding="utf-8")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         STATE.process = subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            cwd=state_dir, env=env, creationflags=flags,
+            cwd=folder, env=env, creationflags=flags,
         )
         log.close()  # the child keeps its own handle
     except OSError as error:

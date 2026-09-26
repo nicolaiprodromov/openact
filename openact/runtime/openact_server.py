@@ -46,10 +46,12 @@ SLOTS = 16  # SemIf answer letters A..P
 MAX_CHOICE_OPTIONS = 255
 MAX_SCORE_LEVELS = 16
 MAX_QUESTIONS = 256
+MAX_TOKENS = 4096  # SemIf's prompt limit per row
 BATCH_ROWS = 32
 CACHE_SIZE = 65536  # questions
 MAX_BODY = 4 * 1024 * 1024
 EMA_ALPHA = 2 / (64 + 1)  # ms_per_row: an EMA spanning about the last 64 scoring calls
+NO_CUDA = "CUDA is not available to PyTorch (is the NVIDIA driver too old for cu128?)"
 
 
 def log(*parts):
@@ -58,8 +60,6 @@ def log(*parts):
 
 class RequestError(ValueError):
     """The request is malformed (HTTP 422)."""
-
-    question = None  # the id of the question at fault, when there is one
 
 
 def _text(value, what):
@@ -94,25 +94,25 @@ def _confidence(probabilities):
 
 
 def _sha256_json(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    # No sort_keys: the answer depends on the order of options and of keys in the state (SemIf's prompt).
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 class Backend(Protocol):
     name: str  # "semif-torch" or "fake"
-    slots: int  # options scored in one row
     model_id: str  # provenance for /health, e.g. "Qwen/Qwen3.5-4B@851bf6e8"
     device: str | None  # known once loaded
 
     def load(self) -> None: ...
 
     def score_rows(self, rows: list[dict]) -> list[dict]:
-        """SemIf rows that share one state -> [{"option_ids", "probabilities", "input_tokens"}]."""
+        """SemIf rows of up to SLOTS options sharing one state -> [{"option_ids", "probabilities",
+        "input_tokens"}]. A ValueError caused by one row carries that row's id as `row`."""
         ...
 
 
 class SemIfTorchBackend(Backend):
     name = "semif-torch"
-    slots = SLOTS
 
     def __init__(self, args):
         self.args = args
@@ -127,7 +127,9 @@ class SemIfTorchBackend(Backend):
         device = self.args.device
         dtype = self.args.dtype
         if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cuda"  # never a silent CPU load: 16 GB of RAM and far too slow
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(NO_CUDA)
         if device == "cpu" and dtype == "bfloat16":
             dtype = "float32"  # SemIf's documented CPU reference path
         log(f"loading {self.args.model}@{self.args.revision[:12]} on {device} ({dtype})")
@@ -145,17 +147,27 @@ class SemIfTorchBackend(Backend):
         ])
 
     def score_rows(self, rows):
-        from semif_phase1.direct import score
+        from semif_phase1.direct import encode_prompt, score
         from semif_phase1.shared import score_shared
 
         results = []
         for start in range(0, len(rows), BATCH_ROWS):
             chunk = rows[start:start + BATCH_ROWS]
-            if len(chunk) == 1:
-                results.append(score(self.model, self.tokenizer, chunk[0], self.metadata))
-            else:
-                scored, _timing = score_shared(self.model, self.tokenizer, chunk, self.metadata)
-                results.extend(scored)
+            try:
+                if len(chunk) == 1:
+                    results.append(score(self.model, self.tokenizer, chunk[0], self.metadata, MAX_TOKENS))
+                else:
+                    scored, _timing = score_shared(self.model, self.tokenizer, chunk, self.metadata, MAX_TOKENS)
+                    results.extend(scored)
+            except ValueError as error:
+                # Only tokenising again tells which row SemIf refused, e.g. one over the token limit.
+                for row in chunk:
+                    try:
+                        encode_prompt(self.tokenizer, row, MAX_TOKENS)
+                    except ValueError:
+                        error.row = row["id"]
+                        break
+                raise
         return results
 
 
@@ -163,14 +175,15 @@ class FakeBackend(Backend):
     """Deterministic answers without torch or a GPU, for tests.
 
     An option's weight depends only on (state, question, option id), so answers are the same in
-    every run and do not depend on the option order. --fake-script is a JSON list of rules: the
-    first rule whose "state" and "question" texts (both optional) occur in a row's state and
-    question decides that row, with its "answer": an option id, or a map of option ids to weights.
-    A row with no matching rule, or none of whose options the answer names, keeps the hash weights.
+    every run, and a row's answer does not depend on the order of its options (a tournament still
+    groups options by position). Rows over SemIf's token limit are refused as SemIf refuses them.
+    --fake-script is a JSON list of rules: the first rule whose "state" and "question" texts (both
+    optional) occur in a row's state and question decides that row, with its "answer": an option
+    id, or a map of option ids to weights. A row with no matching rule, or none of whose options
+    the answer names, keeps the hash weights.
     """
 
     name = "fake"
-    slots = SLOTS
     model_id = "fake"
     device = "fake"
 
@@ -182,20 +195,20 @@ class FakeBackend(Backend):
         time.sleep(self.args.fake_load_seconds)
         if self.args.fake_load_fail:
             raise RuntimeError("simulated load failure (--fake-load-fail)")
+        if self.args.fake_no_cuda:
+            raise RuntimeError(NO_CUDA)
         if self.args.fake_script:
             with open(self.args.fake_script, encoding="utf-8") as handle:
-                script = json.load(handle)
-            if not isinstance(script, list) or not all(
-                    isinstance(rule, dict) and "answer" in rule
-                    and all(isinstance(rule.get(key, ""), str) for key in ("state", "question"))
-                    for rule in script):
-                raise ValueError('--fake-script must be a list of rules with an "answer" and optional '
-                                 '"state" and "question" texts')
-            self.script = script
+                self.script = json.load(handle)
 
     def score_rows(self, rows):
         results = []
         for row in rows:
+            tokens = len(json.dumps(row, ensure_ascii=False)) // 4
+            if tokens > MAX_TOKENS:
+                error = ValueError(f"Row {row['id']}: about {tokens} input tokens exceed limit {MAX_TOKENS}")
+                error.row = row["id"]
+                raise error
             ids = [option["id"] for option in row["options"]]
             # exp() spreads the hash into decisive answers, like the real model's
             weights = self._scripted(row, ids) or [
@@ -204,7 +217,7 @@ class FakeBackend(Backend):
             ]
             total = sum(weights)
             results.append({"option_ids": ids, "probabilities": [weight / total for weight in weights],
-                            "input_tokens": len(json.dumps(row, ensure_ascii=False)) // 4})
+                            "input_tokens": tokens})
         return results
 
     def _scripted(self, row, ids):
@@ -225,7 +238,7 @@ class Engine:
         self.status = "loading"
         self.error = None
         self.gpu = threading.Lock()  # one scoring call at a time
-        self.cache = OrderedDict()  # sha256([state, question, debias]) -> answer
+        self.cache = OrderedDict()  # sha256([sha256(state), question, debias]) -> answer
         self.cache_lock = threading.Lock()
         self.record_lock = threading.Lock()
         self.load_seconds = None
@@ -241,8 +254,8 @@ class Engine:
             self.status = "ready"
             log(f"ready on {self.backend.device} in {self.load_seconds:.1f}s")
         except Exception as error:  # reported through /health and every POST
-            self.status = "error"
             self.error = f"{type(error).__name__}: {error}"
+            self.status = "error"  # after the message, which HTTP threads read once they see "error"
             log("model failed to load:\n" + traceback.format_exc())
 
     def health(self):
@@ -273,7 +286,7 @@ class Engine:
             "version": SERVER_VERSION,
             "backend": self.backend.name,
             "model_id": self.backend.model_id,
-            "slots": self.backend.slots,
+            "slots": SLOTS,
             "max_options": MAX_CHOICE_OPTIONS,
             "max_levels": MAX_SCORE_LEVELS,
             "max_questions": MAX_QUESTIONS,
@@ -283,12 +296,16 @@ class Engine:
         }
 
     def record(self, code, request, answers):
-        """--record: one JSON line per request as received, with its answers (null unless 200)."""
+        """--record: one JSON line per /v1/systemone request whose body was read, refused ones too:
+        its status, the request (the body's text when it is not JSON) and its answers (null unless 200)."""
         if not self.args.record:
             return
-        line = json.dumps({"status": code, "request": request, "answers": answers}, ensure_ascii=False)
-        with self.record_lock, open(self.args.record, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        try:
+            line = json.dumps({"status": code, "request": request, "answers": answers})
+            with self.record_lock, open(self.args.record, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:  # the reply matters more than the test log
+            log("--record failed:\n" + traceback.format_exc())
 
     def _score_rows(self, rows):
         """Score SemIf rows that all share one state; returns results in row order."""
@@ -304,27 +321,35 @@ class Engine:
     def _distributions(self, state, tasks, debias):
         """tasks: {key: (instruction, [(option_id, description), ...])} with 2..16 options.
 
-        Returns ({key: {option_id: probability}}, input_tokens)."""
-        rows = []
+        Keys are tuples that start with the question id. Returns ({key: {option_id: probability}},
+        input_tokens)."""
+        rows, owners = [], []
         for key, (instruction, options) in tasks.items():
             orders = [("f", options)]
             if debias:
                 orders.append(("r", list(reversed(options))))
             for tag, ordered in orders:
+                owners.append((key, tag))
                 rows.append({
-                    "id": f"{key}|{tag}",
+                    "id": str(len(rows)),  # a running index: ids built from free-form question ids can collide
                     "state": state,
                     "question": instruction,
                     "options": [{"id": oid, "description": desc} for oid, desc in ordered],
                 })
-        scored = {row["id"]: result for row, result in zip(rows, self._score_rows(rows))}
+        try:
+            scored = dict(zip(owners, self._score_rows(rows)))
+        except ValueError as error:
+            if getattr(error, "row", None) is not None:
+                key, _tag = owners[int(error.row)]
+                error.question = key[0]
+            raise
         tokens = sum(result["input_tokens"] for result in scored.values())
         out = {}
         for key in tasks:
             tags = ("f", "r") if debias else ("f",)
             merged = {}
             for tag in tags:
-                result = scored[f"{key}|{tag}"]
+                result = scored[(key, tag)]
                 for oid, prob in zip(result["option_ids"], result["probabilities"]):
                     merged[oid] = merged.get(oid, 0.0) + prob / len(tags)
             out[key] = merged
@@ -385,7 +410,8 @@ class Engine:
         """Serve cached questions first and score only the rest."""
         started = time.perf_counter()
         state, questions, debias = self._validate(request)
-        keys = {qid: _sha256_json([state, question, debias]) for qid, question in questions.items()}
+        state_key = _sha256_json(state)  # once: the state can be megabytes, shared by 256 questions
+        keys = {qid: _sha256_json([state_key, question, debias]) for qid, question in questions.items()}
         answers = {}
         with self.cache_lock:
             for qid, key in keys.items():
@@ -433,32 +459,32 @@ class Engine:
             if len(options) == 1:
                 dists[qid] = {options[0][0]: 1.0}
             elif len(options) <= SLOTS:
-                tasks[qid] = (instruction, options)
+                tasks[(qid,)] = (instruction, options)
             else:
                 grouped[qid] = _groups(options)  # 2-16 groups of 8-16 options
                 for index, group in enumerate(grouped[qid]):
-                    tasks[f"{qid}#g{index}"] = (instruction, group)
+                    tasks[(qid, index)] = (instruction, group)
         round1 = {}
         if tasks:
             round1, used = self._distributions(state, tasks, debias)
             tokens += used
         for qid in plans:
-            if qid in round1:
-                dists[qid] = round1[qid]
+            if (qid,) in round1:
+                dists[qid] = round1[(qid,)]
         # Round 2: a final between the group winners (<= 16 groups because options <= 255).
         finals = {}
         for qid, groups in grouped.items():
             lookup = dict(plans[qid][2])
-            group_winners = [max(round1[f"{qid}#g{i}"], key=round1[f"{qid}#g{i}"].get) for i in range(len(groups))]
-            finals[f"{qid}#final"] = (plans[qid][1], [(oid, lookup[oid]) for oid in group_winners])
+            group_winners = [max(round1[(qid, i)], key=round1[(qid, i)].get) for i in range(len(groups))]
+            finals[(qid,)] = (plans[qid][1], [(oid, lookup[oid]) for oid in group_winners])
         if finals:
             round2, used = self._distributions(state, finals, debias)
             tokens += used
             for qid, groups in grouped.items():
-                final = round2[f"{qid}#final"]
+                final = round2[(qid,)]
                 merged = {}
                 for index in range(len(groups)):
-                    probs = round1[f"{qid}#g{index}"]
+                    probs = round1[(qid, index)]
                     group_winner = max(probs, key=probs.get)
                     for oid, prob in probs.items():  # P(item | group) * P(group winner wins)
                         merged[oid] = prob * final[group_winner]
@@ -499,12 +525,13 @@ TOKEN = ""  # from OPENACT_TOKEN; empty means POSTs need no token
 class Handler(BaseHTTPRequestHandler):
     server_version = "OpenActSemIf/" + SERVER_VERSION
     protocol_version = "HTTP/1.1"
+    timeout = 30  # seconds a socket read or write may stall, so no client can hold a thread forever
 
     def log_message(self, fmt, *args):  # keep the log readable
         pass
 
     def _send(self, code, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(payload).encode("utf-8")  # ASCII escapes: a lone surrogate can't break the reply
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -540,40 +567,49 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY:
-            self._send(413, {"error": "request too large"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_BODY:
+            self.close_connection = True  # the body stays unread and must not be taken for the next request
+            code, error = (413, "request too large") if length > MAX_BODY else (400, "invalid Content-Length")
+            self._send(code, {"error": error})
             return
         raw = self.rfile.read(length) if length else b""  # before any reply: an unread body resets the connection
         refused = self._refused()
         if refused is None and TOKEN and not hmac.compare_digest(
                 self.headers.get("X-OpenAct-Token", "").encode(), TOKEN.encode()):
             refused = "missing or wrong X-OpenAct-Token"
-        if refused:
+        if self.path == "/v1/systemone":
+            self._send(*self._systemone(raw, refused))
+        elif refused:
             self._send(403, {"error": refused})
-            return
-        if self.path == "/shutdown":
+        elif self.path == "/shutdown":
             self._send(200, {"ok": True})
             threading.Thread(target=SERVER.shutdown, daemon=True).start()
-            return
-        if self.path != "/v1/systemone":
+        else:
             self._send(404, {"error": "not found"})
-            return
-        self._send(*self._systemone(raw))
 
-    def _systemone(self, raw):
+    def _systemone(self, raw, refused):
         try:
-            request = json.loads(raw.decode("utf-8") or "null")
-        except ValueError:
-            return 422, {"error": "body is not valid JSON", "question": None}
-        if ENGINE.status != "ready":  # never block behind a load: the client polls /health
-            code, payload = 503, {"status": ENGINE.status}
-            if ENGINE.error:
+            request, readable = json.loads(raw.decode("utf-8") or "null"), True
+        except (ValueError, RecursionError):  # deep nesting raises RecursionError
+            request, readable = raw.decode("utf-8", "replace"), False
+        status = ENGINE.status  # read once: the load may finish meanwhile
+        if refused:
+            code, payload = 403, {"error": refused}
+        elif not readable:
+            code, payload = 422, {"error": "body is not valid JSON", "question": None}
+        elif status != "ready":  # never block behind a load: the client polls /health
+            code, payload = 503, {"status": status}
+            if status == "error":
                 payload["error"] = ENGINE.error
         else:
             try:
                 code, payload = 200, ENGINE.decide(request)
-            except ValueError as error:  # RequestError, or SemIf rejecting e.g. an over-long prompt
+            except ValueError as error:  # RequestError, or SemIf refusing e.g. an over-long prompt
+                # "question": the id of the question at fault, set by _decide_uncached() or _distributions()
                 code, payload = 422, {"error": str(error), "question": getattr(error, "question", None)}
             except Exception as error:
                 log("request failed:\n" + traceback.format_exc())
@@ -636,11 +672,18 @@ def main(argv=None):
     parser.add_argument("--fake-script", default=None, metavar="JSON", help="fake backend: answer rules")
     parser.add_argument("--fake-load-seconds", type=float, default=0.0, help="fake backend: how long the load takes")
     parser.add_argument("--fake-load-fail", action="store_true", help="fake backend: the load fails")
+    parser.add_argument("--fake-no-cuda", action="store_true", help="fake backend: load as if PyTorch had no CUDA")
     args = parser.parse_args(argv)
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # SemIf wants exactly one visible GPU
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    if args.record:
+        try:  # a bad path stops the start, rather than failing every request
+            open(args.record, "a", encoding="utf-8").close()
+        except OSError as error:
+            log(f"cannot write --record {args.record}: {error}")
+            return 3
 
     global ENGINE, SERVER, TOKEN
     TOKEN = os.environ.get("OPENACT_TOKEN", "")

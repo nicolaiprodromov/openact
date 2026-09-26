@@ -6,12 +6,16 @@ Each server is openact/runtime/openact_server.py --backend fake, run by this Pyt
   /shutdown does. Launched without OPENACT_TOKEN, requests need no token, but Origin and Host are
   still checked.
 - The per-question cache: cached_questions on a repeat, only new questions scored, the /health
-  counters, and options.debias honoured per request.
-- /v1/capabilities; 422 for 257 questions and for an invalid question, naming it; a 40-option
-  tournament whose 40 probabilities sum to 1.
-- --fake-script answers, the --record log, and the same fake answers in every process.
-- Cold loads: during --fake-load-seconds a POST gets an immediate 503 "loading", and after
-  --fake-load-fail a 503 "error".
+  counters, options.debias honoured per request; reordered options or state keys miss the cache.
+- /v1/capabilities; 422 for 257 questions and for an invalid question or one over the token limit,
+  naming it; a 40-option tournament whose 40 probabilities sum to 1, also next to question ids
+  that look like the tournament's own keys.
+- Bad requests: a negative or non-numeric Content-Length, deeply nested JSON and lone surrogates
+  all get a reply.
+- --fake-script answers, the --record log of every request (refused ones too), a --record path
+  that can't be written, and the same fake answers in every process.
+- Cold loads: during --fake-load-seconds a POST gets an immediate 503 "loading"; after
+  --fake-load-fail, or with --fake-no-cuda, a 503 "error".
 
 Run:  python tests/server_test.py
 """
@@ -40,7 +44,7 @@ SCRIPT = [  # --fake-script: the first matching rule answers
     {"question": "Which item", "answer": "3"},
 ]
 LAUNCHED = []  # (name, process)
-RECORDED = []  # (status, request, answers) of the token server's /v1/systemone requests past the auth checks
+RECORDED = []  # (status, request, answers) of every /v1/systemone request to the token server
 
 
 def free_port():
@@ -50,10 +54,11 @@ def free_port():
 
 
 def call(port, method, path, body=None, headers=None):
-    """(status, JSON reply) of one request. http.client, unlike urllib, never uses a proxy."""
+    """(status, JSON reply) of one request; body is JSON-encoded unless it is bytes. http.client, unlike
+    urllib, never uses a proxy."""
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
-        data = None if body is None else json.dumps(body).encode("utf-8")
+        data = body if body is None or isinstance(body, bytes) else json.dumps(body).encode("utf-8")
         connection.request(method, path, body=data, headers={"Content-Type": "application/json", **(headers or {})})
         response = connection.getresponse()
         return response.status, json.loads(response.read() or b"null")
@@ -107,15 +112,21 @@ def noul(text):
     return {"type": "noul", "instructions": text}
 
 
+def choice(text, criteria):
+    return {"type": "choice", "instructions": text, "criteria": criteria}
+
+
 def answer(reply, qid):
     return (reply.get("answers") or {}).get(qid) or {}
 
 
-def ask(port, request, **headers):
-    """POST /v1/systemone to the token server with its token; remembers what --record must show."""
-    code, reply = call(port, "POST", "/v1/systemone", request, {"X-OpenAct-Token": TOKEN, **headers})
-    if code != 403:
-        RECORDED.append((code, request, reply.get("answers")))
+def ask(port, request, token=TOKEN, **headers):
+    """POST /v1/systemone to the token server; remembers what its --record log must show."""
+    if token:
+        headers["X-OpenAct-Token"] = token
+    code, reply = call(port, "POST", "/v1/systemone", request, headers)
+    sent = request.decode("utf-8", "replace") if isinstance(request, bytes) else request
+    RECORDED.append((code, sent, reply.get("answers")))
     return code, reply
 
 
@@ -133,14 +144,31 @@ def phase_cold_load():
     check("failed load: /health reports the error", wait_status(failed, "error", 15), health(failed).get("status"))
     code, reply = call(failed, "POST", "/v1/systemone", WINDOW)
     check("failed load: a POST gets 503 error with the message",
-          code == 503 and reply.get("status") == "error" and "--fake-load-fail" in reply.get("error", ""), (code, reply))
+          code == 503 and reply.get("status") == "error" and "--fake-load-fail" in reply.get("error", ""),
+          (code, reply))
+    no_cuda, _process = launch("no-cuda", "--fake-no-cuda")
+    check("no CUDA: /health reports the error", wait_status(no_cuda, "error", 15), health(no_cuda).get("status"))
+    code, reply = call(no_cuda, "POST", "/v1/systemone", WINDOW)
+    check("no CUDA: a POST gets 503 error with the driver hint",
+          code == 503 and "CUDA is not available to PyTorch (is the NVIDIA driver too old" in reply.get("error", ""),
+          (code, reply))
     return loading, process
 
 
+def phase_bad_record():
+    missing = os.path.join(TMP, "missing", "record.jsonl")
+    result = subprocess.run(
+        [sys.executable, "-u", SERVER, "--backend", "fake", "--port", str(free_port()), "--record", missing],
+        capture_output=True, text=True, timeout=60)
+    output = result.stdout + result.stderr
+    check("a --record path that can't be written stops the start, with a message",
+          result.returncode != 0 and "cannot write --record" in output, (result.returncode, output[-300:]))
+
+
 def phase_auth(port):
-    code, reply = call(port, "POST", "/v1/systemone", WINDOW)
+    code, reply = ask(port, WINDOW, token=None)
     check("403 without the token", code == 403 and "token" in reply.get("error", "").lower(), (code, reply))
-    code, reply = call(port, "POST", "/v1/systemone", WINDOW, {"X-OpenAct-Token": secrets.token_hex(32)})
+    code, reply = ask(port, WINDOW, token=secrets.token_hex(32))
     check("403 with a wrong token", code == 403, (code, reply))
     code, window = ask(port, WINDOW)
     check("200 with the token", code == 200 and 0.0 < answer(window, "q").get("noul", -1) < 1.0, (code, window))
@@ -172,8 +200,7 @@ def phase_capabilities(port):
 def phase_cache(port):
     batch = {"state": "A quiet library in the afternoon.", "options": {"debias": True}, "questions": {
         "quiet": {"type": "noul", "instructions": "Is it quiet?", "criteria": {"true": "Quiet.", "false": "Loud."}},
-        "read": {"type": "choice", "instructions": "What would you read here?",
-                 "criteria": {"0": "a book", "1": "a lamp", "2": "a chair", "3": "a rug"}},
+        "read": choice("What would you read here?", {"0": "a book", "1": "a lamp", "2": "a chair", "3": "a rug"}),
         "age": {"type": "score", "instructions": "How old is the building?",
                 "criteria": ["new", "recent", "old", "very old", "ancient"]},
     }}
@@ -225,6 +252,23 @@ def phase_cache(port):
           code == 200 and reply.get("debias") is False and reply.get("cached_questions") == 0 and scored == 1,
           (code, reply.get("debias"), reply.get("cached_questions"), scored))
 
+    # SemIf letters options by position and tournaments group them by position: order is part of the question
+    forward = {str(i): f"tool {i}" for i in range(40)}
+    backward = dict(reversed(list(forward.items())))
+    code, reply = ask(port, {"state": "A tool shed.", "questions": {"t": choice("Which tool fits best?", forward)}})
+    before = health(port)
+    code, reply = ask(port, {"state": "A tool shed.", "questions": {"t": choice("Which tool fits best?", backward)}})
+    scored = health(port)["rows_scored"] - before["rows_scored"]
+    check("reordered options miss the cache and are scored again",
+          code == 200 and reply.get("cached_questions") == 0 and scored == 8,
+          (code, reply.get("cached_questions"), scored))
+    check("the reordered answer lists its probabilities in the new order",
+          list(answer(reply, "t").get("probabilities", {})) == list(backward))
+    ask(port, {"state": {"walls": "wood", "roof": "tin"}, "questions": {"s": noul("Is it sturdy?")}})
+    code, reply = ask(port, {"state": {"roof": "tin", "walls": "wood"}, "questions": {"s": noul("Is it sturdy?")}})
+    check("a state with its keys in another order misses the cache",
+          code == 200 and reply.get("cached_questions") == 0, (code, reply.get("cached_questions")))
+
 
 def phase_limits(port):
     def questions(count):
@@ -238,15 +282,24 @@ def phase_limits(port):
     code, reply = ask(port, {"state": "s", "questions": {
         "fine": noul("Is it fine?"), "broken": {"type": "maybe", "instructions": "Is it?"}}})
     check("422 for an invalid question names it", code == 422 and reply.get("question") == "broken", (code, reply))
-    code, reply = ask(port, {"state": "s", "questions": {"fine": noul("Is it fine?"), "wide": {
-        "type": "choice", "instructions": "Which one?", "criteria": {str(i): f"option {i}" for i in range(256)}}}})
+    code, reply = ask(port, {"state": "s", "questions": {
+        "fine": noul("Is it fine?"), "wide": choice("Which one?", {str(i): f"option {i}" for i in range(256)})}})
     check("422 for 256 options names the question", code == 422 and reply.get("question") == "wide", (code, reply))
+    code, reply = ask(port, {"state": "s", "questions": {
+        "fine": noul("Is it fine?"), "long": noul("Is it " + "very " * 5000 + "long?")}})
+    check("422 for a question over the token limit names it",
+          code == 422 and reply.get("question") == "long" and "limit" in reply.get("error", ""),
+          (code, reply.get("question"), reply.get("error", "")[:80]))
+    criteria = dict({str(i): f"option {i}" for i in range(40)}, **{"20": "option " + "x " * 20000})
+    code, reply = ask(port, {"state": "s", "questions": {
+        "fine": noul("Is it fine?"), "wide": choice("Which?", criteria)}})
+    check("422 for a tournament group over the token limit names its question",
+          code == 422 and reply.get("question") == "wide", (code, reply.get("question")))
 
 
 def phase_tournament(port):
-    request = {"state": "A kitchen shelf.", "questions": {"t": {
-        "type": "choice", "instructions": "What fits best on the shelf?",
-        "criteria": {str(i): f"thing {i}" for i in range(40)}}}}
+    request = {"state": "A kitchen shelf.", "questions": {"t": choice(
+        "What fits best on the shelf?", {str(i): f"thing {i}" for i in range(40)})}}
     before = health(port)
     code, reply = ask(port, request)
     scored = health(port)["rows_scored"] - before["rows_scored"]
@@ -260,6 +313,23 @@ def phase_tournament(port):
           probabilities and result.get("choice") == max(probabilities, key=probabilities.get), result.get("choice"))
     check("40-option tournament: 3 groups and a final, in both orders", scored == 8, scored)
 
+    garage = {"state": "A garage.", "questions": {
+        "x": choice("What belongs on the workbench?", {str(i): f"thing {i}" for i in range(40)}),
+        "x#g0": noul("Is it tidy?"),
+        "x#g1": choice("Which light?", {"0": "a lamp", "1": "a torch"}),
+        "x#final": {"type": "score", "instructions": "How cold is it?", "criteria": ["warm", "cool", "cold"]},
+    }}
+    code, reply = ask(port, garage)
+    x = answer(reply, "x").get("probabilities", {})
+    check("question ids like the tournament's own keys: every answer is whole",
+          code == 200 and len(x) == 40 and abs(sum(x.values()) - 1.0) < 1e-9 and min(x.values()) > 0
+          and answer(reply, "x#g0").get("type") == "noul" and len(answer(reply, "x#g1").get("probabilities", {})) == 2
+          and answer(reply, "x#final").get("type") == "score", (code, len(x), sum(x.values())))
+    code, again = ask(port, {"state": "A garage.", "questions": {"y": garage["questions"]["x"]}})
+    check("... and the cache holds the whole answer",
+          code == 200 and again.get("cached_questions") == 1 and answer(again, "y") == answer(reply, "x"),
+          (code, again.get("cached_questions")))
+
 
 def phase_script(port):
     code, reply = ask(port, {"state": "A snowy village.", "questions": {"n": noul("Is it night?")}})
@@ -268,18 +338,35 @@ def phase_script(port):
     code, reply = ask(port, {"state": "A sunny beach.", "questions": {"n": noul("Is it night?")}})
     check("script: a rule's weights become the probabilities",
           code == 200 and abs(answer(reply, "n").get("noul", -1) - 0.25) < 1e-12, (code, answer(reply, "n")))
-    code, reply = ask(port, {"state": "A living room.", "questions": {"i": {
-        "type": "choice", "instructions": "Which item fits?", "criteria": {str(i): f"item {i}" for i in range(40)}}}})
+    code, reply = ask(port, {"state": "A living room.", "questions": {
+        "i": choice("Which item fits?", {str(i): f"item {i}" for i in range(40)})}})
     result = answer(reply, "i")
     check("script: the scripted item wins its group and the final",
           code == 200 and result.get("choice") == "3" and result.get("probabilities", {}).get("3") == 1.0,
           (code, result.get("choice")))
 
 
+def phase_bad_requests(port):
+    for length in ("-1", "abc"):
+        code, reply = call(port, "POST", "/v1/systemone", None, {"Content-Length": length, "X-OpenAct-Token": TOKEN})
+        check(f"Content-Length {length}: 400", code == 400, (code, reply))
+    code, reply = call(port, "POST", "/v1/systemone", None, {"Content-Length": str(5 << 20), "X-OpenAct-Token": TOKEN})
+    check("a Content-Length over 4 MB: 413", code == 413, (code, reply))
+    check("the server keeps serving after bad lengths", call(port, "GET", "/health")[0] == 200)
+    code, reply = ask(port, b"[" * 100000 + b"]" * 100000)
+    check("deeply nested JSON: 422, not a dropped connection",
+          code == 422 and reply.get("error") == "body is not valid JSON", (code, reply))
+    code, reply = ask(port, {"state": "s", "questions": {"bad": noul("Is it \ud800?")}})
+    check("a lone surrogate in a question still gets its 422, --record on", code == 422, (code, reply))
+    code, reply = ask(port, {"state": "s", "questions": {"\ud800": noul("Is it fine?")}})
+    check("a lone surrogate in a question id still gets its answer",
+          code == 200 and "\ud800" in reply.get("answers", {}), (code, reply))
+
+
 def phase_record(path):
     with open(path, encoding="utf-8") as handle:
         lines = [json.loads(line) for line in handle]
-    check("record: one line per request past the auth checks", len(lines) == len(RECORDED),
+    check("record: one line per request whose body was read, refused ones too", len(lines) == len(RECORDED),
           (len(lines), len(RECORDED)))
     check("record: each line holds the request as sent, its status and its answers",
           [(line.get("status"), line.get("request"), line.get("answers")) for line in lines] == RECORDED)
@@ -311,6 +398,7 @@ def phase_open_mode(port, process, window):
 def main():
     try:
         loading, loading_process = phase_cold_load()
+        phase_bad_record()
         record, script = os.path.join(TMP, "record.jsonl"), os.path.join(TMP, "script.json")
         with open(script, "w", encoding="utf-8") as handle:
             json.dump(SCRIPT, handle)
@@ -322,6 +410,7 @@ def main():
         phase_limits(port)
         phase_tournament(port)
         phase_script(port)
+        phase_bad_requests(port)
         phase_record(record)
         phase_shutdown(port, process)
         phase_open_mode(loading, loading_process, window)
