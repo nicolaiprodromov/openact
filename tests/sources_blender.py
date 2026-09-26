@@ -6,7 +6,8 @@ keeps its index, that the Attributes source reads original data, that trace_csv_
 groups and selectors to an Import CSV node and names what is in the way otherwise, that its Delimiter is used, that
 Import CSV and Import Text Paths resolve as Geometry Nodes resolves them, that an untrusted file reads nothing
 outside its folder (whatever Auto Run says, and after the add-on is enabled again) until Allow This File, which the
-pass sees for Rules too, and that the watcher sees edits but doesn't report a file it can't read on every poll.
+pass sees for Rules too, that the watcher sees edits but doesn't report a file it can't read on every poll, and that
+an idle pass with a 4096-cell Rules node used by 16 contexts stays within its budget, trusted or not (§3.2).
 
 Run:  blender -b --factory-startup --python tests/sources_blender.py
 """
@@ -16,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 import bpy
 
@@ -643,6 +645,71 @@ check("prefs: trusted_folders and trusted_files are path collections",
           for name in ("trusted_folders", "trusted_files")))
 for cls in reversed(P.classes):
     bpy.utils.unregister_class(cls)
+
+# ------------------------------------------------------------- the idle pass at the benchmark shape (§3.2)
+bpy.ops.wm.read_homefile(use_empty=True)
+bench = os.path.join(TMP, "bench")
+os.makedirs(bench)
+write("factors.csv", "factor,kind,level,when\n" + "".join(  # 8^4 = 4096 cells, a maximum-size Rules node
+    f"f{f},amount,l{b},level {b} of f{f}\n" for f in range(4) for b in range(8)), bench)
+write("outcomes.csv", "answer,when\nup,it rises\ndown,it falls\n", bench)
+bench_tree = geometry_tree("Bench")[0]
+bench_rules = bench_tree.nodes.new("GeometryNodeOpenActRules")
+bench_rules.name, bench_rules.answer_type = "Bench Rules", 'ONE_OF'
+bench_rules.inputs["Question"].default_value = "Where does it go?"
+bench_rules.inputs["Factors"].default_value = "//factors.csv"
+bench_rules.inputs["Outcomes"].default_value = "//outcomes.csv"
+for i in range(16):
+    host_object(f"Bench {i}", bench_tree)
+bench_blend = os.path.join(bench, "bench.blend")
+bpy.ops.wm.save_as_mainfile(filepath=bench_blend)
+bpy.ops.wm.open_mainfile(filepath=bench_blend)  # untrusted, reading the CSVs next to it
+resolved = []
+
+
+def counted_realpath(path, *args, **kwargs):
+    resolved.append(path)
+    return real_realpath(path, *args, **kwargs)
+
+
+def idle_pass(state):
+    """§3.2: at most 50 ms per idle pass with a maximum-size Rules node used by 16 contexts, under the timing rule of
+    §18.2, and each path resolved once per pass. Returns the plans the pass before made."""
+    made = engine._plans_made
+    engine.run_pass()  # plans what changed
+    made, plans, times = engine._plans_made - made, engine._plans_made, []
+    for _ in range(5):
+        started = time.perf_counter()
+        engine.run_pass()
+        times.append((time.perf_counter() - started) * 1000)
+    ms = min(times)  # the fastest: the one least slowed by other work on the machine
+    resolved.clear()
+    os.path.realpath = counted_realpath
+    try:
+        engine.run_pass()
+    finally:
+        os.path.realpath = real_realpath
+    uid = bpy.data.node_groups["Bench"].nodes["Bench Rules"].uid
+    jobs = [job for (key, _ctx), (_fingerprint, job) in engine.PLANS.items() if key == uid]
+    print(f"TIMING plan cache: idle pass {ms:.1f} ms (budget 50) with a 4096-cell Rules node used by 16 contexts, "
+          f"{state}", flush=True)
+    if ms > 50:
+        print(f"WARN plan cache: idle pass took {ms:.1f} ms, above its 50 ms budget ({state})", flush=True)
+    check(f"plan cache: idle pass within 2x its 50 ms budget (§18.2), planning nothing again, {state}",
+          ms <= 100 and engine._plans_made == plans and len(jobs) == 16
+          and all(len(getattr(job, "rows", ())) == 4096 for job in jobs), f"{ms:.1f} ms, {len(jobs)} plans")
+    check(f"plan cache: an idle pass resolves each path once, not per fingerprint, {state}",
+          len(resolved) <= 4 + len(P._Defaults.trusted_files), resolved)  # the .blend, its folder, the 2 CSVs
+    return made
+
+
+planned = idle_pass("an untrusted file")
+P._Defaults.trusted_files[:] = [write(f"other {i}.blend", "", outside) for i in range(10)]
+bpy.ops.openact.allow_file()  # the 11th trusted file: each click adds one
+replanned = idle_pass("the file allowed, 11 trusted files")
+check("trust: the pass works the trust state out once and every fingerprint gets it: allowing the file plans the 16 "
+      "contexts again", planned == replanned == 16, (planned, replanned))
+P._Defaults.trusted_files.clear()
 
 shutil.rmtree(TMP, ignore_errors=True)
 finish()

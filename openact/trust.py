@@ -35,8 +35,14 @@ def _paths(prefs, name):
     return [item if isinstance(item, str) else item.path for item in getattr(prefs, name, ())]
 
 
+PASS = None  # is_trusted() while engine.run_pass() runs, worked out at its start; None between passes
+
+
 def is_trusted() -> bool:
-    """Whether this .blend may read files outside its own folder tree."""
+    """Whether this .blend may read files outside its own folder tree. Every fingerprint and read asks, so a pass works
+    it out once (PASS): the file and the trusted lists change only between passes."""
+    if PASS is not None:
+        return PASS
     path = bpy.data.filepath
     if TRUST["opened"] is None and not path:  # enabled on an unsaved file: it was created in this session
         TRUST["opened"] = ""
