@@ -336,6 +336,14 @@ def phase_pass_classify():
         check("pass: a numbers-only edit of the Labels CSV re-bakes the payload per row and asks nothing",
               got[:4] == [0.355, 0.6, 0.8, 0.9] and not capture.keys(node) and len(stored) == 1
               and stored[0].words_key == words_key, (got, len(capture.keys(node))))
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text.replace("0.35", "0.355").replace("\nfabric,", "\n\nfabric,"))
+        with Capture() as capture:
+            engine.run_pass()
+        icon, status = engine.STATUS.get(node.uid, ("", ""))
+        check("pass: a Labels CSV warning (a blank line) shows before the summary, and asks nothing",
+              icon == 'ERROR' and status.startswith("families.csv line 5: Line 5 is blank")
+              and status.endswith("(4 items · 4 labels used · 0 unsure)") and not capture.keys(node), (icon, status))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 

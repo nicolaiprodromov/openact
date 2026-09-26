@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline
-from .base import KEY, Spec, confidence
+from .base import KEY, Spec, confidence, warnings
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
 UNSURE_BELOW = 0.30  # the default of the planned unsure_below preference (4.e)
@@ -139,7 +139,9 @@ class MatchSpec(PerItemSpec):
         if not gn[0].strip():
             raise Hint(self.empty_hint)
         items, answers = self.resolved(node, ctx)
-        return self.job(gn, node.answer_type, items, answers, node.balance_order, node.uid)
+        job = self.job(gn, node.answer_type, items, answers, node.balance_order, node.uid)
+        job.problems = warnings(items.problems + answers.problems)  # the pass shows them (§17.1)
+        return job
 
     def job(self, gn, answer_type, items, answers, debias, uid=""):
         """The Job for these words, items (an ItemList or its items) and answer set. Pure, like Ask's and Pick's."""

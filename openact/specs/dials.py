@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import csvfmt, pipeline
-from .base import KEY, Spec, confidence, option_text
+from .base import KEY, Spec, confidence, option_text, warnings
 
 SOCKETS = {"yes_no": 'NodeSocketBool', "amount": 'NodeSocketFloat', "one_of": 'NodeSocketInt'}
 KINDS = {socket: kind for kind, socket in SOCKETS.items()}
@@ -100,13 +100,14 @@ class DialsSpec(Spec):
         from ..evaluator import Hint, Unresolvable
 
         gn = self.gn(node, ctx)
-        found = self.source(node, ctx)
+        found, problems = self.source(node, ctx), ()
         if found is not None:
             source, doc = found
             try:
                 settings, hashes = csvfmt.parse_settings(doc), [doc.text_hash]
             except csvfmt.CsvError as error:
                 raise lists.file_error(doc, error) from None
+            problems = warnings(doc.problems) + ((source.warning,) if source.warning else ())  # shown (§17.1)
         elif not gn[1].strip():
             raise Hint(self.empty_hint)
         else:
@@ -116,7 +117,9 @@ class DialsSpec(Spec):
                 raise Unresolvable(f"Settings: {error}") from None
         if not gn[0].strip():
             raise Hint("Type a prompt")
-        return self.job(gn, settings, node.balance_order, node.uid, hashes)
+        job = self.job(gn, settings, node.balance_order, node.uid, hashes)
+        job.problems = problems
+        return job
 
     def job(self, gn, settings, debias, uid="", csv_hashes=()):
         """The Job for these words and settings: one row per setting, every question about the Prompt, so one request.

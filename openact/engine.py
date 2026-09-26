@@ -16,6 +16,7 @@ node is answered outside evaluation:
 
 from __future__ import annotations
 
+import math
 import time
 import traceback
 import uuid
@@ -279,9 +280,10 @@ def _process(tree, node, contexts):
             LAST_SHOWN[key] = entry.words_key
             shown.append(entry)
             if entry is not found:
-                if found is not None:
-                    entries.remove(found)
-                entries.append(entry)
+                if found is not None:  # in place: the graph keeps its entry order, so values only (§8.8)
+                    entries[entries.index(found)] = entry
+                else:
+                    entries.append(entry)
                 changed = True
             continue
         # Words that mean something else now never show the old answer. A converted v0.1.0 answer has no words
@@ -301,7 +303,9 @@ def _process(tree, node, contexts):
     if changed or left:  # warm order and eviction go by last use (§8.1): stamp what was just in use
         now = time.time()
         for entry in entries:
-            if entry.words_key in showing or entry.words_key in left:
+            if entry.words_key in showing:  # one step after the ones just left: the newest is a shown entry (Dials)
+                entry.t = math.nextafter(now, math.inf)
+            elif entry.words_key in left:
                 entry.t = now
         changed = True
     if changed:
