@@ -7,13 +7,10 @@ PerItemSpec holds what Match and Classify share: the list source and the answer 
 from __future__ import annotations
 
 from .. import pipeline
+from ..csvfmt import _n
 from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings, yes_no_text
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
-
-
-def _n(number):
-    return f"{number:,}".replace(",", " ")  # 8500 -> "8 500", as the messages write numbers
 
 
 class PerItemSpec(Spec):
