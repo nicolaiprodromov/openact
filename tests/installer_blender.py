@@ -4,12 +4,17 @@ Every runtime is a temporary folder, and so is OPENACT_STATE_DIR. Downloads, nvi
 every subprocess are fakes; the installed JevNodes runtime is only read (design section 20.6):
   - the lock pins every package with hashes;
   - the dry run logs the pinned cu128 commands with the runtime's own uv, even with another uv on PATH;
-  - refused before any download: online access off, less than 15 GB free, no nvidia-smi;
-  - an 8 GB GPU gets a warning, and a full install (fake uv, fake SemIf) ends with it;
+  - refused before any download: online access off (also through the Install operator), a runtime folder whose path
+    has a '#', less than 15 GB free, no nvidia-smi; a runtime folder that can't be created fails the install;
+  - an 8 GB GPU gets a warning, and a full install (fake uv, fake SemIf) ends with it; uv gets no UV_* setting of
+    the user's;
   - a download whose SHA-256 differs (uv, then SemIf) stops the install with a clear status;
+  - an existing venv that fails the probe is rebuilt before the lock goes in; one that passes is kept;
   - runtime_installed() rejects a legacy runtime whose venv home is missing (a copy of its pyvenv.cfg);
-  - the import probe: register() returns at once while it runs, a start waits for it, the next session reads
-    probe.json without a subprocess, a changed venv probes again, a failure cancels the start;
+  - the import probe, in a runtime folder with a '#': register() returns at once while it runs, a start waits for
+    it, the next session reads probe.json without a subprocess, a changed venv probes again, a failure cancels the
+    start;
+  - a probe's late result is dropped once its folder was left, an install began or the add-on was re-registered;
   - Locate Existing Runtime sets the runtime folder and probes it in the background.
 
 Run:  blender -b --factory-startup --python tests/installer_blender.py
@@ -62,6 +67,7 @@ class Fake:
         self.files = {}  # url -> the bytes its download writes; other urls get bytes that match no hash
         self.downloads = []
         self.runs = []  # every subprocess.run command
+        self.uv_envs = []  # the environment of every uv command
         self.nvidia_smi = "nvidia-smi"  # what shutil.which finds: None on a machine without it
         self.gpus = "NVIDIA GeForce RTX 3090, 24576\n"
         self.free = 100 * 1024 ** 3
@@ -85,17 +91,20 @@ def fake_which(cmd, *args, **kwargs):
     return FAKE.nvidia_smi if cmd == "nvidia-smi" else REAL_WHICH(cmd, *args, **kwargs)
 
 
-def fake_run(args, **_kwargs):
-    """nvidia-smi answers from FAKE.gpus, the import probe from FAKE.probe_*. uv venv and the model download leave
-    the files they would; every other command succeeds without doing anything."""
+def fake_run(args, **kwargs):
+    """nvidia-smi answers from FAKE.gpus, the import probe from FAKE.probe_* as they were when it started. uv venv
+    and the model download leave the files they would; every other command succeeds without doing anything."""
+    seconds, code = FAKE.probe_seconds, FAKE.probe_code
     FAKE.runs.append(list(args))
+    if os.path.basename(args[0]) == EXE:
+        FAKE.uv_envs.append(kwargs.get("env") or {})
     if "--query-gpu=name,memory.total" in args:
         return subprocess.CompletedProcess(args, 0, FAKE.gpus.encode(), b"")
     if server.PROBE_CODE in args:
         started = time.perf_counter()
-        time.sleep(FAKE.probe_seconds)
+        time.sleep(seconds)
         FAKE.probes.append((threading.current_thread() is threading.main_thread(), time.perf_counter() - started))
-        return subprocess.CompletedProcess(args, FAKE.probe_code, b"", b"")
+        return subprocess.CompletedProcess(args, code, b"", b"")
     if args[1:2] == ["venv"]:
         fake_runtime(os.path.dirname(args[-1]), model=False)
     elif "snapshot_download" in args[-1]:
@@ -251,7 +260,8 @@ def phase_dry_run():
         f"downloading https://github.com/astral-sh/uv/releases/download/{server.UV_VERSION}/{asset} "
         f"(SHA-256 {server.UV_SHA256[asset]})",
         f"$ {uv} venv --clear --python 3.12 {os.path.join(root, 'venv')}\n",
-        f"$ {uv} pip install --python {python} --require-hashes --torch-backend cu128 -r {server.LOCK_FILE}\n",
+        f"$ {uv} pip install --python {python} --require-hashes --no-build --torch-backend cu128 "
+        f"-r {server.LOCK_FILE}\n",
         f"downloading {server.SEMIF_URL} (SHA-256 {server.SEMIF_SHA256})",
         f"$ {uv} pip install --python {python} --no-deps --no-build-isolation semif-phase1 @ {semif}\n",
         f"$ {python} -c from huggingface_hub import snapshot_download; ",
@@ -270,6 +280,21 @@ def phase_dry_run():
 
 
 def phase_refusals():
+    FAKE.reset()
+    root, started, log = install("C# tools")
+    state = server.status()
+    check("path: a runtime folder whose path has a '#' is refused before anything runs or downloads",
+          started and state == ("error", f"Install failed: the runtime folder {root} contains '#', which uv can't "
+                                         "install from: choose another Runtime Folder")
+          and not FAKE.downloads and not FAKE.runs, (state, FAKE.runs))
+
+    FAKE.reset()
+    open(os.path.join(BASE, "a file"), "wb").close()
+    _root, started, log = install(os.path.join("a file", "OpenAct"))
+    state = server.status()
+    check("path: a runtime folder that can't be created fails the install with its error",
+          started and state[0] == "error" and state[1].startswith("Install failed: ") and not FAKE.downloads, state)
+
     FAKE.reset()
     FAKE.free = 10 * 1024 ** 3
     _root, started, log = install("small-disk")
@@ -331,7 +356,9 @@ def phase_hashes():
         FAKE.files[server.SEMIF_URL] = b"fake SemIf archive"
         server.SEMIF_SHA256 = hashlib.sha256(b"fake SemIf archive").hexdigest()
         FAKE.gpus = "NVIDIA GeForce RTX 3070, 8192\n"
+        os.environ["UV_LINK_MODE"] = "symlink"  # would link the venv into the uv-cache that the install deletes
         root, started, log = install("full")
+        os.environ.pop("UV_LINK_MODE")
         state = server.status()
         with open(os.path.join(root, "tools", EXE), "rb") as handle:
             extracted = handle.read()
@@ -340,13 +367,38 @@ def phase_hashes():
         check("install: a checked uv archive is unpacked into the runtime's tools folder", extracted == b"fake uv")
         check("install: every step runs, with the lock and the checked SemIf archive",
               in_order("\n".join(commands), [
-                  "venv --clear --python 3.12", f"{python} -c {server.PROBE_CODE}",
-                  f"--require-hashes --torch-backend cu128 -r {server.LOCK_FILE}",
+                  f"{python} -c {server.PROBE_CODE}", "venv --clear --python 3.12",
+                  f"--require-hashes --no-build --torch-backend cu128 -r {server.LOCK_FILE}",
                   "--no-deps --no-build-isolation semif-phase1 @ file:", "snapshot_download", "cache clean"]) is None,
               commands)
+        check("install: uv runs without the user's UV_* variables and uv.toml",
+              len(FAKE.uv_envs) == 4 and all(env.get("UV_NO_CONFIG") == "1" and "UV_LINK_MODE" not in env
+                                             for env in FAKE.uv_envs),
+              [(env.get("UV_NO_CONFIG"), env.get("UV_LINK_MODE")) for env in FAKE.uv_envs])
         check("install: an 8 GB GPU's warning stays in the final status",
               state[0] == "stopped" and state[1].startswith("Runtime installed. Warning: the GPU has 8 GB of VRAM")
               and P.runtime_installed(root), state)
+
+        FAKE.reset()
+        FAKE.files[uv_url] = archive
+        FAKE.files[server.SEMIF_URL] = b"fake SemIf archive"
+        fake_runtime(os.path.join(BASE, "broken"), model=False)  # a venv and its home, but its imports fail
+        root, started, log = install("broken")
+        commands = [" ".join(run) for run in FAKE.runs if "--query-gpu=name,memory.total" not in run]
+        check("install: an existing venv that fails the probe is rebuilt before the lock goes in",
+              in_order("\n".join(commands), [
+                  f"{P.venv_python(root)} -c {server.PROBE_CODE}", "venv --clear --python 3.12",
+                  "--require-hashes", "semif-phase1 @ file:"]) is None and server.status()[0] == "stopped", commands)
+
+        FAKE.reset()
+        FAKE.files[uv_url] = archive
+        FAKE.probe_code = 0
+        fake_runtime(os.path.join(BASE, "resumed"), model=False)  # its imports work; the model download stopped
+        root, started, log = install("resumed")
+        check("install: an existing venv that passes the probe is kept, and only the model is downloaded",
+              [run[1] for run in FAKE.runs if os.path.basename(run[0]) == EXE] == ["cache"]
+              and any("snapshot_download" in run[-1] for run in FAKE.runs) and FAKE.downloads == [uv_url]
+              and server.status()[0] == "stopped", FAKE.runs)
     finally:
         server.UV_SHA256[asset], server.SEMIF_SHA256 = real_uv_sha, real_semif_sha
 
@@ -373,7 +425,7 @@ def phase_legacy_home():
 
 
 def phase_probe():
-    root = os.path.join(BASE, "Runtime")
+    root = os.path.join(BASE, "Runtime #1")  # only installing refuses a '#'
     fake_runtime(root)
     P._Defaults.runtime_dir, P._Defaults.port, P._Defaults.auto_start = root, free_port(), True
     cached = os.path.join(os.environ["OPENACT_STATE_DIR"], "probe.json")
@@ -444,6 +496,83 @@ def phase_probe():
           len(FAKE.probes) == 4 and len(FakeProcess.launched) == 2, (FAKE.probes, FakeProcess.launched))
 
 
+def late_failing_probe(root):
+    """Choose root and start its probe, which fails after 2 s. Returns an event that is set once it has posted."""
+    posted, real = threading.Event(), server._probe
+
+    def probe(*args):
+        real(*args)
+        posted.set()
+
+    FAKE.probe_seconds, FAKE.probe_code, runs = 2.0, 1, len(FAKE.runs)
+    P._Defaults.runtime_dir, server._probe = root, probe
+    server.refresh()
+    server._probe = real
+    drive(engine, lambda: any(server.PROBE_CODE in run for run in FAKE.runs[runs:]), timeout=20)
+    FAKE.probe_seconds, FAKE.probe_code = 0.0, 0  # the running probe keeps what it started with
+    return posted
+
+
+def phase_late_probe():
+    passed, left, repaired, away, reinstalled = (os.path.join(BASE, name)
+                                                 for name in ("Passed", "Left", "Repaired", "Away", "Reinstalled"))
+    for root in (passed, left, repaired, away, reinstalled):
+        fake_runtime(root)
+    server.STATE.poll_thread.join(5)
+    openact.unregister()
+    P._Defaults.runtime_dir, P._Defaults.auto_start = passed, False
+    FAKE.probe_seconds, FAKE.probe_code = 0.0, 0
+    openact.register()
+    drive(engine, lambda: server.status() == ("stopped", ""), timeout=20)
+
+    posted = late_failing_probe(left)
+    P._Defaults.runtime_dir = passed  # back to a folder whose probe passed: nothing to wait for
+    server.refresh()
+    posted.wait(20)
+    server.pump()
+    server.refresh()
+    check("late probe: the failure of a folder left meanwhile leaves the status alone and is not stored",
+          server.status() == ("stopped", "") and left not in server.STATE.probes,
+          (server.status(), server.STATE.probes))
+
+    posted = late_failing_probe(repaired)
+    openact.unregister()  # the probe runs on: it can't be cancelled any more
+    openact.register()  # the runtime was repaired meanwhile, so this session's probe passes
+    drive(engine, lambda: server.STATE.probes.get(repaired) == "", timeout=20)
+    posted.wait(20)
+    server.pump()
+    server.refresh()
+    check("late probe: a failure from before re-registering doesn't replace this session's pass",
+          server.status() == ("stopped", "") and server.STATE.probes.get(repaired) == "",
+          (server.status(), server.STATE.probes))
+
+    posted = late_failing_probe(away)
+    openact.unregister()
+    index = os.path.join(P.model_dir(away), "model.safetensors.index.json")
+    os.rename(index, index + ".away")  # unavailable while the add-on registers again, so this session doesn't probe
+    openact.register()
+    posted.wait(20)
+    server.pump()
+    unavailable = server.status()
+    os.rename(index + ".away", index)  # back, and repaired
+    server.refresh()
+    drive(engine, lambda: server.status()[0] != "unknown", timeout=20)
+    check("late probe: ...nor sticks to a runtime that was unavailable meanwhile: it is probed again",
+          unavailable[0] == "not_installed" and server.status() == ("stopped", "")
+          and server.STATE.probes.get(away) == "", (unavailable, server.status(), server.STATE.probes))
+
+    posted = late_failing_probe(reinstalled)
+    FAKE.files.clear()  # the install fails at once: its uv download doesn't match the SHA-256
+    started = server.install()
+    server.STATE.install_thread.join(60)
+    failed = server.status()
+    posted.wait(20)
+    server.pump()
+    check("late probe: an install begun meanwhile drops the probe of the folder's old runtime",
+          started and failed[1].startswith("Install failed: ") and server.status() == failed
+          and reinstalled not in server.STATE.probes, (failed, server.status(), server.STATE.probes))
+
+
 def phase_locate():
     import addon_utils
 
@@ -472,6 +601,19 @@ def phase_locate():
           (result, prefs.runtime_dir, status, FAKE.probes[probes:]))
 
 
+def phase_install_operator():
+    """The add-on is enabled (phase_locate): the operator reports why install() refused."""
+    bpy.context.preferences.system.use_online_access = False
+    try:
+        bpy.ops.openact.install_runtime('EXEC_DEFAULT')
+        reported = ""
+    except RuntimeError as error:  # how bpy.ops passes on an ERROR report
+        reported = str(error)
+    bpy.context.preferences.system.use_online_access = True
+    check("install operator: with online access off it reports why", "Online access is disabled" in reported,
+          reported)
+
+
 def main():
     before = snapshot(JEVNODES)
     P._Defaults.auto_start = False  # a finished install must not start anything here
@@ -483,7 +625,9 @@ def main():
     server.pump()  # the installer's posted callbacks, before the add-on registers
     phase_legacy_home()
     phase_probe()
+    phase_late_probe()
     phase_locate()
+    phase_install_operator()
     check("the installed JevNodes runtime is untouched", snapshot(JEVNODES) == before, f"{len(before)} entries")
     finish()
 

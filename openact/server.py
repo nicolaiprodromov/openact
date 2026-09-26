@@ -73,6 +73,7 @@ class _State:
         self.conflict = ""  # the error shown while an OpenAct server with another backend holds the port
         self.probes = {}  # runtime folder -> "" once its import probe passed this session, else the probe's error
         self.checking = ""  # the runtime folder whose import probe is running
+        self.probe_id = 0  # that probe's: a result with another id comes from a superseded probe
         self.start_queued = False  # a start that runs when that probe passes
 
     def set(self, status, message=""):
@@ -234,11 +235,11 @@ def _child_env():
     return env
 
 
-def _imports_ok(python, env=None):
+def _imports_ok(python):
     """The runtime probe: does this Python import torch and SemIf? Takes seconds on a cold disk."""
     try:
         return subprocess.run([python, "-c", PROBE_CODE], capture_output=True, stdin=subprocess.DEVNULL,
-                              env=env or _child_env(), timeout=300, creationflags=_NO_WINDOW).returncode == 0
+                              env=_child_env(), timeout=300, creationflags=_NO_WINDOW).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -254,41 +255,44 @@ def _probe_key(root):
         return None
 
 
-def _probe(root):
+def _probe(root, probe_id):
     """Executor: probe the runtime, unless probe.json holds a pass for it as it is now. Posts the result."""
     key = _probe_key(root)
     path = os.path.join(state_dir(root), "probe.json")
     try:
         with open(path, encoding="utf-8") as handle:
-            passed = key is not None and json.load(handle)["passed"] == key
-    except (OSError, ValueError, KeyError, TypeError):
+            passed = key is not None and json.load(handle) == key
+    except (OSError, ValueError):
         passed = False
     if not passed and _imports_ok(P.venv_python(root)):
         passed = True
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
-                json.dump({"passed": key}, handle)
+                json.dump(key, handle)  # only passes are stored
         except OSError:
             pass  # the next session probes again
     error = "" if passed else (f"The runtime's Python at {P.venv_home(root)} is missing or broken (was it removed "
                                "with `uv python uninstall`?): reinstall the runtime")
-    post(_probed, root, error)
+    post(_probed, root, error, probe_id)
 
 
 def _check(root):
     """Start the probe of this runtime folder on the executor, unless it is running: nothing waits for it."""
     if STATE.checking != root:
         STATE.checking = root
+        STATE.probe_id += 1
         STATE.set("unknown", CHECKING)
-        executor().submit(_probe, root)
+        executor().submit(_probe, root, STATE.probe_id)
 
 
-def _probed(root, error):
-    STATE.probes[root] = error
-    if STATE.checking != root:
-        return  # another runtime folder was chosen meanwhile: its own probe decides
+def _probed(root, error, probe_id):
+    if probe_id != STATE.probe_id:
+        return  # superseded by another probe, an install or unregistering: neither stored nor shown
     STATE.checking = ""
+    if root != P.runtime_root():
+        return  # the runtime folder changed to one that needed no probe: this result is stale
+    STATE.probes[root] = error
     queued, STATE.start_queued = STATE.start_queued, False
     if error:
         STATE.set("error", error)  # this also cancels a queued start
@@ -300,7 +304,7 @@ def _probed(root, error):
 
 def probe_runtime(prefs=None):
     """Probe the runtime folder again in the background, e.g. after Locate Existing Runtime chose it."""
-    STATE.probes.pop(P.runtime_root(prefs or P.get_prefs()), None)
+    STATE.probes.pop(P.runtime_root(prefs), None)
     refresh(prefs)
 
 
@@ -504,6 +508,7 @@ def shutdown_owned():
         stop()
     STATE.probes.clear()  # the next registration probes again: a probe cancelled below would never report
     STATE.checking, STATE.start_queued = "", False
+    STATE.probe_id += 1  # and one that can't be cancelled reports to the next session, which drops it
     global _executor
     if _executor is not None:
         _executor.shutdown(wait=False, cancel_futures=True)
@@ -555,6 +560,7 @@ def install(prefs=None, dry_run=False):
     root = P.runtime_root(prefs)
     previous = status()
     STATE.probes.pop(root, None)  # the runtime is about to change: probe it again afterwards
+    STATE.checking, STATE.probe_id = "", STATE.probe_id + 1  # a running probe describes the runtime before it
     STATE.set("installing", "Preparing...")
     warning = ""
 
@@ -588,12 +594,15 @@ def install(prefs=None, dry_run=False):
 
     def work():
         nonlocal warning
-        os.makedirs(root, exist_ok=True)
         log_path = os.path.join(root, "install.log")
         STATE.log_path = log_path
         try:
+            os.makedirs(root, exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as log:
                 log.write(f"\n===== OpenAct runtime install{' (dry run)' if dry_run else ''} {time.ctime()} =====\n")
+                if "#" in os.path.abspath(root):  # uv cuts the SemIf archive's file: URL at the '#'
+                    raise RuntimeError(f"the runtime folder {os.path.abspath(root)} contains '#', which uv can't "
+                                       "install from: choose another Runtime Folder")
                 free = shutil.disk_usage(root).free / 1024 ** 3
                 log.write(f"free disk space: {free:.1f} GB\n")
                 if free < MIN_FREE_GB:
@@ -608,7 +617,10 @@ def install(prefs=None, dry_run=False):
                     warning = (f"Warning: the GPU has {vram:.0f} GB of VRAM; the model needs about 9 GB, and "
                                f"{MIN_VRAM_GB} GB or more is recommended.")
                     log.write(warning + "\n")
-                env = _child_env()
+                # Without the user's uv settings (UV_* variables, uv.toml): UV_LINK_MODE=symlink, for one, would link
+                # the venv into the uv-cache that the last step deletes.
+                env = {key: value for key, value in _child_env().items() if not key.startswith("UV_")}
+                env["UV_NO_CONFIG"] = "1"
                 env["HF_HOME"] = P.hf_home(root)
                 env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
                 # Keep everything inside the runtime folder: uv's own Python and its download cache.
@@ -640,15 +652,16 @@ def install(prefs=None, dry_run=False):
                         os.chmod(uv, 0o755)
 
                 step("2/5 Creating the Python environment...")
-                # --clear replaces a venv whose base Python is gone, e.g. removed with `uv python uninstall`
-                if not (os.path.isfile(python) and os.path.isdir(P.venv_home(root))):
+                # A venv that fails the probe is rebuilt: installing into it again can't restore files uv already
+                # counts as installed, or a base Python that is gone (`uv python uninstall`).
+                installed = not dry_run and _imports_ok(python)
+                if not installed:
                     run([uv, "venv", "--clear", "--python", "3.12", os.path.join(root, "venv")], log, env)
 
                 step("3/5 Installing PyTorch (about 3 GB)...")
-                installed = not dry_run and _imports_ok(python, env)
-                if not installed:
-                    run([uv, "pip", "install", "--python", python, "--require-hashes", "--torch-backend", "cu128",
-                         "-r", LOCK_FILE], log, env)
+                if not installed:  # --no-build: an sdist would build with packages that aren't in the lock
+                    run([uv, "pip", "install", "--python", python, "--require-hashes", "--no-build", "--torch-backend",
+                         "cu128", "-r", LOCK_FILE], log, env)
 
                 step("4/5 Installing SemIf...")
                 if not installed:
