@@ -713,7 +713,9 @@ sequenceDiagram
    - `(path, delimiter, st_mtime_ns, st_size)` of every referenced CSV, whether typed as a path or
      traced from a linked Import CSV node (§7.7);
    - a list-source fingerprint: collection child names, material slot names, or attribute names;
-   - the node's `balance_order` toggle (§10.3).
+   - the node's `balance_order` toggle (§10.3);
+   - the file trust state (§16.1), which decides the files `plan()` may read. A pass works it out
+     once at its start, and resolves each file's `realpath` once, not per fingerprint.
 
    `engine.PLANS[(uid, ctx key)]` holds `(fingerprint, job)`. An unchanged fingerprint reuses the
    cached Job, so the cost is the evaluator plus one hash. Only a changed fingerprint runs
@@ -1183,8 +1185,10 @@ type the names (Text or CSV source).
   - a selector that cannot be resolved statically: `Unresolvable`, as for words.
 - **Delimiter.** In case (b) the Import CSV node's Delimiter is passed to `csvfmt.read_csv(path,
   delimiter=…)`, and header sniffing (§7.2) is skipped. In case (a) the sniffing applies.
-- **Same rules otherwise.** The traced path goes through the same path resolution, trust
-  confinement (§7.7) and file watcher (§7.8) as a typed path.
+- **Same rules otherwise.** The traced path gets the same trust confinement (§16.1) and file
+  watcher (§7.8) as a typed path. It resolves as its Import CSV node resolves it (§7.7): `//` is
+  relative to the file that holds the node's tree, and any other relative path to Blender's
+  working folder.
 - **Limitation: the match chain can't see a traced path.** It is not a String input of the node
   (§8.2). Contexts that need *different* files must therefore either use route (a), exposing the
   path String on the modifier, or give each context a different `Key` (above). Otherwise they get
@@ -1846,9 +1850,8 @@ alive,2,Survives,0,Survives,1.00,0,model
 - **Inline or path.** `lists.is_csv_path(text)` is true when the stripped value is a single line
   ending in `.csv`, in any case. Anything else is inline text (§6.0).
 - **Resolution.**
-  - A typed path: `bpy.path.abspath(text, library=node.id_data.library)`, then
-    `os.path.normpath`. `//`, like any relative path, is relative to the .blend, or to the library
-    file for linked node groups.
+  - A typed path resolves as an Import node's Path (next item), with `//` implied: `//`, like any
+    relative path, is relative to the .blend, or to the library file for linked node groups.
   - An Import CSV node's Path, like an Import Text Path, resolves as Geometry Nodes resolves it
     (`evaluator.import_path()`), so OpenAct reads the file that node reads. `//` is relative to the
     file that holds the Import node's tree: the .blend, or the library of a linked group. Any other
@@ -2871,7 +2874,8 @@ New:
 - The file watcher runs in `tick()` (§7.8).
 - `run_pass()` follows §5.3, including the plan cache (`PLANS`), per-node dirty flags and the
   materialised-set choice (§8.1).
-- The file trust state is computed on `load_post` (§16.1).
+- The file trust state is worked out once per pass (§5.3); `load_post` records which file was
+  opened (§16.1).
 - `ensure_owned()` handles table objects (§8.5), and garbage collection of orphaned table objects
   runs once per pass.
 - Linked trees are evaluated but never written.
@@ -3442,8 +3446,8 @@ computes for the same words.
 | `STATUS` (per-node icon, text, counts, ETA) | `engine.py` | `load_post` |
 | `PLANS[(uid, ctx key)] → (fingerprint, job)`, the plan cache (§5.3) | `engine.py` | a changed fingerprint; `load_post` |
 | `LAST_SHOWN[(uid, ctx key)] → words_key` of the entry that context showed last (stale-while-refilling, carry-over, and `k_default` for single-context nodes, §5.3–§5.4, §8.2). **Seeded on the first pass after load** from the stored entry whose `gn` equals that context's words, so rows re-asked after a CSV edit made while Blender was closed show stale values, not fallbacks | `engine.py` | `load_post` (then re-seeded); a context that disappears |
-| `TRUST`: whether the open file is trusted (§16.1) | `engine.py` | `load_post`; `openact.allow_file` |
-| `WATCH` (file stamps and `CsvDoc` cache) and the evaluator memo | `engine.py`, `evaluator.py` | `load_post` (watch); every pass (memo) |
+| `TRUST`: which file was opened; `PASS`: whether the open file is trusted, worked out once per pass (§16.1) | `trust.py` | `load_post` and enabling OpenAct (`TRUST`); every pass (`PASS`) |
+| `WATCH` (file stamps and `CsvDoc` cache), the evaluator memo and the file identities (`csvfmt.IDENTITIES`) | `engine.py`, `evaluator.py`, `csvfmt.py` | `load_post` (watch); every pass (memos) |
 | Worker queue, server `STATE` | `server.py` | add-on unregister (`shutdown_owned`) |
 
 ### 14.6 Files on disk
@@ -3639,7 +3643,8 @@ updates for everything per element.
 | Blender responsiveness | Huge inputs exhaust memory or time | Limits: 1 MB per CSV, 4096 rows or cells, 8192 scored rows per context, 256 questions per request, a 4 MB body. Stored JSON per node: 16 warm or cold entries within a 2 MB soft cap; at most 16 live word sets (the over-cap error, §8.1) and 12 pins, kept above 2 MB with a size note; a 4 MB hard cap per entry |
 | Installed runtime | Compromised or changed downloads | See 16.2 |
 
-**Trust rule for opened files** (`engine.TRUST`, computed on `load_post`).
+**Trust rule for opened files** (`trust.is_trusted()`, worked out once per pass; `load_post`
+records which file was opened).
 - **A file is trusted** when any of these holds:
   1. it was created in this session (it is unsaved). A file opened while OpenAct was disabled is
      judged by 2 and 3 once OpenAct is enabled again;
@@ -4240,7 +4245,7 @@ decided (§4.e).
 | KD18 | **Only NVIDIA/CUDA is built** (user decision). A CPU backend (llama.cpp) is future work, outside this plan, and so is Apple Silicon. A high-accuracy 27B model is mentioned in the README only | Built and measured on RTX 3090s. Any future backend must pass the same acceptance suites before being offered | §3.3, NG9, §20.5 |
 | KD19 | **Agents are deferred.** v1 ships only hooks: `pipeline.submit(..., on_rows=…)`, table objects writable without rebuilds, and `geometry.read_attributes` | Keeps v1 focused (NG1) without precluding "think slow, act fast" | §5.6 |
 | KD20 | **Shape agreement across contexts.** All live contexts of a node must agree on the interface shape (list source, answer type, factors, settings, payload headers), **and on every value baked into the graph** (band edges and centres, category offsets and value maps, flag assignments). Anything else (texts, payload values, Dials ranges, Pick's picked material) is per-entry data selected by `k` | The interface exists once per node. A clear error is safer than a silent "first context wins", and per-entry values keep per-object variation possible | §6.0, §8.6 |
-| KD21 | **Trust model for opened files.** Untrusted files may read only inside their own folder tree. Trust comes from Blender's auto-run setting, a per-file *Allow this file* (`trusted_files`), or an explicit *Trust this folder* (`trusted_folders`). Appended groups inherit the host file's trust, which is a documented residual risk | OpenAct stores the words it reads in the saved file, so a crafted file could otherwise exfiltrate local text. Demos with their CSVs still work, and allowing one download does not trust a whole Downloads folder | §16.1 |
+| KD21 | **Trust model for opened files.** Untrusted files may read only inside their own folder tree. Trust comes from a per-file *Allow this file* (`trusted_files`) or an explicit *Trust this folder* (`trusted_folders`), and a file created in this session is trusted. Blender's *Auto Run Python Scripts* does not count: a file that reads outside its folder needs one *Allow this file* click. Appended groups inherit the host file's trust, which is a documented residual risk | OpenAct stores the words it reads in the saved file, so a crafted file could otherwise exfiltrate local text. Blender can refuse Auto Run for one file (*Trusted Source* unchecked), and an add-on can't see that refusal. Demos with their CSVs still work, and allowing one download does not trust a whole Downloads folder | §16.1 |
 | KD22 | **v1 platform matrix.** Windows 10/11 with an NVIDIA GPU of ≥ 10 GB is supported and tested. Linux with NVIDIA is best effort. There is **no CPU path** in v1: the installer refuses without an NVIDIA GPU, and at run time `auto` means CUDA only. macOS is unsupported for authoring (future work) | Every gate runs on the one tested platform. A 13 GB install that cannot meet any target is refused up front, and a model that cannot use CUDA reports an error instead of crawling on the CPU | §3.3, §5.2, §10.5 |
 | KD23 | **Main-thread discipline.** A plan cache with fingerprints; rebuilds only on shape or materialised-set changes; table-object writes throttled; budgets as merge gates | Graph edits and planning are the expensive side (measured); an unchanged scene must cost almost nothing per pass | §5.3, §8.4, §8.8 |
 | KD24 | **Playback safety.** On a node used by exactly one live context, and not in a hint or error state, a no-match falls back to that context's last-shown entry. Shared trees fall back to neutral values. *Prepare for Playback* pins the entries animated words need | Passes stay paused during playback (NG1), yet a single-object sim must not break. On shared trees, one object must never silently show another's answers while OpenAct runs. Without the add-on, `k_default` stays as saved (R6) | §5.5, §8.1, §8.2 |

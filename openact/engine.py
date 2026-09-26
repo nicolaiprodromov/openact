@@ -24,7 +24,7 @@ import uuid
 import bpy
 from bpy.app.handlers import persistent
 
-from . import evaluator, inner, pipeline, server, store
+from . import csvfmt, evaluator, inner, pipeline, server, store, trust
 from . import prefs as P
 from . import tables
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
@@ -215,7 +215,9 @@ def run_pass(everything=True):
     uses = find_uses()
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
+    csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
     try:
+        trust.PASS = trust.is_trusted()
         for tree, node in nodes:
             if not (visit_all or node.uid in dirty):
                 continue
@@ -226,6 +228,7 @@ def run_pass(everything=True):
                 STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
+        csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
     if stored or _plans_made != plans_made:
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
     contexts = {node.uid: {ctx.key() for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]}

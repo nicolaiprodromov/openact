@@ -68,16 +68,11 @@ def is_csv_path(text: str) -> bool:
 
 
 def resolve_path(text: str, node) -> str:
-    """The absolute, normalised path of a path word. '//', like any relative path, is relative to the .blend, or to
-    the library file of a linked tree. Raises Hint for a relative path in an unsaved file."""
-    library = getattr(node.id_data, "library", None)
-    full = bpy.path.abspath(text.strip(), library=library)
-    if not os.path.isabs(full):
-        anchor = bpy.path.abspath("//", library=library)
-        if not os.path.isabs(anchor):
-            raise Hint("Save the .blend: '//' paths are relative to it")
-        full = os.path.join(anchor, full)
-    return os.path.normpath(full)
+    """The absolute, normalised path of a path word: an Import node's Path (evaluator.import_path()) with '//' implied,
+    so any relative path is relative to the .blend, or to the library file of a linked tree. Raises Hint for a
+    relative path in an unsaved file."""
+    text = text.strip()
+    return evaluator.import_path(text if text.startswith("//") or os.path.isabs(text) else "//" + text, node)
 
 
 def find_input(node, name):

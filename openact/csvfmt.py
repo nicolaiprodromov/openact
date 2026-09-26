@@ -323,11 +323,17 @@ def read_csv(path: str, delimiter: str | None = None, schema: str = "answer_set"
 
 _DOCS = {}  # (identity, schema, delimiter) -> the CsvDoc last read; the schema decides the column classes
 MAX_DOCS = 256
+IDENTITIES = None  # path -> identity(path) while engine.run_pass() runs; None between passes
 
 
 def identity(path: str) -> str:
-    """How the parse cache and the file watcher tell files apart: a symlink or '..' spelling is the same file."""
-    return os.path.normcase(os.path.realpath(path))
+    """How the parse cache, the file watcher and the trust rule tell files apart: a symlink or '..' spelling is the
+    same file. realpath opens the file on Windows and every fingerprint asks, so a pass resolves each path once."""
+    if IDENTITIES is None:
+        return os.path.normcase(os.path.realpath(path))
+    if path not in IDENTITIES:
+        IDENTITIES[path] = os.path.normcase(os.path.realpath(path))
+    return IDENTITIES[path]
 
 
 def load(path: str, delimiter: str | None = None, schema: str = "answer_set") -> CsvDoc:
