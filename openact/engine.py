@@ -3,10 +3,7 @@
 Geometry Nodes cannot run Python while it evaluates (Blender has no script node), so an OpenAct
 node is answered outside evaluation:
 
-1. After a change, each OpenAct node's inputs are read with a small static evaluator: values typed
-   on the node, Group Input values from the modifier (through nested groups), String, Join
-   Strings, Value to String, Replace/Slice String, Switch, Index Switch, Import Text, Reroute,
-   and the outputs of other OpenAct nodes.
+1. After a change, each OpenAct node's inputs are read by the static evaluator (evaluator.py).
 2. The local model is asked in the background (see server.py).
 3. The answer is written into the node's hidden node group as a small lookup table keyed by the
    exact input strings. Geometry Nodes picks the matching answer by itself, so one node group
@@ -25,8 +22,9 @@ import uuid
 import bpy
 from bpy.app.handlers import persistent
 
-from . import natsort, server
+from . import evaluator, natsort, server
 from . import prefs as P
+from .evaluator import Ctx, Hint, Pending, Unresolvable, as_text, eval_input, find_uses, is_field
 
 ASK_ID = "GeometryNodeOpenActAsk"
 PICK_ID = "GeometryNodeOpenActPick"
@@ -34,8 +32,6 @@ OPENACT_TYPES = (ASK_ID, PICK_ID)
 INNER_PREFIX = ".OpenAct "
 MAX_ENTRIES = 16  # answers remembered per node
 MAX_ITEMS = 255
-MAX_CONTEXTS = 64
-MAX_DEPTH = 64
 DEBOUNCE = 0.25
 AMOUNT_LEVELS = ["Not at all", "Slightly", "Moderately", "Very", "Extremely"]
 NO_CONTEXT = "No additional context."
@@ -55,77 +51,7 @@ _group_count = -1  # number of node groups at the last pass that found no OpenAc
 SAFETY_PASS = 2.0  # edits to trees no modifier uses don't send depsgraph updates
 
 
-class Unresolvable(Exception):
-    """An input comes from something that cannot be computed outside Geometry Nodes."""
-
-
-class Pending(Exception):
-    """An input depends on another OpenAct node that has no answer yet."""
-
-
-class Hint(Exception):
-    """Nothing to ask yet; tells the user what is missing."""
-
-
-# --------------------------------------------------------------------------- contexts
-
-
-class Ctx:
-    """One way a node tree is reached: object modifier -> top tree -> group nodes -> tree."""
-
-    __slots__ = ("obj", "mod", "path", "root")
-
-    def __init__(self, obj, mod, path, root):
-        self.obj, self.mod, self.path, self.root = obj, mod, path, root
-
-    def push(self, group_node):
-        return Ctx(self.obj, self.mod, self.path + (group_node,), self.root)
-
-    def pop(self):
-        return Ctx(self.obj, self.mod, self.path[:-1], self.root)
-
-    def label(self):
-        if self.obj is None:
-            return "(not used by a modifier)"
-        return f"{self.obj.name} > {self.mod.name}"
-
-
-def find_uses():
-    """Map node tree pointer -> list of Ctx for every modifier that (indirectly) uses it."""
-    uses = {}
-
-    def walk(tree, ctx, stack):
-        key = tree.as_pointer()
-        if len(stack) > 32 or key in stack:
-            return
-        found = uses.setdefault(key, [])
-        if len(found) < MAX_CONTEXTS:
-            found.append(ctx)
-        for node in tree.nodes:
-            if node.bl_idname == "GeometryNodeGroup" and node.node_tree is not None and not node.mute:
-                walk(node.node_tree, ctx.push(node), stack | {key})
-
-    for obj in bpy.data.objects:
-        for mod in obj.modifiers:
-            if mod.type == 'NODES' and mod.node_group is not None:
-                walk(mod.node_group, Ctx(obj, mod, (), mod.node_group), frozenset())
-    return uses
-
-
-# --------------------------------------------------------------------- static evaluator
-
-
-def _available(sock):
-    if getattr(sock, "is_unavailable", False):
-        return False
-    return getattr(sock, "enabled", True)
-
-
-def _in(node, name):
-    for sock in node.inputs:
-        if sock.name == name and _available(sock):
-            return sock
-    raise Unresolvable(f"'{node.name}' has no input '{name}'")
+# ------------------------------------------------------------------------ node specs
 
 
 def _sock(sockets, identifier):
@@ -135,180 +61,10 @@ def _sock(sockets, identifier):
     raise KeyError(identifier)
 
 
-def _text(value):
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bpy.types.ID):
-        return value.name
-    return str(value)
-
-
-def _interface_item(tree, identifier):
-    for item in tree.interface.items_tree:
-        if getattr(item, "item_type", "") == 'SOCKET' and item.identifier == identifier:
-            return item
-    return None
-
-
-def eval_input(sock, ctx, depth=0):
-    """Value of an input socket in the given context."""
-    if depth > MAX_DEPTH:
-        raise Unresolvable("the connection chain is too deep")
-    links = [link for link in sock.links if not link.is_muted]
-    if any(not link.is_valid for link in links):
-        raise Unresolvable("An input has an invalid (red) link")
-    multi = getattr(sock, "is_multi_input", False)
-    if not links:
-        return [] if multi else getattr(sock, "default_value", None)
-    if multi:  # Join Strings joins the most recently connected link first
-        ordered = sorted(links, key=lambda link: -link.multi_input_sort_id)
-        return [eval_output(link.from_node, link.from_socket, ctx, depth + 1) for link in ordered]
-    return eval_output(links[0].from_node, links[0].from_socket, ctx, depth + 1)
-
-
-def eval_output(node, out, ctx, depth):
-    if node.mute:
-        for internal in node.internal_links:
-            if internal.to_socket == out:
-                value = eval_input(internal.from_socket, ctx, depth + 1)
-                if isinstance(value, list):  # a muted Join Strings passes its first link on
-                    value = value[0] if value else ""
-                return value
-        return _muted_value(out)
-    kind = node.bl_idname
-    if kind == "NodeReroute":
-        return eval_input(node.inputs[0], ctx, depth + 1)
-    if kind == "NodeGroupInput":
-        return _group_input(out.identifier, ctx, depth)
-    if kind == "GeometryNodeGroup":
-        return _group_output(node, out, ctx, depth)
-    if kind in OPENACT_TYPES:
-        return _openact_output(node, out, ctx)
-    handler = _HANDLERS.get(kind)
-    if handler is None:
-        raise Unresolvable(f"Can't read '{node.name}' ({node.bl_label} isn't supported as an OpenAct input)")
-    return handler(node, out, ctx, depth + 1)
-
-
-def _muted_value(out):
-    """What a muted node without a pass-through outputs: the type's zero value."""
-    return {'STRING': "", 'VALUE': 0.0, 'INT': 0, 'BOOLEAN': False}.get(out.type)
-
-
-def _group_input(identifier, ctx, depth):
-    if ctx.path:
-        parent = ctx.path[-1]
-        for sock in parent.inputs:
-            if sock.identifier == identifier:
-                return eval_input(sock, ctx.pop(), depth + 1)
-        raise Unresolvable("a group input is missing on the group node")
-    if ctx.mod is not None:
-        if ctx.mod.get(identifier + "_use_attribute"):
-            raise Unresolvable("a modifier input is set to use an attribute")
-        try:
-            return ctx.mod[identifier]
-        except KeyError:
-            pass
-    item = _interface_item(ctx.root, identifier)
-    return getattr(item, "default_value", None) if item is not None else None
-
-
-def _group_output(node, out, ctx, depth):
-    sub = node.node_tree
-    if sub is None:
-        return getattr(out, "default_value", None)
-    output = next((n for n in sub.nodes if n.bl_idname == "NodeGroupOutput" and n.is_active_output), None)
-    if output is None:
-        return getattr(out, "default_value", None)
-    for sock in output.inputs:
-        if sock.identifier == out.identifier:
-            return eval_input(sock, ctx.push(node), depth + 1)
-    return getattr(out, "default_value", None)
-
-
-def _h_join(node, out, ctx, depth):
-    delimiter = _text(eval_input(_in(node, "Delimiter"), ctx, depth))
-    parts = eval_input(_in(node, "Strings"), ctx, depth)
-    if not isinstance(parts, list):
-        parts = [parts]
-    return delimiter.join(_text(part) for part in parts)
-
-
-def _h_value_to_string(node, out, ctx, depth):
-    value = eval_input(_in(node, "Value"), ctx, depth)
-    if getattr(node, "data_type", "FLOAT") == 'INT':
-        return str(int(value))
-    decimals = int(eval_input(_in(node, "Decimals"), ctx, depth) or 0)
-    return f"{float(value):.{max(decimals, 0)}f}"
-
-
-def _h_replace(node, out, ctx, depth):
-    text = _text(eval_input(_in(node, "String"), ctx, depth))
-    find = _text(eval_input(_in(node, "Find"), ctx, depth))
-    replace = _text(eval_input(_in(node, "Replace"), ctx, depth))
-    return text.replace(find, replace) if find else text
-
-
-def _h_slice(node, out, ctx, depth):
-    text = _text(eval_input(_in(node, "String"), ctx, depth))
-    position = max(int(eval_input(_in(node, "Position"), ctx, depth) or 0), 0)
-    length = max(int(eval_input(_in(node, "Length"), ctx, depth) or 0), 0)
-    return text[position:position + length]
-
-
-def _h_switch(node, out, ctx, depth):
-    condition = bool(eval_input(_in(node, "Switch"), ctx, depth))
-    return eval_input(_in(node, "True" if condition else "False"), ctx, depth)
-
-
-def _h_index_switch(node, out, ctx, depth):
-    index = int(eval_input(_in(node, "Index"), ctx, depth) or 0)
-    items = [s for s in node.inputs if s.identifier not in ("Index", "__extend__") and _available(s)]
-    if 0 <= index < len(items):
-        return eval_input(items[index], ctx, depth)
-    return getattr(out, "default_value", None)
-
-
-def _h_import_text(node, out, ctx, depth):
-    path = _text(eval_input(_in(node, "Path"), ctx, depth))
-    if not path:
-        return ""
-    try:
-        with open(bpy.path.abspath(path), "rb") as handle:
-            data = handle.read()
-    except OSError:
-        raise Unresolvable(f"Can't read the text file '{path}'") from None
-    # Same as Blender's Import Text (measured in 4.5 and 5.1): CRLF becomes LF, a lone CR and a
-    # BOM are kept, and invalid UTF-8 or a NUL byte gives an empty string.
-    if b"\x00" in data:
-        return ""
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return ""
-    return text.replace("\r\n", "\n")
-
-
-_HANDLERS = {
-    "FunctionNodeInputString": lambda node, out, ctx, depth: node.string,
-    "GeometryNodeInputCollection": lambda node, out, ctx, depth: node.collection,
-    "GeometryNodeInputObject": lambda node, out, ctx, depth: node.object,
-    "ShaderNodeValue": lambda node, out, ctx, depth: node.outputs[0].default_value,
-    "FunctionNodeInputInt": lambda node, out, ctx, depth: node.integer,
-    "FunctionNodeInputBool": lambda node, out, ctx, depth: node.boolean,
-    "GeometryNodeStringJoin": _h_join,
-    "FunctionNodeValueToString": _h_value_to_string,
-    "FunctionNodeReplaceString": _h_replace,
-    "FunctionNodeSliceString": _h_slice,
-    "GeometryNodeSwitch": _h_switch,
-    "GeometryNodeIndexSwitch": _h_index_switch,
-    "GeometryNodeImportText": _h_import_text,
-}
-
-
-def _openact_output(node, out, ctx):
+def _openact_output(node, out, ctx, depth):
+    """Evaluator handler: the answer an OpenAct node shows for the words it gets in this context."""
+    if is_field(out):
+        raise Unresolvable(f"'{node.name}' output '{out.name}' is a field; words must be single values")
     spec = SPECS[node.bl_idname]
     try:
         req = spec.request(node, ctx)
@@ -324,7 +80,7 @@ def _openact_output(node, out, ctx):
     return spec.output(answer, out.name)
 
 
-# ------------------------------------------------------------------------ node specs
+evaluator.HANDLERS.update(dict.fromkeys(OPENACT_TYPES, _openact_output))
 
 
 class Req:
@@ -370,8 +126,8 @@ class AskSpec:
 
     @staticmethod
     def request(node, ctx):
-        q_raw = _text(eval_input(node.inputs["Question"], ctx))
-        c_raw = _text(eval_input(node.inputs["Context"], ctx))
+        q_raw = as_text(eval_input(node.inputs["Question"], ctx))
+        c_raw = as_text(eval_input(node.inputs["Context"], ctx))
         question, context = q_raw.strip(), c_raw.strip()
         if not question:
             raise Hint(AskSpec.empty_hint)
@@ -448,8 +204,8 @@ class PickSpec:
 
     @staticmethod
     def request(node, ctx):
-        prompt_raw = _text(eval_input(node.inputs["Prompt"], ctx))
-        items_raw = _text(eval_input(node.inputs["Items"], ctx))
+        prompt_raw = as_text(eval_input(node.inputs["Prompt"], ctx))
+        items_raw = as_text(eval_input(node.inputs["Items"], ctx))
         collection = eval_input(node.inputs["Collection"], ctx)
         if not isinstance(collection, bpy.types.Collection):
             collection = None
@@ -645,24 +401,31 @@ def ensure_owned(nodes):
     """Give every OpenAct node a unique uid and its own hidden group.
 
     Copies (duplicated nodes or trees, appended data) arrive sharing the original's group; the
-    rightful owner is the node whose uid matches the group's name, everyone else gets a copy."""
+    rightful owner is the node whose uid matches the group's name, everyone else gets a copy.
+    Linked data is read-only: linked nodes are left alone and keep their uids, so a local node that
+    shares one (appended from the library that is also linked) gets a new uid. A local node whose
+    group is linked (a tree made local on its own) gets a local copy."""
+    seen = {node.uid for tree, node in nodes if tree.library is not None}
+    nodes = [(tree, node) for tree, node in nodes if tree.library is None]
     owners = {}
     for _tree, node in nodes:
         inner = node.node_tree
         if node.uid and inner is not None and inner.name == inner_name(node):
             owners.setdefault(inner.as_pointer(), node)
-    seen = set()
     for _tree, node in nodes:
-        if not node.uid or node.uid in seen:
+        fresh = not node.uid or node.uid in seen
+        if fresh:
             node.uid = new_uid()
         seen.add(node.uid)
         inner = node.node_tree
         if inner is None:
             create_inner(node)
-        elif owners.setdefault(inner.as_pointer(), node) is not node:
+        elif inner.library is not None or owners.setdefault(inner.as_pointer(), node) is not node:
             own = inner.copy()
             own.name = inner_name(node)
             node.node_tree = own
+        elif fresh:  # frees the old uid's group name. Only once: a taken name would be retried every pass
+            inner.name = inner_name(node)
 
 
 def iter_nodes():
@@ -702,16 +465,23 @@ def run_pass():
         return
     ensure_owned(nodes)
     uses = find_uses()
-    for tree, node in nodes:
-        try:
-            _process(tree, node, uses.get(tree.as_pointer()))
-        except Exception as error:
-            traceback.print_exc()
-            STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
+    evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
+    try:
+        for tree, node in nodes:
+            try:
+                _process(tree, node, uses.get(tree.as_pointer()))
+            except Exception as error:
+                traceback.print_exc()
+                STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
+    finally:
+        evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
     redraw()
 
 
 def _process(tree, node, contexts):
+    if tree.library is not None:  # read-only: the library file holds this node's answers
+        STATUS[node.uid] = ('LINKED', f"Linked from {tree.library.name}: answers come from that file")
+        return
     spec = SPECS[node.bl_idname]
     contexts = contexts or [Ctx(None, None, (), tree)]
     wanted = {}
@@ -841,6 +611,8 @@ def answers_for(node):
 
 def reask(node):
     """Forget this node's answers and ask again."""
+    if node.id_data.library is not None:  # linked data is read-only
+        return
     for entry in get_entries(node):
         MEMORY.pop(entry.get("key"), None)
     FAILED.clear()
