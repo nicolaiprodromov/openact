@@ -10,9 +10,10 @@ server.ask are patched to count what the passes would ask.
 - Rules: a locked corner takes part in interpolation, against rules_core.blend.
 - The export never loses or changes rows it doesn't own, byte for byte: it creates a missing file and refuses one with
   errors; of duplicate keys the locked row wins and the others stay; a name twice in the table is written once; a CSV
-  that isn't an Overrides CSV for the node, or is a node's input, is refused; every context sharing the file adds its
-  rows, and a per-object file gets only its object's; a BOM, a ';' delimiter and a read-only flag are respected; a
-  leftover .tmp is replaced; an untrusted file can't write outside its folder.
+  that isn't an Overrides CSV for the node (no key column, or an Items or Settings CSV no node reads: no 'lock'
+  column), or is a node's input, is refused; every context sharing the file adds its rows, and a per-object file gets
+  only its object's; a BOM, a ';' delimiter and a read-only flag are respected; a leftover .tmp is replaced; an
+  untrusted file can't write outside its folder.
 - A factor can't be named after an Overrides column; numeric level names lock by name, and exported numbers read back
   as the same value.
 
@@ -502,6 +503,24 @@ def phase_unrelated():
     check("unrelated: an existing CSV without the node's key column is refused and left as it was",
           got == "contacts.csv is not an Overrides CSV for this node (no 'item' column): choose another file"
           and bytes_of(contacts) == before and node.inputs["Overrides"].default_value == "", got)
+    inventory = write("inventory.csv", "item,when\npan,for cooking\nsofa,to sit on\nkettle,boils water\n")
+    before = bytes_of(inventory)
+    got = export(node, 0, inventory)  # e.g. another .blend's Items CSV: no node here reads it
+    check("unrelated: an Items CSV no node reads is refused although it has the 'item' column (no 'lock'), and left as "
+          "it was", got == "inventory.csv is not an Overrides CSV (no 'lock' column): choose another file"
+          and bytes_of(inventory) == before and node.inputs["Overrides"].default_value == "", got)
+    tree = new_tree("UnrelatedAsk")
+    ask = tree.nodes.new("GeometryNodeOpenActAsk")
+    ask.inputs["Question"].default_value = "Is it windy?"
+    user("UnrelatedAskUser", tree)
+    answer(ask, {"Is it windy?": {"p": 0.7}})
+    settings = write("weather_settings.csv", "setting,type,question,answers,min,max\n"
+                                             "Wind,amount,How windy is it?,,0,100\nRain,yes/no,Is it raining?,,,\n")
+    before = bytes_of(settings)
+    got = export(ask, 0, settings)
+    check("unrelated: a Settings CSV no node reads is refused for Ask, whose 'question' key column it has, and left as "
+          "it was", got == "weather_settings.csv is not an Overrides CSV (no 'lock' column): choose another file"
+          and bytes_of(settings) == before and ask.inputs["Overrides"].default_value == "", got)
     items = write("kitchen_items.csv", "item,when\npan,for cooking\nsofa,to sit on\nkettle,boils water\n")
     node.inputs["Items"].default_value = items
     before = bytes_of(items)
