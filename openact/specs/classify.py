@@ -70,7 +70,7 @@ class ClassifySpec(PerItemSpec):
         items, labels = self.resolved(node, ctx)
         job = self.job(gn, items, labels, node.balance_order, node.uid)
         job.problems = warnings(items.problems + labels.problems)  # the pass shows them (§17.1)
-        return self.locked(node, ctx, job)  # after the warnings: locked() appends its own
+        return job
 
     def job(self, gn, items, labels, debias, uid=""):
         """The Job for these words, items (an ItemList or its items) and labels. Pure, like Ask's and Pick's."""

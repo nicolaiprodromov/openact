@@ -12,8 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import csvfmt, pipeline
-from .base import KEY, Spec, confidence, warnings
-from .base import named, number_text, overrides_inputs, parse_number, yes_no_text  # PR-21: the Overrides CSV
+from .base import KEY, Spec, confidence, named, number_text, overrides_inputs, warnings, yes_no_text
 
 SOCKETS = {"yes_no": 'NodeSocketBool', "amount": 'NodeSocketFloat', "one_of": 'NodeSocketInt'}
 KINDS = {socket: kind for kind, socket in SOCKETS.items()}
@@ -144,7 +143,7 @@ class DialsSpec(Spec):
             raise Hint("Type a prompt")
         job = self.job(gn, settings, node.balance_order, node.uid, hashes)
         job.problems, job.context = problems, ctx.label()
-        return self.locked(node, ctx, job)  # after the warnings: locked() appends its own
+        return job
 
     def job(self, gn, settings, debias, uid="", csv_hashes=()):
         """The Job for these words and settings: one row per setting, every question about the Prompt, so one request.
@@ -300,7 +299,7 @@ class DialsSpec(Spec):
                 return (mapped(kind, value) if kind != "amount" else float(value)), setting["min"], setting["max"]
         return FALLBACK[kind], 0.0, 1.0
 
-    # ------------------------------------------------------------------ PR-21: the Overrides CSV (§7.6)
+    # ------------------------------------------------------------------ the Overrides CSV (§7.6)
 
     OVERRIDE_KEYS = ("setting",)
 
@@ -310,7 +309,7 @@ class DialsSpec(Spec):
             value = 1.0 if answer.casefold() == "yes" else 0.0 if answer.casefold() == "no" else None
             return f"'{answer}' is not yes or no" if value is None else [{"value": value, "c": 1.0}]
         if kind == "amount":  # in output units, mapped back to 0-1
-            number = parse_number(answer)
+            number = csvfmt.number(answer)
             if number is None or not min(low, high) <= number <= max(low, high):
                 return f"'{answer}' is not a number from {low:g} to {high:g}"
             return [{"value": (number - low) / (high - low) if high != low else 0.0, "c": 1.0}]

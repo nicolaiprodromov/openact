@@ -49,10 +49,10 @@ def is_trusted() -> bool:
     return any(p and _inside(own, ident(p)) for p in _paths(prefs, "trusted_folders"))
 
 
-def blocked(path: str) -> str:
-    """Why this file may not read path, or "" when it may. A path outside the folder tree is blocked without touching
-    it (realpath opens a UNC path's server); one inside is compared by ident() too, so neither a symlink nor '..'
-    escapes."""
+def blocked(path: str, writing: bool = False) -> str:
+    """Why this file may not read path (or write it), or "" when it may. A path outside the folder tree is blocked
+    without touching it (realpath opens a UNC path's server); one inside is compared by ident() too, so neither a
+    symlink nor '..' escapes."""
     if is_trusted():
         return ""
     # abspath: Blender 5 saves file paths relative ('//../x' arrives as '<folder>/../x'), and a bare path is read
@@ -60,7 +60,8 @@ def blocked(path: str) -> str:
     full, folder = os.path.abspath(path), os.path.abspath(os.path.dirname(bpy.data.filepath))
     if _inside(os.path.normcase(full), os.path.normcase(folder)) and _inside(ident(full), ident(folder)):
         return ""
-    return f"Blocked reading {full}: outside this file's folder. Allow this file (or trust its folder) to read it"
+    doing, verb = ("writing", "write") if writing else ("reading", "read")
+    return f"Blocked {doing} {full}: outside this file's folder. Allow this file (or trust its folder) to {verb} it"
 
 
 def allow(path: str | None = None) -> bool:

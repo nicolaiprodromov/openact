@@ -86,15 +86,15 @@ evaluator.HANDLERS.update(dict.fromkeys(OPENACT_TYPES, _openact_output))
 
 
 def _plan(spec, node, ctx):
-    """The node's Job in ctx, planned again only when its fingerprint changed (§5.3). Raises Hint, Pending or
-    Unresolvable."""
+    """The node's Job in ctx with its Overrides CSV applied, planned again only when its fingerprint changed (§5.3).
+    Raises Hint, Pending or Unresolvable."""
     global _plans_made
     key = (node.uid, ctx.key())
     fingerprint = spec.fingerprint(node, ctx)
     cached = PLANS.get(key)
     if cached is None or cached[0] != fingerprint:
         try:
-            planned = spec.plan(node, ctx)
+            planned = spec.locked(node, ctx, spec.plan(node, ctx))
         except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
             planned = (type(error), str(error))
         cached = PLANS[key] = (fingerprint, planned)

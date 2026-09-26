@@ -109,9 +109,12 @@ def test_dialect():
         )
     doc = read("bom.csv", b"\xef\xbb\xbfanswer,when\nyes,cold\nno,warm\n")
     check("dialect: one leading BOM is stripped", doc.header == ("answer", "when") and not doc.problems, doc.header)
+    check("dialect: the doc says it had a BOM, so a rewrite can keep it", doc.bom and not lf.bom, (doc.bom, lf.bom))
 
     doc = read("semicolon.csv", "answer;when;scale\nmetal;steel, iron;1,5\nwood;planks;0,6\n")
     check("dialect: ';' when the header line has no ','", doc.rows[0] == ("metal", "steel, iron", "1,5"), doc.rows)
+    check("dialect: the doc says which delimiter it split with", doc.delimiter == ";" and lf.delimiter == ",",
+          (doc.delimiter, lf.delimiter))
     warning = (
         "Column 'scale' has cells that don't read as numbers in lines 2, 3 (first: '1,5'); treated as text, no output"
     )
@@ -712,6 +715,8 @@ def test_factors():
         ("wide_name", flag("\u4e00" * 22), 2, "Line 2: the factor name has 66 bytes in UTF-8 (limit 63)"),
         ("clash", flag("Seed"), 2, "Line 2: rename factor 'Seed': it clashes with a node input"),
         ("clash_key", flag("key"), 2, "Line 2: rename factor 'key': it clashes with a node input"),
+        ("clash_source", flag("source"), 2, "Line 2: rename factor 'source': it clashes with an Overrides CSV column"),
+        ("clash_lock", flag("Lock"), 2, "Line 2: rename factor 'Lock': it clashes with an Overrides CSV column"),
         ("empty_name", ",flag,x,0\n" + flag("a"), 2, "Line 2: the factor name is empty"),
         ("nine", "".join(flag(f"f{i}") for i in range(9)), 0, "Rules need 1 to 8 factors; this file has 9"),
         ("none", "", 0, "Rules need 1 to 8 factors; this file has 0"),
@@ -935,6 +940,11 @@ def test_overrides():
         f"alive{SEP}4": csvfmt.Lock("Dies", 6),
     }
     check("overrides: locked rows only, by their casefolded key cells", locks == expected, locks)
+    check("overrides: lock_key() is that key, trimmed and ignoring case, for rows and table units alike",
+          csvfmt.lock_key([" Dead ", "6"]) == f"dead{SEP}6" and csvfmt.lock_key(["Pan"]) == "pan")
+    got = [csvfmt.number(cell) for cell in ("0.5", "-.5", "1e-3", "1_000", "\u0665", "nan", "inf")]
+    check("overrides: a lock's number follows the rule of every numeric cell", got == [0.5, -0.5, 0.001] + [None] * 4,
+          got)
     check(
         "overrides: key columns match ignoring case", csvfmt.parse_overrides(doc, ["State", "NEIGHBOURS"]) == expected
     )
