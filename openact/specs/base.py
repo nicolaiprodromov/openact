@@ -130,6 +130,11 @@ def stored_rows(entry) -> list[pipeline.Row]:
             for i, wkey in enumerate(rows.wkey) if wkey and rows.src[i] in "mc"]
 
 
+def complete(entry) -> bool:
+    """False for a partial table (§5.4): some row is still pending or stale."""
+    return not {"p", "s"} & set(entry.rows.src)
+
+
 class Spec:
     """A node type: its sockets and words, how the words of a context become a Job, and how answers become the
     Job's rows, the entry the node stores and its outputs."""
@@ -196,15 +201,16 @@ class Spec:
             rows.append(row)
         return rows
 
-    def resolve(self, job: pipeline.Job, entries, last_shown: str = ""):
+    def resolve(self, job: pipeline.Job, entries, last_shown: str = "", partial: bool = False):
         """Answer the job by the validity rule (§5.4), from the node's stored entries and this session's caches.
 
         The stored entry with the job's words holds while its words key matches, whatever its ask keys. Otherwise
         each row takes the answer of a row with its wkey in that entry or in the one this context showed last
         (words key last_shown), else its cell's answer in MEMORY. Returns (entry, missing cells, failure messages):
-        the stored entry, or a new one once every row is answered, else None."""
+        the stored entry, or a new one once every row is answered, else None; with `partial`, once any row is known,
+        the table so far (stale()), which the pass stores while it refills."""
         found = next((entry for entry in entries if entry.gn == job.gn), None)
-        if found is not None and found.words_key == job.words_key:
+        if found is not None and found.words_key == job.words_key and complete(found):
             return found, [], []
         shown = next((entry for entry in entries if entry.words_key == last_shown), None) if last_shown else None
         sources = [entry for entry in (found, shown) if entry is not None]
@@ -227,14 +233,43 @@ class Spec:
                 else:
                     missing[key] = row.cell
             rows.append(row)
-        if missing or failed:
+        if (missing or failed) and not partial:
             return None, list(missing.values()), list(failed.values())
         if answers:
             model = next(iter(answers.values()))["model"]
             model = " ".join(filter(None, (model, "debias" if job.debias else "")))
         else:  # every row carried over
             model = sources[0].model if sources else ""
-        return self.entry(job, self.rows(dataclasses.replace(job, rows=rows), answers), model), [], []
+        rows = self.rows(dataclasses.replace(job, rows=rows), answers)
+        if missing or failed:
+            rows = self.stale(job, rows, shown)
+            if all(row.source == "pending" for row in rows):  # nothing known yet: no table worth storing
+                return None, list(missing.values()), list(failed.values())
+        return self.entry(job, rows, model), list(missing.values()), list(failed.values())
+
+    def stale(self, job: pipeline.Job, rows: list[pipeline.Row], shown) -> list[pipeline.Row]:
+        """The rows of a partial table (stale-while-refilling, §5.4): a row not answered yet takes the values of the
+        row of its name in `shown`, the entry its context showed last, marked stale; else neutral() values, pending."""
+        before = {}
+        if shown is not None:
+            for i, name in enumerate(shown.rows.name):
+                if shown.rows.src[i] in "mcls":
+                    before.setdefault(name, ({column: v[i] for column, v in shown.rows.v.items()},
+                                             shown.asks[shown.rows.ask[i]]))
+        out = []
+        for index, row in enumerate(rows):
+            if row.source == "pending":
+                values, ask = before.get(row.name, ({}, ""))
+                if all(column in values for column, _type in job.shape.columns):
+                    row = dataclasses.replace(row, source="stale", values=values, ask=ask)
+                else:  # e.g. a new row, or the answer type changed
+                    row = dataclasses.replace(row, values=self.neutral(job, index), ask="")
+            out.append(row)
+        return out
+
+    def neutral(self, job: pipeline.Job, index: int) -> dict:
+        """Row `index`'s values before its first answer: -1 for a chosen row's position (INT columns), else 0."""
+        return {column: -1 if kind == "INT" else 0.0 for column, kind in job.shape.columns}
 
     def entry(self, job: pipeline.Job, rows: list[pipeline.Row], model: str = "") -> store.Entry:
         """An answered table as the entry the node stores (§14.2): columnar rows and the ask keys behind them."""

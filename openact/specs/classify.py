@@ -103,10 +103,10 @@ class ClassifySpec(PerItemSpec):
         label = values["label"]
         return job.labels[label] if 0 <= label < len(job.labels) else ""
 
-    def resolve(self, job, entries, last_shown=""):
+    def resolve(self, job, entries, last_shown="", partial=False):
         """Spec.resolve(), with each row's payload baked from its label (denormalised, §8.1). A numbers-only edit of
         the Labels CSV keeps the words key: the stored entry comes back with the new payload, and nothing is asked."""
-        entry, missing, failed = super().resolve(job, entries, last_shown)
+        entry, missing, failed = super().resolve(job, entries, last_shown, partial)
         if entry is None:
             return entry, missing, failed
         labels, payload, baked = (getattr(job, name, ()) for name in ("labels", "payload", "baked"))

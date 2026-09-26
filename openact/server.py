@@ -2,12 +2,14 @@
 
 The model runs in its own Python environment (the "runtime") as a separate process that
 serves a Jev-compatible API on 127.0.0.1. Nothing heavy is imported into Blender. All network
-and process work happens on background threads; results are handed back to Blender's main
-thread through a queue that a timer drains, because bpy may only be touched from there.
+and process work happens on background threads: the decision worker sends the questions, the
+executor does the rest. Results are handed back to Blender's main thread through a queue that a
+timer drains, because bpy may only be touched from there.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import glob
 import hashlib
 import json
@@ -15,6 +17,7 @@ import os
 import pathlib
 import platform
 import queue
+import secrets
 import shutil
 import subprocess
 import sys
@@ -29,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import bpy
 
+from . import pipeline
 from . import prefs as P
 
 SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime", "openact_server.py")
@@ -36,7 +40,8 @@ SERVER_ID = "openact-semif"
 LEGACY_SERVER_ID = "jev-nodes-semif"  # started by the jev_nodes v0.1.0 add-on
 LEGACY_SERVER_MESSAGE = ("An old Jev Nodes model server is running on this port: disable the Jev Nodes add-on "
                          "or choose another port.")
-MODEL_NAME = "semif-qwen3.5-4b"
+TOKEN_REFUSED = "The model server refused this Blender (token)"
+FAKE_ARGS: list[str] = []  # tests: more openact_server.py flags for the fake backend, e.g. --record <path.jsonl>
 
 SEMIF_COMMIT = "23cf1f39fc9534fe81437200959b6dfc7106e45a"
 SEMIF_URL = f"https://github.com/TheoLeeCJ/SemIf-OpenJev/archive/{SEMIF_COMMIT}.zip"
@@ -75,6 +80,7 @@ class _State:
         self.checking = ""  # the runtime folder whose import probe is running
         self.probe_id = 0  # that probe's: a result with another id comes from a superseded probe
         self.start_queued = False  # a start that runs when that probe passes
+        self.token = ""  # the launch token of the server this Blender started, sent as X-OpenAct-Token (§16.1)
 
     def set(self, status, message=""):
         with self.lock:
@@ -87,6 +93,7 @@ class _State:
 STATE = _State()
 _results: queue.Queue = queue.Queue()
 _executor: ThreadPoolExecutor | None = None
+_worker: Worker | None = None
 _status_listeners = []
 
 
@@ -124,9 +131,10 @@ def add_status_listener(fn):
 
 
 def executor():
+    """For the /health probes and the runtime's import probe; the questions go through the worker (§5.5)."""
     global _executor
     if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="openact")
+        _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="openact")
     return _executor
 
 
@@ -150,7 +158,10 @@ def http(method, path, body=None, port=None, timeout=10.0):
     """Blocking JSON request to the local server. Returns (status_code, json)."""
     url = f"http://127.0.0.1:{port or STATE.port}{path}"
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if method == "POST" and STATE.token:  # every POST needs it; GETs don't, so /health never shows it around
+        headers["X-OpenAct-Token"] = STATE.token
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with _opener().open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8") or "{}")
@@ -169,30 +180,111 @@ def _offline(error):
     )
 
 
-def ask(payload, on_done, timeout=180.0):
-    """Send one /v1/systemone request in the background.
+class Worker(threading.Thread):
+    """The decision worker 'openact-decide' (§5.5, §10.5): sends pipeline's queued chunks, highest priority first, one
+    request at a time, and posts each result to the main thread. It never touches bpy: engine.tick() publishes the
+    two events it reads."""
 
-    on_done(kind, data) runs on the main thread; kind is "ok", "error" or "offline"."""
-    port = STATE.port
+    render_running = threading.Event()  # no new chunk starts during a render job; the one in flight completes
+    playing = threading.Event()  # queued chunks may still finish during playback: only the pass waits for its end
 
-    def work():
+    def __init__(self):
+        super().__init__(name="openact-decide", daemon=True)
+        self.stopped = False
+        self.sized = None  # (port, pid) of the server whose /v1/capabilities sized the chunks
+
+    def run(self):
+        while not self.stopped:
+            if self.render_running.is_set():
+                time.sleep(0.1)
+                continue
+            chunk = pipeline.take(timeout=0.25)
+            if chunk is None:
+                continue
+            if self.stopped or self.render_running.is_set():
+                pipeline.requeue(chunk)
+                continue
+            try:
+                self.send(chunk)
+            except Exception as error:  # a bug must not stop the thread, nor leave the chunk's cells pending
+                traceback.print_exc()
+                post(pipeline.answered, chunk, "error", f"Internal error: {error}")
+
+    def send(self, chunk):
+        self.size()
+        request, ids = pipeline.build_request(chunk)
         try:
-            code, body = http("POST", "/v1/systemone", payload, port=port, timeout=timeout)
-            if code == 200:
-                result = ("ok", body)
-            elif code == 503:
-                result = ("offline", body.get("error") or "model is not ready")
-            else:
-                result = ("error", body.get("error") or f"HTTP {code}")
+            code, body = http("POST", "/v1/systemone", request, timeout=180.0)
         except Exception as error:
-            if _offline(error):
-                result = ("offline", "model server is not running")
-                post(_lost_connection)
-            else:
-                result = ("error", f"{type(error).__name__}: {error}")
-        post(on_done, *result)
+            if not _offline(error):
+                post(pipeline.answered, chunk, "error", f"{type(error).__name__}: {error}")
+                return
+            pipeline.requeue(chunk)  # its cells stay queued, and auto-start applies (§13.2)
+            post(_lost_connection)
+            self.wait()
+            return
+        if code == 200:
+            post(pipeline.answered, chunk, "ok", body)
+        elif code == 503 and body.get("status") == "loading":
+            pipeline.requeue(chunk)  # at the head: P0 work may overtake it, and cancel() acts, while the model loads
+            self.wait()
+        elif code in (413, 422) and len(chunk.cells) > 1:
+            if code == 413:  # never expected: chunks stay far below the 4 MB limit (§13.2)
+                print(f"[OpenAct] the model server found a request of {len(chunk.cells)} questions too large; "
+                      "splitting it")
+            named = body.get("question") if code == 422 else None
+            if named in ids:  # only the question the server names fails; the others are sent again
+                bad = ids.index(named)
+                post(pipeline.answered, dataclasses.replace(chunk, cells=chunk.cells[bad:bad + 1]), "error",
+                     f"The model refused: {body.get('error')}")
+                pipeline.requeue(dataclasses.replace(chunk, cells=chunk.cells[:bad] + chunk.cells[bad + 1:]))
+            else:  # unnamed: halves, until the bad question travels alone (§10.3)
+                half = len(chunk.cells) // 2
+                pipeline.requeue(dataclasses.replace(chunk, cells=chunk.cells[:half]),
+                                 dataclasses.replace(chunk, cells=chunk.cells[half:]))
+        elif code == 403:
+            STATE.set("error", TOKEN_REFUSED)
+            post(pipeline.answered, chunk, "error", TOKEN_REFUSED)
+        elif code == 503:  # the model failed to load: a failure, never requeued
+            error = body.get("error") or "The model failed to load"
+            STATE.set("error", error)
+            post(pipeline.answered, chunk, "error", error)
+        else:  # one refused question, or a 500: Ask Again retries
+            post(pipeline.answered, chunk, "error", f"The model refused: {body.get('error') or f'HTTP {code}'}")
 
-    executor().submit(work)
+    def wait(self):
+        """Poll /health every 0.5 s until the server answers with its model loaded or failed (§10.5). Nothing is in
+        flight meanwhile, so cancel() acts and P0 work overtakes the requeued chunk."""
+        while not self.stopped:
+            time.sleep(0.5)
+            try:
+                code, health = http("GET", "/health", timeout=1.0)
+            except Exception:
+                continue
+            if code == 200 and health.get("status") != "loading":
+                return
+
+    def size(self):
+        """Size the chunks from /v1/capabilities, once per server process (§5.5); the defaults stay without it."""
+        sized = (STATE.port, STATE.health.get("pid"))
+        if sized == self.sized:
+            return
+        self.sized = sized
+        try:
+            code, capabilities = http("GET", "/v1/capabilities", timeout=2.0)
+        except Exception:
+            return
+        if code == 200:
+            pipeline.size_chunks(capabilities)
+
+
+def worker():
+    """The decision worker, started on first use."""
+    global _worker
+    if _worker is None or not _worker.is_alive():
+        _worker = Worker()
+        _worker.start()
+    return _worker
 
 
 def _lost_connection():
@@ -402,9 +494,10 @@ def start(prefs=None):
     python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
     folder = state_dir(root)
     STATE.log_path = os.path.join(folder, "server.log")
+    STATE.token = secrets.token_hex(32)  # new for every start; in the environment, as argv is readable by others
     env = _child_env()
-    env.pop("OPENACT_TOKEN", None)  # this add-on sends no X-OpenAct-Token, so its server must not require one
     env.update({
+        "OPENACT_TOKEN": STATE.token,
         "HF_HOME": P.hf_home(root),
         "HF_HUB_OFFLINE": "1",
         "PYTHONUNBUFFERED": "1",
@@ -415,6 +508,8 @@ def start(prefs=None):
             "--parent-pid", str(os.getpid())]
     if prefs.device != "cpu":
         args += ["--gpu", str(prefs.gpu)]
+    if backend == "fake":
+        args += FAKE_ARGS
     try:
         os.makedirs(folder, exist_ok=True)
         log = open(STATE.log_path, "w", encoding="utf-8")
@@ -482,7 +577,7 @@ def _log_tail(lines=6):
 
 
 def stop():
-    """Stop the server (ours, or one another Blender started on the same port)."""
+    """Stop the server this Blender started (one another Blender started refuses: /shutdown needs its token)."""
     try:
         http("POST", "/shutdown", body={}, timeout=2.0)
     except Exception:
@@ -509,10 +604,13 @@ def shutdown_owned():
     STATE.probes.clear()  # the next registration probes again: a probe cancelled below would never report
     STATE.checking, STATE.start_queued = "", False
     STATE.probe_id += 1  # and one that can't be cancelled reports to the next session, which drops it
-    global _executor
+    global _executor, _worker
     if _executor is not None:
         _executor.shutdown(wait=False, cancel_futures=True)
         _executor = None
+    if _worker is not None:
+        _worker.stopped = True  # it ends within 0.25 s, or when its request in flight returns
+        _worker = None
 
 
 # ------------------------------------------------------------------------------ installer

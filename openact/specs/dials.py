@@ -159,7 +159,7 @@ class DialsSpec(Spec):
         return {"type": "choice", "instructions": setting.question,
                 "criteria": {str(i): option_text(option) for i, option in enumerate(setting.answers)}}
 
-    def resolve(self, job, entries, last_shown=""):
+    def resolve(self, job, entries, last_shown="", partial=False):
         from .. import evaluator  # imports bpy
 
         if evaluator.MEMO is not None:  # in a pass: every live context must agree on the outputs (§6.0)
@@ -171,7 +171,11 @@ class DialsSpec(Spec):
                 what = f"{', '.join(one) or '-'} vs {', '.join(other) or '-'}" if one or other else "another order"
                 return None, [], [f"Dials: contexts use different settings ({what}); setting names and types must "
                                   f"agree"]
-        return super().resolve(job, entries, last_shown)
+        return super().resolve(job, entries, last_shown, partial)
+
+    def neutral(self, job, index):
+        _name, kind, _low, _high = job.shape.settings[index]
+        return {"value": -1.0 if kind == "one_of" else 0.0, "c": 0.0}  # a one-of output shows -1 before its answer
 
     # ------------------------------------------------------------------------------------------- answers
 

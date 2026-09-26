@@ -16,6 +16,7 @@ node is answered outside evaluation:
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 import traceback
@@ -41,12 +42,15 @@ DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
+INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
+P0_CELLS = 8
 
-STATUS = {}  # node uid -> (icon, text)
+STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
 LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last
 LIVE = {}  # node uid -> words keys of the entries its contexts showed at its last pass
 DIRTY = set()  # uids of the nodes the next pass visits, when not all of them are dirty
+GENERATIONS = {}  # node uid -> its generation, bumped when its words change: its older queued chunks are dropped
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -56,6 +60,19 @@ _last_pass = 0.0
 _has_nodes = False
 _group_count = -1  # number of node groups at the last pass that found no OpenAct nodes
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
+
+
+class NodeStatus(tuple):
+    """STATUS[uid], the node's status record (§17.1) in skeleton: (icon, text) as the node body draws it, the rows of
+    the tables its contexts show, and the ETA of its fill. A tuple, so it unpacks and compares as (icon, text)."""
+
+    def __new__(cls, icon, text, shown=(), fill=None):
+        status = super().__new__(cls, (icon, text))
+        src = "".join(entry.rows.src for entry in shown)
+        status.rows, status.pending, status.stale = len(src), src.count("p"), src.count("s")
+        status.answered = status.rows - status.pending - status.stale
+        status.eta_s = None if fill is None else (fill[1] - fill[0]) * fill[2] / 1000  # fill: pipeline.progress()
+        return status
 
 
 # ----------------------------------------------------------------------------- plans
@@ -90,6 +107,8 @@ def _plan(spec, node, ctx):
     fingerprint = spec.fingerprint(node, ctx)
     cached = PLANS.get(key)
     if cached is None or cached[0] != fingerprint:
+        if cached is not None:  # new words: the chunks still queued for the node ask about the old ones
+            _bump(node.uid)
         try:
             planned = spec.plan(node, ctx)
         except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
@@ -100,6 +119,12 @@ def _plan(spec, node, ctx):
         kind, message = cached[1]
         raise kind(message)
     return cached[1]
+
+
+def _bump(uid):
+    """A new generation for the node, whose queued chunks of older ones are dropped (§5.5)."""
+    GENERATIONS[uid] = GENERATIONS.get(uid, 0) + 1
+    pipeline.cancel(uid, below=GENERATIONS[uid])
 
 
 def _jobs(node):
@@ -191,9 +216,11 @@ def run_pass(everything=True):
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
-    for uid in WATCH.take_dirty():  # a CSV they read changed on disk: plan them again (§7.8)
+    for uid, kind in WATCH.take_dirty().items():  # a CSV they read changed on disk: plan them again (§7.8)
         for key in [key for key in PLANS if key[0] == uid]:
             del PLANS[key]
+        if kind == "text":  # new words: the chunks queued for the old ones go
+            _bump(uid)
         dirty.add(uid)
     _dirty = _dirty_all = False
     _last_pass = time.monotonic()
@@ -220,7 +247,7 @@ def run_pass(everything=True):
                 stored |= _process(tree, node, uses.get(tree.as_pointer()))
             except Exception as error:
                 traceback.print_exc()
-                STATUS[node.uid] = ('ERROR', f"Internal error: {error}")
+                STATUS[node.uid] = NodeStatus('ERROR', f"Internal error: {error}")
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
     if stored or _plans_made != plans_made:
@@ -239,11 +266,11 @@ def run_pass(everything=True):
 def _process(tree, node, contexts):
     """Plan and answer the node's contexts, store new answers and rebuild its group. True if it stored any."""
     if tree.library is not None:  # read-only: the library file holds this node's answers
-        STATUS[node.uid] = ('LINKED', f"Linked from {tree.library.name}: answers come from that file")
+        STATUS[node.uid] = NodeStatus('LINKED', f"Linked from {tree.library.name}: answers come from that file")
         return False
     node_store = store.load(node)
     if node_store.schema > store.SCHEMA:  # save() would refuse any answer, and the group holds the newer ones
-        STATUS[node.uid] = ('ERROR', store.newer_message(node_store))
+        STATUS[node.uid] = NodeStatus('ERROR', store.newer_message(node_store))
         return False
     spec = SPECS[node.bl_idname]
     entries = node_store.entries
@@ -276,7 +303,13 @@ def _process(tree, node, contexts):
         found = next((entry for entry in entries if entry.gn == job.gn), None)
         if found is not None:
             LAST_SHOWN.setdefault(key, found.words_key)  # after a load, a context shows its stored entry
-        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""))
+        # A converted v0.1.0 answer has no words key to judge it by: it stays until the new answer replaces it.
+        legacy = found is not None and found.legacy and found.answer_type == job.answer_type
+        # While cells are missing, the table so far is stored: stale-while-refilling (§5.4)
+        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=not legacy)
+        if entry is not None and found is not None and entry is not found and dataclasses.replace(
+                entry, t=found.t) == found:
+            entry = found  # the partial table as stored already
         if entry is not None:
             LAST_SHOWN[key] = entry.words_key
             shown.append(entry)
@@ -286,17 +319,14 @@ def _process(tree, node, contexts):
                 else:
                     entries.append(entry)
                 changed = True
-            continue
-        # Words that mean something else now never show the old answer. A converted v0.1.0 answer has no words
-        # key to judge it by, so it stays until the new answer replaces it.
-        if found is not None and found.words_key != job.words_key and not (
-                found.legacy and found.answer_type == job.answer_type):
-            entries.remove(found)
+        elif found is not None and found.words_key != job.words_key and not legacy:
+            entries.remove(found)  # words that mean something else now never show the old answer
             changed = True
         failed += errors
         if missing:
             waiting = True
-            _submit(job, missing)
+            _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
+                                        generation=GENERATIONS.get(node.uid, 0)), missing)
     rows = changed  # entries were added, replaced or dropped: the table object's rows change too
     showing = {entry.words_key for entry in shown}
     left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
@@ -321,7 +351,8 @@ def _process(tree, node, contexts):
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     if not inner.update_values(node, node_store, live, default, rows=rows):  # values only when it can (§8.8)
         inner.build(node, node_store, live, default)
-    STATUS[node.uid] = _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings)
+    STATUS[node.uid] = NodeStatus(*_status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings),
+                                  shown, pipeline.progress(node.uid))
     return changed
 
 
@@ -342,6 +373,20 @@ def _submit(job, missing):
         pipeline.submit(job, missing, job.priority, on_rows=lambda _job: schedule(immediate=True))
     elif state in ("stopped", "unknown") and P.get_prefs().auto_start:
         server.start()  # asked by the pass that runs when the server is ready
+
+
+def _priority(spec, node, missing):
+    """The job's class (§5.5): P0 for Ask, Pick, Dials and any job of at most P0_CELLS missing cells, P1 for the table
+    of the node active in a node editor, P2 for every other table."""
+    if spec.name in INTERACTIVE or len(missing) <= P0_CELLS:
+        return 0
+    wm = getattr(bpy.context, "window_manager", None)
+    for window in wm.windows if wm else ():
+        for area in window.screen.areas if window.screen else ():
+            tree = getattr(area.spaces.active, "edit_tree", None) if area.type == 'NODE_EDITOR' else None
+            if tree is not None and tree.nodes.active == node:
+                return 1
+    return 2
 
 
 def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings=()):
@@ -421,12 +466,20 @@ def redraw():
 # ------------------------------------------------------------------ handlers & timer
 
 
-def _playing():
-    """Don't touch node trees during playback or while a render job runs."""
-    if bpy.app.is_job_running('RENDER'):
-        return True
+def _rendering():
+    return bpy.app.is_job_running('RENDER')
+
+
+def _animation_playing():
     wm = getattr(bpy.context, "window_manager", None)
     return bool(wm) and any(w.screen and w.screen.is_animation_playing for w in wm.windows)
+
+
+def _publish(event, value):
+    if value:
+        event.set()
+    else:
+        event.clear()
 
 
 def tick():
@@ -434,11 +487,14 @@ def tick():
     try:
         if server.pump():
             redraw()
+        rendering, playing = _rendering(), _animation_playing()
+        _publish(server.Worker.render_running, rendering)  # for the worker, which never calls bpy (§5.5)
+        _publish(server.Worker.playing, playing)
         now = time.monotonic()
         if now - _last_refresh > 5.0 and (_has_nodes or server.STATE.status in ("unknown", "ready", "starting")):
             _last_refresh = now
             server.refresh()
-        if not _playing():
+        if not (rendering or playing):  # node trees are left alone during playback and render jobs
             if WATCH.poll(now):  # a watched CSV changed: the pass visits the nodes that read it (take_dirty())
                 _dirty = True
             if _dirty and now - _last_change >= DEBOUNCE:
