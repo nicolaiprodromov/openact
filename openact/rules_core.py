@@ -16,11 +16,16 @@ from typing import NamedTuple
 from . import csvfmt
 from .csvfmt import ERROR, WARNING, CsvError, Option, Problem
 
-PROMPT_VERSION = 1  # stored per entry as "pv"; never part of a key (5.4)
+PROMPT_VERSION = 2  # RulesSpec's: stored per entry as "pv"; part of the ask key, never of a words key (5.4)
 ANSWER_TYPES = ("ONE_OF", "YES_NO", "AMOUNT")  # the node's answer_type
 QUESTION_TYPES = {"ONE_OF": "choice", "YES_NO": "noul", "AMOUNT": "score"}
 NO_CONTEXT = "No additional context."
 FACTS_INTRO = "Each question describes one situation with these facts:"
+CONDITIONS = (  # the state's last lines when One-of outcomes have `when` texts: the options' conditions decide (4.c)
+    "Each option is an outcome and when it applies.",
+    "Decide only by the conditions the options state, not by outside knowledge.",
+    "Choose the outcome whose condition this situation meets.",
+)
 SITUATION = "Situation:"
 DEFAULT_QUESTION = "Which outcome applies in this situation?"  # One-of only
 QUESTION_HINT = "Type a question"  # Yes/No and Amount: a scale without a question is meaningless
@@ -260,10 +265,12 @@ def default_options(answer_type: str) -> tuple[Option, ...]:
     raise ValueError("One-of needs Outcomes")
 
 
-def state_text(context: str, factors) -> str:
+def state_text(context: str, factors, conditions: bool = False) -> str:
+    """The state every cell shares: the Context, the facts and their levels, then CONDITIONS when conditions is set
+    (One-of outcomes with `when` texts, see plan_table)."""
     lines = [context.strip() or NO_CONTEXT, FACTS_INTRO]
     lines += [f"- {factor.name}: " + " | ".join(level.name for level in factor.levels) for factor in factors]
-    return "\n".join(lines)
+    return "\n".join(lines + list(CONDITIONS if conditions else ()))
 
 
 def instructions(factors, levels, question: str) -> str:
@@ -373,7 +380,8 @@ def plan_table(factors, answer_type: str, answers, question: str, context: str, 
         more = len(empty) - len(shown)
         error = "No outcome applies to " + "; ".join(shown)
         error += f" and {more} more cell{'s' if more > 1 else ''}" if more else ""
-    return RulesPlan(state_text(context, factors), tuple(cells), rows, error, tuple(warnings))
+    conditions = answer_type == "ONE_OF" and any(option.when for option in options)
+    return RulesPlan(state_text(context, factors, conditions), tuple(cells), rows, error, tuple(warnings))
 
 
 def ok_value(source: str) -> float:

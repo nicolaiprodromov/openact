@@ -27,6 +27,7 @@ sys.modules["openact"] = _package
 from openact import csvfmt  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
 from openact.specs.base import confidence  # noqa: E402
+from openact.specs.rules import RulesSpec  # noqa: E402
 
 try:
     import numpy
@@ -294,9 +295,13 @@ def test_templates():
         "A cellular automaton on a square grid; every cell has eight neighbours.\n"
         "Each question describes one situation with these facts:\n"
         "- state: dead | alive\n"
-        "- neighbours: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8"
+        "- neighbours: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8\n"
+        "Each option is an outcome and when it applies.\n"
+        "Decide only by the conditions the options state, not by outside knowledge.\n"
+        "Choose the outcome whose condition this situation meets."
     )
-    check("9.5 the shared state", plan.state == state, plan.state)
+    check("9.5 the shared state (One-of outcomes with whens end it with the conditions lines)", plan.state == state,
+          plan.state)
     question = {
         "type": "choice",
         "instructions": "Situation:\n"
@@ -309,7 +314,7 @@ def test_templates():
         },
     }
     check("9.5 the question for cell 12", plan.cells[12].question == question, plan.cells[12].question)
-    check("9.5 PROMPT_VERSION is 1", rc.PROMPT_VERSION == 1)
+    check("9.5 PROMPT_VERSION is 2, and it is the Rules spec's", rc.PROMPT_VERSION == 2 == RulesSpec.PROMPT_VERSION)
     plan = rc.plan_table([flag("wet")], "ONE_OF", inline("Grow", "Wait"), "  ", " ")
     good = (
         plan.state
@@ -342,6 +347,10 @@ def test_templates():
     good = all(cell.question["criteria"] == criteria and cell.allowed == (0, 1, 2) for cell in plan.cells)
     warning = [("warning", 2, "'if' is not used for Amount answers")]
     check("9.5 Amount levels lowest first; 'if' ignored with a warning", good and summary(plan.warnings) == warning)
+    yes_no = answers("lively.csv", "answer,when\nyes,it is lively\nno,it is quiet\n", "yes_no")
+    states = [plan.state, rc.plan_table(life, "YES_NO", yes_no, "Lively?", "").state]
+    check("9.5 Yes/No and Amount states have no conditions lines, even with whens",
+          all(state.endswith("- neighbours: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8") for state in states), states)
 
 
 def test_limits():
