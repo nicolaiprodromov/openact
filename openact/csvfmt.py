@@ -24,37 +24,36 @@ MAX_COLUMNS = 64
 MAX_CELL = 2000  # characters: keeps prompts inside SemIf's context
 MAX_ANSWER = 200
 MAX_PAYLOAD = 16
-MAX_NAME = 63  # factor and setting names become socket names
+MAX_NAME = 63  # bytes of UTF-8: Blender cuts longer socket names
 MAX_FACTORS = 8
 MAX_CELLS = 4096
 MAX_SETTINGS = 64
+MAX_LISTED = 50  # problems of one kind per file; the sidebar shows at most 50
 KEY_SEP = "\x1f"  # joins the key cells of an Overrides row
 
 KINDS = ("yes_no", "amount", "one_of", "items")
 NAME_COLUMNS = ("answer", "name", "item", "label", "outcome")  # the first one present names the options
 WHEN_COLUMNS = ("when", "description")
-# Never payload. One document serves every node that reads the file, whatever its schema, so the column names of
-# every schema are reserved in all of them.
-RESERVED = frozenset(
-    NAME_COLUMNS
-    + WHEN_COLUMNS
-    + ("if", "lock", "unsure", "confidence", "model_answer", "source", "question", "prompt")
-    + ("factor", "kind", "level", "value", "from", "to", "setting", "type", "answers", "min", "max")
+FACTOR_REQUIRED = ("factor", "kind", "level")
+SETTING_REQUIRED = ("setting", "type", "question")
+# Never payload: each schema's own column names. read_csv() tells Factors and Settings files by their required
+# columns; any other file is an answer set or an Overrides file.
+ANSWER_COLUMNS = frozenset(
+    NAME_COLUMNS + WHEN_COLUMNS + ("if", "lock", "unsure", "confidence", "model_answer", "source")
 )
-# Payload columns become output sockets, so they must not take one of the node's fixed output names.
-FIXED_OUTPUTS = {
-    "pick": ("Index", "Item", "Confidence", "Selection", "Probability"),
-    "classify": ("Label", "Confidence"),
-    "rules": ("Outcome", "Probability", "Yes", "Amount", "Confidence"),
+FACTOR_COLUMNS = frozenset(FACTOR_REQUIRED + WHEN_COLUMNS + ("value", "from", "to"))
+SETTING_COLUMNS = frozenset(SETTING_REQUIRED + ("answers", "min", "max"))
+# Where an answer set's numeric columns become output sockets: (node, kind) -> the node's fixed output names, which
+# those sockets must not take.
+PAYLOAD_OUTPUTS = {
+    ("pick", "items"): frozenset(("index", "item", "confidence", "selection", "probability")),
+    ("classify", "one_of"): frozenset(("label", "confidence")),
+    ("rules", "one_of"): frozenset(("outcome", "probability", "yes", "amount", "confidence")),
 }
-ANY_FIXED_OUTPUT = (
-    *("Index", "Item", "Confidence", "Selection", "Probability", "Instance", "Material"),
-    *("Label", "Outcome", "Yes", "Amount"),
-)
-# Factor names become input sockets of the Rules node.
-RULES_INPUTS = (
-    *("Question", "Context", "Factors", "Outcomes", "Overrides", "Dither", "Seed", "Key"),
-    *("Factors CSV", "Outcomes CSV", "Overrides CSV"),
+# Factor names become input sockets of the Rules node, next to these.
+RULES_INPUTS = frozenset(
+    ("question", "context", "factors", "outcomes", "overrides", "dither", "seed", "key")
+    + ("factors csv", "outcomes csv", "overrides csv")
 )
 FACTOR_LEVELS = {"amount": (2, 16), "category": (2, 64), "flag": (2, 2)}
 SETTING_TYPES = {
@@ -65,9 +64,10 @@ LOCKED = frozenset(("1", "yes", "true", "x"))
 
 _INT = re.compile(r"[+-]?[0-9]+")
 _FLOAT = re.compile(r"[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?")
-_DECIMAL_COMMA = re.compile(r"[+-]?[0-9]*,[0-9]+")
+# Numbers as decimal-comma locales write them: "1,5", or with digit groups such as "1 000" or "1.234,5".
+_LOCALE_NUMBER = re.compile("[+-]?[0-9]*,[0-9]+|[+-]?[0-9]{1,3}([ .,'\u00a0\u202f][0-9]{3})+([.,][0-9]+)?")
 # Cells that make a column text although it was meant to hold numbers.
-_NUMBER_LIKE = re.compile(rf"{_DECIMAL_COMMA.pattern}|[+-]?(inf|infinity|nan)|true|false", re.IGNORECASE)
+_NUMBER_LIKE = re.compile(f"{_LOCALE_NUMBER.pattern}|[+-]?(inf|infinity|nan)|true|false", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,7 @@ class Problem:
 
 @dataclass(frozen=True)
 class CsvDoc:
-    path: str  # absolute, os.path.normpath
+    path: str  # absolute and normalised (os.path.abspath)
     stamp: tuple[int, int]  # (st_mtime_ns, st_size) when read; (0, 0) if it could not be read
     header: tuple[str, ...]  # trimmed, as written
     rows: tuple[tuple[str, ...], ...]  # data rows, trimmed, padded to header width
@@ -98,8 +98,8 @@ class CsvDoc:
 class Option:
     name: str
     when: str
-    if_expr: str  # as written; only Rules outcomes keep it
-    payload: dict[str, int | float]  # this row's numeric columns
+    if_expr: str  # as written; nodes other than Rules drop it
+    payload: dict[str, int | float]  # this row's numeric columns, where the node bakes them
 
 
 @dataclass(frozen=True)
@@ -148,7 +148,7 @@ class CsvError(Exception):
 
     def __init__(self, problems):
         self.problems = tuple(problems)
-        super().__init__(next(p.message for p in self.problems if p.severity == ERROR))
+        super().__init__(next((p.message for p in self.problems if p.severity == ERROR), ""))
 
 
 class _Problems(list):
@@ -170,7 +170,7 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
     delimiter: an Import CSV node's Delimiter. None sniffs it: "," unless the header line has none but has ";" (as
     Excel writes in decimal-comma locales) or a tab.
     """
-    path = os.path.normpath(os.path.abspath(path))
+    path = os.path.abspath(path)
     name = os.path.basename(path)
     problems = _Problems(path)
     stamp, data, text = (0, 0), b"", ""
@@ -198,86 +198,122 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
     if delimiter is None:
         first = next((line for line in io.StringIO(text, newline="") if line.strip()), "")
         delimiter = next((sign for sign in (",", ";", "\t") if sign in first), ",")
-    elif len(delimiter) != 1:
-        problems.add(ERROR, 0, "", f"The delimiter must be one character, not '{delimiter}'")
+    elif len(delimiter) != 1 or delimiter in '"\r\n':
+        message = f"The delimiter must be one character other than a quote or a line break, not {delimiter!r}"
+        problems.add(ERROR, 0, "", message)
         text, delimiter = "", ","
+    try:  # skipping the spaces after a delimiter lets a quote follow them; a space delimiter keeps its empty cells
+        reader = csv.reader(
+            io.StringIO(text, newline=""), delimiter=delimiter, skipinitialspace=delimiter != " ", strict=True
+        )
+    except (TypeError, ValueError) as error:  # the check above covers what Python 3.11 to 3.13 reject
+        problems.add(ERROR, 0, "", f"The delimiter {delimiter!r} can't be used: {error}")
+        reader = ()
 
-    records, end, wrapped = [], 0, False  # records: (first physical line, trimmed cells)
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+    header, rows, lines = None, [], []
+    end = width = counted = blank = long_rows = long_cells = 0
+    wrapped = gap = False
     try:
         for cells in reader:
             start, end = end + 1, reader.line_num
+            if len(rows) == MAX_ROWS:  # past the limit, rows are only counted
+                counted += bool("".join(cells).strip())
+                continue
             if end > start and not wrapped:  # Import CSV may not read it the same way
                 problems.add(WARNING, start, "", f"Line {start}: a quoted cell has a line break")
                 wrapped = True
-            records.append((start, [cell.replace("\r\n", "\n").replace("\r", "\n").strip() for cell in cells]))
+            cells = [cell.replace("\r\n", "\n").replace("\r", "\n").strip() for cell in cells]
+            if not any(cells):
+                blank = blank or start
+                continue
+            if header is None:
+                header, width, blank = cells, len(cells), 0
+                if width > MAX_COLUMNS:
+                    problems.add(ERROR, start, "", f"{name} has {_n(width)} columns (limit {MAX_COLUMNS})")
+                    header, width = [], 0
+                    break
+                seen = set()
+                for i, column in enumerate(header):
+                    if not column:
+                        problems.add(ERROR, start, "", f"Column {i + 1} has no name")
+                    elif column.casefold() in seen:
+                        problems.add(ERROR, start, column, f"Two columns are named '{column}'")
+                    seen.add(column.casefold())
+                continue
+            if blank and rows and not gap:  # messages count physical lines, Import CSV may not
+                problems.add(WARNING, blank, "", f"Line {blank} is blank: blank lines between rows are skipped")
+                gap = True
+            blank = 0
+            if len(cells) > width:
+                long_rows += 1
+                if long_rows <= MAX_LISTED:
+                    problems.add(ERROR, start, "", f"Line {start} has {len(cells)} cells; the header has {width}")
+                del cells[width:]
+            cells += [""] * (width - len(cells))
+            for column, cell in zip(header, cells):
+                if len(cell) > MAX_CELL:
+                    long_cells += 1
+                    if long_cells <= MAX_LISTED:
+                        size = f"{_n(len(cell))} characters (limit {_n(MAX_CELL)})"
+                        problems.add(ERROR, start, column, f"Line {start}: column '{column}' has {size}")
+            rows.append(tuple(cells))
+            lines.append(start)
     except csv.Error as error:
-        problems.add(ERROR, end + 1, "", f"Line {end + 1}: bad quoting ({error})")
+        if "field limit" in str(error):  # the csv module's own cap on a cell
+            size = f"over {_n(csv.field_size_limit())} characters (limit {_n(MAX_CELL)})"
+            problems.add(ERROR, end + 1, "", f"Line {end + 1}: a cell has {size}")
+        else:
+            problems.add(ERROR, end + 1, "", f"Line {end + 1}: bad quoting ({error})")
+    header = header or []
+    if long_rows > MAX_LISTED:
+        problems.add(ERROR, 0, "", f"{_n(long_rows - MAX_LISTED)} more rows have more cells than the header")
+    if long_cells > MAX_LISTED:
+        problems.add(ERROR, 0, "", f"{_n(long_cells - MAX_LISTED)} more cells have over {_n(MAX_CELL)} characters")
+    if counted:
+        problems.add(ERROR, 0, "", f"{name} has {_n(MAX_ROWS + counted)} rows (limit {_n(MAX_ROWS)})")
 
-    at = next((i for i, (_, cells) in enumerate(records) if any(cells)), len(records))
-    header_line, header = records[at] if records[at:] else (0, [])
-    width = len(header)
-    if width > MAX_COLUMNS:
-        problems.add(ERROR, header_line, "", f"{name} has {width} columns (limit {MAX_COLUMNS})")
-    seen = set()
-    for i, column in enumerate(header):
-        if not column:
-            problems.add(ERROR, header_line, "", f"Column {i + 1} has no name")
-        elif column.casefold() in seen:
-            problems.add(ERROR, header_line, column, f"Two columns are named '{column}'")
-        seen.add(column.casefold())
-
-    rows, lines, blank, gap = [], [], 0, False
-    for line, cells in records[at + 1 :]:
-        if not any(cells):
-            blank = blank or line
-            continue
-        if blank and rows and not gap:  # messages count physical lines, Import CSV may not
-            problems.add(WARNING, blank, "", f"Line {blank} is blank: blank lines between rows are skipped")
-            gap = True
-        blank = 0
-        if len(cells) > width:
-            problems.add(ERROR, line, "", f"Line {line} has {len(cells)} cells; the header has {width}")
-            del cells[width:]
-        cells += [""] * (width - len(cells))
-        for column, cell in zip(header, cells):
-            if len(cell) > MAX_CELL:
-                message = f"Line {line}: column '{column}' has {_n(len(cell))} characters (limit {_n(MAX_CELL)})"
-                problems.add(ERROR, line, column, message)
-        rows.append(tuple(cells))
-        lines.append(line)
-    if len(rows) > MAX_ROWS:
-        problems.add(ERROR, 0, "", f"{name} has {_n(len(rows))} rows (limit {_n(MAX_ROWS)})")
-
-    text_cols, num_cols, numbers = [], {}, {}
+    names = {column.casefold() for column in header}
+    if names.issuperset(FACTOR_REQUIRED):
+        reserved = FACTOR_COLUMNS
+    elif names.issuperset(SETTING_REQUIRED):
+        reserved = SETTING_COLUMNS
+    else:
+        reserved = ANSWER_COLUMNS
+    texts, num_cols, numbers = {}, {}, {}  # texts: text column -> its cells
     for i, column in enumerate(header):
         cells = [row[i] for row in rows]
-        reserved = column.casefold() in RESERVED
-        kind, values = (None, ()) if reserved else _classify(cells)
+        free = column.casefold() not in reserved
+        kind, values = _classify(cells) if free else (None, ())
         if kind:
             num_cols[column], numbers[column] = kind, values
             continue
-        text_cols.append(column)
+        texts[column] = cells
+        if not free:
+            continue
         odd = [(line, cell) for line, cell in zip(lines, cells) if not _FLOAT.fullmatch(cell)]
-        meant = any(_FLOAT.fullmatch(cell) or _DECIMAL_COMMA.fullmatch(cell) for cell in cells)
-        if not reserved and meant and all(not c or _NUMBER_LIKE.fullmatch(c) for _, c in odd):
-            what = f"'{odd[0][1]}'" if odd[0][1] else "an empty cell"
+        meant = any(_FLOAT.fullmatch(cell) or _LOCALE_NUMBER.fullmatch(cell) for cell in cells)
+        if meant and all(not cell or _NUMBER_LIKE.fullmatch(cell) for _, cell in odd):
+            first = f"'{odd[0][1]}'" if odd[0][1] else "an empty cell"
             where = ", ".join(str(line) for line, _ in odd[:5]) + (", ..." if len(odd) > 5 else "")
-            message = f"Column '{column}' has {what} in line{'s' if len(odd) > 1 else ''} {where}"
-            problems.add(WARNING, odd[0][0], column, message + "; treated as text, no output")
+            if len(odd) == 1:
+                what = f"{first} in line {where}"
+            elif len({cell for _, cell in odd}) == 1:
+                what = f"{first if odd[0][1] else 'empty cells'} in lines {where}"
+            else:
+                what = f"cells that don't read as numbers in lines {where} (first: {first})"
+            problems.add(WARNING, odd[0][0], column, f"Column '{column}' has {what}; treated as text, no output")
 
-    texts = [[column, [row[i] for row in rows]] for i, column in enumerate(header) if column not in num_cols]
     return CsvDoc(
         path=path,
         stamp=stamp,
         header=tuple(header),
         rows=tuple(rows),
         lines=tuple(lines),
-        text_cols=tuple(text_cols),
+        text_cols=tuple(texts),
         num_cols=num_cols,
         numbers=numbers,
         text_hash=_sha1([header, len(rows), texts]),
-        num_hash=_sha1([list(num_cols.items()), [[column, list(v)] for column, v in numbers.items()]]),
+        num_hash=_sha1([num_cols, numbers]),
         problems=tuple(problems),
     )
 
@@ -285,12 +321,12 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
 def parse_inline(text: str) -> list[tuple[str, str]]:
     """An inline list or answer set as (name, when) pairs.
 
-    Entries are split on new lines if there are any, else on ";" if present, else on ",". Within an entry, the first
-    ": " separates the name from its when.
+    Entries are split on new lines if there are any, else on ";" if present, else on ",". New lines at either end do
+    not count, so the trailing one of an Import Text file changes nothing. Within an entry, the first ": " separates
+    the name from its when.
     """
-    text = text.strip()  # a lone trailing new line (Import Text) does not make a list of lines
-    if "\n" in text or "\r" in text:
-        entries = re.split(r"\r\n|\r|\n", text)
+    if len(text.strip().splitlines()) > 1:
+        entries = text.splitlines()
     else:
         entries = text.split(";" if ";" in text else ",")
     pairs = []
@@ -304,9 +340,10 @@ def parse_inline(text: str) -> list[tuple[str, str]]:
 def parse_answer_set(doc: CsvDoc, kind: str, node: str = "") -> AnswerSet:
     """The options of an answer-set CSV (Answers, Labels, Outcomes or Items). Row r is option r.
 
-    kind: "yes_no" | "amount" | "one_of" | "items". node: the Spec name of the node that reads the set. Only "rules"
-    keeps 'if', and payload columns must not take that node's fixed output names (any node's when node is "").
-    Raises CsvError when the file has an error.
+    kind: "yes_no" | "amount" | "one_of" | "items". node: the Spec name of the node that reads the set, or "" when not
+    known. A known node other than Rules drops 'if', with a warning. Numeric columns are payload only where the node
+    bakes them (Pick items, Classify labels, Rules one-of outcomes; for an unknown node, wherever one of those could),
+    and there they must not take one of the node's fixed output names. Raises CsvError when the file has an error.
     """
     if kind not in KINDS:
         raise ValueError(f"unknown answer-set kind {kind!r}")
@@ -317,21 +354,26 @@ def parse_answer_set(doc: CsvDoc, kind: str, node: str = "") -> AnswerSet:
         problems.add(ERROR, 0, "", "No 'answer' column (or name, item, label, outcome)")
         problems.check()
     when_at, if_at = _find(doc.header, WHEN_COLUMNS), _find(doc.header, ("if",))
-    rules = node == "rules"
-    if if_at is not None and not rules:
+    keep_if = node in ("", "rules")
+    if if_at is not None and not keep_if:
         used = [line for row, line in zip(doc.rows, doc.lines) if row[if_at]]
         if used:
             problems.add(WARNING, used[0], doc.header[if_at], "'if' is only used by Rules; ignored")
-    fixed = {output.casefold() for output in FIXED_OUTPUTS.get(node, ANY_FIXED_OUTPUT)}
-    for column in doc.num_cols:
+    outputs = [names for (baker, baked), names in PAYLOAD_OUTPUTS.items() if baked == kind and node in ("", baker)]
+    payload = doc.num_cols if outputs else {}
+    fixed = frozenset().union(*outputs)
+    for column in payload:
+        size = len(column.encode("utf-8"))
         if column.casefold() in fixed:
             problems.add(ERROR, 0, column, f"Rename column '{column}': it clashes with a node output")
-    if len(doc.num_cols) > MAX_PAYLOAD:
-        message = f"{os.path.basename(doc.path)} has {len(doc.num_cols)} payload columns (limit {MAX_PAYLOAD})"
+        elif size > MAX_NAME:
+            problems.add(ERROR, 0, column, f"Rename column '{column}': it has {size} bytes in UTF-8 (limit {MAX_NAME})")
+    if len(payload) > MAX_PAYLOAD:
+        message = f"{os.path.basename(doc.path)} has {len(payload)} payload columns (limit {MAX_PAYLOAD})"
         problems.add(ERROR, 0, "", message)
     for i, column in enumerate(doc.header):
         if i not in (name_at, when_at, if_at) and column not in doc.num_cols:
-            if column.casefold() in RESERVED:
+            if column.casefold() in ANSWER_COLUMNS:
                 problems.add(INFO, 0, column, f"Column '{column}' is not used: '{column}' is a reserved name")
             else:
                 problems.add(INFO, 0, column, f"Column '{column}' is text and is not used")
@@ -341,8 +383,8 @@ def parse_answer_set(doc: CsvDoc, kind: str, node: str = "") -> AnswerSet:
         if message:
             problems.add(ERROR, line, doc.header[name_at], f"Line {line}: {message}")
         when = row[when_at] if when_at is not None else ""
-        if_expr = row[if_at] if rules and if_at is not None else ""
-        options.append(Option(row[name_at], when, if_expr, {column: doc.numbers[column][r] for column in doc.num_cols}))
+        if_expr = row[if_at] if keep_if and if_at is not None else ""
+        options.append(Option(row[name_at], when, if_expr, {column: doc.numbers[column][r] for column in payload}))
     message = _count_problem(kind, [option.name for option in options])
     if message:
         problems.add(ERROR, 0, "", message)
@@ -357,9 +399,9 @@ def parse_factors(doc: CsvDoc) -> list[Factor]:
     """
     problems = _Problems(doc.path, doc.problems)
     problems.check()
-    at = {column: _find(doc.header, (column,)) for column in ("factor", "kind", "level", "value", "from", "to")}
+    at = {column: _find(doc.header, (column,)) for column in FACTOR_REQUIRED + ("value", "from", "to")}
     at["when"] = _find(doc.header, WHEN_COLUMNS)
-    for column in ("factor", "kind", "level"):
+    for column in FACTOR_REQUIRED:
         if at[column] is None:
             problems.add(ERROR, 0, "", f"No '{column}' column")
     problems.check()
@@ -376,14 +418,14 @@ def parse_factors(doc: CsvDoc) -> list[Factor]:
             groups.setdefault(key, []).append((cells, line))
             last = key
 
-    inputs = {name.casefold() for name in RULES_INPUTS}
     factors = []
     for rows in groups.values():
         first, line = rows[0]
         name, kind = first["factor"], first["kind"].casefold()
-        if len(name) > MAX_NAME:
-            problems.add(ERROR, line, "", f"Line {line}: the factor name has {len(name)} characters (limit {MAX_NAME})")
-        if name.casefold() in inputs:
+        size = len(name.encode("utf-8"))
+        if size > MAX_NAME:
+            problems.add(ERROR, line, "", f"Line {line}: the factor name has {size} bytes in UTF-8 (limit {MAX_NAME})")
+        if name.casefold() in RULES_INPUTS:
             problems.add(ERROR, line, "", f"Line {line}: rename factor '{name}': it clashes with a node input")
         if kind not in FACTOR_LEVELS:
             problems.add(ERROR, line, "", f"Line {line}: factor '{name}' needs a kind: amount, category or flag")
@@ -469,8 +511,8 @@ def parse_settings(doc: CsvDoc) -> list[Setting]:
     """The settings of a Settings CSV, in row order. Raises CsvError when the file has an error."""
     problems = _Problems(doc.path, doc.problems)
     problems.check()
-    at = {column: _find(doc.header, (column,)) for column in ("setting", "type", "question", "answers", "min", "max")}
-    for column in ("setting", "type", "question"):
+    at = {column: _find(doc.header, (column,)) for column in SETTING_REQUIRED + ("answers", "min", "max")}
+    for column in SETTING_REQUIRED:
         if at[column] is None:
             problems.add(ERROR, 0, "", f"No '{column}' column")
     problems.check()
@@ -478,10 +520,11 @@ def parse_settings(doc: CsvDoc) -> list[Setting]:
     for row, line in zip(doc.rows, doc.lines):
         cells = {column: row[i] if i is not None else "" for column, i in at.items()}
         name, kind = cells["setting"], SETTING_TYPES.get(cells["type"].casefold())
+        size = len(name.encode("utf-8"))
         if not name:
             problems.add(ERROR, line, "", f"Line {line}: the setting name is empty")
-        elif len(name) > MAX_NAME:
-            message = f"Line {line}: the setting name has {len(name)} characters (limit {MAX_NAME})"
+        elif size > MAX_NAME:
+            message = f"Line {line}: the setting name has {size} bytes in UTF-8 (limit {MAX_NAME})"
             problems.add(ERROR, line, "", message)
         elif name.casefold() == "confidence":
             problems.add(ERROR, line, "", f"Line {line}: rename setting '{name}': it clashes with a node output")
@@ -526,7 +569,8 @@ def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]:
 
     keys: the node's key columns, e.g. ["question"] for Ask, or one per factor for Rules. Unlocked rows and the
     informational columns are ignored. Matching locks to table rows and checking their answers is the caller's.
-    Raises CsvError when a key column is missing or two locked rows share a key.
+    Factor key columns may hold numbers, so an edit to them can change only num_hash: re-parse when either hash
+    changes. Raises CsvError when a key column is missing or two locked rows share a key.
     """
     problems = _Problems(doc.path, doc.problems)
     problems.check()
@@ -556,7 +600,7 @@ def _n(number):
 
 
 def _sha1(parts):
-    return hashlib.sha1(json.dumps(parts, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return hashlib.sha1(json.dumps(parts, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _find(header, names):
@@ -567,7 +611,7 @@ def _find(header, names):
 
 def _int32(cell):
     """The cell's value if it is an integer that fits an Int socket, else None."""
-    if _INT.fullmatch(cell):
+    if _INT.fullmatch(cell) and len(cell.lstrip("+-").lstrip("0")) <= 10:  # int() refuses over 4300 digits
         value = int(cell)
         if -(2**31) <= value < 2**31:
             return value

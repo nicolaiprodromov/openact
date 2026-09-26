@@ -110,10 +110,20 @@ def test_dialect():
 
     doc = read("semicolon.csv", "answer;when;scale\nmetal;steel, iron;1,5\nwood;planks;0,6\n")
     check("dialect: ';' when the header line has no ','", doc.rows[0] == ("metal", "steel, iron", "1,5"), doc.rows)
-    warning = "Column 'scale' has '1,5' in lines 2, 3; treated as text, no output"
+    warning = (
+        "Column 'scale' has cells that don't read as numbers in lines 2, 3 (first: '1,5'); treated as text, no output"
+    )
     check(
         "dialect: decimal commas make a text column, with a warning",
         not doc.num_cols and only(doc.problems, "warning", 2, warning),
+        summary(doc.problems),
+    )
+    doc = read("grouped.csv", "answer;scale\na;1 000\nb;2 500\nc;1.234,5\n")
+    warning = "Column 'scale' has cells that don't read as numbers in lines 2, 3, 4 (first: '1 000')"
+    warning += "; treated as text, no output"
+    check(
+        "dialect: digit groups make a text column, with a warning",
+        only(doc.problems, "warning", 2, warning),
         summary(doc.problems),
     )
     doc = read("tab.csv", "answer\twhen\nmetal\tsteel; iron, copper\n")
@@ -130,11 +140,24 @@ def test_dialect():
         doc.header == ("a,b", "c") and doc.rows == (("1,2", "3"),),
         doc.header,
     )
-    doc = read("delimiter.csv", "a,b\n", delimiter=";;")
+    for number, delimiter in enumerate((";;", '"', "\n", "\r")):
+        doc = read(f"delimiter_{number}.csv", 'a,b\n"x",y\n', delimiter=delimiter)
+        message = f"The delimiter must be one character other than a quote or a line break, not {delimiter!r}"
+        check(
+            f"dialect: the delimiter {delimiter!r} is a problem, not an exception",
+            only(doc.problems, "error", 0, message) and not doc.rows,
+            summary(doc.problems),
+        )
+    doc = read("space_delimiter.csv", "x y z\na  b\n", delimiter=" ")
+    check("dialect: a space delimiter keeps its empty cells", doc.rows == (("a", "", "b"),), doc.rows)
+    doc = read("spaced_quotes.csv", 'answer, when, roughness\nmetal, "steel, iron", 0.35\n')
+    good = (
+        doc.rows == (("metal", "steel, iron", "0.35"),) and doc.num_cols == {"roughness": "FLOAT"} and not doc.problems
+    )
     check(
-        "dialect: a delimiter must be one character",
-        only(doc.problems, "error", 0, "The delimiter must be one character, not ';;'"),
-        summary(doc.problems),
+        "dialect: a quote after the spaces that follow a delimiter still quotes",
+        good,
+        (doc.rows, summary(doc.problems)),
     )
 
     doc = read("quotes.csv", 'answer,when\nsay,"he said ""hi"", twice"\n')
@@ -166,7 +189,7 @@ def test_dialect():
 def test_classes():
     doc = read(
         "classes.csv",
-        "answer,when,ints,big,floats,words,mixed,blank,inf,nan,truth,Value\n"
+        "answer,when,ints,big,floats,words,mixed,blank,inf,nan,truth,Confidence\n"
         "a,1,007,2147483648,0.5,x,3,,inf,NaN,true,1\n"
         "b,2,-2,1,.5,y,fragile,1,1,1,1,2\n"
         "c,3,+3,1,1e3,z,,2,2,2,2,3\n",
@@ -192,7 +215,7 @@ def test_classes():
     )
     check(
         "classes: reserved names are text whatever they hold",
-        {"answer", "when", "Value"} <= set(doc.text_cols),
+        {"answer", "when", "Confidence"} <= set(doc.text_cols),
         doc.text_cols,
     )
     warned = {p.column: p.message for p in doc.problems if p.severity == "warning"}
@@ -209,6 +232,47 @@ def test_classes():
     check(
         "classes: text columns with a stray number do not warn", {"words", "mixed"} <= set(doc.text_cols), doc.text_cols
     )
+    doc = read("odd_cells.csv", "answer,a,b\nx,1,1\ny,,\nz,inf,\n")
+    warned = [p.message for p in doc.problems]
+    expected = [
+        "Column 'a' has cells that don't read as numbers in lines 3, 4 (first: an empty cell); treated as text, "
+        "no output",
+        "Column 'b' has empty cells in lines 3, 4; treated as text, no output",
+    ]
+    check("classes: the warning names a value only when every odd cell holds it", warned == expected, warned)
+
+    # Neither factor + kind + level (a Factors file) nor setting + type + question (a Settings file).
+    names = "value,level,type,min,max,kind,from,to,question,answers,prompt"
+    doc = read("other_schemas.csv", f"answer,{names}\na,{','.join(['1'] * 11)}\n")
+    check(
+        "classes: an answer set may use other schemas' column names as payload",
+        list(doc.num_cols) == names.split(","),
+        doc.num_cols,
+    )
+    for name, columns in (
+        ("life_factors.csv", ("value",)),
+        ("biome_factors.csv", ("from", "to")),
+        ("weather_dials.csv", ("min", "max")),
+    ):
+        doc = csvfmt.read_csv(fixture(name))
+        good = set(columns) <= set(doc.text_cols) and not doc.num_cols and not doc.problems
+        check(
+            f"classes: {name} keeps its own columns as text, blanks and all",
+            good,
+            (doc.num_cols, summary(doc.problems)),
+        )
+
+    digits = "7" * 5000
+    doc = read("digits.csv", f"answer,v\na,{digits}\n")
+    message = "Line 2: column 'v' has 5 000 characters (limit 2 000)"
+    check(
+        "classes: a cell of 5 000 digits is a problem, not an exception",
+        only(doc.problems, "error", 2, message),
+        summary(doc.problems),
+    )
+    doc = read("zeros.csv", "answer,v,w\na," + "0" * 30 + "7,12345678901\n")
+    good = doc.numbers.get("v") == (7,) and doc.num_cols.get("w") == "FLOAT"
+    check("classes: leading zeros don't count towards int32; 11 digits make FLOAT", good, (doc.num_cols, doc.numbers))
 
 
 def test_limits():
@@ -224,8 +288,8 @@ def test_limits():
     check("limits: 64 columns are fine", len(doc.header) == 64 and not doc.problems, summary(doc.problems))
     doc = read("columns_65.csv", ",".join(f"c{i}" for i in range(65)) + "\n")
     check(
-        "limits: 65 columns",
-        only(doc.problems, "error", 1, "columns_65.csv has 65 columns (limit 64)"),
+        "limits: 65 columns, and nothing more is read",
+        only(doc.problems, "error", 1, "columns_65.csv has 65 columns (limit 64)") and not doc.header,
         summary(doc.problems),
     )
     doc = read("cell_2000.csv", "answer,when\na," + "w" * 2000 + "\n")
@@ -233,6 +297,27 @@ def test_limits():
     doc = read("cell_2001.csv", "answer,when\na," + "w" * 2001 + "\n")
     message = "Line 2: column 'when' has 2 001 characters (limit 2 000)"
     check("limits: 2 001 characters in a cell", only(doc.problems, "error", 2, message), summary(doc.problems))
+    doc = read("cell_huge.csv", "answer,when\na," + "w" * 140000 + "\nb,c\n")
+    message = "Line 2: a cell has over 131 072 characters (limit 2 000)"
+    check(
+        "limits: a cell over the csv module's own cap", only(doc.problems, "error", 2, message), summary(doc.problems)
+    )
+
+    doc = read("rows_many.csv", "answer\n" + lines(6000, lambda i: f"r{i}"))
+    good = only(doc.problems, "error", 0, "rows_many.csv has 6 000 rows (limit 4 096)") and len(doc.rows) == 4096
+    check("limits: rows past the limit are counted, not kept", good, (len(doc.rows), summary(doc.problems)))
+    doc = read("long_rows.csv", "answer\n" + lines(60, lambda i: f"r{i},extra"))
+    listed = summary(doc.problems)
+    good = len(listed) == 51 and listed[0] == ("error", 2, "Line 2 has 2 cells; the header has 1")
+    check(
+        "limits: at most 50 long rows are listed",
+        good and listed[-1] == ("error", 0, "10 more rows have more cells than the header"),
+        listed[-2:],
+    )
+    doc = read("long_cells.csv", "answer,when\n" + lines(55, lambda i: f"r{i}," + "w" * 2001))
+    listed = summary(doc.problems)
+    good = len(listed) == 51 and listed[-1] == ("error", 0, "5 more cells have over 2 000 characters")
+    check("limits: at most 50 long cells are listed", good, listed[-2:])
 
 
 def test_messages():
@@ -366,12 +451,11 @@ def test_answer_sets():
         len(biome.options) == 7 and biome.doc.num_cols == {"instance": "INT", "scale": "FLOAT"},
         biome.doc.num_cols,
     )
-    problems = raised(csvfmt.parse_answer_set, biome.doc, "one_of")
-    message = "Rename column 'instance': it clashes with a node output"
+    unknown = csvfmt.parse_answer_set(biome.doc, "one_of")
     check(
-        "answers: with the node unknown, 'instance' clashes with Pick's Instance",
-        only(problems, "error", 0, message),
-        summary(problems),
+        "answers: with the node unknown, biome's 'instance' is payload",
+        unknown.options[0].payload == {"instance": 0, "scale": 1.2},
+        unknown.options[0],
     )
     props = csvfmt.parse_answer_set(csvfmt.read_csv(fixture("props.csv")), "items", node="pick")
     anvil = props.options[8]
@@ -379,6 +463,49 @@ def test_answer_sets():
         "answers: props, an Items CSV",
         len(props.options) == 10 and anvil.name == "anvil" and anvil.payload == {"instance": 8, "scale": 0.6},
         anvil,
+    )
+    for node in ("match", "ask", "classify", ""):
+        items = csvfmt.parse_answer_set(props.doc, "items", node=node)
+        baked = {"instance": 8, "scale": 0.6} if node == "" else {}
+        check(
+            f"answers: props as items for node {node!r}",
+            items.options[8].payload == baked and not items.problems,
+            items.options[8],
+        )
+    wide = read(
+        "wide.csv",
+        "answer,"
+        + ",".join(f"p{i}" for i in range(17))
+        + "\nyes,"
+        + ",".join("1" * 17)
+        + "\nno,"
+        + ",".join("0" * 17)
+        + "\n",
+    )
+    answers = csvfmt.parse_answer_set(wide, "yes_no", node="match")
+    check(
+        "answers: numbers where no node bakes them are no payload, whatever their count",
+        not answers.problems and answers.options[0].payload == {},
+        summary(answers.problems),
+    )
+    problems = raised(csvfmt.parse_answer_set, read("index_payload.csv", "answer,Index\na,1\n"), "items")
+    message = "Rename column 'Index': it clashes with a node output"
+    check(
+        "answers: with the node unknown, items payload may not take Pick's outputs",
+        only(problems, "error", 0, message),
+        summary(problems),
+    )
+    long_name = "p" * 64
+    problems = raised(
+        csvfmt.parse_answer_set, read("payload_long.csv", f"answer,{long_name}\na,1\n"), "one_of", node="classify"
+    )
+    message = f"Rename column '{long_name}': it has 64 bytes in UTF-8 (limit 63)"
+    check("answers: a payload name over 63 bytes", only(problems, "error", 0, message), summary(problems))
+    rules = csvfmt.parse_answer_set(csvfmt.read_csv(fixture("life_outcomes.csv")), "one_of")
+    check(
+        "answers: with the node unknown, 'if' is kept, without a warning",
+        [o.if_expr for o in rules.options] == ifs and not rules.problems,
+        summary(rules.problems),
     )
 
     answers = csvfmt.parse_answer_set(read("yes_no.csv", "answer,when\nNo,warm and calm\nYES,cold or wet\n"), "yes_no")
@@ -490,7 +617,8 @@ def test_factors():
             2,
             "c: category values must count up by one, or all lie between 0 and 4095",
         ),
-        ("long_name", flag(long_name), 2, "Line 2: the factor name has 64 characters (limit 63)"),
+        ("long_name", flag(long_name), 2, "Line 2: the factor name has 64 bytes in UTF-8 (limit 63)"),
+        ("wide_name", flag("\u4e00" * 22), 2, "Line 2: the factor name has 66 bytes in UTF-8 (limit 63)"),
         ("clash", flag("Seed"), 2, "Line 2: rename factor 'Seed': it clashes with a node input"),
         ("clash_key", flag("key"), 2, "Line 2: rename factor 'key': it clashes with a node input"),
         ("empty_name", ",flag,x,0\n" + flag("a"), 2, "Line 2: the factor name is empty"),
@@ -527,6 +655,9 @@ def test_factors():
         check(f"factors: {case}", only(problems, "error", line, message), summary(problems))
     problems = raised(csvfmt.parse_factors, read("factors_columns.csv", "factor,level\na,x\n"))
     check("factors: a required column is missing", only(problems, "error", 0, "No 'kind' column"), summary(problems))
+    name = "\u4e00" * 21
+    factors = csvfmt.parse_factors(read("factors_wide_ok.csv", FACTORS + flag(name)))
+    check("factors: a name of exactly 63 bytes is fine", factors[0].name == name)
 
 
 def test_settings():
@@ -583,7 +714,13 @@ def test_settings():
             2,
             "Line 2: rename setting 'Confidence': it clashes with a node output",
         ),
-        ("long_name", "s" * 64 + ",yes/no,q?,,,\n", 2, "Line 2: the setting name has 64 characters (limit 63)"),
+        ("long_name", "s" * 64 + ",yes/no,q?,,,\n", 2, "Line 2: the setting name has 64 bytes in UTF-8 (limit 63)"),
+        (
+            "wide_name",
+            "\u00e9" * 32 + ",yes/no,q?,,,\n",
+            2,
+            "Line 2: the setting name has 64 bytes in UTF-8 (limit 63)",
+        ),
         ("empty_name", ",yes/no,q?,,,\n", 2, "Line 2: the setting name is empty"),
         ("min_text", "W,amount,q?,,low,30\n", 2, "Line 2: 'min' must be a number, not 'low'"),
         ("many", lines(65, lambda i: f"s{i},yes/no,q?,,,"), 0, "settings_many.csv has 65 settings (limit 64)"),
@@ -714,7 +851,20 @@ def test_inline():
         parse("a, b\n") == [("a", ""), ("b", "")],
         parse("a, b\n"),
     )
+    for text, pairs in (
+        ("a: x; b: ", [("a", "x"), ("b", "")]),
+        ("b: ; a: x", [("b", ""), ("a", "x")]),
+        ("a: x\nb: ", [("a", "x"), ("b", "")]),
+        ("\n\nb: \na: x\n", [("b", ""), ("a", "x")]),
+    ):
+        check(
+            f"inline: a trailing ': ' parses the same wherever the entry is ({text!r})",
+            parse(text) == pairs,
+            parse(text),
+        )
     check("inline: lists offers csvfmt's parser", lists.parse_inline is csvfmt.parse_inline)
+    error = csvfmt.CsvError([csvfmt.Problem("warning", "f.csv", 1, "", "just a warning")])
+    check("CsvError: built without an error, it still builds", str(error) == "" and len(error.problems) == 1)
     paths = ("//life_outcomes.csv", "  C:\\data\\Life.CSV \n")
     check("csv path: a single line ending in .csv, any case", all(lists.is_csv_path(text) for text in paths))
     texts = ("", "a.csv\nb.csv", "life.csv.txt", "yes: cold; no: warm", "a, b")
