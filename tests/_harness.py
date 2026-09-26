@@ -12,10 +12,11 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # suites import openact from this checkout; Blender does not install it
 FAILURES = []
+_NO_DETAIL = object()  # details like 0, None or [] must still print
 
 
-def check(name, condition, detail=""):
-    print(("PASS " if condition else "FAIL ") + name + (f"  [{detail}]" if detail else ""), flush=True)
+def check(name, condition, detail=_NO_DETAIL):
+    print(("PASS " if condition else "FAIL ") + name + ("" if detail is _NO_DETAIL else f"  [{detail}]"), flush=True)
     if not condition:
         FAILURES.append(name)
 
