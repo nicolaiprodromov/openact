@@ -2,7 +2,8 @@
 
 Checks the CSV dialect (BOM, CRLF and CR, ";" and tab delimiters, quoting), the INT/FLOAT/text split, the limits,
 every design 7.9 message that the reader and the parsers give (one broken fixture each), the Answers, Factors,
-Settings and Overrides parsers, the change hashes, and the inline-list rules.
+Settings and Overrides parsers, the Rules `if` grammar (rules_core.parse_if), the change hashes, and the inline-list
+rules.
 
 Run:  python tests/csv_test.py
       blender -b --factory-startup --python tests/csv_test.py
@@ -21,7 +22,7 @@ from _harness import ROOT, check, finish  # noqa: E402
 _package = types.ModuleType("openact")
 _package.__path__ = [os.path.join(ROOT, "openact")]
 sys.modules["openact"] = _package
-from openact import csvfmt, lists  # noqa: E402
+from openact import csvfmt, lists, rules_core  # noqa: E402
 
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
 TMP = tempfile.mkdtemp(prefix="openact_csv_")
@@ -749,6 +750,62 @@ def test_factors():
     check("factors: a name of exactly 63 bytes is fine", factors[0].name == name)
 
 
+def test_if():
+    life = csvfmt.parse_factors(csvfmt.read_csv(fixture("life_factors.csv"), schema="factors"))
+    biome = csvfmt.parse_factors(csvfmt.read_csv(fixture("biome_factors.csv"), schema="factors"))
+    body = "size,category,small,10\nsize,category,large,20\n"
+    sizes = csvfmt.parse_factors(read("if_sizes.csv", FACTORS + body, schema="factors"))
+    clause = rules_core.Clause
+    for text, factors, expected in (
+        ("", life, ()),
+        ("  ", life, ()),
+        ("state=dead", life, (clause(0, False, frozenset({0})),)),
+        (" State = ALIVE ", life, (clause(0, False, frozenset({1})),)),
+        ("state=1", life, (clause(0, False, frozenset({1})),)),
+        ("neighbours=2|3", life, (clause(1, False, frozenset({2, 3})),)),
+        ("neighbours != 2 | 3", life, (clause(1, True, frozenset({2, 3})),)),
+        ("state=dead;neighbours=3", life, (clause(0, False, frozenset({0})), clause(1, False, frozenset({3})))),
+        ("size=large", sizes, (clause(0, False, frozenset({1})),)),
+        ("size=10|LARGE", sizes, (clause(0, False, frozenset({0, 1})),)),
+        ("temperature=cold|Mild", biome, (clause(0, False, frozenset({0, 1})),)),
+        ("altitude!=high; moisture=wet", biome, (clause(2, True, frozenset({2})), clause(1, False, frozenset({2})))),
+    ):
+        got = rules_core.parse_if(text, factors)
+        check(f"if: {text!r}", got == expected, got)
+    for text, factors, message in (
+        ("state", life, "'if' clause 'state' needs '=' or '!='"),
+        ("state=dead;", life, "'if' has an empty clause"),
+        (";state=dead", life, "'if' has an empty clause"),
+        ("=dead", life, "'if' clause '=dead' names no factor"),
+        ("!=dead", life, "'if' clause '!=dead' names no factor"),
+        ("state=", life, "'if' clause 'state=' has an empty level"),
+        ("state=dead|", life, "'if' clause 'state=dead|' has an empty level"),
+        ("colour=red", life, "'if' names unknown factor 'colour'"),
+        ("state=alvie", life, "'if' names unknown level 'alvie' of factor 'state'"),
+        ("neighbours=9", life, "'if' names unknown level '9' of factor 'neighbours'"),
+        ("size=15", sizes, "'if' names unknown level '15' of factor 'size'"),
+        ("temperature=0", biome, "'if' names unknown level '0' of factor 'temperature'"),  # amount levels: names only
+    ):
+        try:
+            rules_core.parse_if(text, factors)
+            got = None
+        except rules_core.IfError as error:
+            got = str(error)
+        check(f"if: {text!r} is an error", got == message, got)
+    answers = csvfmt.parse_answer_set(csvfmt.read_csv(fixture("broken_if.csv")), "one_of", node="rules")
+    problems = raised(rules_core.restrictions, answers, life)
+    message = "Line 2: 'if' names unknown level 'shiny' of factor 'state'"
+    check("7.9 'if' names an unknown level", only(problems, "error", 2, message), summary(problems))
+    doc = read("if_lines.csv", "answer,IF\na,state=alvie\nb,\nc,colour=red\nd,state=dead\n")
+    problems = raised(rules_core.restrictions, csvfmt.parse_answer_set(doc, "one_of", node="rules"), life)
+    expected = [
+        ("error", 2, "Line 2: 'if' names unknown level 'alvie' of factor 'state'"),
+        ("error", 4, "Line 4: 'if' names unknown factor 'colour'"),
+    ]
+    good = summary(problems) == expected and {(p.file, p.column) for p in problems} == {(doc.path, "IF")}
+    check("if: every bad line is listed, in the file's 'if' column", good, summary(problems))
+
+
 def test_settings():
     weather = csvfmt.parse_settings(csvfmt.read_csv(fixture("weather_dials.csv"), schema="settings"))
     kinds = [(s.name, s.type) for s in weather]
@@ -971,6 +1028,7 @@ test_limits()
 test_messages()
 test_answer_sets()
 test_factors()
+test_if()
 test_settings()
 test_overrides()
 test_hashes()
