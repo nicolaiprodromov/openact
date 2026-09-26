@@ -300,7 +300,7 @@ reading of evaluated geometry through `GeometrySet`.
 | Largest table | 4096 cells and ≤ 8192 scored rows per node context | fill time ≈ 3–5 min worst case |
 | Per-element lookup cost, 1M elements | ≤ 5 ms above a no-lookup baseline, up to 8 interpolation corners (review measurement: within ~1 ms on 4.5.2 and 5.1.1) | §8.7 |
 | Main-thread cost per pass | ≤ 5 ms per unchanged node; ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts | §5.3 |
-| Graph edits on the main thread | `inner.build()` ≤ 100 ms for the demo shapes and ≤ 1 s at each derived worst shape (§8.4), run only on shape or materialised-set changes, at most one per edit; `update_values()` (entry-level Index Switches only) ≤ 30 ms; a table-object write ≤ 5 ms | §8.4, §8.8 |
+| Graph edits on the main thread | `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and ≤ 1 s at each derived worst shape (§8.4), run only on shape or materialised-set changes, at most one per edit; `update_values()` (entry-level Index Switches only) ≤ 30 ms per changed entry, ≤ 150 ms when every entry-level value of 16 entries changes at once; a table-object write ≤ 5 ms | §8.4, §8.8 |
 | Add-on upgrade (new templates), toggling a node's *Balance Option Order*, or upgrade of a v0.1.0 file | 0 requests until the words change | §5.4, §10.3 |
 | Prepare for Playback over 250 frames | < 1 s on the F-curve path (channelbag F-curves, no scene evaluation). The fallback for drivers, NLA, tweak mode or blended actions costs frames × one scene evaluation, with progress and Esc | §5.5 |
 | Blender versions | 4.5 LTS, 5.0, 5.1 | §11 |
@@ -718,7 +718,8 @@ sequenceDiagram
    `spec.plan(node, ctx)`, which resolves the list, answer set and CSV documents and builds the
    Job. Nodes are marked dirty by socket updates, the file watcher and depsgraph updates.
    `SAFETY_PASS` only recomputes fingerprints (§10.6). Budget: ≤ 5 ms per unchanged node and ≤ 50 ms
-   per idle pass (§3.2). A changed 4096-cell context costs about 50 ms of planning, once.
+   per idle pass (§3.2). A changed 4096-cell context costs about 120 ms of planning, once: two
+   sha1-over-JSON keys per cell (its `wkey` and its cell key), measured by the PR-08 spike.
    Evaluation or planning can stop with one of:
    - `Hint`: shows a hint, as today.
    - `Pending`: another OpenAct node upstream has no answer yet.
@@ -1767,8 +1768,8 @@ altitude,amount,high,"mountains and high slopes",,
 | `answers` | yes for `one-of`, optional otherwise | Inline answer set (§6.0): `;`-separated `name: when` entries. One-of: 2–255 options (a tournament above 16). Amount: 2–16 ordered levels. Yes/No: `yes`/`no` whens |
 | `min`, `max` | optional, `amount` only | Numbers, default 0 and 1. `min > max` inverts the mapping. Python writes them into the Map Range (§6.6) |
 
-A Settings CSV has at most 64 settings. It is not a payload source: Dials outputs are the answers
-themselves (§6.6).
+A Settings CSV has at most 32 settings, the limit at which the Dials graph still builds within its
+budget (§8.4). It is not a payload source: Dials outputs are the answers themselves (§6.6).
 
 ### 7.6 Overrides CSV (all six nodes)
 
@@ -1983,8 +1984,7 @@ The sidebar lists every problem (at most 50 per file), each with *Open File*.
 
     If the live entries alone exceed 16, the over-cap error above applies.
   - **Why a cap.** Every materialised entry costs graph nodes and items (§8.2, §8.4). The PR-08
-    spike confirms that the §8.4 budgets hold at 16. If they don't, the cap drops to 8 before the
-    contracts freeze.
+    spike confirmed that the §8.4 budgets hold at 16, so the cap did not drop to 8.
 
   Warm entries let a recently used prompt, or a keyframed Menu Switch choice, switch back inside
   Geometry Nodes without waiting for a pass. Switching to a stored entry that is not materialised
@@ -2130,9 +2130,10 @@ flowchart LR
   17;
 - Rules band centres (at most 16 per Amount factor).
 
-**Dials is the exception to watch.** At its 64-setting limit, one Index Switch per setting plus
-per-entry `min`/`max` switches would mean about 250 nodes. Writing a new entry's 64–192 values at
-about 0.9 ms per socket would take 60–170 ms, above the `update_values()` budget.
+**Dials is the exception to watch.** At its 32-setting limit (§7.5), one Index Switch per setting
+plus per-entry `min`/`max` switches would mean more than 100 Index Switches of 17 items. Writing a
+new entry's 32–96 values at about 0.9 ms per socket would take 30–85 ms, above the
+`update_values()` budget.
 - Dials therefore stores its values in a **one-row-per-entry table object** (columns: each
   setting's value, `min`, `max`), read with `Sample Index` at `k − 1` behind a `Switch` on
   `k > 0`. Map Range then applies `min`/`max`, and a value update is a `foreach_set`.
@@ -2141,8 +2142,8 @@ about 0.9 ms per socket would take 60–170 ms, above the `update_values()` budg
   - **Verified by the review (round 3) on 4.5.2, 5.0.0 and 5.1.1.** A custom group node sampling a
     table object's INT attribute at a single-value index fed Mesh Grid's *Vertices X* through a
     valid link, and the grid evaluated correctly; 5.x infers the output as `SINGLE`.
-  - The PR-08 spike re-checks it as a regression guard. The fallback (Index Switches, 16 settings)
-    remains a contingency only.
+  - The PR-08 spike re-checked it on 4.5.2 and 5.1.1 (`tests/lookup_blender.py` keeps it as a
+    regression guard). The fallback (Index Switches, 16 settings) remains a contingency only.
 
 Non-contiguous category value maps also go through the table object (§9.2).
 
@@ -2170,24 +2171,48 @@ so about 34 nodes (§8.2).
 
 | Node type | Worst shape under the limits | Approx. nodes |
 |---|---|---|
-| Rules | Custom-edge compares are maximised by three 16-level Amount factors (16³ = 4096 cells, the cell limit), giving 45 Compare + 45 Add. Plus 8 interpolation corners × 3 columns = 24 lookups (48 nodes), weights and blend, and 16 payload lookups in One-of mode (not combined with interpolation) | ≈ 250 |
-| Dials | 64 settings: value lookups from the Dials table object (§8.4), 64 Map Range, and the match chain | ≈ 200 |
-| Pick, with payload | 16 payload columns and Material on `k` (17 items each), plus the per-element `prob` lookup | ≈ 80 |
-| Match / Classify | a fixed graph, plus the chain | ≈ 60 |
+| Rules | Custom-edge compares are maximised by three 16-level Amount factors (16³ = 4096 cells, the cell limit), giving 45 Compare + 45 Add. Plus 8 interpolation corners × 3 columns = 24 lookups (48 nodes), weights and blend, and 16 payload lookups in One-of mode (not combined with interpolation) | ≈ 290 |
+| Dials | 32 Amount settings, 8 nodes each: its value, `min` and `max` lookups from the Dials table object (§8.4), a Map Range and the `k > 0` Switch; plus the match chain | ≈ 300 |
+| Pick, with payload | 16 payload columns and Material on `k` (17 items each), plus the per-element `prob` lookup | ≈ 70 |
+| Match / Classify | a fixed graph, plus the chain; Classify with 16 payload lookups | ≈ 60–100 |
 
 - The review measured a synthetic 379-node Rules-like group at about 1.2 s to build, roughly
-  3.2 ms per node at that size. The derived worst shapes (≤ about 250 nodes) are expected to take
-  ≈ 0.8 s.
+  3.2 ms per node at that size. Each new node, link and property write costs a tree update
+  proportional to the tree's size, so build time grows with the square of the node count.
 - **Budgets:**
-  - `inner.build()` ≤ 100 ms for the demo shapes, and ≤ 1 s at each derived worst shape;
-  - `update_values()` ≤ 30 ms (entry-level Index Switches only);
+  - `inner.build()` ≤ 100 ms for the demo shapes, and ≤ 1 s at each derived worst shape. The
+    interpolated Rules demo (snow) is allowed ≤ 250 ms: its 8-corner blend is a fixed graph of about
+    170 nodes, whatever the table's size;
+  - `update_values()` ≤ 30 ms per changed entry (entry-level Index Switches only), and ≤ 150 ms
+    when every entry-level value of 16 entries changes at once (a numeric CSV edit re-baking the
+    payload of every Pick context);
   - `tables.write_rows()` ≤ 5 ms.
 - `inner.build()` runs only when the **shape or the materialised set** changes (§8.8), at most once
   per pass and never per chunk. A new prompt on a live context changes the materialised set, so it
   costs one rebuild.
-- The **PR-08 contract spike** builds each derived worst shape on 4.5 and 5.1 before the
-  contracts freeze. If a budget fails, the cap drops to 8, or the shape's limits are tightened.
-- `tests/lookup_blender.py --bench` enforces these numbers as merge gates (§18).
+- The **PR-08 contract spike** built each shape on 4.5 and 5.1 before the contracts froze (headless
+  4.5.2 and 5.1.1, in a tree used by a modifier; stand-in graphs for the nodes that did not exist
+  yet, built through the real `inner.build()`). The cap stays at 16; Dials' limit dropped from 64
+  settings to 32, and the budgets above were split where the measurements required it:
+
+  | Shape | Nodes | 4.5.2 | 5.1.1 |
+  |---|---|---|---|
+  | Ask / Pick, the prototype's scene (2 entries) | 13 / 17 | 2 / 3 ms | 2 / 3 ms |
+  | Classify (materials), Rules One-of (biome), Dials (weather), 1 entry | 24 / 45 / 51 | 4 / 14 / 19–20 ms | 4 / 12 / 16–18 ms |
+  | Rules Amount, interpolated (snow), 1 entry | 169 | 166–168 ms | 115–163 ms |
+  | Ask / Pick, 16 entries | 69 / 73 | 75–76 / 61–83 ms | 54–75 / 60–83 ms |
+  | Pick with payload / Classify with payload, 16 entries | 68 / 96 | 200–273 / 93–94 ms | 197–202 / 79–80 ms |
+  | Rules worst / Dials at 32 settings, 16 entries | 289 / 297 | 580–590 / 540–545 ms | 583–595 / 520–531 ms |
+  | Dials at 64 settings, 16 entries (the former limit) | 553 | 1.99 s | 1.87 s |
+  | `update_values()`, one entry / all 16 entries, Pick with payload | 20 / 320 sockets | 7–9 / 100–129 ms | 7 / 97–101 ms |
+  | `update_values()`, all 16 entries, Ask / Pick | 48 / 48 sockets | 13–14 / 11–14 ms | 10–13 / 11–15 ms |
+  | Planning a 4096-cell context (§5.3; Python 3.11 / 3.13) | — | 118–121 ms | 120–123 ms |
+
+  These are three runs on an otherwise idle machine. With another project's 8-thread Blender job
+  running, the 16-entry Rules and Dials builds rose to 0.71–0.91 s, still within budget, and planning
+  to about 0.2–0.27 s.
+- `tests/lookup_blender.py --bench` enforces these numbers as merge gates (§18), timing each as the
+  fastest of several runs so that other work on the machine does not fail it.
 
 | Typical node | Table object (per materialised entry) | Index Switch |
 |---|---|---|
@@ -2289,8 +2314,10 @@ prototype.
   - **Per-element lookup, 1M points:** ≤ 5 ms above a no-lookup baseline, for up to 4096 rows and
     8 interpolation corners. The review measured within ~1 ms.
   - **Main thread, the expensive side:**
-    - `inner.build()` ≤ 100 ms for the demo shapes and ≤ 1 s at the documented worst shape;
-    - `update_values()` ≤ 30 ms;
+    - `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and
+      ≤ 1 s at the documented worst shape;
+    - `update_values()` ≤ 30 ms per changed entry, ≤ 150 ms when every entry-level value of 16
+      entries changes at once (§8.4);
     - `tables.write_rows()` ≤ 5 ms for 16 × 4096 rows.
 
   If a budget fails, the PR that introduced the cost must fix it before merge.
@@ -3421,7 +3448,7 @@ The start-up probe checks that external interpreter (§12.2).
 | Game of Life, 18 rows, 1 payload | ≈ 1.5 KB | about 40 nodes | 18 vertices × 3 columns, < 1 KB |
 | Pick, 255 items (Probability field linked) | ≈ 5 KB | about 20 nodes | 255 vertices, about 4 KB |
 | Rules, 4096 rows, 2 payload columns, one context | ≈ 250 KB (no `top` above 1024 rows) | about 60 nodes | 4096 vertices, about 150 KB |
-| Worst case: **16 warm or cold entries, plus live (at most 16) and pinned (at most 12) entries**, × 4096 rows; materialised up to the cap of 16, pinned included (usually 4 or fewer, §8.1) | warm/cold bounded by the 2 MB soft cap; live and pinned kept above it with a size note; each entry ≤ 4 MB (below). Realistic worst case about 3 MB (12 pins of a 4096-cell table) | at most about 250 nodes for the derived worst shapes (§8.4) | typically 4 × 4096 = 16 384 vertices, about 0.6 MB; 65 536 and about 2.4 MB at the cap |
+| Worst case: **16 warm or cold entries, plus live (at most 16) and pinned (at most 12) entries**, × 4096 rows; materialised up to the cap of 16, pinned included (usually 4 or fewer, §8.1) | warm/cold bounded by the 2 MB soft cap; live and pinned kept above it with a size note; each entry ≤ 4 MB (below). Realistic worst case about 3 MB (12 pins of a 4096-cell table) | at most about 300 nodes for the derived worst shapes (§8.4) | typically 4 × 4096 = 16 384 vertices, about 0.6 MB; 65 536 and about 2.4 MB at the cap |
 
 - **Soft cap.** If a node's `entries` exceeds 2 MB, the least recently used **warm and cold**
   entries are evicted until it fits. The status notes "2 old contexts dropped to keep the file
@@ -3894,7 +3921,7 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 | R16 | **Weaker tournaments** above 16 options: conservative confidence and occasional misses | Low | Medium | Unsure flags; README recommends 16 labels or fewer per question, or a two-level split; locks |
 | R17 | **Undo and file-size growth** from large `entries` JSON | Low | Low | The 2 MB soft cap bounds warm and cold entries. **Deliberate exception:** live and pinned entries are kept above 2 MB with a size note, bounded by the 16-live-word-set over-cap error, the 12-pin limit and the 4 MB per-entry hard cap (realistic worst case about 3 MB: 12 pins of a 4096-cell table). Prepare for Playback shows the projected size first. During fills the JSON is written at most every 2 s and once at completion (§14.7) |
 | R18 | **Scope creep towards agents** delays v1 | Medium | Medium | NG1. v1 ships only the hooks (§5.6), and the PR Plan contains no playback-time updates |
-| R19 | **Main-thread planning and graph-edit cost at the documented limits** (measured: RNA writes slow down as trees grow; planning 4096 cells takes about 50 ms) | Medium | Medium | Per-element data in the table object (§8.4); bounded materialised entries (§8.1); plan cache and fingerprints (§5.3); the PR-08 contract spike; `--bench` and TIMING budgets as merge gates (§3.2, §8.7) |
+| R19 | **Main-thread planning and graph-edit cost at the documented limits** (measured: RNA writes slow down as trees grow; planning 4096 cells takes about 120 ms, and a 64-setting Dials graph took 1.9 s to build, so Dials is limited to 32 settings, §8.4) | Medium | Medium | Per-element data in the table object (§8.4); bounded materialised entries (§8.1); plan cache and fingerprints (§5.3); the PR-08 contract spike; `--bench` and TIMING budgets as merge gates (§3.2, §8.7) |
 | R20 | **Mass re-asks** after an add-on upgrade (new templates), toggling a node's *Balance Option Order*, or a backend switch, silently changing saved scenes | High | Low (by design) | Words keys decide validity and ask keys only label rows (§5.4). A template bump, a toggle change and an upgrade each send 0 requests, asserted in `store_test`, `pipeline_blender` and `migrate_blender` |
 | R21 | **Self-referential inputs**: a word source that reads the node's own output (evaluated geometry) re-asks or oscillates | Medium | Low (by design) | Attributes reads original data only and skips names the tree writes (§6.0). A test checks that the tree settles in one pass with one request |
 | R22 | **Exfiltration through an untrusted .blend**: OpenAct reads a private file named in a crafted file and stores its text in the saved file | High | Low | Trust rule: untrusted files may read only inside their own folder tree, and blocked text is never read or stored (§16.1). Pipeline test |

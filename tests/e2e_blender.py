@@ -222,7 +222,7 @@ def phase_build(path, port, gpu):
     check("copy: duplicated node owns its hidden group",
           twin.node_tree is not None and twin.node_tree != night.node_tree and twin.uid not in ("", night.uid),
           (twin.uid, getattr(twin.node_tree, "name", None)))
-    check("copy: the copy starts with the same answers", engine.get_entries(twin) == engine.get_entries(night))
+    check("copy: the copy starts with the same answers", twin.entries == night.entries)
     throwaway = tree.copy()
     engine.run_pass()
     bpy.data.node_groups.remove(throwaway)

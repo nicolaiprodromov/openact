@@ -13,6 +13,7 @@ node is answered outside evaluation:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import time
@@ -22,22 +23,21 @@ import uuid
 import bpy
 from bpy.app.handlers import persistent
 
-from . import evaluator, natsort, server
+from . import evaluator, inner, natsort, server, store
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, as_text, eval_input, find_uses, is_field
+from .inner import INNER_PREFIX, SocketDef, sock
 
 ASK_ID = "GeometryNodeOpenActAsk"
 PICK_ID = "GeometryNodeOpenActPick"
 OPENACT_TYPES = (ASK_ID, PICK_ID)
-INNER_PREFIX = ".OpenAct "
-MAX_ENTRIES = 16  # answers remembered per node
 MAX_ITEMS = 255
 DEBOUNCE = 0.25
 AMOUNT_LEVELS = ["Not at all", "Slightly", "Moderately", "Very", "Extremely"]
 NO_CONTEXT = "No additional context."
 PICK_STATE = "Choose one of the listed items."
 
-MEMORY = {}   # request key -> parsed answer (this session)
+MEMORY = {}   # request key -> parsed answer, a store.Entry without gn and t (this session)
 PENDING = {}  # request key -> set of node uids waiting for it
 FAILED = {}   # request key -> error message (not retried until inputs change or Re-ask)
 STATUS = {}   # node uid -> (icon, text)
@@ -54,13 +54,6 @@ SAFETY_PASS = 2.0  # edits to trees no modifier uses don't send depsgraph update
 # ------------------------------------------------------------------------ node specs
 
 
-def _sock(sockets, identifier):
-    for sock in sockets:
-        if sock.identifier == identifier:
-            return sock
-    raise KeyError(identifier)
-
-
 def _openact_output(node, out, ctx, depth):
     """Evaluator handler: the answer an OpenAct node shows for the words it gets in this context."""
     if is_field(out):
@@ -74,7 +67,7 @@ def _openact_output(node, out, ctx, depth):
         return spec.fallback(out.name)
     answer = MEMORY.get(req.key)
     if answer is None:
-        answer = next((e["a"] for e in get_entries(node) if e.get("key") == req.key), None)
+        answer = next((e for e in store.load(node).entries if e.words_key == req.key), None)
     if answer is None:
         raise Pending()
     return spec.output(answer, out.name)
@@ -113,15 +106,16 @@ class AskSpec:
     keys = ("Question", "Context")
     empty_hint = "Type a question"
     iface = (
-        ('INPUT', "Question", "NodeSocketString",
-         "The question, e.g. 'Is this scene set at night?' (Amount mode: 'How weathered should it look?')"),
-        ('INPUT', "Context", "NodeSocketString",
-         "Optional facts the question is about, e.g. a scene description"),
-        ('OUTPUT', "Answer", "NodeSocketFloat",
-         "Yes / No: probability of yes (0-1). Amount: how much (0-1). 0 until answered"),
-        ('OUTPUT', "Yes", "NodeSocketBool", "True when Answer is 0.5 or more"),
-        ('OUTPUT', "Confidence", "NodeSocketFloat",
-         "How clearly the top answer wins over the runner-up (0 = unsure, 1 = certain)"),
+        SocketDef('INPUT', "Question", "NodeSocketString",
+                  "The question, e.g. 'Is this scene set at night?' (Amount mode: 'How weathered should it look?')",
+                  kind="word"),
+        SocketDef('INPUT', "Context", "NodeSocketString",
+                  "Optional facts the question is about, e.g. a scene description", kind="word"),
+        SocketDef('OUTPUT', "Answer", "NodeSocketFloat",
+                  "Yes / No: probability of yes (0-1). Amount: how much (0-1). 0 until answered"),
+        SocketDef('OUTPUT', "Yes", "NodeSocketBool", "True when Answer is 0.5 or more"),
+        SocketDef('OUTPUT', "Confidence", "NodeSocketFloat",
+                  "How clearly the top answer wins over the runner-up (0 = unsure, 1 = certain)"),
     )
 
     @staticmethod
@@ -148,20 +142,19 @@ class AskSpec:
     def parse(req, answers):
         answer = answers["answer"]
         if answer["type"] == "score":
+            mode = 'AMOUNT'
             value = min(max(float(answer["score"]) / (len(AMOUNT_LEVELS) - 1), 0.0), 1.0)
-            return {"mode": 'AMOUNT', "value": value, "confidence": float(answer.get("confidence", 0.0)),
-                    "levels": [float(answer["probabilities"].get(str(i), 0.0)) for i in range(len(AMOUNT_LEVELS))]}
-        p = float(answer["noul"])
-        return {"mode": 'YES_NO', "value": p, "confidence": abs(2.0 * p - 1.0)}
+            confidence = float(answer.get("confidence", 0.0))
+        else:
+            mode = 'YES_NO'
+            value = float(answer["noul"])
+            confidence = abs(2.0 * value - 1.0)
+        return _entry(req, "ask", mode, {"Answer": value, "Yes": value >= 0.5, "Confidence": confidence})
 
     @staticmethod
     def output(answer, name):
-        if name == "Answer":
-            return answer["value"]
-        if name == "Yes":
-            return answer["value"] >= 0.5
-        if name == "Confidence":
-            return answer["confidence"]
+        if name in ("Answer", "Yes", "Confidence"):
+            return answer.single[name]
         raise Unresolvable(f"unknown output {name}")
 
     @staticmethod
@@ -170,18 +163,17 @@ class AskSpec:
 
     @staticmethod
     def summary(answer):
-        if answer["mode"] == 'AMOUNT':
-            return f"Amount {answer['value']:.2f}"
-        p = answer["value"]
+        if answer.answer_type == 'AMOUNT':
+            return f"Amount {answer.single['Answer']:.2f}"
+        p = answer.single["Answer"]
         return f"{'Yes' if p >= 0.5 else 'No'}  ({p * 100:.0f}% yes)"
 
     @staticmethod
     def build(b, gi, go, entries):
-        index = b.match_chain([gi.outputs["Question"], gi.outputs["Context"]], [e["gn"] for e in entries])
-        answers = [e["a"] for e in entries]
-        b.lookup(index, 'FLOAT', 0.0, [a["value"] for a in answers], go.inputs["Answer"], 200)
-        b.lookup(index, 'BOOLEAN', False, [a["value"] >= 0.5 for a in answers], go.inputs["Yes"], 0)
-        b.lookup(index, 'FLOAT', 0.0, [a["confidence"] for a in answers], go.inputs["Confidence"], -200)
+        index = b.match_chain([gi.outputs["Question"], gi.outputs["Context"]], [e.gn for e in entries])
+        for name, data_type, fallback, y in (("Answer", 'FLOAT', 0.0, 200), ("Yes", 'BOOLEAN', False, 0),
+                                             ("Confidence", 'FLOAT', 0.0, -200)):
+            b.lookup(index, data_type, fallback, [e.single[name] for e in entries], go.inputs[name], y)
 
 
 class PickSpec:
@@ -189,17 +181,18 @@ class PickSpec:
     keys = ("Prompt", "Items")
     empty_hint = "Type a prompt and items"
     iface = (
-        ('INPUT', "Prompt", "NodeSocketString", "What to pick, e.g. 'something to sit on'"),
-        ('INPUT', "Items", "NodeSocketString",
-         "Items separated by commas (or one per line, e.g. from Import Text). Ignored when a Collection is set"),
-        ('INPUT', "Collection", "NodeSocketCollection",
-         "Pick one of this collection's children instead, in the same order as Collection Info"),
-        ('OUTPUT', "Index", "NodeSocketInt",
-         "Position of the picked item, -1 until answered. Matches Collection Info / Pick Instance order"),
-        ('OUTPUT', "Item", "NodeSocketString", "Name of the picked item"),
-        ('OUTPUT', "Confidence", "NodeSocketFloat", "How clearly the pick wins over the runner-up (0-1)"),
-        ('OUTPUT', "Instance", "NodeSocketGeometry",
-         "The picked collection child as an instance (empty when picking from text)"),
+        SocketDef('INPUT', "Prompt", "NodeSocketString", "What to pick, e.g. 'something to sit on'", kind="word"),
+        SocketDef('INPUT', "Items", "NodeSocketString",
+                  "Items separated by commas (or one per line, e.g. from Import Text). Ignored when a Collection is set",
+                  kind="word"),
+        SocketDef('INPUT', "Collection", "NodeSocketCollection",
+                  "Pick one of this collection's children instead, in the same order as Collection Info", kind="word"),
+        SocketDef('OUTPUT', "Index", "NodeSocketInt",
+                  "Position of the picked item, -1 until answered. Matches Collection Info / Pick Instance order"),
+        SocketDef('OUTPUT', "Item", "NodeSocketString", "Name of the picked item"),
+        SocketDef('OUTPUT', "Confidence", "NodeSocketFloat", "How clearly the pick wins over the runner-up (0-1)"),
+        SocketDef('OUTPUT', "Instance", "NodeSocketGeometry",
+                  "The picked collection child as an instance (empty when picking from text)"),
     )
 
     @staticmethod
@@ -238,17 +231,17 @@ class PickSpec:
         items = req.meta["items"]
         index = int(answer["choice"])
         probabilities = [float(answer["probabilities"].get(str(i), 0.0)) for i in range(len(items))]
-        return {"index": index, "item": items[index], "confidence": float(answer.get("confidence", 0.0)),
-                "probabilities": probabilities, "items": items, "collection": req.meta["collection"]}
+        entry = _entry(req, "pick", 'ONE_OF', {"Index": index, "Item": items[index],
+                                               "Confidence": float(answer.get("confidence", 0.0))})
+        entry.shape = {"rows": len(items), "columns": {"prob": "FLOAT"}}
+        entry.rows = store.Rows(name=list(items), wkey=[""] * len(items), ask=[0] * len(items), src="m" * len(items),
+                                v={"prob": probabilities})
+        return entry
 
     @staticmethod
     def output(answer, name):
-        if name == "Index":
-            return answer["index"]
-        if name == "Item":
-            return answer["item"]
-        if name == "Confidence":
-            return answer["confidence"]
+        if name in ("Index", "Item", "Confidence"):
+            return answer.single[name]
         raise Unresolvable("the Instance output is geometry, not text")
 
     @staticmethod
@@ -257,144 +250,48 @@ class PickSpec:
 
     @staticmethod
     def summary(answer):
-        p = answer["probabilities"][answer["index"]]
-        return f"{answer['item']}  ({p * 100:.0f}%)"
+        p = answer.rows.v["prob"][answer.single["Index"]]
+        return f"{answer.single['Item']}  ({p * 100:.0f}%)"
 
     @staticmethod
     def build(b, gi, go, entries):
-        index = b.match_chain([gi.outputs["Prompt"], gi.outputs["Items"]], [e["gn"] for e in entries])
-        answers = [e["a"] for e in entries]
-        picked = b.lookup(index, 'INT', -1, [a["index"] for a in answers], go.inputs["Index"], 300)
-        b.lookup(index, 'STRING', "", [a["item"] for a in answers], go.inputs["Item"], 100)
-        b.lookup(index, 'FLOAT', 0.0, [a["confidence"] for a in answers], go.inputs["Confidence"], -100)
+        index = b.match_chain([gi.outputs["Prompt"], gi.outputs["Items"]], [e.gn for e in entries])
+        picked = b.lookup(index, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
+        b.lookup(index, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
+        b.lookup(index, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
         info = b.new("GeometryNodeCollectionInfo", 150, -350)
-        b.link(gi.outputs["Collection"], _sock(info.inputs, "Collection"))
-        _sock(info.inputs, "Separate Children").default_value = True
-        _sock(info.inputs, "Reset Children").default_value = True
+        b.link(gi.outputs["Collection"], sock(info.inputs, "Collection"))
+        sock(info.inputs, "Separate Children").default_value = True
+        sock(info.inputs, "Reset Children").default_value = True
         position = b.new("GeometryNodeInputIndex", 150, -560)
         other = b.new("FunctionNodeCompare", 350, -520)
         other.data_type = 'INT'
         other.operation = 'NOT_EQUAL'
-        b.link(position.outputs[0], _sock(other.inputs, "A_INT"))
-        b.link(picked, _sock(other.inputs, "B_INT"))
+        b.link(position.outputs[0], sock(other.inputs, "A_INT"))
+        b.link(picked, sock(other.inputs, "B_INT"))
         delete = b.new("GeometryNodeDeleteGeometry", 550, -350)
         delete.domain = 'INSTANCE'
-        b.link(info.outputs[0], _sock(delete.inputs, "Geometry"))
-        b.link(other.outputs[0], _sock(delete.inputs, "Selection"))
+        b.link(info.outputs[0], sock(delete.inputs, "Geometry"))
+        b.link(other.outputs[0], sock(delete.inputs, "Selection"))
         b.link(delete.outputs[0], go.inputs["Instance"])
 
 
+def _entry(req, kind, answer_type, single):
+    """A parsed answer as a stored entry, without the gn and t that each node's pass adds. The request key
+    covers both what was asked and how (debias), so it is the entry's words key and its one ask key."""
+    return store.Entry(words_key=req.key, asks=[req.key], model=server.MODEL_NAME, kind=kind,
+                       answer_type=answer_type, shape={"rows": 0, "columns": {}}, single=single)
+
+
 SPECS = {ASK_ID: AskSpec, PICK_ID: PickSpec}
+inner.SPECS.update(SPECS)
 
 
 # ------------------------------------------------------------------------ inner trees
 
 
-class _Builder:
-    def __init__(self, tree):
-        self.tree = tree
-
-    def new(self, idname, x, y):
-        node = self.tree.nodes.new(idname)
-        node.location = (x, y)
-        return node
-
-    def link(self, a, b):
-        return self.tree.links.new(a, b)
-
-    def match_chain(self, sockets, keys):
-        """Integer socket: 1 + index of the entry whose key strings equal the inputs, else 0."""
-        previous = None
-        for i, key in enumerate(keys, start=1):
-            y = 400 - i * 110
-            conditions = []
-            for j, (sock, value) in enumerate(zip(sockets, key)):
-                compare = self.new("FunctionNodeCompare", -600 + j * 40, y - j * 40)
-                compare.data_type = 'STRING'
-                compare.operation = 'EQUAL'
-                compare.hide = True
-                self.link(sock, _sock(compare.inputs, "A_STR"))
-                _sock(compare.inputs, "B_STR").default_value = value
-                conditions.append(compare.outputs[0])
-            condition = conditions[0]
-            for other in conditions[1:]:
-                both = self.new("FunctionNodeBooleanMath", -380, y)
-                both.operation = 'AND'
-                both.hide = True
-                self.link(condition, both.inputs[0])
-                self.link(other, both.inputs[1])
-                condition = both.outputs[0]
-            switch = self.new("GeometryNodeSwitch", -200, y)
-            switch.input_type = 'INT'
-            switch.hide = True
-            self.link(condition, _sock(switch.inputs, "Switch"))
-            if previous is None:
-                _sock(switch.inputs, "False").default_value = 0
-            else:
-                self.link(previous, _sock(switch.inputs, "False"))
-            _sock(switch.inputs, "True").default_value = i
-            previous = switch.outputs[0]
-        return previous
-
-    def lookup(self, index, data_type, fallback, values, target, y):
-        node = self.new("GeometryNodeIndexSwitch", 150, y)
-        node.data_type = data_type
-        items = node.index_switch_items
-        items.clear()
-        for _ in range(len(values) + 1):
-            items.new()
-        slots = [s for s in node.inputs if s.identifier not in ("Index", "__extend__")]
-        slots[0].default_value = fallback
-        for slot, value in zip(slots[1:], values):
-            slot.default_value = value
-        if index is not None:
-            self.link(index, _sock(node.inputs, "Index"))
-        self.link(node.outputs[0], target)
-        return node.outputs[0]
-
-
 def new_uid():
     return uuid.uuid4().hex[:12]
-
-
-def inner_name(node):
-    return f"{INNER_PREFIX}{SPECS[node.bl_idname].label} {node.uid}"
-
-
-def create_inner(node):
-    spec = SPECS[node.bl_idname]
-    tree = bpy.data.node_groups.new(inner_name(node), 'GeometryNodeTree')
-    for in_out, name, socket_type, description in spec.iface:
-        item = tree.interface.new_socket(name, in_out=in_out, socket_type=socket_type)
-        item.description = description
-    node.node_tree = tree
-    build_inner(node)
-    return tree
-
-
-def build_inner(node):
-    """Rebuild the hidden node group from the node's stored answers."""
-    tree = node.node_tree
-    if tree is None:
-        create_inner(node)
-        return
-    tree.nodes.clear()
-    builder = _Builder(tree)
-    group_in = builder.new("NodeGroupInput", -900, 0)
-    group_out = builder.new("NodeGroupOutput", 800, 0)
-    SPECS[node.bl_idname].build(builder, group_in, group_out, get_entries(node))
-
-
-def get_entries(node):
-    try:
-        data = json.loads(node.entries or "[]")
-    except ValueError:
-        return []
-    return data if isinstance(data, list) else []
-
-
-def set_entries(node, entries):
-    node.entries = json.dumps(entries, ensure_ascii=False)
 
 
 def ensure_owned(nodes):
@@ -409,23 +306,23 @@ def ensure_owned(nodes):
     nodes = [(tree, node) for tree, node in nodes if tree.library is None]
     owners = {}
     for _tree, node in nodes:
-        inner = node.node_tree
-        if node.uid and inner is not None and inner.name == inner_name(node):
-            owners.setdefault(inner.as_pointer(), node)
+        group = node.node_tree
+        if node.uid and group is not None and group.name == inner.inner_name(node):
+            owners.setdefault(group.as_pointer(), node)
     for _tree, node in nodes:
         fresh = not node.uid or node.uid in seen
         if fresh:
             node.uid = new_uid()
         seen.add(node.uid)
-        inner = node.node_tree
-        if inner is None:
-            create_inner(node)
-        elif inner.library is not None or owners.setdefault(inner.as_pointer(), node) is not node:
-            own = inner.copy()
-            own.name = inner_name(node)
+        group = node.node_tree
+        if group is None:
+            inner.create_inner(node)
+        elif group.library is not None or owners.setdefault(group.as_pointer(), node) is not node:
+            own = group.copy()
+            own.name = inner.inner_name(node)
             node.node_tree = own
         elif fresh:  # frees the old uid's group name. Only once: a taken name would be retried every pass
-            inner.name = inner_name(node)
+            group.name = inner.inner_name(node)
 
 
 def iter_nodes():
@@ -505,32 +402,33 @@ def _process(tree, node, contexts):
             continue
         wanted[req.gn] = req
 
-    entries = get_entries(node)
+    node_store = store.load(node)
+    entries = node_store.entries
     changed = False
     asks = []
     for gn, req in wanted.items():
-        found = next((e for e in entries if tuple(e.get("gn", ())) == gn), None)
-        if found is not None and found.get("key") == req.key:
+        found = next((e for e in entries if e.gn == gn), None)
+        if found is not None and found.words_key == req.key:
             continue
         if found is not None:  # same strings, different meaning (collection or settings changed)
             entries.remove(found)
             changed = True
         answer = MEMORY.get(req.key)
         if answer is not None:
-            entries.append({"key": req.key, "gn": list(gn), "a": answer, "t": time.time()})
+            entries.append(dataclasses.replace(answer, gn=gn, t=time.time()))
             changed = True
         elif req.key not in FAILED:
             asks.append(req)
     if changed:
-        if len(entries) > MAX_ENTRIES:
-            keep = [e for e in entries if tuple(e["gn"]) in wanted]
-            rest = sorted((e for e in entries if tuple(e["gn"]) not in wanted), key=lambda e: e.get("t", 0.0))
-            entries = keep + rest[-max(MAX_ENTRIES - len(keep), 0):] if len(keep) < MAX_ENTRIES else keep
-        set_entries(node, entries)
-        build_inner(node)
+        try:
+            store.save(node, node_store, frozenset(wanted))  # the only save that knows the live set, so it evicts
+        except ValueError as error:  # newer OpenAct's answers, or a table too large: the node keeps what it has
+            problems.append(str(error))
+        else:
+            inner.build(node, node_store)
     for req in asks:
         _submit(node, req)
-    STATUS[node.uid] = _status(spec, wanted, entries, problems, hints, upstream)
+    STATUS[node.uid] = _status(spec, wanted, node_store.entries, problems, hints, upstream)
 
 
 def _submit(node, req):
@@ -566,7 +464,7 @@ def _status(spec, wanted, entries, problems, hints, upstream):
     failed = [FAILED[req.key] for req in wanted.values() if req.key in FAILED]
     if failed:
         return ('ERROR', failed[0])
-    keys = {e.get("key") for e in entries}
+    keys = {e.words_key for e in entries}
     missing = [req for req in wanted.values() if req.key not in keys]
     if missing or upstream:
         state, message = server.status()
@@ -586,8 +484,8 @@ def _status(spec, wanted, entries, problems, hints, upstream):
     if not wanted:
         return ('INFO', hints[0] if hints else spec.empty_hint)
     first = next(iter(wanted.values()))
-    entry = next(e for e in entries if e.get("key") == first.key)
-    text = spec.summary(entry["a"])
+    entry = next(e for e in entries if e.words_key == first.key)
+    text = spec.summary(entry)
     if len(wanted) > 1:
         text += f"   +{len(wanted) - 1} more"
     return ('CHECKMARK', text)
@@ -598,7 +496,7 @@ def answers_for(node):
     tree = node.id_data
     contexts = find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
     spec = SPECS[node.bl_idname]
-    entries = {e.get("key"): e["a"] for e in get_entries(node)}
+    entries = {e.words_key: e for e in store.load(node).entries}
     rows = []
     for ctx in contexts:
         try:
@@ -613,11 +511,12 @@ def reask(node):
     """Forget this node's answers and ask again."""
     if node.id_data.library is not None:  # linked data is read-only
         return
-    for entry in get_entries(node):
-        MEMORY.pop(entry.get("key"), None)
+    for entry in store.load(node).entries:
+        MEMORY.pop(entry.words_key, None)
     FAILED.clear()
-    set_entries(node, [])
-    build_inner(node)
+    empty = store.NodeStore()
+    store.save(node, empty)  # live_gns=None, as for every save outside the pass: only the pass evicts
+    inner.build(node, empty)
     schedule(immediate=True)
 
 

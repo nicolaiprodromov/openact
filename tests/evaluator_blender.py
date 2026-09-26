@@ -16,8 +16,9 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, finish, sock, store  # noqa: E402
-from openact import engine, evaluator, nodes  # noqa: E402  (bpy must be imported first)
+from openact import engine, evaluator, inner, nodes  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
+from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 
 TMP = tempfile.mkdtemp(prefix="openact_eval_")
 P._Defaults.auto_start = False  # the passes below must never start a model server
@@ -254,9 +255,10 @@ cases.append(("string length as an index switch index", by_length.outputs[0]))
 answered = N.new(engine.ASK_ID)  # an OpenAct single-value output used as a word
 answered.inputs["Question"].default_value = "Is it night?"
 request = engine.SPECS[engine.ASK_ID].request(answered, ctx)
-engine.set_entries(answered, [{"key": request.key, "gn": list(request.gn), "t": 0.0,
-                               "a": {"mode": 'YES_NO', "value": 0.8125, "confidence": 0.625}}])
-engine.build_inner(answered)
+saved = S.NodeStore([S.Entry(words_key=request.key, gn=request.gn, kind="ask", answer_type='YES_NO',
+                             single={"Answer": 0.8125, "Yes": True, "Confidence": 0.625})])
+S.save(answered, saved)
+inner.build(answered, saved)
 cases.append(("OpenAct Ask answer used as a word", answered.outputs["Answer"], 'FLOAT'))
 
 field_ask = N.new(engine.ASK_ID)  # its Answer made a field, as a per-element output would be
@@ -447,14 +449,15 @@ def linked_library():
     library_tree = bpy.data.node_groups.new("Library Tree", 'GeometryNodeTree')
     node = library_tree.nodes.new(engine.ASK_ID)
     node.inputs["Question"].default_value = "Is it linked?"
-    engine.set_entries(node, [{"key": "saved", "gn": ["Is it linked?", ""], "t": 0.0,
-                               "a": {"mode": 'YES_NO', "value": 1.0, "confidence": 1.0}}])
-    engine.build_inner(node)
+    saved = S.NodeStore([S.Entry(words_key="saved", gn=("Is it linked?", ""), kind="ask", answer_type='YES_NO',
+                                 single={"Answer": 1.0, "Yes": True, "Confidence": 1.0})])
+    S.save(node, saved)
+    inner.build(node, saved)
     path = os.path.join(TMP, "library.blend")
     bpy.data.libraries.write(path, {library_tree})
-    inner = node.node_tree
+    group = node.node_tree
     bpy.data.node_groups.remove(library_tree)
-    bpy.data.node_groups.remove(inner)
+    bpy.data.node_groups.remove(group)
     loaded = []
     for link in (False, True):  # appended, then linked: two nodes that arrive with one uid
         with bpy.data.libraries.load(path, link=link) as (_source, target):
@@ -485,7 +488,7 @@ def linked_library():
     check("append then link: each uid finds its own node, so Ask Again can't clear the wrong one",
           engine.find_node(node.uid)[1] == node and engine.find_node(local_node.uid)[1] == local_node)
     check("append then link: the local copy's hidden group follows its new uid",
-          local_node.node_tree.library is None and local_node.node_tree.name == engine.inner_name(local_node),
+          local_node.node_tree.library is None and local_node.node_tree.name == inner.inner_name(local_node),
           local_node.node_tree.name)
     check("linked: the pass's memo is gone after it", evaluator.MEMO is None, evaluator.MEMO)
     engine.reask(node)
@@ -497,7 +500,7 @@ def linked_library():
     engine.run_pass()
     check("made local: the node gets a local hidden group, the linked one is untouched",
           node.node_tree is not linked_inner and node.node_tree.library is None
-          and node.node_tree.name == engine.inner_name(node) and len(linked_inner.nodes) == before[4],
+          and node.node_tree.name == inner.inner_name(node) and len(linked_inner.nodes) == before[4],
           (node.node_tree.name, node.node_tree.library, local.library))
     bpy.data.objects.remove(user)  # its tree has no Group Output, which later scene updates would report
 
