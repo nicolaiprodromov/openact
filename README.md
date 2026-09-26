@@ -40,6 +40,18 @@ on your GPU. Nothing leaves your computer.
 ## Tests
 
 ```
+tests\run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1] [-Gpu 0] [-Port 18765]
+```
+
+The `*_blender.py` suites run on each `-Versions` entry. The `*_test.py` suites run under every
+CPython 3.11+ found, and always inside Blender 4.5 and 5.1. `-Model` adds the e2e phases with the
+real model on the given GPU, once it has 9 GB free. The port defaults to 18765 on GPU 0 and 18767
+on GPU 1, and must be free: close any Blender session running OpenAct or Jev Nodes, or pass
+`-Port`. The runner prints a summary table and exits with 1 if anything failed.
+
+To run a single suite:
+
+```
 blender -b --factory-startup --python tests/evaluator_blender.py
 blender -b --factory-startup --python tests/legacy_blender.py
 blender -b --factory-startup --python tests/e2e_blender.py -- build   <file.blend> [port] [gpu]

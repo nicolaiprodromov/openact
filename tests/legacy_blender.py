@@ -21,14 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bpy
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FAILURES = []
-
-
-def check(name, condition, detail=""):
-    print(("PASS " if condition else "FAIL ") + name + (f"  [{detail}]" if detail else ""), flush=True)
-    if not condition:
-        FAILURES.append(name)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import check, finish  # noqa: E402
 
 
 def phase_old_blender():
@@ -171,10 +165,7 @@ def main():
         os.environ["LOCALAPPDATA" if sys.platform == "win32" else "XDG_DATA_HOME"] = base
         root = phase_runtime_root(P, base)
         phase_old_server(engine, server, P, root)
-    print(f"BLENDER {bpy.app.version_string} RESULT {'OK' if not FAILURES else 'FAILED: ' + ', '.join(FAILURES)}",
-          flush=True)
-    sys.stdout.flush()
-    os._exit(0 if not FAILURES else 1)
+    finish()
 
 
 main()
