@@ -9,11 +9,16 @@ outputs of OpenAct nodes, through the handler the engine registers.
 
 Anything that needs geometry or fields raises Unresolvable, with a breadcrumb from the socket that
 was read to the node that failed: "Context ← Join Strings ← Named Attribute: fields can't be words".
+The one geometry link followed is a CSV socket's, by trace_csv_source(), and only to read the Path
+and Delimiter of the Import CSV node at its end. Import Text obeys the file trust rule (trust.py).
 """
 
 from __future__ import annotations
 
 import bpy
+
+from . import trust
+from .csvfmt import CsvSource
 
 MAX_CONTEXTS = 64
 MAX_DEPTH = 64
@@ -36,6 +41,14 @@ class Unresolvable(Exception):
         if len(names) > 3:
             names = [names[0], "…", *names[-2:]]
         return f"{' ← '.join(names)}: {message}"
+
+
+class FileError(Unresolvable):
+    """A CSV with errors: the node keeps its last good table. problems holds every csvfmt.Problem of the file."""
+
+    def __init__(self, message, problems=()):
+        super().__init__(message)
+        self.problems = tuple(problems)
 
 
 class Pending(Exception):
@@ -314,8 +327,12 @@ def _h_import_text(node, out, ctx, depth):
     path = as_text(eval_input(_in(node, "Path"), ctx, depth))
     if not path:
         return ""
+    full = bpy.path.abspath(path)
+    message = trust.blocked(full)  # before open(): blocked text is never read
+    if message:
+        raise Unresolvable(message)
     try:
-        with open(bpy.path.abspath(path), "rb") as handle:
+        with open(full, "rb") as handle:
             data = handle.read()
     except OSError:
         raise Unresolvable(f"Can't read the text file '{path}'") from None
@@ -348,3 +365,96 @@ HANDLERS = {  # node bl_idname -> handler(node, out, ctx, depth); the engine add
     "GeometryNodeMenuSwitch": _h_menu_switch,
     "GeometryNodeImportText": _h_import_text,
 }
+
+
+# ------------------------------------------------------------------ Import CSV hand-off
+
+IMPORT_CSV = "GeometryNodeImportCSV"
+
+
+def _by_id(node, identifier):
+    return next(s for s in node.inputs if s.identifier == identifier)
+
+
+def _read(sock, ctx, node, label):
+    """eval_input() for a socket the trace needs, with the CSV socket and the node in the breadcrumb."""
+    try:
+        return eval_input(sock, ctx)
+    except Unresolvable as error:
+        error.hops.insert(0, f"{node.name}.{error.socket}" if error.socket else node.name)
+        error.socket = label
+        raise
+
+
+def trace_csv_source(node, csv_socket, ctx) -> CsvSource:
+    """The Import CSV node plugged into a node's '<Input> CSV' socket, with its Path and Delimiter in this context.
+
+    Follows geometry links upstream through Reroutes, muted nodes, nested group boundaries, and Switch, Index Switch
+    and Menu Switch nodes whose selector is read statically. The Import CSV geometry itself is never used. Raises
+    Unresolvable when the trace ends anywhere but at an Import CSV node, and Hint when that node has no Path.
+    """
+    label = csv_socket.name
+    via = []
+    sock = csv_socket
+    for _ in range(MAX_DEPTH):
+        links = [link for link in sock.links if not link.is_muted]
+        if not links:
+            raise Unresolvable(f"{label}: connect an Import CSV node")
+        if not links[0].is_valid:
+            raise Unresolvable(f"{label}: the link is invalid (red)")
+        up, out = links[0].from_node, links[0].from_socket
+        kind = up.bl_idname
+        if up.mute:  # passes its first geometry input on, or nothing
+            sock = next((i.from_socket for i in up.internal_links if i.to_socket == out), None)
+            if sock is None:
+                raise Unresolvable(f"{label}: connect an Import CSV node ('{up.name}' is muted)")
+            continue
+        if kind == IMPORT_CSV:
+            path = as_text(_read(_by_id(up, "Path"), ctx, up, label)).strip()
+            if not path:
+                raise Hint(f"{label}: type a Path on '{up.name}'")
+            delimiter = as_text(_read(_by_id(up, "Delimiter"), ctx, up, label))
+            return CsvSource(path, delimiter, tuple(via + [up.name]))
+        if kind == "NodeReroute":
+            sock = up.inputs[0]
+        elif kind == "NodeGroupInput":
+            if not ctx.path:
+                raise Unresolvable(f"{label}: connect an Import CSV node (found the modifier's '{out.name}' input)")
+            parent = ctx.path[-1]
+            sock = next((s for s in parent.inputs if s.identifier == out.identifier), None)
+            if sock is None:
+                raise Unresolvable(f"{label}: a group input is missing on '{parent.name}'")
+            ctx = ctx.pop()
+            via.append(parent.name)
+        elif kind == "GeometryNodeGroup":
+            sub = up.node_tree
+            output = sub and next((n for n in sub.nodes if n.bl_idname == "NodeGroupOutput" and n.is_active_output),
+                                  None)
+            sock = output and next((s for s in output.inputs if s.identifier == out.identifier), None)
+            if sock is None:
+                raise Unresolvable(f"{label}: connect an Import CSV node ('{up.name}' has no such output)")
+            ctx = ctx.push(up)
+            via.append(up.name)
+        elif kind == "GeometryNodeSwitch":
+            condition = bool(_read(_in(up, "Switch"), ctx, up, label))
+            sock = _in(up, "True" if condition else "False")
+            via.append(up.name)
+        elif kind == "GeometryNodeIndexSwitch":
+            index = int(_read(_in(up, "Index"), ctx, up, label) or 0)
+            items = [s for s in up.inputs if s.identifier not in ("Index", "__extend__") and _available(s)]
+            if not 0 <= index < len(items):
+                raise Unresolvable(f"{label}: connect an Import CSV node ('{up.name}' selects nothing)")
+            sock = items[index]
+            via.append(up.name)
+        elif kind == "GeometryNodeMenuSwitch":
+            name = _read(_in(up, "Menu"), ctx, up, label)
+            items = [s for s in up.inputs if s.identifier not in ("Menu", "__extend__")]
+            sock = next((s for item, s in zip(up.enum_items, items) if item.name == name), None)
+            if sock is None:
+                raise Unresolvable(f"{label}: '{up.name}' has no item '{as_text(name)}'")
+            via.append(up.name)
+        elif any(s.type == 'GEOMETRY' for s in up.inputs):  # it changes the points it passes on
+            raise Unresolvable(f"{label}: connect the Import CSV node directly ('{up.name}' is in between)")
+        else:
+            raise Unresolvable(f"{label}: connect an Import CSV node (found '{up.name}')")
+    raise Unresolvable(f"{label}: the connection chain is too deep")
