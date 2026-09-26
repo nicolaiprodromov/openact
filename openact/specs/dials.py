@@ -163,12 +163,14 @@ class DialsSpec(Spec):
         return pipeline.Job(uid, tuple(gn), words_key, shape, rows, debias=debias,
                             options=tuple(tuple(name for name, _when in s.answers) for s in settings))
 
-    def agree(self, node, jobs):
-        """§6.0, once per pass before any context is answered: every live context must plan the same settings, by
-        name and type in any order, since each entry fills the outputs by name (_cell()). Jobs that agree give the
+    def agree(self, node, jobs, unknown=False, _entries=()):
+        """§6.0, once per pass before any context is answered: every context that plans must plan the same settings,
+        by name and type in any order, since each entry fills the outputs by name (_cell()). Jobs that agree give the
         node the outputs of the first one's settings, so they exist before the first answer, and "" is returned; with
         no job, the node keeps its outputs and their links. Otherwise the error naming the first two contexts that
-        differ is returned, and the node, its entries and its graph stay as they are.
+        differ is returned, and the node, its entries and its graph stay as they are. unknown: a live context has no
+        job, and may still show the outputs as they are (engine._process()): they stay, and None is returned unless
+        the jobs fit them.
 
         A renamed or retyped setting replaces its socket, and its dropped link warns until that output is back and
         linked (undo, File > Revert), a socket that came with it is linked, or the outputs change again without it."""
@@ -183,6 +185,10 @@ class DialsSpec(Spec):
                 theirs = _outputs(job.shape.settings)
                 if sorted(theirs) != sorted(wanted):
                     return differ(first_ctx.label(), wanted, ctx.label(), theirs)
+            if unknown:
+                if sorted(wanted) != sorted(have):
+                    return None
+                wanted = have
             FACES[uid] = sorted(wanted)
         if wanted != have:
             linked = {socket.name for socket in node.outputs if socket.is_linked}
