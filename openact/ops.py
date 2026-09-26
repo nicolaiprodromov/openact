@@ -254,8 +254,8 @@ def _writes_to(node, ctx, ident):
 
 
 def _mergeable(doc, keys):
-    """Raise OverridesError unless the existing file can be merged into: an Overrides CSV with these key columns and
-    no errors, or an empty file."""
+    """Raise OverridesError unless the existing file can be merged into: an Overrides CSV with these key columns, a
+    'lock' column and no errors, or an empty file."""
     name = os.path.basename(doc.path)
     errors = [p.message for p in doc.problems if p.severity == csvfmt.ERROR]
     if errors:
@@ -266,6 +266,10 @@ def _mergeable(doc, keys):
     if not any(key.casefold() in folded for key in keys):
         raise OverridesError(f"{name} is not an Overrides CSV for this node (no '{keys[0]}' column): choose another "
                              "file")
+    # An input file can have the key column (an Items CSV's 'item', a Settings CSV's 'question') although no open node
+    # reads it (input_files()); none has 'lock', which an Overrides file needs to lock anything.
+    if "lock" not in folded:
+        raise OverridesError(f"{name} is not an Overrides CSV (no 'lock' column): choose another file")
     try:
         csvfmt.parse_overrides(doc, keys)
     except csvfmt.CsvError as error:  # a factor's column is missing, or a key is locked twice
