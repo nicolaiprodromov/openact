@@ -12,19 +12,11 @@ import tempfile
 
 import bpy
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import check, finish, sock, store  # noqa: E402
 from openact import engine  # noqa: E402  (bpy must be imported first)
 
-FAILURES = []
 TMP = tempfile.mkdtemp(prefix="openact_eval_")
-
-
-def sock(sockets, identifier):
-    return next(s for s in sockets if s.identifier == identifier)
-
-
-def value_input(node):
-    return next(s for s in node.inputs if s.name == "Value" and s.enabled)
 
 
 tree = bpy.data.node_groups.new("Eval", 'GeometryNodeTree')
@@ -169,13 +161,7 @@ for index, (name, source) in enumerate(cases):
         ours = f"<{type(error).__name__}: {error}>"
     sock(compare.inputs, "B_STR").default_value = ours if isinstance(ours, str) else str(ours)
     expected.append((name, ours))
-    store = N.new("GeometryNodeStoreNamedAttribute")
-    store.data_type = 'BOOLEAN'
-    store.domain = 'POINT'
-    store.inputs["Name"].default_value = f"case{index}"
-    L.new(geometry, store.inputs["Geometry"])
-    L.new(compare.outputs[0], value_input(store))
-    geometry = store.outputs[0]
+    geometry = store(tree, geometry, compare.outputs[0], f"case{index}", 'BOOLEAN')
 L.new(geometry, g_out.inputs[0])
 
 depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -183,10 +169,7 @@ depsgraph.update()
 evaluated = host.evaluated_get(depsgraph)
 result = evaluated.to_mesh()
 for index, (name, ours) in enumerate(expected):
-    same = result.attributes[f"case{index}"].data[0].value
-    print(("PASS " if same else "FAIL ") + f"{name}: reader gives {ours!r}", flush=True)
-    if not same:
-        FAILURES.append(name)
+    check(name, result.attributes[f"case{index}"].data[0].value, f"reader gives {ours!r}")
 evaluated.to_mesh_clear()
 
 # a red (invalid) link must be reported, not silently read
@@ -194,11 +177,8 @@ bad = N.new("GeometryNodeStringJoin")
 L.new(N.new("ShaderNodeValue").outputs[0], bad.inputs["Strings"])  # float into string: invalid
 try:
     engine.eval_input(bad.inputs["Strings"], ctx)
-    print("FAIL invalid link is reported: no error", flush=True)
-    FAILURES.append("invalid link")
+    check("invalid link is reported", False, "no error")
 except engine.Unresolvable as error:
-    print(f"PASS invalid link is reported: {error}", flush=True)
+    check("invalid link is reported", True, error)
 
-print(f"BLENDER {bpy.app.version_string} RESULT {'OK' if not FAILURES else 'FAILED: ' + ', '.join(FAILURES)}", flush=True)
-sys.stdout.flush()
-os._exit(0 if not FAILURES else 1)
+finish()

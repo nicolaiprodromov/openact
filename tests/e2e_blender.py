@@ -15,49 +15,15 @@ import time
 
 import bpy
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ADDON_PARENT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import check, drive, enable_addon, finish, store  # noqa: E402
+
 SCENES = {
     "A": ("A snowy mountain village at night, warm windows glowing.", "something to sit on"),
     "B": ("A sunny tropical beach at noon, people swimming.", "something to put books on"),
 }
 ITEMS = "table, lamp, armchair, bookshelf, rug"
 PROPS = {"Armchair": 3, "Bookshelf": 6, "Floor Lamp": 4, "Rug": 7, "Table": 5}  # name -> vertex count
-FAILURES = []
-
-
-def check(name, condition, detail=""):
-    print(("PASS " if condition else "FAIL ") + name + (f"  [{detail}]" if detail else ""), flush=True)
-    if not condition:
-        FAILURES.append(name)
-
-
-def enable_addon():
-    import addon_utils
-
-    sys.path.insert(0, ADDON_PARENT)
-    module = addon_utils.enable("openact", default_set=True, handle_error=None)
-    assert module is not None, "add-on failed to enable"
-    from openact import engine, server
-    from openact import prefs as P
-
-    return engine, server, P
-
-
-def sock(sockets, identifier):
-    return next(s for s in sockets if s.identifier == identifier)
-
-
-def store(tree, geometry_socket, value_socket, name, data_type, x):
-    node = tree.nodes.new("GeometryNodeStoreNamedAttribute")
-    node.data_type = data_type
-    node.domain = 'POINT'
-    node.location = (x, 0)
-    node.inputs["Name"].default_value = name
-    tree.links.new(geometry_socket, node.inputs["Geometry"])
-    value = next(s for s in node.inputs if s.name == "Value" and s.enabled)
-    tree.links.new(value_socket, value)
-    return node.outputs["Geometry"]
 
 
 def build_scene():
@@ -171,16 +137,6 @@ def verify(tag):
           (a["lamp_index"], b["lamp_index"]))
     check(f"{tag}: Instance output is the Floor Lamp mesh", a["verts"] == 4 + lamp_verts == b["verts"],
           (a["verts"], b["verts"]))
-
-
-def drive(engine, done, timeout):
-    started = time.time()
-    while time.time() - started < timeout:
-        engine.tick()
-        if done():
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def all_answered(engine):
@@ -325,9 +281,7 @@ def main():
         phase_noaddon(path)
     elif phase == "reopen":
         phase_reopen(path)
-    print(f"RESULT {'OK' if not FAILURES else 'FAILED: ' + ', '.join(FAILURES)}", flush=True)
-    sys.stdout.flush()
-    os._exit(0 if not FAILURES else 1)
+    finish()
 
 
 main()

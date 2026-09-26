@@ -40,6 +40,14 @@ on your GPU. Nothing leaves your computer.
 ## Tests
 
 ```
+tests\run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1] [-Gpu 0] [-Port 18765]
+```
+
+The runner runs every suite on each Blender version, prints a summary table and exits with 1 if
+anything failed. `-Model` adds the e2e phases with the real model on the given GPU; the port
+defaults to 18765 on GPU 0 and 18767 on GPU 1. One suite at a time:
+
+```
 blender -b --factory-startup --python tests/evaluator_blender.py
 blender -b --factory-startup --python tests/legacy_blender.py
 blender -b --factory-startup --python tests/e2e_blender.py -- build   <file.blend> [port] [gpu]
