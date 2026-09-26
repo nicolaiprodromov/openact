@@ -36,13 +36,13 @@ NAME_COLUMNS = ("answer", "name", "item", "label", "outcome")  # the first one p
 WHEN_COLUMNS = ("when", "description")
 FACTOR_REQUIRED = ("factor", "kind", "level")
 SETTING_REQUIRED = ("setting", "type", "question")
-# Never payload: the answer-set and Overrides names in every file, plus the Factors or Settings names in a file that
-# read_csv() takes for one (it has factor + level, or setting + question), as those files carry no payload.
+# What the socket that reads a file expects it to be. "answer_set" also covers Items lists and Overrides files;
+# Factors and Settings files carry no payload, so read_csv() classifies none of their columns as numbers.
+SCHEMAS = ("answer_set", "factors", "settings")
+# Never payload in an answer set (design 7.3); every other numeric column is.
 ANSWER_COLUMNS = frozenset(
     NAME_COLUMNS + WHEN_COLUMNS + ("if", "lock", "unsure", "confidence", "model_answer", "source")
 )
-FACTOR_COLUMNS = frozenset(FACTOR_REQUIRED + WHEN_COLUMNS + ("value", "from", "to"))
-SETTING_COLUMNS = frozenset(SETTING_REQUIRED + ("answers", "min", "max"))
 # Where an answer set's numeric columns become output sockets: (node, kind) -> the node's fixed output names, which
 # those sockets must not take.
 PAYLOAD_OUTPUTS = {
@@ -92,6 +92,7 @@ class CsvDoc:
     text_hash: str  # sha1: header order, row count, normalised text columns
     num_hash: str  # sha1: num_cols + numbers
     problems: tuple[Problem, ...]
+    schema: str  # the SCHEMAS entry the columns were classified for; each parser insists on its own
 
 
 @dataclass(frozen=True)
@@ -164,12 +165,15 @@ class _Problems(list):
             raise CsvError(self)
 
 
-def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
+def read_csv(path: str, delimiter: str | None = None, schema: str = "answer_set") -> CsvDoc:
     """Reads a CSV file and sorts its columns into text and numeric payload.
 
     delimiter: an Import CSV node's Delimiter. None sniffs it: "," unless the header line has none but has ";" (as
-    Excel writes in decimal-comma locales) or a tab.
+    Excel writes in decimal-comma locales) or a tab. schema: what the reading socket expects (SCHEMAS): "factors"
+    for Rules' Factors, "settings" for Dials' Settings, else "answer_set".
     """
+    if schema not in SCHEMAS:
+        raise ValueError(f"unknown schema {schema!r}")
     path = os.path.abspath(path)
     name = os.path.basename(path)
     problems = _Problems(path)
@@ -264,16 +268,10 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
     if counted:
         problems.add(ERROR, 0, "", f"{name} has {_n(MAX_ROWS + counted)} rows (limit {_n(MAX_ROWS)})")
 
-    names = {column.casefold() for column in header}
-    reserved = ANSWER_COLUMNS
-    if names >= {"factor", "level"}:
-        reserved |= FACTOR_COLUMNS
-    if names >= {"setting", "question"}:
-        reserved |= SETTING_COLUMNS
     texts, num_cols, numbers = {}, {}, {}  # texts: text column -> its cells
     for i, column in enumerate(header):
         cells = [row[i] for row in rows]
-        free = column.casefold() not in reserved
+        free = schema == "answer_set" and column.casefold() not in ANSWER_COLUMNS
         kind, values = _classify(cells) if free else (None, ())
         if kind:
             num_cols[column], numbers[column] = kind, values
@@ -306,6 +304,7 @@ def read_csv(path: str, delimiter: str | None = None) -> CsvDoc:
         text_hash=_sha1([header, len(rows), texts]),
         num_hash=_sha1([num_cols, numbers]),
         problems=tuple(problems),
+        schema=schema,
     )
 
 
@@ -341,6 +340,7 @@ def parse_answer_set(doc: CsvDoc, kind: str, node: str = "") -> AnswerSet:
         raise ValueError(f"unknown answer-set kind {kind!r}")
     if node not in NODES:
         raise ValueError(f"unknown node {node!r}")
+    _expect(doc, "answer_set")
     problems = _Problems(doc.path, doc.problems)
     problems.check()
     name_at = _find(doc.header, NAME_COLUMNS)
@@ -391,6 +391,7 @@ def parse_factors(doc: CsvDoc) -> list[Factor]:
 
     Raises CsvError when the file has an error.
     """
+    _expect(doc, "factors")
     problems = _Problems(doc.path, doc.problems)
     problems.check()
     at = {column: _find(doc.header, (column,)) for column in FACTOR_REQUIRED + ("value", "from", "to")}
@@ -503,6 +504,7 @@ def _bands(name, rows, problems):
 
 def parse_settings(doc: CsvDoc) -> list[Setting]:
     """The settings of a Settings CSV, in row order. Raises CsvError when the file has an error."""
+    _expect(doc, "settings")
     problems = _Problems(doc.path, doc.problems)
     problems.check()
     at = {column: _find(doc.header, (column,)) for column in SETTING_REQUIRED + ("answers", "min", "max")}
@@ -566,6 +568,7 @@ def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]:
     Factor key columns may hold numbers, so an edit to them can change only num_hash: re-parse when either hash
     changes. Raises CsvError when a key column is missing or two locked rows share a key.
     """
+    _expect(doc, "answer_set")
     problems = _Problems(doc.path, doc.problems)
     problems.check()
     at = [_find(doc.header, (key.casefold(),)) for key in keys]
@@ -595,6 +598,12 @@ def _n(number):
 
 def _sha1(parts):
     return hashlib.sha1(json.dumps(parts, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _expect(doc, schema):
+    """A document classified for another schema would give wrong payload or hashes: a programming error."""
+    if doc.schema != schema:
+        raise ValueError(f"{os.path.basename(doc.path)} was read as {doc.schema!r}, not {schema!r}")
 
 
 def _find(header, names):

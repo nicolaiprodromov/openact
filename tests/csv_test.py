@@ -241,40 +241,92 @@ def test_classes():
     ]
     check("classes: the warning names a value only when every odd cell holds it", warned == expected, warned)
 
-    # Neither factor + kind + level (a Factors file) nor setting + type + question (a Settings file).
-    names = "value,level,type,min,max,kind,from,to,question,answers,prompt"
-    doc = read("other_schemas.csv", f"answer,{names}\na,{','.join(['1'] * 11)}\n")
+    names = "factor,kind,level,value,from,to,setting,type,question,answers,min,max,prompt"
+    doc = read("other_schemas.csv", f"answer,{names}\na,{','.join(['1'] * 13)}\n")
     check(
-        "classes: an answer set may use other schemas' column names as payload",
+        "classes: an answer set may use every other schema's column names as payload",
         list(doc.num_cols) == names.split(","),
         doc.num_cols,
     )
-    for name, columns in (
-        ("life_factors.csv", ("value",)),
-        ("biome_factors.csv", ("from", "to")),
-        ("weather_dials.csv", ("min", "max")),
+    for name, content, node, payload in (
+        (
+            "items_factor_level.csv",
+            "answer,when,factor,level,value\nchair,a seat,2,3,7\n",
+            "pick",
+            ("factor", "level", "value"),
+        ),
+        (
+            "labels_settings.csv",
+            "answer,when,setting,question,min,max\nmetal,shiny,1,2,0.5,1\n",
+            "classify",
+            ("setting", "question", "min", "max"),
+        ),
+        (
+            "outcomes_factor_level.csv",
+            "answer,when,factor,level,scale\nBirth,alive,1,3,0.5\n",
+            "rules",
+            ("factor", "level", "scale"),
+        ),
     ):
-        doc = csvfmt.read_csv(fixture(name))
+        option = csvfmt.parse_answer_set(
+            read(name, content), "one_of" if node != "pick" else "items", node=node
+        ).options[0]
+        check(
+            f"classes: {name}: Factors and Settings names stay payload in an answer set",
+            tuple(option.payload) == payload,
+            option.payload,
+        )
+    for name, schema, columns in (
+        ("life_factors.csv", "factors", ("value",)),
+        ("biome_factors.csv", "factors", ("from", "to")),
+        ("weather_dials.csv", "settings", ("min", "max")),
+    ):
+        doc = csvfmt.read_csv(fixture(name), schema=schema)
         good = set(columns) <= set(doc.text_cols) and not doc.num_cols and not doc.problems
         check(
-            f"classes: {name} keeps its own columns as text, blanks and all",
+            f"classes: {name} read as {schema} keeps every column as text, blanks and all",
             good,
             (doc.num_cols, summary(doc.problems)),
         )
-    for parse, content, message in (
-        (csvfmt.parse_factors, "factor,level,from,to\nt,a,0,0.5\nt,b,0.5,\n", "No 'kind' column"),
-        (csvfmt.parse_settings, "setting,question,min,max\nW,How windy?,0,\n", "No 'type' column"),
+    for parse, schema, content, message in (
+        (csvfmt.parse_factors, "factors", "factor,level,from,to\nt,a,0,0.5\nt,b,0.5,\n", "No 'kind' column"),
+        (csvfmt.parse_settings, "settings", "setting,question,min,max\nW,How windy?,0,\n", "No 'type' column"),
     ):
-        problems = raised(parse, read(f"incomplete_{parse.__name__}.csv", content))
+        problems = raised(parse, read(f"incomplete_{schema}.csv", content, schema=schema))
         check(
-            f"classes: an incomplete file for {parse.__name__} gives only its real error",
+            f"classes: an incomplete {schema} file gives only its real error",
             only(problems, "error", 0, message),
             summary(problems),
         )
+    wrong = []
+    for parse, schema in ((csvfmt.parse_factors, "answer_set"), (csvfmt.parse_settings, "factors")):
+        try:
+            parse(csvfmt.read_csv(fixture("life_factors.csv"), schema=schema))
+        except ValueError as error:
+            wrong.append(str(error))
+    try:
+        csvfmt.parse_answer_set(csvfmt.read_csv(fixture("props.csv"), schema="settings"), "items", node="pick")
+    except ValueError as error:
+        wrong.append(str(error))
+    try:
+        csvfmt.read_csv(fixture("props.csv"), schema="factor")
+    except ValueError as error:
+        wrong.append(str(error))
+    expected = [
+        "life_factors.csv was read as 'answer_set', not 'factors'",
+        "life_factors.csv was read as 'factors', not 'settings'",
+        "props.csv was read as 'settings', not 'answer_set'",
+        "unknown schema 'factor'",
+    ]
+    check(
+        "classes: a document read for another schema, or an unknown one, is a programming error",
+        wrong == expected,
+        wrong,
+    )
     doc = read("items_with_settings_names.csv", "answer,when,setting,type,question\n1,10,a,b,c\n")
     items = csvfmt.parse_answer_set(doc, "items", node="pick")
     check(
-        "classes: a file taken for Settings keeps the answer-set names reserved",
+        "classes: an Items CSV with Settings column names keeps the answer-set names reserved",
         not doc.num_cols and items.options[0].payload == {},
         doc.num_cols,
     )
@@ -401,7 +453,7 @@ def test_messages():
     message = "A Yes/No answer set needs rows 'yes' and 'no'"
     check("7.9 Yes/No set without yes and no", only(problems, "error", 0, message), summary(problems))
 
-    problems = raised(csvfmt.parse_factors, csvfmt.read_csv(fixture("broken_bands.csv")))
+    problems = raised(csvfmt.parse_factors, csvfmt.read_csv(fixture("broken_bands.csv"), schema="factors"))
     message = "temperature: 'to' of cold (0.3) must equal 'from' of mild (0.35)"
     check("7.9 invalid band edges", only(problems, "error", 3, message), summary(problems))
 
@@ -596,7 +648,7 @@ def test_answer_sets():
 
 
 def test_factors():
-    life = csvfmt.parse_factors(csvfmt.read_csv(fixture("life_factors.csv")))
+    life = csvfmt.parse_factors(csvfmt.read_csv(fixture("life_factors.csv"), schema="factors"))
     shape = [(f.name, f.kind, len(f.levels), f.line) for f in life]
     check("factors: Game of Life", shape == [("state", "flag", 2, 2), ("neighbours", "category", 9, 4)], shape)
     state = [(level.name, level.value, level.band) for level in life[0].levels]
@@ -608,7 +660,7 @@ def test_factors():
         good and eight.when == "Eight live neighbours; every surrounding cell is alive.",
         eight,
     )
-    biome = csvfmt.parse_factors(csvfmt.read_csv(fixture("biome_factors.csv")))
+    biome = csvfmt.parse_factors(csvfmt.read_csv(fixture("biome_factors.csv"), schema="factors"))
     check(
         "factors: biome order",
         [f.name for f in biome] == ["temperature", "moisture", "altitude"],
@@ -620,7 +672,7 @@ def test_factors():
     check("factors: equal-width bands, and amount levels carry no value", equal, biome[1].levels)
     for name, values in (("negative", (-1, 0, 1)), ("sparse", (0, 5, 4095)), ("far", (10000, 10001))):
         body = "".join(f"c,category,l{value},{value}\n" for value in values)
-        levels = csvfmt.parse_factors(read(f"category_{name}.csv", FACTORS + body))[0].levels
+        levels = csvfmt.parse_factors(read(f"category_{name}.csv", FACTORS + body, schema="factors"))[0].levels
         check(f"factors: category values {values} are fine", tuple(level.value for level in levels) == values, levels)
 
     def amount(name, count):
@@ -688,17 +740,17 @@ def test_factors():
             "Line 2: 'from' of a must be a number, not 'zero'",
         ),
     ):
-        problems = raised(csvfmt.parse_factors, read(f"factors_{case}.csv", FACTORS + body))
+        problems = raised(csvfmt.parse_factors, read(f"factors_{case}.csv", FACTORS + body, schema="factors"))
         check(f"factors: {case}", only(problems, "error", line, message), summary(problems))
-    problems = raised(csvfmt.parse_factors, read("factors_columns.csv", "factor,level\na,x\n"))
+    problems = raised(csvfmt.parse_factors, read("factors_columns.csv", "factor,level\na,x\n", schema="factors"))
     check("factors: a required column is missing", only(problems, "error", 0, "No 'kind' column"), summary(problems))
     name = "\u4e00" * 21
-    factors = csvfmt.parse_factors(read("factors_wide_ok.csv", FACTORS + flag(name)))
+    factors = csvfmt.parse_factors(read("factors_wide_ok.csv", FACTORS + flag(name), schema="factors"))
     check("factors: a name of exactly 63 bytes is fine", factors[0].name == name)
 
 
 def test_settings():
-    weather = csvfmt.parse_settings(csvfmt.read_csv(fixture("weather_dials.csv")))
+    weather = csvfmt.parse_settings(csvfmt.read_csv(fixture("weather_dials.csv"), schema="settings"))
     kinds = [(s.name, s.type) for s in weather]
     expected = [("Rain", "yes_no"), ("Wind speed", "amount"), ("Time of day", "one_of"), ("Street lights", "yes_no")]
     check("settings: weather dials", kinds == expected + [("Fog", "amount")], kinds)
@@ -715,9 +767,10 @@ def test_settings():
     rain = weather[0]
     check("settings: defaults", (rain.answers, rain.min, rain.max) == ((), 0.0, 1.0) and weather[4].answers == (), rain)
     body = "A,bool,q?,,,\nB,yes_no,q?,,,\nC,choice,q?,x: 1; y: 2,,\nD,one_of,q?,x;y,,\nE,Yes/No,q?,,,\nF,AMOUNT,q?,,,\n"
-    types_ = [s.type for s in csvfmt.parse_settings(read("settings_types.csv", SETTINGS + body))]
+    types_ = [s.type for s in csvfmt.parse_settings(read("settings_types.csv", SETTINGS + body, schema="settings"))]
     check("settings: type synonyms", types_ == ["yes_no", "yes_no", "one_of", "one_of", "yes_no", "amount"], types_)
-    inverted = csvfmt.parse_settings(read("settings_inverted.csv", SETTINGS + "W,amount,q?,,30,0\nR,yes/no,q?,,abc,\n"))
+    content = SETTINGS + "W,amount,q?,,30,0\nR,yes/no,q?,,abc,\n"
+    inverted = csvfmt.parse_settings(read("settings_inverted.csv", content, schema="settings"))
     good = (inverted[0].min, inverted[0].max) == (30.0, 0.0) and (inverted[1].min, inverted[1].max) == (0.0, 1.0)
     check("settings: min above max is allowed; min and max only count for amount", good, inverted)
 
@@ -763,9 +816,9 @@ def test_settings():
         ("many", lines(65, lambda i: f"s{i},yes/no,q?,,,"), 0, "settings_many.csv has 65 settings (limit 64)"),
         ("none", "", 0, "No settings"),
     ):
-        problems = raised(csvfmt.parse_settings, read(f"settings_{case}.csv", SETTINGS + body))
+        problems = raised(csvfmt.parse_settings, read(f"settings_{case}.csv", SETTINGS + body, schema="settings"))
         check(f"settings: {case}", only(problems, "error", line, message), summary(problems))
-    problems = raised(csvfmt.parse_settings, read("settings_columns.csv", "setting,type\nA,bool\n"))
+    problems = raised(csvfmt.parse_settings, read("settings_columns.csv", "setting,type\nA,bool\n", schema="settings"))
     check(
         "settings: a required column is missing", only(problems, "error", 0, "No 'question' column"), summary(problems)
     )
