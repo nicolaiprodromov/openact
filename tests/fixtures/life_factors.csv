@@ -1,0 +1,12 @@
+factor,kind,level,value,when
+state,flag,dead,0,The cell is empty.
+state,flag,alive,1,The cell holds a living cell.
+neighbours,category,0,0,No live neighbours.
+neighbours,category,1,1,Exactly one live neighbour.
+neighbours,category,2,2,Exactly two live neighbours.
+neighbours,category,3,3,Exactly three live neighbours.
+neighbours,category,4,4,Exactly four live neighbours.
+neighbours,category,5,5,Exactly five live neighbours.
+neighbours,category,6,6,Exactly six live neighbours.
+neighbours,category,7,7,Exactly seven live neighbours.
+neighbours,category,8,8,Eight live neighbours; every surrounding cell is alive.

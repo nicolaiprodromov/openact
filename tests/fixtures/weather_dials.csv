@@ -1,0 +1,6 @@
+setting,type,question,answers,min,max
+Rain,yes/no,Is it raining?,,,
+Wind speed,amount,How windy is it?,calm: still air; breeze: leaves move; strong: branches sway; gale: trees bend; storm: things break,0,30
+Time of day,one-of,What time of day is it?,dawn: first light; day: the sun is high; dusk: evening glow; night: dark sky,,
+Street lights,yes/no,Are the street lights on?,yes: it is dark or foggy; no: there is enough daylight,,
+Fog,amount,How foggy is it?,,,
