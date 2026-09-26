@@ -91,7 +91,8 @@ class OPENACT_OT_open_log(bpy.types.Operator):
 
     def execute(self, context):
         root = P.runtime_root()
-        for path in (server.STATE.log_path, os.path.join(root, "server.log"), os.path.join(root, "install.log")):
+        for path in (server.STATE.log_path, os.path.join(server.state_dir(root), "server.log"),
+                     os.path.join(root, "install.log")):
             if path and os.path.isfile(path):
                 _open_path(path)
                 return {'FINISHED'}

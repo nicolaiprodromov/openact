@@ -1,0 +1,4 @@
+factor,kind,level,when,from,to
+temperature,amount,cold,freezing to chilly,0,0.3
+temperature,amount,mild,cool to warm,0.35,0.7
+temperature,amount,hot,hot all year,0.7,1

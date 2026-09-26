@@ -1,0 +1,5 @@
+answer,when,if,alive
+Birth,"A dead cell with exactly three, six, seven or eight live neighbours comes to life.",state=dead,1
+Stays empty,A dead cell with any other number of live neighbours stays empty.,state=dead,0
+Survives,"A live cell with three, four, six, seven or eight live neighbours stays alive.",state=alive,1
+Dies,"A live cell with zero, one, two or five live neighbours dies.",state=alive,0

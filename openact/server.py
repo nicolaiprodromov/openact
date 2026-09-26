@@ -55,6 +55,7 @@ class _State:
         self.install_thread = None
         self.install_step = ""
         self.log_path = ""
+        self.conflict = ""  # the error shown while an OpenAct server with another backend holds the port
 
     def set(self, status, message=""):
         with self.lock:
@@ -183,6 +184,30 @@ def _lost_connection():
 # ------------------------------------------------------------------------------ lifecycle
 
 
+def _backend():
+    """The server's --backend. OPENACT_BACKEND=fake needs no GPU or installed runtime (tests)."""
+    return "fake" if os.environ.get("OPENACT_BACKEND") == "fake" else "semif"
+
+
+def _other_backend(health):
+    """The backend of the OpenAct server that sent this /health, if it is not the one this session uses."""
+    running = health.get("backend", "semif-torch")  # servers before 1.0.0 only ran SemIf
+    return None if running == ("fake" if _backend() == "fake" else "semif-torch") else running
+
+
+def _refuse_backend(other):
+    """Treat an OpenAct server with another backend on the port like any other program there."""
+    STATE.conflict = (f"Port {STATE.port} is used by an OpenAct model server with the {other} backend. "
+                      "Stop it or pick another port in the preferences")
+    STATE.set("error", STATE.conflict)
+
+
+def state_dir(root):
+    """Writable state such as server.log: OPENACT_STATE_DIR, so the runtime can be shared read-only,
+    else the runtime folder."""
+    return os.environ.get("OPENACT_STATE_DIR") or root
+
+
 def refresh(prefs=None):
     """Update the status from the file system and a quick /health probe (non-blocking)."""
     prefs = prefs or P.get_prefs()
@@ -190,7 +215,7 @@ def refresh(prefs=None):
     root = P.runtime_root(prefs)
     if STATE.status in ("installing", "starting"):
         return
-    if not P.runtime_installed(root):
+    if _backend() != "fake" and not P.runtime_installed(root):
         if STATE.status != "error":  # keep an install error visible
             STATE.set("not_installed", "The model runtime is not installed")
         return
@@ -205,12 +230,16 @@ def refresh(prefs=None):
             code, health = 0, {}
             if STATE.status == "ready":
                 STATE.set("stopped", "The model server stopped")
-        if code == 200 and health.get("server") == SERVER_ID:
+        other = _other_backend(health) if code == 200 and health.get("server") == SERVER_ID else None
+        if other:
+            _refuse_backend(other)  # also ends a "ready" left over from the server it replaced
+        elif code == 200 and health.get("server") == SERVER_ID:
             _apply_health(health)
             if health.get("status") == "loading":
                 _start_polling(None)
-        elif health.get("server") != LEGACY_SERVER_ID and status() == ("error", LEGACY_SERVER_MESSAGE):
-            STATE.set("stopped", "")  # the old server has gone or the port changed: auto-start may retry
+        elif health.get("server") != LEGACY_SERVER_ID and status() in (
+                ("error", LEGACY_SERVER_MESSAGE), ("error", STATE.conflict)):
+            STATE.set("stopped", "")  # the refused server has gone, or the port changed: auto-start may retry
 
     executor().submit(probe)
 
@@ -233,12 +262,17 @@ def start(prefs=None):
         return True
     STATE.port = prefs.port
     root = P.runtime_root(prefs)
-    if not P.runtime_installed(root):
+    backend = _backend()
+    if backend != "fake" and not P.runtime_installed(root):
         STATE.set("not_installed", "The model runtime is not installed")
         return False
     try:
         code, health = http("GET", "/health", timeout=0.5)
         if code == 200 and health.get("server") == SERVER_ID:
+            other = _other_backend(health)
+            if other:
+                _refuse_backend(other)
+                return False
             _apply_health(health)
             if health.get("status") == "loading":
                 _start_polling(None)
@@ -251,11 +285,13 @@ def start(prefs=None):
     except Exception:
         pass  # nothing is listening: start our own
 
-    python = P.venv_python(root)
-    STATE.log_path = os.path.join(root, "server.log")
+    python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
+    folder = state_dir(root)
+    STATE.log_path = os.path.join(folder, "server.log")
     env = dict(os.environ)
     for key in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
+    env.pop("OPENACT_TOKEN", None)  # this add-on sends no X-OpenAct-Token, so its server must not require one
     env.update({
         "HF_HOME": P.hf_home(root),
         "HF_HUB_OFFLINE": "1",
@@ -263,16 +299,17 @@ def start(prefs=None):
         "PYTHONIOENCODING": "utf-8",
         "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
     })
-    args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--device", prefs.device,
+    args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--backend", backend, "--device", prefs.device,
             "--parent-pid", str(os.getpid())]
     if prefs.device != "cpu":
         args += ["--gpu", str(prefs.gpu)]
     try:
+        os.makedirs(folder, exist_ok=True)
         log = open(STATE.log_path, "w", encoding="utf-8")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         STATE.process = subprocess.Popen(
             args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            cwd=root, env=env, creationflags=flags,
+            cwd=folder, env=env, creationflags=flags,
         )
         log.close()  # the child keeps its own handle
     except OSError as error:
