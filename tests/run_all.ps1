@@ -9,8 +9,8 @@ Runs the OpenAct test suites and prints a summary table.
   lookup_blender.py runs with -- --bench: its main-thread budgets are merge gates. Following the
   design's timing rule, a result above its budget prints a WARN line, counted in the summary, and
   fails only above twice the budget.
-- e2e_blender.py runs only with -Model: build, noaddon and reopen in a temporary folder, with the
-  real model on -Gpu and -Port (a GPU lease: port 18765 on GPU 0, 18767 on GPU 1). Each build
+- e2e_blender.py runs only with -Model: build, noaddon, reopen and reopen-bumped in a temporary folder, with
+  the real model on -Gpu and -Port (a GPU lease: port 18765 on GPU 0, 18767 on GPU 1). Each build
   needs the port free and 9 GB free on the GPU; the runner waits up to 30 minutes for the memory.
 A run that takes longer than 10 minutes (30 for an e2e build) is stopped. Every suite ends with a
 RESULT line. The script exits with 1 if any run failed.
@@ -203,7 +203,7 @@ try {
         if ($blocked) { Add-Row "e2e_blender.py" "Blender $version" $false 0 0 0 $blocked; continue }
         New-Item -ItemType Directory -Force -Path $tmp | Out-Null
         $blend = Join-Path $tmp "e2e-$version.blend"
-        foreach ($phase in "build", "noaddon", "reopen") {
+        foreach ($phase in "build", "noaddon", "reopen", "reopen-bumped") {
             $argv = @("-b", "--factory-startup", "--python", (Join-Path $PSScriptRoot "e2e_blender.py"), "--", $phase, $blend)
             if ($phase -eq "build") { Invoke-Suite "e2e_blender.py build" "Blender $version" $exe ($argv + "$Port", "$Gpu") 30 }
             else { Invoke-Suite "e2e_blender.py $phase" "Blender $version" $exe $argv }

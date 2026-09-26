@@ -254,8 +254,8 @@ cases.append(("string length as an index switch index", by_length.outputs[0]))
 
 answered = N.new(engine.ASK_ID)  # an OpenAct single-value output used as a word
 answered.inputs["Question"].default_value = "Is it night?"
-request = engine.SPECS[engine.ASK_ID].request(answered, ctx)
-saved = S.NodeStore([S.Entry(words_key=request.key, gn=request.gn, kind="ask", answer_type='YES_NO',
+job = engine.SPECS[engine.ASK_ID].plan(answered, ctx)
+saved = S.NodeStore([S.Entry(words_key=job.words_key, gn=job.gn, kind="ask", answer_type='YES_NO',
                              single={"Answer": 0.8125, "Yes": True, "Confidence": 0.625})])
 S.save(answered, saved)
 inner.build(answered, saved)

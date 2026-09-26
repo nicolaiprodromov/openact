@@ -5,6 +5,8 @@ Phases (pass after "--"):
                                    check the evaluated geometry, save the file
   noaddon <file.blend>             reopen WITHOUT the add-on: stored answers must still evaluate
   reopen  <file.blend>             reopen WITH the add-on and no server: no new questions needed
+  reopen-bumped <file.blend>       the same with a newer PROMPT_VERSION (new templates): the
+                                   saved answers still hold, so still no questions
 
 Run:  blender -b --factory-startup --python tests/e2e_blender.py -- build C:/tmp/openact_e2e.blend
 """
@@ -43,7 +45,7 @@ def build_scene():
     n_in = nested.nodes.new("NodeGroupInput")
     n_out = nested.nodes.new("NodeGroupOutput")
     cold = nested.nodes.new("GeometryNodeOpenActAsk")
-    cold.mode = 'AMOUNT'
+    cold.answer_type = 'AMOUNT'
     cold.inputs["Question"].default_value = "How cold is it?"
     nested.links.new(n_in.outputs["Ctx"], cold.inputs["Context"])
     nested.links.new(cold.outputs["Answer"], n_out.inputs["Cold"])
@@ -142,8 +144,10 @@ def verify(tag):
 def all_answered(engine):
     """Nodes of the scene's trees must be answered; nodes in unused copies may show a hint instead
     (an unused tree has empty default inputs, e.g. no prompt)."""
+    from openact import pipeline
+
     nodes = list(engine.iter_nodes())
-    if not nodes or engine.PENDING:
+    if not nodes or pipeline.PENDING:
         return False
     for tree, node in nodes:
         icon = engine.STATUS.get(node.uid, ('', ''))[0]
@@ -255,19 +259,30 @@ def phase_noaddon(path):
     verify("no add-on")
 
 
-def phase_reopen(path):
+def phase_reopen(path, bump=False):
     engine, server, P = enable_addon()
+    from openact import pipeline
+    from openact.specs.base import Spec
+
+    tag = "reopen with a newer PROMPT_VERSION" if bump else "reopen"
     prefs = P.get_prefs()
     prefs.port, prefs.auto_start = 18799, False  # nothing listens there: no model available
+    if bump:  # an add-on upgrade with new templates: only the ask key changes, never a words key
+        Spec.PROMPT_VERSION += 1
+    asked, submit = [], engine._submit  # every missing cell passes here, whether or not a server is up
+    engine._submit = lambda job, missing: (asked.extend(missing), submit(job, missing))
     bpy.ops.wm.open_mainfile(filepath=path)
+    saved = {node.uid: node.entries for _tree, node in engine.iter_nodes()}
     engine.schedule(immediate=True)
     drive(engine, lambda: all_answered(engine), timeout=15)
     dump_status(engine, server)
-    check("reopen: every node answered from the file", all_answered(engine))
-    check("reopen: no questions were sent", not engine.PENDING)
+    check(f"{tag}: every node answered from the file", all_answered(engine))
+    check(f"{tag}: no questions were sent", not asked and not pipeline.PENDING, len(asked))
+    check(f"{tag}: the saved answers are kept as saved",
+          {node.uid: node.entries for _tree, node in engine.iter_nodes()} == saved)
     count, used = inner_groups_used()
-    check("reopen: every OpenAct node has its own hidden group", count == 9 and used == 9, (count, used))
-    verify("reopen")
+    check(f"{tag}: every OpenAct node has its own hidden group", count == 9 and used == 9, (count, used))
+    verify(tag)
 
 
 def main():
@@ -281,6 +296,8 @@ def main():
         phase_noaddon(path)
     elif phase == "reopen":
         phase_reopen(path)
+    elif phase == "reopen-bumped":
+        phase_reopen(path, bump=True)
     finish()
 
 

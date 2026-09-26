@@ -662,6 +662,8 @@ class Job:
     rows: list[Row]
     priority: int                # 0 interactive, 1 active node's table, 2 other tables (§5.5)
     generation: int              # bumped whenever the node's words change; stale chunks are dropped
+    answer_type: str             # YES_NO | AMOUNT | ONE_OF, stored with the entry (§14.2)
+    debias: bool                 # the node's balance_order: its requests carry it as options.debias (§10.3)
 ```
 
 Every spec implements three pure functions. Only `plan()` sees `bpy`, and then only through the
@@ -2628,7 +2630,7 @@ only inside the .blend's folder tree.
 class Spec:                                        # specs/base.py
     name: str                                      # "ask" | "pick" | "match" | "classify" | "rules" | "dials"
     idname: str                                    # "GeometryNodeOpenActAsk", ...
-    PROMPT_VERSION = 1                             # stored per entry as "pv"; never part of a key (§5.4)
+    PROMPT_VERSION = 1                             # stored per entry as "pv"; part of the ask key, never of a words key (§5.4)
     def words(self, node) -> list[str]: ...        # String word sockets, in match-chain order (§8.2)
     def interface(self, node) -> list[SocketDef]: ...
     def plan(self, node, ctx) -> Job: ...          # raises Hint / Pending / Unresolvable

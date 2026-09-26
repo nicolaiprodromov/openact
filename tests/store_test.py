@@ -1,4 +1,5 @@
-"""The node store, openact/store.py: the schema-2 entries JSON, the v0.1.0 conversion and eviction.
+"""The node store, openact/store.py: the schema-2 entries JSON, the v0.1.0 conversion and eviction; and the
+entries the specs make from their plans (§5.4): the two key families and the validity rule.
 
 No bpy and no model. tests/fixtures/jev_v010_entries.json holds the exact entries strings that the
 v0.1.0 prototype's set_entries() wrote for Ask Yes/No, Ask Amount, Pick from text and Pick from a
@@ -8,28 +9,25 @@ Run:  python tests/store_test.py
       blender -b --factory-startup --python tests/store_test.py
 """
 
+import contextlib
 import dataclasses
 import hashlib
-import importlib.util
 import json
 import math
 import os
 import sys
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import ROOT, check, finish  # noqa: E402
 
+# openact/__init__.py imports bpy, so the pure modules are loaded without running it.
+_package = types.ModuleType("openact")
+_package.__path__ = [os.path.join(ROOT, "openact")]
+sys.modules["openact"] = _package
+from openact import pipeline, store  # noqa: E402
+from openact.specs import ask, base, pick  # noqa: E402
 
-def import_store():
-    """openact/store.py on its own: importing the openact package needs bpy."""
-    spec = importlib.util.spec_from_file_location("openact_store", os.path.join(ROOT, "openact", "store.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # dataclasses look up the module of the classes they build
-    spec.loader.exec_module(module)
-    return module
-
-
-store = import_store()
 NodeStore, MB, SOFT_CAP = store.NodeStore, store.MB, store.SOFT_CAP
 EMPTY = '{"schema":2,"entries":[]}'
 KEPT = "live and pinned contexts are kept; pin fewer word sets to shrink the file"
@@ -361,6 +359,152 @@ def phase_newer_schema():
           broken.entries)
 
 
+ASK, PICK = ask.AskSpec(), pick.PickSpec()
+ASK_WORDS = ("Is it night?", "A snowy mountain village, warm windows glowing.", "", "", "")  # gn: Key last
+PICK_WORDS = ("something to sit on", "", "table, lamp, armchair", "", "")
+ITEMS = ["table", "lamp", "armchair"]
+MODEL = "semif-torch Qwen/Qwen3.5-4B@851bf6e8"
+PLANS = {"Ask": lambda gn, debias: ASK.job(gn, 'YES_NO', debias),
+         "Ask Amount": lambda gn, debias: ASK.job(gn, 'AMOUNT', debias),
+         "Pick": lambda gn, debias: PICK.job(gn, ITEMS, debias)}
+
+
+def wkeys(job):
+    return [row.wkey for row in job.rows]
+
+
+def cells(job):
+    return [row.cell.key for row in job.rows]
+
+
+@contextlib.contextmanager
+def bumped():
+    """PROMPT_VERSION one higher inside, as new templates make it."""
+    base.Spec.PROMPT_VERSION += 1
+    try:
+        yield
+    finally:
+        base.Spec.PROMPT_VERSION -= 1
+
+
+def answered(spec, job, answer):
+    """The entry spec.resolve() makes once the job's one question has this parsed answer in MEMORY."""
+    key = job.rows[0].cell.key
+    pipeline.remember(key, dict(answer, model=MODEL))
+    try:
+        return spec.resolve(job, [], "")[0]
+    finally:
+        pipeline.forget([key])
+
+
+def phase_keys():
+    for name, plan in PLANS.items():
+        gn = PICK_WORDS if name == "Pick" else ASK_WORDS
+        on, off = plan(gn, True), plan(gn, False)
+        check(f"keys, {name}: Balance Option Order changes the cell keys and the ask key, and no words key",
+              (on.words_key, wkeys(on)) == (off.words_key, wkeys(off)) and cells(on) != cells(off)
+              and ASK.ask_key(True, MODEL) != ASK.ask_key(False, MODEL))
+        before = ASK.ask_key(True, MODEL)
+        with bumped():
+            newer, after = plan(gn, True), ASK.ask_key(True, MODEL)
+        check(f"keys, {name}: a new PROMPT_VERSION changes the ask key, and no words key",
+              (newer.words_key, wkeys(newer)) == (on.words_key, wkeys(on)) and after != before)
+        keyed = plan(gn[:-1] + ("left",), True)
+        check(f"keys, {name}: changing only Key leaves every wkey and cell key unchanged; the words key follows gn",
+              wkeys(keyed) == wkeys(on) and cells(keyed) == cells(on) and keyed.words_key != on.words_key)
+        edited = plan((gn[0] + " Really?",) + gn[1:], True)
+        check(f"keys, {name}: other words change every wkey", not set(wkeys(edited)) & set(wkeys(on)))
+    check("keys: the answer type is part of the words keys",
+          PLANS["Ask"](ASK_WORDS, True).words_key != PLANS["Ask Amount"](ASK_WORDS, True).words_key)
+    check("keys: the backend is part of the ask key", ASK.ask_key(True, MODEL) != ASK.ask_key(True, "fake fake"))
+    check("keys: a question's cost in scored rows (§5.5)",
+          (pipeline.cost(2, True), pipeline.cost(16, False), pipeline.cost(17, False), pipeline.cost(255, True))
+          == (2, 1, 3, 34))
+
+
+def phase_parse():
+    score = pipeline.Cell("k", "s", {"type": "score", "instructions": "q", "criteria": list("abcde")}, 2)
+    parsed = pipeline.parse(score, {"type": "score", "score": 1.55, "confidence": 0.1,
+                                    "probabilities": {"4": 0.0, "3": 0.0, "2": 0.55, "1": 0.45, "0": 0.0}})
+    check("parse: score gives the level probabilities in level order and amount = score / (L - 1)",
+          parsed == {"probabilities": [0.0, 0.45, 0.55, 0.0, 0.0], "amount": 1.55 / 4}, parsed)
+    choice = pipeline.Cell("k", "s", {"type": "choice", "instructions": "q", "criteria": {"1": "b", "0": "a"}}, 2)
+    parsed = pipeline.parse(choice, {"type": "choice", "choice": "0", "probabilities": {"0": 0.75, "1": 0.25}})
+    check("parse: choice gives the probabilities in the order the options were sent",
+          parsed == {"probabilities": [0.25, 0.75]}, parsed)
+    noul = pipeline.Cell("k", "s", {"type": "noul", "instructions": "q"}, 2)
+    refused = []
+    for answer in ({"type": "choice", "noul": 0.5}, {"type": "noul"}, {"type": "noul", "noul": "x"},
+                   {"type": "noul", "noul": float("nan")}, [0.5], None):
+        try:
+            pipeline.parse(noul, answer)
+        except (KeyError, TypeError, ValueError):
+            refused.append(True)
+    check("parse: noul gives p, and a malformed or non-finite answer raises",
+          pipeline.parse(noul, {"type": "noul", "noul": 0.25}) == {"p": 0.25} and len(refused) == 6, len(refused))
+    saved = pipeline.MEMORY_MAX
+    pipeline.MEMORY_MAX = 2
+    try:
+        for key in "abc":
+            pipeline.remember(key, {"p": 0.5})
+            pipeline.cached("a")  # still in use
+        kept = sorted(pipeline.MEMORY)
+    finally:
+        pipeline.MEMORY_MAX = saved
+        pipeline.forget("abc")
+    check("MEMORY: least recently used cells go first beyond the cap", kept == ["a", "c"], kept)
+
+
+def phase_validity():
+    job = ASK.job(ASK_WORDS, 'YES_NO', True)
+    entry, missing, failed = ASK.resolve(job, [], "")
+    check("validity: a new question is missing its one cell",
+          entry is None and [cell.key for cell in missing] == cells(job) and not failed)
+    entry = answered(ASK, job, {"p": 0.93})
+    check("validity: its answer becomes an entry for the words, labelled with the ask key it was asked with",
+          (entry.gn, entry.words_key, entry.asks, entry.pv, entry.model, entry.rows.src, entry.rows.wkey, entry.single)
+          == (ASK_WORDS, job.words_key, [ASK.ask_key(True, MODEL)], 1, MODEL + " debias", "m", wkeys(job),
+              {"Answer": 0.93, "Yes": True, "Confidence": 0.86}), entry)
+    node = Node()
+    store.save(node, NodeStore([entry]))
+    stored = store.load(node).entries
+    with bumped():
+        again = [ASK.resolve(ASK.job(ASK_WORDS, 'YES_NO', debias), stored, "") for debias in (True, False)]
+    check("validity: after a new PROMPT_VERSION, with either Balance Option Order, the stored entry holds: 0 requests",
+          all(held is stored[0] and not missing for held, missing, _failed in again))
+    keyed = ASK.job(ASK_WORDS[:-1] + ("left",), 'YES_NO', True)
+    moved, missing, _failed = ASK.resolve(keyed, stored, stored[0].words_key)
+    check("validity: a new Key carries the row over from the entry the context showed last, with its old ask key",
+          moved is not None and not missing and (moved.gn, moved.words_key, moved.asks, moved.single)
+          == (keyed.gn, keyed.words_key, stored[0].asks, stored[0].single), moved)
+    unseen, missing, _failed = ASK.resolve(keyed, stored, "")
+    check("validity: without an entry to carry from, the new words are asked", unseen is None and len(missing) == 1)
+    amount = ASK.job(ASK_WORDS, 'AMOUNT', True)
+    other, missing, _failed = ASK.resolve(amount, stored, stored[0].words_key)
+    check("validity: the same words meaning something else (another answer type) are asked again",
+          other is None and [cell.key for cell in missing] == cells(amount))
+    pipeline.FAILED[cells(amount)[0]] = "prompt too long"
+    try:
+        _entry, missing, failed = ASK.resolve(amount, stored, "")
+    finally:
+        pipeline.FAILED.clear()
+    check("validity: a failed cell is not asked again and says why", not missing and failed == ["prompt too long"])
+    entry = answered(ASK, amount, {"probabilities": [0.0, 0.45, 0.55, 0.0, 0.0], "amount": 1.55 / 4})
+    check("validity: Amount answers score / (L - 1), with the sigma confidence (4.e)",
+          entry.single["Answer"] == 1.55 / 4 and round(entry.single["Confidence"], 2) == 0.65, entry.single)
+
+    job = PICK.job(PICK_WORDS, ITEMS, True)
+    entry = answered(PICK, job, {"probabilities": [0.2, 0.1, 0.7]})
+    check("validity, Pick: a row per item with its probability, then the pick and top minus runner-up",
+          (entry.rows.name, entry.rows.v, entry.single, entry.shape)
+          == (ITEMS, {"prob": [0.2, 0.1, 0.7]}, {"Index": 2, "Item": "armchair", "Confidence": 0.5},
+              {"rows": 3, "columns": {"prob": "FLOAT"}}), entry)
+    grown = PICK.job(PICK_WORDS[:2] + ("table, lamp, armchair, rug",) + PICK_WORDS[3:], ITEMS + ["rug"], True)
+    other, missing, _failed = PICK.resolve(grown, [entry], entry.words_key)
+    check("validity, Pick: a new item changes what every row was offered, so the question is asked again",
+          other is None and len(missing) == 1)
+
+
 def main():
     phase_conversion()
     phase_round_trip()
@@ -371,6 +515,9 @@ def main():
     phase_hard_cap()
     phase_damaged()
     phase_newer_schema()
+    phase_keys()
+    phase_parse()
+    phase_validity()
     finish()
 
 

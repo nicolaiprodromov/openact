@@ -5,10 +5,11 @@ from __future__ import annotations
 import bpy
 
 from . import engine, inner
+from . import prefs as P
 
 
 def _changed(self, context):
-    engine.schedule(immediate=True)
+    engine.schedule(immediate=True, node=self)
 
 
 class _OpenActNode:
@@ -19,6 +20,11 @@ class _OpenActNode:
 
     uid: bpy.props.StringProperty(options={'HIDDEN'})
     entries: bpy.props.StringProperty(options={'HIDDEN'}, default="[]")
+    balance_order: bpy.props.BoolProperty(
+        name="Balance Option Order", default=True, update=_changed,
+        description="Ask every question with its options in both orders and average the answers. Removes the small "
+                    "model's bias toward early options, at twice the cost. Changing it keeps the answers given so far",
+    )
 
     @classmethod
     def poll(cls, ntree):
@@ -26,6 +32,7 @@ class _OpenActNode:
 
     def init(self, context):
         self.uid = engine.new_uid()
+        self.balance_order = P.get_prefs().debias
         inner.create_inner(self)
         engine.schedule(immediate=True)
 
@@ -42,10 +49,10 @@ class _OpenActNode:
         engine.STATUS.pop(self.uid, None)
 
     def update(self):
-        engine.schedule()
+        engine.schedule(node=self)
 
     def socket_value_update(self, context):
-        engine.schedule()
+        engine.schedule(node=self)
 
     def draw_status(self, layout, full=False):
         icon, text = engine.STATUS.get(self.uid, ('SORTTIME', "Waiting..."))
@@ -75,6 +82,8 @@ class _OpenActNode:
                 col.label(text="Asking...", icon='SORTTIME')
                 continue
             col.label(text=spec.summary(answer), icon='CHECKMARK')
+            if engine.older_settings(self, answer):
+                col.label(text="Asked with older settings: Ask Again refreshes it", icon='BLANK1')
             if self.bl_idname == engine.PICK_ID:
                 ranked = sorted(zip(answer.rows.name, answer.rows.v["prob"]), key=lambda pair: -pair[1])[:5]
                 for name, probability in ranked:
@@ -85,7 +94,7 @@ class _OpenActNode:
                 col.label(text=f"Confidence {answer.single['Confidence']:.2f}", icon='BLANK1')
 
     def draw_settings(self, layout):
-        pass
+        layout.prop(self, "balance_order")
 
     def draw_buttons(self, context, layout):
         self.draw_settings(layout)
@@ -106,7 +115,7 @@ class GeometryNodeOpenActAsk(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_idname = engine.ASK_ID
     bl_label = "Ask"
 
-    mode: bpy.props.EnumProperty(
+    answer_type: bpy.props.EnumProperty(
         name="Answer",
         items=(
             ('YES_NO', "Yes / No", "Probability that the answer is yes (0-1)"),
@@ -117,7 +126,8 @@ class GeometryNodeOpenActAsk(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     )
 
     def draw_settings(self, layout):
-        layout.row().prop(self, "mode", expand=True)
+        layout.row().prop(self, "answer_type", expand=True)
+        super().draw_settings(layout)
 
 
 class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):

@@ -10,6 +10,7 @@ Run:  blender -b --factory-startup --python tests/lookup_blender.py [-- --bench]
 """
 
 import contextlib
+import dataclasses
 import itertools
 import json
 import os
@@ -22,10 +23,11 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, finish, sock, store  # noqa: E402
-from openact import engine, evaluator, inner, nodes, ops, tables  # noqa: E402  (bpy must be imported first)
+from openact import engine, evaluator, inner, nodes, ops, pipeline, tables  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
+from openact.specs.base import Spec  # noqa: E402
 
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
@@ -80,14 +82,14 @@ for key, words in WORDS.items():
 
 
 def ask_entry(key, answer, confidence):
-    return S.Entry(words_key=key, gn=(WORDS[key]["Question"], ""), kind="ask", answer_type='YES_NO',
+    return S.Entry(words_key=key, gn=(WORDS[key]["Question"], "", "", "", ""), kind="ask", answer_type='YES_NO',
                    single={"Answer": answer, "Yes": answer >= 0.5, "Confidence": confidence})
 
 
 def pick_entry(key, index, confidence):
     words = WORDS[key]
     names = [name.strip() for name in words["Items"].split(",")]
-    return S.Entry(words_key=key, gn=(words["Prompt"], words["Items"]), kind="pick", answer_type='ONE_OF',
+    return S.Entry(words_key=key, gn=(words["Prompt"], "", words["Items"], "", ""), kind="pick", answer_type='ONE_OF',
                    single={"Index": index, "Item": names[index], "Confidence": confidence})
 
 
@@ -146,7 +148,7 @@ def phase_lookup():
     got = {key: read(key) for key in WORDS}
     check("build: the new entry reaches its context", got["C"]["answer"] == 1.0 and got["C"]["yes"] is True, got["C"])
     try:
-        inner.build(ask, S.NodeStore(grown.entries + [S.Entry(gn=("Is it broken?", ""))]))  # no values
+        inner.build(ask, S.NodeStore(grown.entries + [S.Entry(gn=("Is it broken?", "", "", "", ""))]))  # no values
         raised = False
     except KeyError:
         raised = True
@@ -159,9 +161,10 @@ def phase_lookup():
 
 
 def phase_converted():
-    """Entries converted from schema 1 keep v1's 5-word gn (§14.4), which the 2-word prototype specs can't
-    compare. Compared word by word, a converted text Pick (Prompt, "", Items, "", "") would give its answer to
-    any context with that prompt and no Items text, such as a collection Pick."""
+    """Entries converted from schema 1 hold v1's 5-word gn (§14.4), so the match chain compares each word at its
+    position: a converted text Pick matches only its prompt and Items text, a converted collection Pick only its
+    prompt with no Items text. An entry with the prototype's 2-word gn (saved before the fixed word tuples)
+    matches nothing, and the entries after it keep their numbers."""
     pick.entries = json.dumps([
         {"key": "a", "gn": [WORDS["A"]["Prompt"], WORDS["A"]["Items"]], "t": 1.0,
          "a": {"index": 1, "item": "chair", "confidence": 0.5, "probabilities": [0.25, 0.75],
@@ -170,8 +173,10 @@ def phase_converted():
          "a": {"index": 0, "item": "book", "confidence": 0.5, "probabilities": [0.75, 0.25],
                "items": ["book", "lamp"], "collection": "Shelf"}}])  # v0.1.0, schema 1
     converted = S.load(pick)
-    inner.build(pick, converted)
-    got = {key: read(key)["index"] for key in ("A", "B")}
+    old = S.Entry(words_key="old", gn=(WORDS["C"]["Prompt"], WORDS["C"]["Items"]), kind="pick", answer_type='ONE_OF',
+                  single={"Index": 1, "Item": "pear", "Confidence": 0.5})
+    inner.build(pick, S.NodeStore(converted.entries + [old, pick_entry("C", 0, 0.5)]))
+    got = {key: read(key)["index"] for key in WORDS}
     mod = objects["C"].modifiers["Lookup"]
     for key in ("A", "B"):  # C with that prompt and no Items text: a collection Pick's words
         mod[ids["Prompt"]], mod[ids["Items"]] = WORDS[key]["Prompt"], ""
@@ -179,15 +184,29 @@ def phase_converted():
         got[f"C with {key}'s prompt"] = read("C")["index"]
     mod[ids["Prompt"]], mod[ids["Items"]] = WORDS["C"]["Prompt"], WORDS["C"]["Items"]
     objects["C"].update_tag()
-    check("converted entries: a text Pick and a collection Pick show the fallback, never another context's answer",
+    check("converted entries: each matches its own words at v1's positions, a 2-word entry matches nothing, and the "
+          "entries after it keep their numbers",
           [e.gn for e in converted.entries] == [(WORDS["A"]["Prompt"], "", WORDS["A"]["Items"], "", ""),
                                                 (WORDS["B"]["Prompt"], "", "", "", "")]
-          and set(got.values()) == {-1}, got)
+          and got == {"A": 1, "B": -1, "C": 0, "C with A's prompt": -1, "C with B's prompt": 0}, got)
+
+
+@contextlib.contextmanager
+def asking(node_, questions):
+    """The cell keys that the passes inside ask for node_ go into `questions`; nothing reaches a server."""
+    submit = engine._submit
+    engine._submit = lambda job, missing: questions.extend(cell.key for cell in missing if job.uid == node_.uid)
+    try:
+        yield
+    finally:
+        engine._submit = submit
 
 
 def phase_pass():
-    """The pass keeps entries through store.py: schema 1 is converted on read, schema 2 is written, the live
-    set it passes to save() keeps a live entry that eviction would otherwise remove, and a newer OpenAct's
+    """The pass works on Jobs by the validity rule (§5.4) and keeps entries through store.py. A stored entry whose
+    words key holds is reused, and a cached answer becomes a new entry; a new PROMPT_VERSION or Balance Option Order
+    asks nothing, and a new Key carries every row over. Schema 1 is converted on read, schema 2 is written, the
+    live set it passes to save() keeps a live entry that eviction would otherwise remove, and a newer OpenAct's
     JSON is left as it is."""
     live = bpy.data.node_groups.new("Pass", 'GeometryNodeTree')
     live.interface.new_socket("Question", in_out='INPUT', socket_type='NodeSocketString')
@@ -197,18 +216,20 @@ def phase_pass():
         user = bpy.data.objects.new(name, bpy.data.meshes.new(name))
         user.modifiers.new("Pass", 'NODES').node_group = live
         user.modifiers["Pass"][live.interface.items_tree["Question"].identifier] = name
-    requests = {ctx.obj.name: engine.AskSpec.request(node_, ctx) for ctx in evaluator.find_uses()[live.as_pointer()]}
-    old = S.Entry(words_key=requests["Old words"].key, gn=requests["Old words"].gn, t=1.0, kind="ask",
-                  answer_type='YES_NO', single={"Answer": 0.25, "Yes": False, "Confidence": 0.5})
-    warm = [S.Entry(words_key=f"warm {i}", gn=(f"Warm {i}?", ""), t=10.0 + i, kind="ask", answer_type='YES_NO',
-                    single={"Answer": 0.5, "Yes": True, "Confidence": 0.0}) for i in range(S.MAX_ENTRIES + 2)]
+    spec = engine.SPECS[engine.ASK_ID]
+    jobs = {ctx.obj.name: spec.plan(node_, ctx) for ctx in evaluator.find_uses()[live.as_pointer()]}
+    old_rows = spec.rows(jobs["Old words"], {jobs["Old words"].rows[0].cell.key: {"p": 0.25, "model": "fake"}})
+    old = dataclasses.replace(spec.entry(jobs["Old words"], old_rows, "fake"), t=1.0)
+    warm = [S.Entry(words_key=f"warm {i}", gn=(f"Warm {i}?", "", "", "", ""), t=10.0 + i, kind="ask",
+                    answer_type='YES_NO', single={"Answer": 0.5, "Yes": True, "Confidence": 0.0})
+            for i in range(S.MAX_ENTRIES + 2)]
     S.save(node_, S.NodeStore([old] + warm))
-    engine.MEMORY[requests["New words"].key] = engine.AskSpec.parse(requests["New words"],
-                                                                     {"answer": {"type": "noul", "noul": 0.875}})
+    new_cell = jobs["New words"].rows[0].cell.key
+    pipeline.remember(new_cell, {"p": 0.875, "model": "fake"})
     try:
         engine.run_pass()
     finally:
-        engine.MEMORY.clear()
+        pipeline.forget([new_cell])
     saved = S.load(node_).entries
     check("pass: a new answer is stored, and eviction keeps the oldest entry because its words are live",
           node_.entries.startswith('{"schema":2,') and [e.gn[0] for e in saved[:1] + saved[-1:]] == ["Old words", "New words"]
@@ -216,18 +237,39 @@ def phase_pass():
           [e.gn[0] for e in saved])
     check("pass: the inner group shows the stored answers", engine.STATUS[node_.uid][0] == 'CHECKMARK'
           and inner.update_values(node_, S.load(node_)), engine.STATUS[node_.uid])
+
+    before, questions = node_.entries, []
+    with asking(node_, questions):
+        Spec.PROMPT_VERSION += 1
+        node_.balance_order = False
+        try:
+            engine.run_pass()
+        finally:
+            Spec.PROMPT_VERSION -= 1
+            node_.balance_order = True
+    check("pass: a new PROMPT_VERSION and Balance Option Order ask nothing and keep every answer",
+          not questions and node_.entries == before and engine.STATUS[node_.uid][0] == 'CHECKMARK', len(questions))
+    node_.inputs["Key"].default_value = "left"
+    with asking(node_, questions):
+        engine.run_pass()
+    keyed = {e.gn[0]: e.single["Answer"] for e in S.load(node_).entries if e.gn[-1] == "left"}
+    check("pass: a new Key carries every row over from what each context showed, and asks nothing",
+          not questions and keyed == {"Old words": 0.25, "New words": 0.875}, (len(questions), keyed))
+    node_.inputs["Key"].default_value = ""
+
     node_.entries = ('[{"key": "k", "gn": ["Old words", ""], "t": 1.0,'
                      ' "a": {"mode": "YES_NO", "value": 1.0, "confidence": 1.0}}]')  # v0.1.0, schema 1
-    engine.MEMORY[requests["New words"].key] = engine.AskSpec.parse(requests["New words"],
-                                                                     {"answer": {"type": "noul", "noul": 0.875}})
+    pipeline.remember(new_cell, {"p": 0.875, "model": "fake"})
     try:
-        engine.run_pass()
+        with asking(node_, questions):
+            engine.run_pass()
     finally:
-        engine.MEMORY.clear()
+        pipeline.forget([new_cell])
     saved = [(e.gn, e.legacy) for e in S.load(node_).entries]
-    check("pass: a schema 1 list is converted on read, its entry kept, and the store written as schema 2",
-          node_.entries.startswith('{"schema":2,')
-          and saved == [(("Old words", "", "", "", ""), True), (("New words", ""), False)], saved)
+    check("pass: a schema 1 list is converted on read, its entry kept until a new answer replaces it, and the store "
+          "written as schema 2",
+          node_.entries.startswith('{"schema":2,') and questions == [jobs["Old words"].rows[0].cell.key]
+          and saved == [(("Old words", "", "", "", ""), True), (("New words", "", "", "", ""), False)], saved)
     engine.reask(node_)
     check("Ask Again: the node's answers are forgotten, saved as schema 2 and the group rebuilt",
           node_.entries == '{"schema":2,"entries":[]}' and inner.update_values(node_, S.NodeStore()), node_.entries)
@@ -235,7 +277,7 @@ def phase_pass():
     newer = '{"schema":3,"entries":[{"written by":"a newer OpenAct"}]}'
     node_.entries = newer
     group, asked = pointers(node_), []
-    submit, engine._submit = engine._submit, lambda node, _req: asked.append(node.uid)
+    submit, engine._submit = engine._submit, lambda job, _missing: asked.append(job.uid)
     try:
         engine.run_pass()
     finally:
@@ -1023,15 +1065,16 @@ def check_update(node_, node_store):
 
 
 def ask_store(count, offset=0.0):
-    return S.NodeStore([S.Entry(words_key=str(i), gn=(f"Question {i}?", f"Context {i}"), single={
+    return S.NodeStore([S.Entry(words_key=str(i), gn=(f"Question {i}?", f"Context {i}", "", "", ""), single={
         "Answer": (i + offset) / 40, "Yes": i % 2 == bool(offset), "Confidence": (i + 2 * offset) / 50})
         for i in range(count)])
 
 
 def pick_store(count, offset=0):
-    return S.NodeStore([S.Entry(words_key=str(i), gn=(f"Prompt {i}", "table, chair, lamp, rug, bookshelf"), single={
-        "Index": (i + offset) % 5, "Item": f"item {(i + offset) % 5}", "Confidence": (i + offset) / 40})
-        for i in range(count)])
+    return S.NodeStore([S.Entry(words_key=str(i), gn=(f"Prompt {i}", "", "table, chair, lamp, rug, bookshelf", "", ""),
+                                single={"Index": (i + offset) % 5, "Item": f"item {(i + offset) % 5}",
+                                        "Confidence": (i + offset) / 40})
+                        for i in range(count)])
 
 
 def pick_payload_store(count, offset=0):
@@ -1052,7 +1095,7 @@ def words_store(spec, count):
 
 def plan_4096():
     """What planning a changed 4096-cell Rules context costs in Python (§5.3): each cell's instructions,
-    its row words key and its cell key, then the entry's words key, hashed as engine._key() does."""
+    its row words key and its cell key, then the entry's words key, with the pipeline's key functions."""
     factors = [[(f"band {i} of {j}", f"the value lies in the {i}th of sixteen bands of factor {j}") for i in range(16)]
                for j in ("temperature", "moisture", "altitude")]
     options = [(f"outcome {o}", f"when the {o}th outcome's condition holds for this situation") for o in range(7)]
@@ -1064,9 +1107,9 @@ def plan_4096():
     for levels in itertools.product(*factors):
         facts = "\n".join(f"- {j}: {name} ({when})" for j, (name, when) in enumerate(levels))
         instructions = f"Situation:\n{facts}\n{question}"
-        wkeys.append(engine._key("row", "rules", 'AMOUNT', ["", question], levels, options))
-        engine._key("cell", "score", state, instructions, criteria, True)
-    return engine._key("words", ["", question], [], 'AMOUNT', "shape", wkeys, "")
+        wkeys.append(pipeline.wkey("rules", 'AMOUNT', ["", question], levels, options))
+        pipeline.cell_key("score", state, instructions, list(criteria.items()), True)
+    return pipeline.words_key(["", question], [], 'AMOUNT', "shape", wkeys)
 
 
 def phase_bench(shapes):

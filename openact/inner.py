@@ -22,9 +22,9 @@ import bpy
 
 from . import compat, tables
 from . import store as _store  # build() and update_values() take `store`, the name §13.3 fixes
+from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
-SPECS = {}  # node bl_idname -> spec (label, iface, build); the engine adds the OpenAct nodes
 BUILT = "openact_built"  # ID property of the group: what build() laid out, for update_values()
 SEP = "\x1f"  # joins a word tuple into one key (§8.2)
 MATERIALISED_MAX = 16  # entries in the graph and table object, pinned included (§8.1)
@@ -253,7 +253,7 @@ def create_inner(node, store=None):
     """Give the node a new inner group with its spec's interface, built from its stored entries."""
     tree = bpy.data.node_groups.new(inner_name(node), 'GeometryNodeTree')
     node.node_tree = tree
-    sync_interface(node, SPECS[node.bl_idname].iface)
+    sync_interface(node, SPECS[node.bl_idname].interface(node))
     build(node, _store.load(node) if store is None else store)
     return tree
 
