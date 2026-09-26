@@ -20,7 +20,7 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, finish, sock, store  # noqa: E402
-from openact import engine, evaluator, inner, nodes, ops  # noqa: E402  (bpy must be imported first)
+from openact import engine, evaluator, inner, nodes, ops, tables  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
@@ -618,6 +618,318 @@ def phase_single_value_sample():
               link.is_valid and count == 7 * 2 and shape == 'SINGLE', (link.is_valid, count, shape))
 
 
+# ------------------------------------------ the materialised set, table objects, the per-element lookup
+
+def phase_materialised():
+    """§8.1: live entries first (at most 16, in context order), then pins in pin order, then warm ones while the
+    total is below 4; laid out in store order. Ten successive edits of one context stay within 4 entries."""
+    def entry(i, t=0.0, pinned=False, frames=()):
+        return S.Entry(words_key=f"k{i}", gn=(f"Question {i}?", ""), t=t, pinned=pinned, frames=[list(f) for f in frames],
+                       kind="ask", answer_type='YES_NO', single={"Answer": i / 32, "Yes": False, "Confidence": 0.5})
+
+    def keys(entries, live, default=None):
+        return [e.words_key for e in inner.materialised(entries, live, default)]
+
+    many = [entry(i, t=i) for i in range(20)]
+    got = keys(many, [e.gn for e in reversed(many)])
+    check("materialised: at most 16, the first live contexts in context order, laid out in store order",
+          got == [f"k{i}" for i in range(4, 20)], got)
+    mixed = [entry(0, t=5), entry(1, pinned=True, frames=[(30, 40)]), entry(2, pinned=True, frames=[(10, 20)]),
+             entry(3, t=9), entry(4, t=8), entry(5, pinned=True, frames=[(50, 60)])]
+    warm = [entry(0, t=5), entry(1, t=9), entry(2, t=7), entry(3, t=8), entry(4, t=6)]
+    crowded = [entry(i, t=i) for i in range(10)] + [entry(10 + p, pinned=True, frames=[(100 - p, 200)]) for p in range(12)]
+    got = (keys(mixed, [mixed[0].gn]), keys(warm, [warm[0].gn]), keys(warm, [warm[0].gn], "k4"),
+           keys(crowded, [e.gn for e in crowded[:10]]))
+    check("materialised: live, then pins, then the most recent warm entries (the default first) up to 4 in total; "
+          "above 16, the pins that start latest stay out",
+          got == (["k0", "k1", "k2", "k5"], ["k0", "k1", "k2", "k3"], ["k0", "k1", "k3", "k4"],
+                  [f"k{i}" for i in range(10)] + [f"k{i}" for i in range(16, 22)]), got)
+
+    stored, sizes, rebuilds = [], [], []
+    for i in range(10):  # ten successive Question edits of one context
+        stored.append(entry(100 + i, t=100 + i))
+        live = [stored[-1].gn]
+        rebuilt = not inner.update_values(ask, S.NodeStore(stored), live)
+        if rebuilt:
+            inner.build(ask, S.NodeStore(stored), live)
+        rebuilds.append(rebuilt and inner.update_values(ask, S.NodeStore(stored), live))
+        sizes.append(sum(n.bl_idname == "FunctionNodeCompare" for n in ask.node_tree.nodes))
+    back = keys(stored, [stored[0].gn])
+    check("materialised: 10 successive edits keep at most 4 entries in the graph, one rebuild per edit; "
+          "switching back materialises the stored entry",
+          max(sizes) <= 4 and all(rebuilds) and "k100" in back and len(back) <= 4, (sizes, rebuilds, back))
+
+
+class PickV1:
+    """Pick as the 5-word specs declare it (§6.2, §8.2), built from inner's primitives only: the recipe for
+    specs/pick.py. Context, Overrides and Key are absent from this interface, so the chain joins them as ""."""
+
+    label = "Pick"
+    words = ("Prompt", "Context", "Items", "Overrides", "Key")
+    per_element = (inner.Column("Probability", "prob", 'FLOAT', 0.0, linked_only=True),)
+    iface = (SocketDef('INPUT', "Prompt", 'NodeSocketString', kind="word"),
+             SocketDef('INPUT', "Items", 'NodeSocketString', kind="word"),
+             SocketDef('INPUT', "ID", 'NodeSocketInt', kind="field", default_input='INDEX', hide_value=True),
+             SocketDef('OUTPUT', "Index", 'NodeSocketInt'), SocketDef('OUTPUT', "Item", 'NodeSocketString'),
+             SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'), SocketDef('OUTPUT', "Selection", 'NodeSocketBool'),
+             SocketDef('OUTPUT', "Probability", 'NodeSocketFloat'))
+
+    @staticmethod
+    def build(b, gi, go, entries):
+        k = b.match_chain(b.words(gi, PickV1.words), [e.gn for e in entries])
+        picked = b.lookup(k, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
+        b.lookup(k, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
+        b.lookup(k, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
+        b.selection(gi.outputs["ID"], picked, go.inputs["Selection"])
+
+
+POINTS = 6
+TABLE_WORDS = {  # object -> its modifier's words, and the shift of its ID (ID = index + Shift)
+    "TA": {"Prompt": "something to sit on", "Items": "stool, chair, bench", "Shift": -1},
+    "TB": {"Prompt": "something to read", "Items": "book, map, note, card", "Shift": 0},
+    "TC": {"Prompt": "something to eat", "Items": "apple, pear", "Shift": 0},
+}
+
+
+def table_entry(key, index, probs, prompt=None, items=None):
+    words = TABLE_WORDS.get(key, {})
+    gn = (words["Prompt"] if prompt is None else prompt, "", words["Items"] if items is None else items, "", "")
+    names = [f"row {r}" for r in range(len(probs))]
+    return S.Entry(words_key=key, gn=gn, t=1.0, kind="pick", answer_type='ONE_OF', asks=["a"],
+                   shape={"rows": len(probs), "columns": {"prob": "FLOAT"}},
+                   rows=S.Rows(name=names, wkey=[""] * len(probs), ask=[0] * len(probs), src="m" * len(probs),
+                               v={"prob": list(probs)}),
+                   single={"Index": index, "Item": names[index], "Confidence": 0.5})
+
+
+def table_scene():
+    """A tree used by three objects of POINTS points; its Pick reads ID = index + Shift and the tree stores
+    Probability, Selection and Index as point attributes."""
+    tree_ = bpy.data.node_groups.new("Table", 'GeometryNodeTree')
+    for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Prompt", 'NodeSocketString'),
+                              ("Items", 'NodeSocketString'), ("Shift", 'NodeSocketInt')):
+        tree_.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
+    tree_.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi, go = tree_.nodes.new("NodeGroupInput"), tree_.nodes.new("NodeGroupOutput")
+    picker = tree_.nodes.new(engine.PICK_ID)
+    for name in ("Prompt", "Items"):
+        tree_.links.new(gi.outputs[name], picker.inputs[name])
+    shifted = tree_.nodes.new("FunctionNodeIntegerMath")
+    shifted.operation = 'ADD'
+    tree_.links.new(tree_.nodes.new("GeometryNodeInputIndex").outputs[0], shifted.inputs[0])
+    tree_.links.new(gi.outputs["Shift"], shifted.inputs[1])
+    tree_.links.new(shifted.outputs[0], picker.inputs["ID"])
+    geometry = gi.outputs["Geometry"]
+    for name, output, data_type in (("prob", "Probability", 'FLOAT'), ("sel", "Selection", 'BOOLEAN'),
+                                    ("idx", "Index", 'INT')):
+        geometry = store(tree_, geometry, picker.outputs[output], name, data_type)
+    tree_.links.new(geometry, go.inputs[0])
+    idents = {i.name: i.identifier for i in tree_.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
+    users = {}
+    for key, words in TABLE_WORDS.items():
+        mesh = bpy.data.meshes.new(key)
+        mesh.from_pydata([(i, 0, 0) for i in range(POINTS)], [], [])
+        users[key] = bpy.data.objects.new(key, mesh)
+        bpy.context.scene.collection.objects.link(users[key])
+        users[key].modifiers.new("Table", 'NODES').node_group = tree_
+    for key, words in TABLE_WORDS.items():
+        set_words(users, idents, key, **words)
+    return tree_, picker, users, idents
+
+
+def set_words(users, idents, key, **words):
+    mod = users[key].modifiers["Table"]
+    for name, value in words.items():
+        mod[idents[name]] = value
+    users[key].update_tag()
+
+
+def table_read(obj):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        return {name: None if name not in mesh.attributes else
+                [round(d.value, 6) if isinstance(d.value, float) else d.value for d in mesh.attributes[name].data]
+                for name in ("prob", "sel", "idx")}
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def table_expected(entry, shift):
+    """What a context reads: entry e's row ID for 0 <= ID < N, else the fallbacks; Selection = (ID == Index) and
+    Index >= 0. entry None: an unmatched context's neutral values."""
+    probs = entry.rows.v["prob"] if entry else []
+    index = entry.single["Index"] if entry else -1
+    ids = [i + shift for i in range(POINTS)]
+    return {"prob": [round(probs[i], 6) if 0 <= i < len(probs) else 0.0 for i in ids],
+            "sel": [i == index >= 0 for i in ids], "idx": [index] * POINTS}
+
+
+def reads(users, entries):
+    return ({key: table_read(obj) for key, obj in users.items()},
+            {key: table_expected(entry, TABLE_WORDS[key]["Shift"]) for key, entry in zip(users, entries)})
+
+
+def phase_table(tree_, picker, users, idents):
+    entries = [table_entry("TA", 1, [0.25, 0.625, 0.125]), table_entry("TB", 3, [0.125, 0.25, 0.125, 0.5]),
+               table_entry("TC", 0, [0.75, 0.25])]
+    node_store, live = S.NodeStore(entries), [e.gn for e in entries]
+    inner.build(picker, node_store, live)
+    table = tables.find(picker)
+    column = table and [round(d.value, 6) for d in table.data.attributes["oa_prob"].data]
+    check("table: one loose vertex per flat row, an oa_prob column, named after the node, linked to no collection",
+          table is not None and table.name == tables.PREFIX + picker.uid and table.get(tables.UID) == picker.uid
+          and not table.users_collection and column == [0.25, 0.625, 0.125, 0.125, 0.25, 0.125, 0.5, 0.75, 0.25],
+          column)
+    got, want = reads(users, entries)
+    check("per-element: 3 contexts through the joined-key chain each read their own rows at base + ID, and "
+          "Selection = (ID == Index) AND (Index >= 0)", got == want, got)
+    check("per-element: invalid IDs (-1 on TA's first point; past the row count on TB, where TC's rows follow) "
+          "give the fallbacks", got["TA"]["prob"][0] == 0.0 and got["TA"]["sel"][0] is False
+          and got["TB"]["prob"][4:] == [0.0, 0.0] and got["TC"]["prob"][2:] == [0.0] * 4, got)
+    joins = [n for n in picker.node_tree.nodes if n.bl_idname == "GeometryNodeStringJoin"]
+    empties = [n for n in picker.node_tree.nodes if n.bl_idname == "FunctionNodeInputString"]
+    check("joined key: one Join Strings over the 5-word tuple, linked in reverse order; the absent Context, "
+          "Overrides and Key are constant \"\" nodes, and every stored entry matches",
+          len(joins) == 1 and len(joins[0].inputs["Strings"].links) == 5 and len(empties) == 3
+          and [got[key]["idx"][0] for key in users] == [1, 3, 0], (len(joins), len(empties)))
+
+    tables.write_rows(picker, {"prob": [0.5] * 3})  # damaged: the rebuild must regenerate it from entries alone
+    pointer = table.as_pointer()
+    inner.build(picker, node_store, live)
+    check("rebuild: every output unchanged, the same table object rewritten from the entries alone",
+          reads(users, entries)[0] == got and tables.find(picker).as_pointer() == pointer, reads(users, entries)[0])
+
+    before = pointers(picker)
+    entries[1] = table_entry("TB", 2, [0.5, 0.125, 0.25, 0.125])  # new values
+    entries[2] = table_entry("TC", 1, [0.125, 0.5, 0.375])  # one row more, the same words
+    updated = inner.update_values(picker, node_store, live)
+    got, want = reads(users, entries)
+    check("values only: new rows, single values and a changed row count, with the same nodes",
+          updated is True and pointers(picker) == before and got == want
+          and len(tables.find(picker).data.vertices) == 10, (updated, got))
+    return node_store, live
+
+
+def phase_no_match(picker, users, idents, node_store, live):
+    entries = node_store.entries
+    before = pointers(picker)
+    set_words(users, idents, "TA", Prompt="something to sit on, edited")
+    edited = ("something to sit on, edited", "", TABLE_WORDS["TA"]["Items"], "", "")
+    two = inner.k_default_key(["TA", "TB"])
+    updated = [inner.update_values(picker, node_store, [edited, live[1]], two)]
+    got = table_read(users["TA"]), table_read(users["TB"])
+    check("no match, two live contexts: TA's unmatched words show neutral values, never another context's answers",
+          two is None and got == (table_expected(None, -1), table_expected(entries[1], 0)), got)
+    one = inner.k_default_key(["TA"])
+    updated.append(inner.update_values(picker, node_store, [edited], one))
+    got = table_read(users["TA"])
+    check("no match, one live context: TA shows its own last answers", one == "TA"
+          and got == table_expected(entries[0], -1), got)
+    set_words(users, idents, "TA", Prompt="")
+    hint = inner.k_default_key(["TA"], blocked=True)
+    updated.append(inner.update_values(picker, node_store, [], hint))
+    got = table_read(users["TA"])
+    check("no match, a cleared Prompt (a hint): neutral values", hint is None and got == table_expected(None, -1), got)
+    check("no match: every k_default change is a values-only update", updated == [True] * 3
+          and pointers(picker) == before, updated)
+    set_words(users, idents, "TA", Prompt=TABLE_WORDS["TA"]["Prompt"])
+    inner.update_values(picker, node_store, live)
+
+
+def phase_per_word(picker, users, idents, node_store, live):
+    """A word containing SEP could make two different tuples join to the same key, so the node compares each word."""
+    tricky = table_entry("TX", 0, [0.375], prompt="p\x1f", items="i")
+    set_words(users, idents, "TA", Prompt="p\x1f", Items="i")  # tricky's words
+    set_words(users, idents, "TB", Prompt="p", Items="\x1fi")  # joined, the same key as tricky's
+    gns = [tricky.gn, ("p", "", "\x1fi", "", ""), live[2]]
+    inner.build(picker, S.NodeStore([tricky, node_store.entries[2]]), gns)
+    got = {key: table_read(obj) for key, obj in users.items()}
+    check("joined key: a word containing \\x1f switches the node to per-word Compares, which still match",
+          "\x1f".join(gns[0]) == "\x1f".join(gns[1])
+          and not any(n.bl_idname == "GeometryNodeStringJoin" for n in picker.node_tree.nodes)
+          and got == {"TA": table_expected(tricky, -1), "TB": table_expected(None, 0),
+                      "TC": table_expected(node_store.entries[2], 0)}, got)
+    for key in ("TA", "TB"):
+        set_words(users, idents, key, Prompt=TABLE_WORDS[key]["Prompt"], Items=TABLE_WORDS[key]["Items"])
+    inner.build(picker, node_store, live)
+
+
+def phase_write_rows(picker, users, node_store, live):
+    types = {"prob": 'FLOAT', "n": 'INT', "ok": 'BOOLEAN'}
+    steps = []
+    for count in (12, 5, 20):  # grow, shrink (clear_geometry() drops every attribute), grow
+        columns = {"prob": [r / 16 for r in range(count)], "n": [3 * r - 1 for r in range(count)],
+                   "ok": [r % 3 == 0 for r in range(count)]}
+        mesh = tables.write_rows(picker, columns, types).data
+        written = {name: [round(d.value, 6) if isinstance(d.value, float) else d.value
+                          for d in mesh.attributes[tables.ATTR + name].data] for name in columns}
+        steps.append(len(mesh.vertices) == count and written == columns
+                     and {name: mesh.attributes[tables.ATTR + name].data_type for name in columns} == types)
+    check("write_rows: grow -> shrink -> grow keeps every column, its values and its type", steps == [True] * 3, steps)
+    restored = inner.update_values(picker, node_store, live)
+    names = sorted(a.name for a in tables.find(picker).data.attributes if a.name.startswith(tables.ATTR))
+    got, want = reads(users, node_store.entries)
+    check("values only: the node's own rows are back, columns it no longer writes are gone, evaluation sees them",
+          restored and names == ["oa_prob"] and got == want, (restored, names, got))
+
+
+def phase_table_copies(tree_, picker, users, node_store, live):
+    def column(obj):
+        return [round(d.value, 6) for d in obj.data.attributes["oa_prob"].data]
+
+    mine = tables.find(picker)
+    rows = column(mine)
+    twin_tree = tree_.copy()  # copy() runs for every node: the copy clears its uid and shares the group
+    twin = next(n for n in twin_tree.nodes if n.bl_idname == engine.PICK_ID)
+    shared = twin.uid == "" and tables.find(twin) == mine
+    engine.ensure_owned(list(engine.iter_nodes()))
+    theirs = tables.find(twin)
+    check("copies: a copied node gets its own table object, named after it, with the same rows",
+          shared and theirs is not None and theirs != mine and theirs.data != mine.data and tables.find(picker) == mine
+          and theirs.name == tables.PREFIX + twin.uid and theirs.get(tables.UID) == twin.uid
+          and not theirs.users_collection and column(theirs) == rows, theirs and theirs.name)
+    tables.write_rows(twin, {"prob": [1.0] * 4})
+    check("copies: writing the copy's table leaves the original's alone", column(mine) == rows, column(mine))
+    gone = theirs.name
+    twin_tree.nodes.remove(twin)
+    removed = tables.collect_garbage(list(engine.iter_nodes()))
+    check("garbage: deleting the node removes its table object; live tables stay",
+          removed == 1 and gone not in bpy.data.objects and tables.find(picker) == mine, removed)
+
+    link = next(link for link in tree_.links if link.from_node == picker and link.from_socket.name == "Probability")
+    target = link.to_socket
+    tree_.links.remove(link)
+    refused = inner.update_values(picker, node_store, live)
+    inner.build(picker, node_store, live)
+    released = tables.find(picker) is None
+    removed = tables.collect_garbage(list(engine.iter_nodes()))
+    tree_.links.new(picker.outputs["Probability"], target)
+    rebuilt = not inner.update_values(picker, node_store, live)
+    inner.build(picker, node_store, live)
+    got, want = reads(users, node_store.entries)
+    check("Pick: with Probability unlinked, build() releases the table object and garbage removes it; linked "
+          "again, a rebuild brings a new one", refused is False and released and removed == 1 and rebuilt
+          and tables.find(picker) is not None and got == want, (refused, released, removed, rebuilt))
+
+
+def phase_tables():
+    """The per-element path on synthetic tables, through a stand-in Pick (PickV1) on a real Pick node."""
+    saved = inner.SPECS[engine.PICK_ID]
+    inner.SPECS[engine.PICK_ID] = PickV1
+    try:
+        tree_, picker, users, idents = table_scene()
+        node_store, live = phase_table(tree_, picker, users, idents)
+        phase_no_match(picker, users, idents, node_store, live)
+        phase_per_word(picker, users, idents, node_store, live)
+        phase_write_rows(picker, users, node_store, live)
+        phase_table_copies(tree_, picker, users, node_store, live)
+    finally:
+        inner.SPECS[engine.PICK_ID] = saved
+
+
 # ------------------------------------------------------------------------------ the bench
 
 def timed(fn, runs=5):
@@ -743,6 +1055,8 @@ phase_lookup()
 phase_converted()
 phase_pass()
 phase_single_value_sample()
+phase_materialised()
+phase_tables()
 if "--bench" in ARGS:
     chosen = os.environ.get("OPENACT_BENCH_SHAPE", "")
     phase_bench({chosen} if chosen in ("demo", "worst") else {"demo", "worst"})
