@@ -677,17 +677,20 @@ def redact(text) -> str:
     """A message as diagnostics copy it: its shape and numbers, with each path cut to its file name and each quoted
     segment replaced by '…'."""
     text = PATH.sub(lambda found: re.split(r"[\\/]", found.group().rstrip("\\/"))[-1], text)
-    return QUOTED.sub(lambda found: found.group(1) + "…" + found.group(1), text)
+    return QUOTED.sub(r"\1…\1", text)
 
 
 def diagnostics() -> str:
-    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime, the
-    model server's status and /health counters, the queue, the nodes and the first 10 problems, each cut to 200
-    characters. The server's message and the problems are redacted: it holds no prompt and no CSV contents (§16.3)."""
+    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime (the home
+    folder as ~), the model server's status and /health counters, the queue, the nodes and the first 10 problems. A
+    problem is given by its node type, severity, file name and line, never its text; the server's message is redacted.
+    So the report holds no words of the artist's (§16.3)."""
     from . import bl_info  # the package's
 
     prefs, health = P.get_prefs(), server.STATE.health
-    root = P.runtime_root(prefs)
+    root, home = P.runtime_root(prefs), os.path.expanduser("~")
+    if os.path.normcase(root).startswith(os.path.normcase(home) + os.sep):
+        root = "~" + root[len(home):]
     state, message = server.status()
     per_class, flight = pipeline.queue_counts()
     nodes = list(engine.iter_nodes())
@@ -706,18 +709,22 @@ def diagnostics() -> str:
         "Nodes: " + (", ".join(f"{n} {label}" for label, n in Counter(node.bl_label for _tree, node in nodes).items())
                      or "none"),
     ]
+    problems = Counter()
     for _tree, node in nodes:  # counts only: a label or a word could be the artist's text
         status = engine.STATUS.get(node.uid)
+        for problem in status.problems if status else ():  # its kind and place, never its text (§16.3)
+            where = f"{node.bl_label} {problem.severity}"
+            if problem.file:
+                where += f" in {os.path.basename(problem.file)}" + (f", line {problem.line}" if problem.line else "")
+            problems[where] += 1
         jobs = [job for _label, job, _entry in status.uses] if status else []
         entries = store.load(node).entries
         lines.append(f"  {node.bl_label}: {status.state if status else 'no pass yet'}; rows per table "
                      f"{', '.join(str(len(job.rows)) for job in jobs) or 'none'}; "
                      f"{len(inner.materialised(entries, [job.gn for job in jobs]))} of {len(entries)} stored entries "
                      f"materialised; {len(node.node_tree.nodes) if node.node_tree else 0} nodes in the inner group")
-    problems = list(dict.fromkeys(redact(problem.message) for status in engine.STATUS.values()
-                                  for problem in status.problems))
-    lines.append(f"Problems: {len(problems)}")
-    lines += [f"  {problem[:200]}" for problem in problems[:10]]
+    lines.append(f"Problems: {sum(problems.values())}")
+    lines += [f"  {where}" + (f" (x{count})" if count > 1 else "") for where, count in list(problems.items())[:10]]
     return "\n".join(lines)
 
 

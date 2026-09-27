@@ -514,7 +514,7 @@ def _submit(job, missing):
     if state == "ready":
         pipeline.submit(job, missing, job.priority, on_rows=_answered)
         return True
-    if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
+    if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start and not server.STATE.detached:
         return server.start()  # asked by the pass that runs when the server is ready; an install starts it as it ends
     return state == "starting" or server.STATE.start_queued
 
@@ -567,7 +567,7 @@ def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
             return "starting", "Starting the model...", None
         if message == server.CHECKING:  # a start waits for the runtime probe
             return "starting", message, None
-        if state in ("stopped", "unknown") and not P.get_prefs().auto_start:
+        if state in ("stopped", "unknown") and (not P.get_prefs().auto_start or server.STATE.detached):
             return "paused", "Model server is stopped (OpenAct tab)", None
         if upstream and not waiting:
             return "waiting", "Waiting for another OpenAct node...", None

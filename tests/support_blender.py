@@ -383,18 +383,19 @@ def phase_diagnostics():
                 Items="//savanna.csv")
     doubled = used("Doubled", MATCH, Question="Is it there twice?", Items="okapi-sentinel, okapi-sentinel")
     missing = used("Missing", MATCH, Question="Is it there?", Items="//folder-sentinel/names.csv")
+    with open(os.path.join(folder, "zebra_factors.csv"), "w", encoding="utf-8") as handle:
+        handle.write("factor,kind,level,value\nzebrafactor,flag,quokkalevel,0\nzebrafactor,flag,otherlevel,1\n")
+    with open(os.path.join(folder, "zebra_outcomes.csv"), "w", encoding="utf-8") as handle:
+        handle.write("answer,when,if\nStays,It stays.,zebrafactor=otherlevel\nGoes,It goes.,zebrafactor=otherlevel\n")
+    uncovered = used("Uncovered", RULES, Factors="//zebra_factors.csv", Outcomes="//zebra_outcomes.csv")
     engine.schedule(immediate=True)
-    done = settle(lambda: complete(node) and line(missing)[0] == line(doubled)[0] == "error", 60)
-    quoted, pathed = line(doubled)[1], line(missing)[1]
-    engine.STATUS["long problem"] = engine.NodeStatus("error", "", problems=[
-        engine._problem(csvfmt.ERROR, "Line 9: " + "w" * 300)])  # one without names or paths to leave out
-    try:
-        text = ops.diagnostics()
-    finally:
-        del engine.STATUS["long problem"]
+    done = settle(lambda: complete(node) and line(missing)[0] == line(doubled)[0] == "error"
+                  and "No outcome applies" in line(uncovered)[1], 60)
+    quoted, pathed, named = line(doubled)[1], line(missing)[1], line(uncovered)[1]
+    text = ops.diagnostics()
     version = ".".join(map(str, openact.bl_info["version"]))
     parts = [f"OpenAct {version}, Blender {bpy.app.version_string}, {platform.platform()}", "Backend: fake, model fake",
-             f"Runtime: {P.runtime_root()}", f"Server: ready on port {PORT}", "Health: status ready, requests "]
+             "\nRuntime: ", f"Server: ready on port {PORT}", "Health: status ready, requests "]
     check("diagnostics: OpenAct, Blender and OS versions, the backend and model, the runtime, the server's status and "
           "its /health counters", done and all(part in text for part in parts)
           and all(re.search(rf"\b{key} \d", text) for key in ("requests", "questions", "rows_scored", "cache_hits")),
@@ -404,15 +405,14 @@ def phase_diagnostics():
           and re.search(r"^Nodes: .*\b\d+ Match\b", text, re.M) is not None and re.search(
               r"^  Match: complete; rows per table 2; 1 of 1 stored entries materialised; \d+ nodes in the inner "
               r"group$", text, re.M) is not None, text)
-    check("diagnostics: a problem keeps its shape and numbers, with its quoted text replaced and its path cut to the "
-          "file name", "'okapi-sentinel' appears twice" in quoted and "folder-sentinel" in pathed
-          and re.search(r"^  Items: Entry 2: '…' appears twice$", text, re.M) is not None
-          and re.search(r"^  Can't find names\.csv$", text, re.M) is not None, (quoted, pathed, text))
-    cut = [row.strip() for row in text.splitlines() if row.startswith("  Line 9: w")]
-    check("diagnostics: the problems, each cut to 200 characters", len(cut) == 1 and len(cut[0]) == 200, cut)
-    leaked = [word for word in ("aardvark", "dusk-sentinel", "okapi", "quokka", "zebra", "folder-sentinel")
-              if word in text]
-    check("diagnostics: no prompt, context, item name, folder or other CSV text", not leaked, leaked)
+    check("diagnostics: a problem is copied as its node type, severity, file name and line, never its text",
+          "'okapi-sentinel' appears twice" in quoted and "folder-sentinel" in pathed
+          and "zebrafactor=quokkalevel" in named and re.search(r"^  Match error \(x2\)$", text, re.M)
+          and re.search(r"^  Rules error( \(x\d+\))?$", text, re.M), (quoted, pathed, named, text))
+    leaked = [word for word in ("aardvark", "dusk-sentinel", "okapi", "quokka", "zebra", "folder-sentinel",
+                                "appears twice", "No outcome", HOME + os.sep) if word in text]
+    check("diagnostics: no prompt, context, item name, factor or level name, folder, message or other CSV text",
+          not leaked, leaked)
     reports, wm = [], SimpleNamespace(clipboard="")  # a stand-in: the user's own clipboard is left alone
     got = ops.OPENACT_OT_copy_diagnostics.execute(SimpleNamespace(report=lambda _kind, message: reports.append(message)),
                                                   SimpleNamespace(window_manager=wm))
@@ -782,6 +782,77 @@ def phase_lost_race():
           server.start() and drive(engine, server.is_ready, 30), server.status())
 
 
+def attach_other(port, token):
+    """This Blender attached to a server another Blender started on its own port: (that server, attached)."""
+    other = other_server(port, token)
+    server.stop()
+    P._Defaults.port = port
+    up = drive(engine, lambda: listening(port) and os.path.exists(os.path.join(STATE_DIR, f"server-{port}.token")), 20)
+    return other, up and server.start() and drive(engine, server.is_ready, 20) and server.attached()
+
+
+def phase_own_after_other():
+    """§10.5: the other Blender's server goes away, and this Blender starts its own: before that one's first /health,
+    the Model box must not call it shared, and Stop Model must shut it down (not detach and leave it on the port)."""
+    port = free_port()
+    other, attached = attach_other(port, secrets.token_hex(32))
+    try:
+        ended(other)  # the other Blender closes
+        server.refresh()
+        gone = drive(engine, lambda: server.status()[0] == "stopped", 10)
+        started, own = server.start(), server.STATE.process
+        box = drawn(lambda layout: ui.draw_server(layout))
+        shown = (server.attached(), server.SHARED in text_of(box), ("op", "openact.server_stop", None) in box)
+        server.stop()
+        ended_own = own is not None and own.poll() is not None and not listening(port)
+        check("own after other: once the other Blender's server has gone, this Blender's own starting server shows "
+              "Stop Model, not a shared line and Detach", attached and gone and started and shown == (False, False, True),
+              (attached, gone, started, shown))
+        check("own after other: and Stop Model shuts it down, leaving the port free", ended_own,
+              (own and own.poll(), listening(port)))
+    finally:
+        ended(other)
+        P._Defaults.port = PORT
+    check("own after other: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
+def phase_detach_sticks():
+    """§10.5: after Detach, this Blender doesn't attach again by itself, auto-start or not, until Start Model, or until
+    the other server goes away."""
+    port = free_port()
+    other, attached = attach_other(port, secrets.token_hex(32))
+    found = {}
+    try:
+        server.stop()  # Detach
+        node = used("Detached", MATCH, Question="Is it detached?", Items="rope, knot")  # cells to ask meanwhile
+        for auto in (False, True):
+            P._Defaults.auto_start = auto
+            server.refresh()  # a health probe, which finds the other server
+            drive(engine, lambda: False, 1.5)
+            found[auto] = (server.status()[0], line(node)[0])
+        again = server.start() and drive(engine, lambda: server.is_ready() and complete(node), 20)
+        server.stop()
+        ended(other)  # the other server goes: auto-start (on) starts this Blender's own for new cells
+        server.refresh()
+        drive(engine, lambda: False, 1.0)
+        node.inputs["Question"].default_value = "Is it detached for good?"
+        engine.run_pass()
+        own = drive(engine, lambda: server.is_ready() and not server.attached(), 20)
+        check("detach: after Detach a health probe doesn't attach again, with auto-start off or on, and the node "
+              "waits as paused", attached and found == {False: ("stopped", "paused"), True: ("stopped", "paused")},
+              found)
+        check("detach: Start Model attaches again and the node is answered; once the other server has gone, auto-start "
+              "starts this Blender's own", again and own, (again, own, server.status()))
+    finally:
+        P._Defaults.auto_start = True
+        ended(other)
+        server.stop()
+        P._Defaults.port = PORT
+    check("detach: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
 # ---------------------------------------------------------------------------------------- crash loop
 
 def restart_after_crash(node, question):
@@ -902,6 +973,8 @@ def main():
         phase_sharing()
         phase_wrong_token()
         phase_lost_race()
+        phase_own_after_other()
+        phase_detach_sticks()
         phase_crash_loop()
         phase_stall()
         phase_slow()

@@ -2896,8 +2896,10 @@ clean exit if it still holds its token.
   the new token.
 - **Stop Model only detaches from another Blender's server:** this Blender stops using it and
   forgets its token, and it runs on for the Blender that started it. The Model box says "Shared:
-  started by another Blender", and the Stop button reads *Detach* there. *Start Model*, or
-  auto-start, attaches again.
+  started by another Blender", and the Stop button reads *Detach* there. Detach lasts: health probes
+  don't attach and auto-start waits, until *Start Model*, or until that server goes away. A server
+  of this Blender's own is always shut down by *Stop Model*, and a start forgets the health of a
+  server that has gone, so its own new server never looks shared.
 - The watchdog still ties the server's life to the Blender that launched it. Attached sessions
   see *stopped* when it exits, and can start their own.
 
@@ -3787,8 +3789,7 @@ records which file was opened).
   - `log_requests` (off by default) writes full requests and responses to `<runtime>/logs/`. Its
     tooltip says exactly that.
   - `openact.copy_diagnostics` copies versions, GPU, status, counters and the last errors
-    (truncated to 200 characters, with quoted names and paths redacted, §17.5). It never includes
-    CSV contents or prompts.
+    (as node type, severity, file name and line, §17.5). It never includes CSV contents or prompts.
 
 ### 16.4 Licences and naming
 
@@ -3915,11 +3916,11 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 - server status and `/health` counters;
 - a node count per type, with rows per table, materialised entries and inner-group node counts;
 - queue state;
-- the last 10 problems, each truncated to 200 characters.
+- the last 10 problems, each as node type, severity, file name and line (never its text).
 
-It contains **no prompts and no CSV contents** (§16.3). The problems and the server's message
-keep their shape and numbers, but every quoted segment becomes `'…'` and every path its file
-name, as those hold the artist's names and folders.
+It contains **no prompts and no CSV contents** (§16.3): problems keep no text, the runtime root
+shows the home folder as `~`, and the server's message has every quoted segment as `'…'` and
+every path cut to its file name.
 
 ### 17.6 Alerts (local)
 

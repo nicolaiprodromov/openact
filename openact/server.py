@@ -92,6 +92,7 @@ class _State:
         self.token = ""
         self.folder = ""  # state_dir() of the runtime: token files and logs/, for threads, which can't read preferences
         self.log_requests = False  # the preference, for the worker
+        self.detached = False  # Stop Model left another Blender's server: no attaching until Start Model (§10.5)
         self.exits = []  # time.monotonic() of recent unexpected exits of the server this Blender started (§17.6)
 
     def set(self, status, message=""):
@@ -512,7 +513,11 @@ def refresh(prefs=None):
             if STATE.status == "ready":
                 STATE.set("stopped", "The model server stopped")
         other = _other_backend(health) if code == 200 and health.get("server") == SERVER_ID else None
-        if other:
+        if code == 0:
+            STATE.detached = False  # the server this Blender detached from has gone
+        if STATE.detached:
+            pass  # Detach lasts until Start Model (§10.5)
+        elif other:
             _refuse_backend(other)  # also ends a "ready" left over from the server it replaced
         elif code == 200 and health.get("server") == SERVER_ID:
             _apply_health(health)
@@ -549,6 +554,7 @@ def start(prefs=None):
         return True
     if _reap():
         return False
+    STATE.detached = False
     STATE.port = prefs.port
     root = P.runtime_root(prefs)
     STATE.folder = state_dir(root)
@@ -565,6 +571,7 @@ def start(prefs=None):
     found = _attach()
     if found is not None:
         return found
+    STATE.health = {}  # a server that has gone: the one started here must not look like another Blender's
 
     python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
     folder = STATE.folder
@@ -714,13 +721,15 @@ def stop():
     """Stop the server this Blender started (/shutdown needs its token: one that refuses keeps running, which the status
     then says). Another Blender's server is never shut down from here (§10.5): this Blender only stops using it, and
     forgets its token until it attaches again; one whose token it can't read keeps its error."""
-    if attached() or (STATE.process is None and not STATE.token):  # nothing of this Blender's to shut down
-        if STATE.refused is None:
-            STATE.health, STATE.token = {}, ""
+    own = STATE.process is not None and STATE.process.poll() is None
+    if not own and (attached() or not STATE.token):  # nothing of this Blender's to shut down
+        if STATE.refused is None:  # stays detached until Start Model, or until that server goes
+            STATE.health, STATE.token, STATE.detached = {}, "", attached()
+            pipeline.cancel_all()  # queued chunks would go out without a token
             STATE.set("stopped", "")
         return
-    try:
-        code, _reply = http("POST", "/shutdown", body={}, timeout=2.0)
+    try:  # a process of this Blender's while another's server answers lost the port: it is only ended
+        code = 0 if attached() else http("POST", "/shutdown", body={}, timeout=2.0)[0]
     except Exception:
         code = 0
     process = STATE.process
