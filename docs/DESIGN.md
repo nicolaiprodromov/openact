@@ -910,8 +910,14 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
   apply.
 
 **Cancellation.**
-- When a node's words change, its generation is bumped and `pipeline.cancel(uid, below=generation)`
-  removes the queued chunks.
+- A node's generation is bumped, and `pipeline.cancel(uid, below=generation)` removes its queued
+  chunks, when:
+  - a context's words change: a new fingerprint, or a text edit of a CSV it reads (§7.8);
+  - a context goes away while the node stays: its object is deleted, its modifier is removed,
+    renamed or pointed at another group, or a group node on its path is muted. The next pass
+    queues the missing cells of the contexts left again, at the new generation.
+- A deleted node's queued chunks all go (`cancel(uid, below=inf)`), and so does every queued chunk
+  when another file is opened or the add-on unregisters (`cancel_all()`).
 - The in-flight chunk always completes. Its answers land in `MEMORY`, where they remain useful:
   undo, or switching back to the previous words.
 
@@ -3199,7 +3205,7 @@ still work):
 | Code | When | Client reaction (`server.Worker`) |
 |---|---|---|
 | 200 | answered | fill `MEMORY`, post to the main thread |
-| 403 | missing or wrong token, `Origin` present, bad `Host` | status *error* "The model server refused this Blender (token)"; no retry |
+| 403 | missing or wrong token, `Origin` present, bad `Host` | status *error* "A model server started by another Blender holds port N: close that Blender or choose another port" while `/health` reports that server's pid; the cells stay unanswered (not `FAILED`) and are asked again once it has gone. A refused *Stop Model* (`/shutdown`) is reported the same way |
 | 413 | body over 4 MB | should never happen, because chunks stay far below it; log, then split the chunk |
 | 422 | invalid question; `question` names it | mark that cell `FAILED`; resend the rest of the chunk (§10.3) |
 | 503 `loading` | model still loading (returned immediately, no blocking) | requeue at the head, poll `/health` until `ready` |
@@ -3482,7 +3488,7 @@ computes for the same words.
 |---|---|---|
 | `MEMORY` (cell answers, LRU 100 000), `PENDING`, `FAILED` | `pipeline.py` | Blender restart. `load_post` clears `FAILED`, as today; *Ask Again* clears a node's keys |
 | `STATUS` (per-node icon, text, counts, ETA) | `engine.py` | `load_post` |
-| `PLANS[(uid, ctx key)] → (fingerprint, job)`, the plan cache (§5.3) | `engine.py` | a changed fingerprint; `load_post` |
+| `PLANS[(uid, ctx key)] → (fingerprint, job)`, the plan cache (§5.3) | `engine.py` | a changed fingerprint; a context that disappears, unless the pass planned it (an evaluator read also reaches contexts `find_uses()` doesn't list, through a group node in a tree no modifier uses); `load_post` |
 | `LAST_SHOWN[(uid, ctx key)] → words_key` of the entry that context showed last (stale-while-refilling, carry-over, and `k_default` for single-context nodes, §5.3–§5.4, §8.2). **Seeded on the first pass after load** from the stored entry whose `gn` equals that context's words, so rows re-asked after a CSV edit made while Blender was closed show stale values, not fallbacks | `engine.py` | `load_post` (then re-seeded); a context that disappears |
 | `TRUST`: which file was opened; `PASS`: whether the open file is trusted, worked out once per pass (§16.1) | `trust.py` | `load_post` and enabling OpenAct (`TRUST`); every pass (`PASS`) |
 | `WATCH` (file stamps and `CsvDoc` cache), the evaluator memo and the file identities (`csvfmt.IDENTITIES`) | `engine.py`, `evaluator.py`, `csvfmt.py` | `load_post` (watch); every pass (memos) |

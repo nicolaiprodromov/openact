@@ -124,10 +124,10 @@ class ClassifySpec(PerItemSpec):
             sync_interface(node, self.interface(node, list(first.payload)))
         return ""
 
-    def resolve(self, job, entries, last_shown=""):
+    def resolve(self, job, entries, last_shown="", partial=False):
         """Spec.resolve(), with each row's payload baked from its label (denormalised, §8.1). A numbers-only edit of
         the Labels CSV keeps the words key: the stored entry comes back with the new payload, and nothing is asked."""
-        entry, missing, failed = super().resolve(job, entries, last_shown)
+        entry, missing, failed = super().resolve(job, entries, last_shown, partial)
         if entry is None:
             return entry, missing, failed
         payload, baked = job.payload, job.baked

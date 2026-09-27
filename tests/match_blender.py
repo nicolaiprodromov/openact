@@ -127,17 +127,16 @@ def entry(kind, gn, v, payload=None):
 
 
 class Capture:
-    """Patches engine._submit and server.ask: the missing cells the passes want, and any request, are recorded."""
+    """Patches engine._submit: the missing cells the passes want are recorded, and nothing is queued."""
 
     def __enter__(self):
-        self.cells, self.requests = [], []
-        self.saved = engine._submit, server.ask
+        self.cells = []
+        self.saved = engine._submit
         engine._submit = lambda job, missing: self.cells.extend((job.uid, cell) for cell in missing)
-        server.ask = lambda payload, on_done, timeout=180.0: self.requests.append(payload)
         return self
 
     def __exit__(self, *_exc):
-        engine._submit, server.ask = self.saved
+        engine._submit = self.saved
 
     def keys(self, node):
         return {cell.key for uid, cell in self.cells if uid == node.uid}
@@ -265,15 +264,12 @@ def phase_jobs():
           cells[0].question == {"type": "noul", "instructions": f"Item: thing 0\n{KITCHEN}",
                                 "criteria": {"true": "Yes.", "false": "No."}}
           and cells[1].question["instructions"] == f"Item: thing 1 — found near a sink\n{KITCHEN}", cells[1].question)
-    with Capture() as capture:
-        pipeline.submit(job, cells, job.priority)
-    for cell in cells:
-        pipeline.PENDING.pop(cell.key, None)
-    sent = [question for payload in capture.requests for question in payload["questions"].values()]
+    requests = [pipeline.build_request(pipeline.Chunk(job, tuple(part)))[0] for part in pipeline.chunked(cells)]
+    sent = [question for payload in requests for question in payload["questions"].values()]
     check("jobs: the requests carry the one state, the 40 questions and the node's debias",
-          capture.requests and all(p["state"] == "A small flat" and p["options"] == {"debias": True}
-                                   for p in capture.requests) and sent == [cell.question for cell in cells],
-          (len(capture.requests), len(sent)))
+          requests and all(p["state"] == "A small flat" and p["options"] == {"debias": True}
+                           for p in requests) and sent == [cell.question for cell in cells],
+          (len(requests), len(sent)))
     empty = MATCH.job((KITCHEN, "", "", "", "", ""), 'YES_NO', items[:2], sources.default_set("yes_no"), False)
     amount = MATCH.job(("How heavy is it?", "", "", "", "", ""), 'AMOUNT', items[:1], sources.default_set("amount"),
                        True)
@@ -316,7 +312,7 @@ def phase_limits():
         engine.run_pass()
     status = engine.STATUS.get(node.uid, ("", ""))
     check("limits: the node shows the error before anything is sent",
-          not capture.keys(node) and not capture.requests and status[0] == 'ERROR' and "8 500" in status[1], status)
+          not capture.keys(node) and status[0] == 'ERROR' and "8 500" in status[1], status)
 
     def costs(count, debias, n=3):
         return [row.cell.cost for row in CLASSIFY.job(gn, items[:n], labels_of(count), debias).rows]

@@ -142,6 +142,9 @@ class PickSpec(Spec):
         return job.rows[rows[best]].name, confidence('ONE_OF', probabilities), table[rows[best]][0]
 
     def single(self, rows):
+        asked = [row for row in rows if row.cell is not None]
+        if asked and all(row.source == "pending" for row in asked):  # a partial table with no answer yet (§5.4)
+            return dict(self.FALLBACK)
         probabilities = [row.values["prob"] for row in rows]
         index = max(range(len(rows)), key=probabilities.__getitem__)  # the first of equal ones, as the server picks
         return {"Index": index, "Item": rows[index].name, "Confidence": confidence('ONE_OF', probabilities)}

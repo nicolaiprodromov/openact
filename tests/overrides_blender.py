@@ -1,5 +1,5 @@
-"""The Overrides CSV (§7.6) in a headless Blender, with no model: fake answers go into MEMORY, and engine._submit and
-server.ask are patched to count what the passes would ask.
+"""The Overrides CSV (§7.6) in a headless Blender, with no model: fake answers go into MEMORY, and engine._submit is
+patched to count what the passes would ask.
 
 - Every node has the Overrides word and its CSV companion, hidden like Key.
 - Match through the pass: export fills the empty socket; locking an exported row keeps the model's probability; locks
@@ -33,7 +33,7 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, finish, store  # noqa: E402
-from openact import csvfmt, engine, evaluator, nodes, ops, pipeline, server, trust  # noqa: E402
+from openact import csvfmt, engine, evaluator, nodes, ops, pipeline, trust  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
 from openact import store as S  # noqa: E402
@@ -89,21 +89,20 @@ def export(node, index=0, path=None):
 
 
 class Capture:
-    """Patches engine._submit and server.ask: the missing cells the passes want, and any request, are recorded."""
+    """Patches engine._submit: the missing cells the passes want are recorded, and nothing is queued."""
 
     def __enter__(self):
-        self.cells, self.requests = [], []
-        self.saved = engine._submit, server.ask
+        self.cells = []
+        self.saved = engine._submit
         engine._submit = lambda job, missing: self.cells.extend((job.uid, cell) for cell in missing)
-        server.ask = lambda payload, on_done, timeout=180.0: self.requests.append(payload)
         return self
 
     def __exit__(self, *_exc):
-        engine._submit, server.ask = self.saved
+        engine._submit = self.saved
 
     @property
     def asked(self):
-        return len(self.cells) + len(self.requests)
+        return len(self.cells)
 
     def of(self, node):
         """The missing cells of this node the passes would ask."""
