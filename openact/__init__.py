@@ -29,6 +29,7 @@ def register():
         raise RuntimeError("OpenAct needs Blender 4.5 or newer")
     for cls in prefs.classes:
         bpy.utils.register_class(cls)
+    prefs.import_jev()
     for module in _modules:
         module.register()
     engine.register()

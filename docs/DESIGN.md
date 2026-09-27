@@ -3044,9 +3044,10 @@ Consequences:
   Checking only `Scripts\python.exe` and the model shards would call a broken runtime
   "installed".
 - **Custom locations.** If `jev_nodes` preferences are available at first registration, OpenAct
-  imports `runtime_dir`, `port`, `device`, `gpu`, `auto_start` and `debias`. Otherwise the sidebar
-  offers **Locate Existing Runtime…** (`openact.locate_runtime`, PR-07), a folder picker that sets
-  `runtime_dir` and runs the background probe.
+  imports `runtime_dir`, `port`, `device`, `gpu`, `auto_start` and `debias`. It does so once: a
+  hidden preference (`jev_imported`) remembers it, so later changes are the user's. Otherwise the
+  sidebar offers **Locate Existing Runtime…** (`openact.locate_runtime`, PR-07), a folder picker
+  that sets `runtime_dir` and runs the background probe.
   A user with a custom `runtime_dir` is therefore never pushed into a fresh 13 GB install.
 
 Using the folder in place costs nothing. The server script ships inside the add-on (`SERVER_SCRIPT`
@@ -3089,25 +3090,30 @@ undo step:
 2. **Copy settings.**
    - Ask: `mode` → `answer_type`.
    - Pick: the prototype's precedence is kept, a set Collection winning over the Items text
-     (`collection_items(coll) if coll is not None else parse_items(items)`):
-     - `list_source = COLLECTION` if the Collection socket is set or linked; its Items text is
-       ignored;
+     (`collection_items(coll) if coll is not None else parse_items(items)`), so old files keep
+     their answers:
+     - an old Pick with a collection becomes `list_source = COLLECTION` (the Collection socket
+       is set, or has an unmuted link: v0.1.0 ignored muted links), and its Items text is ignored;
      - otherwise `TEXT`.
    - Pick nodes also get the hidden property `items_parse_v0 = True` (below).
    - `balance_order` is seeded from the `debias` preference. The imported value of `jev_nodes`'
      global `debias`, when available, keeps the prototype's behaviour (§10.3, §12.2).
    - `uid` is kept.
-3. **Inputs, by socket name.** Copy unlinked default values and re-create links for Question and
-   Context (Ask), and for Prompt, Items and Collection (Pick). The new optional inputs (Answers,
-   Pick's Context, ID, Overrides) stay at their defaults, so the words are unchanged.
+3. **Inputs, by socket name.** Copy default values and re-create links (muted ones stay muted) for
+   Question and Context (Ask), and for Prompt and, by the list source, Items or Collection (Pick):
+   the Items text of a collection Pick is dropped, as v0.1.0 ignored it. The new optional inputs
+   (Answers, Pick's Context, ID, Overrides) stay at their defaults, so the words are unchanged.
    - **Legacy item parsing.** v1 splits inline items on newlines, else `;`, else `,`, and separates
      `name: when`. The prototype split on newlines, else commas, with no descriptions.
    - While `items_parse_v0` is set, `lists.parse_inline(text, mode="v0")` parses the Items text
      with the prototype's rule, so an item string containing `;` or `": "` keeps its v0.1.0 item
      names, and its words key.
-   - The flag is cleared the first time the Items text changes, and the node then uses v1 parsing.
+   - The flag is cleared the first time the Items text changes, that is, when the node meets an
+     Items text that none of its stored answers was given for; the node then uses v1 parsing.
+     An Import CSV linked to *Items CSV* wins over the text, as always.
 4. **Outputs, by name.** Re-link Answer, Yes and Confidence (Ask), and Index, Item, Confidence and
-   Instance (Pick). The names are identical by design.
+   Instance (Pick). The names are identical by design. A multi-input socket they feed (Join
+   Strings, Join Geometry) keeps its links' order, which decides the joined result.
 5. **Answers.**
    - Convert `entries` from schema 1 to schema 2 (§14.4), and save them with
      `store.save(node, store)` (`live_gns=None`, no eviction, §13.3).
@@ -3118,12 +3124,15 @@ undo step:
    orphaned.
 
 The operator reports a count, e.g. "Upgraded 9 nodes in 3 node groups; 0 problems". A problem, such
-as an unexpected link type, leaves that node as a frozen legacy node and names it.
+as a linked output the new node lacks (the Instance of a Pick that picks from text), leaves that
+node as a frozen legacy node and names it. Legacy nodes in linked (library) trees are upgraded in
+their library file.
 
 ### 12.4 Answers survive the upgrade
 
-- Converted entries are marked `legacy: true` and keep their v0.1.0 `gn` strings (the raw words).
-- The conversion (§14.4) computes each entry's `words_key`, and each Pick row's `wkey`, with v1's
+- Converted entries are marked `legacy: true` and keep their v0.1.0 words (the raw `gn` strings),
+  except the Items text that a collection Pick ignored, which becomes `""` (§14.4).
+- The conversion (§14.4) computes each entry's `words_key`, and each row's `wkey`, with v1's
   own definition (§5.4), using the stored words and item names. The live plan of the upgraded node
   produces the same `words_key`, so the entry is reused under the validity rule. The rows' ask key
   is `jev_nodes 0.1.0`, and they are labelled "asked with older settings". **Reopening an upgraded
@@ -3146,14 +3155,17 @@ as an unexpected link type, leaves that node as a frozen legacy node and names i
 which Blender 4.5+ still evaluates from their stored answers.
 
 **Test.** `tests/migrate_blender.py` (§18) runs these steps:
-1. Build a v0.1.0 file with the prototype package, reusing `tests/e2e_blender.py build` from the
-   untouched `jev_nodes` folder.
+1. Build a v0.1.0 file with the prototype package, enabled from a temporary copy of the untouched
+   `jev_nodes` folder: the scene of its `tests/e2e_blender.py build` plus the upgrade's other cases,
+   answered by the prototype through a fake Jev server (that `build` phase itself needs the real
+   model).
 2. Reopen it with OpenAct and run `openact.upgrade_legacy`.
 3. Assert, on 4.5 and 5.1:
    - evaluated outputs equal the v0.1.0 values;
    - 0 requests were sent;
    - inner groups are renamed and owned;
-   - undo restores the legacy nodes.
+   - undo restores the legacy nodes (a real `ed.undo`: `ed.undo_push` starts the undo system in
+     background mode).
 
 ## 13. API / Interface Changes
 
@@ -3244,7 +3256,7 @@ def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]: ...   # §
 
 # lists.py
 def resolve_items(node, ctx) -> ItemList: ...                   # §6.0; raises Hint / Unresolvable
-def parse_inline(text: str) -> list[tuple[str, str]]: ...       # newline, then ";", then "," (§6.0)
+def parse_inline(text: str, mode: str = "v1") -> list[tuple[str, str]]: ...  # newline, then ";", then "," (§6.0); "v0": v0.1.0's Items rule (§12.3)
 def is_csv_path(text: str) -> bool: ...
 def csv_source(node, input_name: str, ctx) -> CsvSource | None: ...   # the linked "<input> CSV" wins, else the String path (§6.0)
 
@@ -3465,7 +3477,7 @@ Schema 1 is the v0.1.0 list `[{"key", "gn", "a", "t"}]`. `store.load` converts i
 
 | v0.1.0 `a` | Schema-2 entry |
 |---|---|
-| Ask `{"mode", "value", "confidence", "levels"?}` | `kind "ask"`, `answer_type = mode`, `single = {"Answer": value, "Yes": value ≥ 0.5, "Confidence": confidence}`, no rows |
+| Ask `{"mode", "value", "confidence", "levels"?}` | `kind "ask"`, `answer_type = mode`, `single = {"Answer": value, "Yes": value ≥ 0.5, "Confidence": confidence}`. One row, as v1 stores an Ask: `name` = the stripped Question, `v.p` (Yes/No) or `v.amount` (Amount) = value, `v.c` = confidence, `src = "m"`, so the sidebar table, Show Question, the Overrides CSV and carry-over by `wkey` work as for any Ask entry |
 | Pick `{"index", "item", "confidence", "probabilities", "items", "collection"}` | `kind "pick"`, `single = {"Index", "Item", "Confidence"}`. Rows: `name = items`, `v.prob = probabilities`, `src = "m" × N` |
 
 In both cases `gn` is re-ordered to v1's fixed-length `spec.words()` tuple (§8.2):
@@ -3474,16 +3486,20 @@ In both cases `gn` is re-ordered to v1's fixed-length `spec.words()` tuple (§8.
 - Pick `(Prompt, Items)` becomes `(Prompt, "", Items, "", "")`. The `""` are the new empty Context,
   Overrides and Key words.
   - For a collection Pick, the collection applied because it was set, not because the Items text
-    was empty: the prototype ignored any Items text then (§12.3). The conversion therefore writes
-    `""` at the Items position. Under `COLLECTION` the absent Items socket also contributes `""`,
-    so the converted tuple matches the live words exactly.
-  - Item names are re-derived with legacy parsing (`items_parse_v0`, §12.3), so the words key
-    matches too.
+    was empty: the prototype ignored any Items text then (§12.3). A set Collection wins over the
+    Items text, so the conversion writes `""` at the Items position, and the upgraded node picks
+    from the collection. Under `COLLECTION` the absent Items socket also contributes `""`, so the
+    converted tuple matches the live words exactly.
+  - The row names are the stored `items`: for a text Pick, what the prototype's parser made of
+    the Items text. The upgraded node parses its old Items texts the same way (`items_parse_v0`,
+    §12.3), so the words key matches too.
 
 Every converted entry gets:
 - `legacy = true`, `pv = 0` and `model = "jev_nodes 0.1.0"`;
 - `asks = ["jev_nodes 0.1.0"]`, so its rows are labelled "asked with older settings";
-- a `words_key`, and for Pick a `wkey` per item row, computed with **v1's own definition** (§5.4).
+- a `words_key`, its `shape`, and a `wkey` per row (Ask's one row, Pick's item rows), from the
+  spec's own plan of the same words (`AskSpec.job()`, `PickSpec.job()`): **v1's own definition**
+  (§5.4).
 
 The words-key inputs come from the stored raw words, the answer type and the stored item names
 (for a collection Pick, the prototype stored the child names in `items`). The upgraded node's live
@@ -5220,8 +5236,9 @@ flowchart LR
   1 → 2 conversion.
   - The conversion computes v1 `words_key`s with fixed-length word tuples (§8.2, §14.4), so the
     upgraded nodes' live plans reuse the converted entries.
-  - Pick keeps the prototype's precedence (a set Collection over the Items text, §12.3) and legacy
-    item parsing.
+  - Pick keeps the prototype's precedence: a set Collection wins over the Items text, so an old
+    Pick with a collection becomes Source = Collection and its Items text is ignored, and old files
+    keep their answers (§12.3). Pick also keeps legacy item parsing for its old Items texts.
 - **Tests to merge:**
   - `tests/migrate_blender.py` on 4.5 and 5.1: a v0.1.0 file built with the untouched prototype
     is upgraded, then:

@@ -372,13 +372,19 @@ def clear_cache(path: str | None = None) -> None:
         del _DOCS[key]
 
 
-def parse_inline(text: str) -> list[tuple[str, str]]:
+def parse_inline(text: str, mode: str = "v1") -> list[tuple[str, str]]:
     """An inline list or answer set as (name, when) pairs.
 
     Entries are split on new lines if there are any, else on ";" if present, else on ",". New lines at either end do
     not count, so the trailing one of an Import Text file changes nothing. Within an entry, the first ": " separates
     the name from its when.
+
+    mode "v0": the Items rule of jev_nodes v0.1.0, which an upgraded Pick keeps for its old Items texts (§12.3): split
+    on new lines if the text has any, even at an end, else on ","; no whens.
     """
+    if mode == "v0":
+        parts = text.splitlines() if "\n" in text or "\r" in text else text.split(",")
+        return [(part.strip(), "") for part in parts if part.strip()]
     if len(text.strip().splitlines()) > 1:
         entries = text.splitlines()
     else:

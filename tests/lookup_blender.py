@@ -269,11 +269,12 @@ def phase_pass():
             engine.run_pass()
     finally:
         pipeline.forget([new_cell])
-    saved = [(e.gn, e.legacy) for e in S.load(node_).entries]
-    check("pass: a schema 1 list is converted on read, its entry kept until a new answer replaces it, and the store "
-          "written as schema 2",
-          node_.entries.startswith('{"schema":2,') and questions == [jobs["Old words"].rows[0].cell.key]
-          and saved == [(("Old words", "", "", "", ""), True), (("New words", "", "", "", ""), False)], saved)
+    saved = [(e.gn, e.legacy, e.single["Answer"]) for e in S.load(node_).entries]
+    check("pass: a schema 1 list is converted on read with v1's words keys, so its words are answered from it with 0 "
+          "requests, and the store is written as schema 2",
+          node_.entries.startswith('{"schema":2,') and not questions
+          and saved == [(("Old words", "", "", "", ""), True, 1.0), (("New words", "", "", "", ""), False, 0.875)],
+          (questions, saved))
     engine.reask(node_)
     check("Ask Again: the node's answers are forgotten, saved as schema 2 and the group rebuilt",
           node_.entries == '{"schema":2,"entries":[]}' and inner.update_values(node_, S.NodeStore()), node_.entries)
@@ -398,9 +399,9 @@ def phase_pick_pass():
 
 
 def phase_converted_default():
-    """Every entry converted from v0.1.0 has the words key "", so that key names none of them (§8.2): a single context
-    whose words changed shows its own last answer or neutral values while it waits, never another converted entry's;
-    and the warm entries are the most recent ones, not the converted ones."""
+    """Entries converted from v0.1.0 have v1's words keys (§14.4), so a single context whose words changed keeps
+    showing its own last answer, a converted one too, while it waits, never another converted entry's (§8.2). The
+    words key "" names no entry: with that default, the warm entries are the most recent ones, never the keyless."""
     group = bpy.data.node_groups.new("Converted", 'GeometryNodeTree')
     for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Question", 'NodeSocketString')):
         group.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
@@ -434,13 +435,13 @@ def phase_converted_default():
             evaluated.to_mesh_clear()
 
     before, after = shown("Is it cold?"), shown("Is it cold outside?")
-    check("converted entries: a single context whose words changed keeps its own answer or shows neutral values, "
-          "never the other converted entry's", before == 0.125 and after in (0.125, 0.0), (before, after))
+    check("converted entries: a single context whose words changed keeps showing its own converted answer, never the "
+          "other converted entry's", before == 0.125 and after == 0.125, (before, after))
     live = S.Entry(words_key="live", gn=("Live?", "", "", "", ""))
-    old = [S.Entry(words_key="", gn=(f"Converted {i}?", "", "", "", ""), t=float(i), legacy=True) for i in range(3)]
+    old = [S.Entry(words_key="", gn=(f"Keyless {i}?", "", "", "", ""), t=float(i), legacy=True) for i in range(3)]
     recent = [S.Entry(words_key=f"recent {i}", gn=(f"Recent {i}?", "", "", "", ""), t=10.0 + i) for i in range(3)]
     warm = [e.gn[0] for e in inner.materialised(old + recent + [live], [live.gn], "")]
-    check("converted entries: with the default \"\", the warm entries are the most recent, not the converted ones",
+    check("entries without a words key: with the default \"\", the warm entries are the most recent, never the keyless",
           warm == ["Recent 0?", "Recent 1?", "Recent 2?", "Live?"], warm)
     bpy.data.objects.remove(user)
     bpy.data.node_groups.remove(group)
@@ -650,8 +651,8 @@ def phase_live_set():
 
 
 def phase_converted_last_shown():
-    """k_default never names a converted v0.1.0 entry, which has no words key: a context showing one gets new words
-    that no model answers, and shows neutral values, never another question's converted answer (§8.2)."""
+    """k_default names a converted v0.1.0 entry like any other, by its v1 words key (§14.4): a single context showing
+    one gets new words that no model answers, and keeps showing its own answer, never another question's (§8.2)."""
     group = bpy.data.node_groups.new("Converted", 'GeometryNodeTree')
     group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -669,8 +670,8 @@ def phase_converted_last_shown():
             asker.inputs["Question"].default_value = question
             engine.run_pass()
             got.append(table_read(user)["prob"][0])
-    check("converted entries: a context shows its own, and with new words neutral values, never another question's "
-          "converted answer", got == [0.875, 0.0], got)
+    check("converted entries: a context shows its own, and with new words keeps showing it while they wait, never "
+          "another question's converted answer", got == [0.875, 0.875], got)
 
 
 def phase_statuses():

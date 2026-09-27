@@ -40,6 +40,7 @@ from .watch import WATCH
 
 ASK_ID, PICK_ID = AskSpec.idname, PickSpec.idname
 OPENACT_TYPES = tuple(SPECS)
+LEGACY_TYPES = {"GeometryNodeJevAsk": ASK_ID, "GeometryNodeJevPick": PICK_ID}  # old Jev node -> what it upgrades to
 DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
@@ -207,12 +208,14 @@ def ensure_owned(nodes):
             group.name = inner.inner_name(node)
 
 
-def iter_nodes():
+def iter_nodes(types=OPENACT_TYPES):
+    """(tree, node) of each node of these types outside inner groups: the OpenAct nodes, which the pass visits, or the
+    old Jev nodes (LEGACY_TYPES), which stay frozen until the upgrade (§12.3)."""
     for tree in bpy.data.node_groups:
         if tree.bl_idname != 'GeometryNodeTree' or tree.name.startswith(INNER_PREFIX):
             continue
         for node in tree.nodes:
-            if node.bl_idname in OPENACT_TYPES:
+            if node.bl_idname in types:
                 yield tree, node
 
 
@@ -385,16 +388,14 @@ def _process(tree, node, contexts):
             problems.append(CLASH.format(other[1].label(), ctx.label()))
             continue
         found = next((entry for entry in entries if entry.gn == job.gn), None)
-        if found is not None and found.words_key:  # after a load, a context shows its stored entry
-            LAST_SHOWN.setdefault(key, found.words_key)  # (a converted one has no words key to name it by)
+        if found is not None:  # after a load, a context shows its stored entry
+            LAST_SHOWN.setdefault(key, found.words_key)
         if other[0] is not job:  # the same words and meaning as an earlier context: the graph shows it that entry
             if any(entry is found for entry in shown):
                 LAST_SHOWN[key] = found.words_key
             continue
-        # A converted v0.1.0 answer has no words key to judge it by: it shows until the new answer replaces it.
-        legacy = found is not None and found.legacy and found.answer_type == job.answer_type
         # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
-        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=not legacy)
+        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)
         if entry is not None and found is not None and entry is not found and dataclasses.replace(
                 entry, t=found.t) == found:
             entry = found  # the partial table as stored already
@@ -404,8 +405,7 @@ def _process(tree, node, contexts):
         # Words that mean something else now never show the old answer, but its rows carry over until the new table is
         # whole, also after a reload: the old entry stays stored, and the partial table shows in its place unstored.
         # LAST_SHOWN keeps naming the stored entry its stale rows come from.
-        if found is not None and found.words_key != job.words_key and not legacy and (
-                entry is None or missing or errors):
+        if found is not None and found.words_key != job.words_key and (entry is None or missing or errors):
             hidden[(found.gn, found.words_key)] = entry
             if entry is not None:
                 instead[key] = entry.words_key
@@ -710,6 +710,8 @@ def on_load_post(*_args):
     LIVE.clear()
     CONTEXTS.clear()
     schedule(immediate=True)
+    if next(iter_nodes(LEGACY_TYPES), None) is not None:  # a line pointing at the upgrade, which stays the user's call
+        bpy.ops.openact.legacy_report()
 
 
 @persistent

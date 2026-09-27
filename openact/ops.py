@@ -1,5 +1,5 @@
 """Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; show
-what a row asks; open files; trust a .blend's file reads."""
+what a row asks; open files; trust a .blend's file reads; upgrade the old Jev nodes of a v0.1.0 file."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import sys
 
 import bpy
 
-from . import csvfmt, engine, lists, server, store, trust, ui
+from . import csvfmt, engine, lists, migrate, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
 from .specs.base import UNSURE_BELOW, stored_rows, table_of
@@ -586,10 +586,43 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------- the upgrade from v0.1.0 (§12.3)
+
+class OPENACT_OT_upgrade_legacy(bpy.types.Operator):
+    bl_idname = "openact.upgrade_legacy"
+    bl_label = "Upgrade"
+    bl_description = ("Replace this file's old Jev nodes with OpenAct nodes, keeping their words, links and answers. "
+                      "One undo step")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        upgraded, trees, problems = migrate.upgrade_all()
+        if not (upgraded or problems):
+            self.report({'INFO'}, "This file has no old Jev nodes")
+            return {'CANCELLED'}
+        self.report({'WARNING'} if problems else {'INFO'}, migrate.report(upgraded, trees, problems))
+        return {'FINISHED'} if upgraded else {'CANCELLED'}
+
+
+class OPENACT_OT_legacy_report(bpy.types.Operator):
+    """Say that the file just opened has old Jev nodes, and where to upgrade them"""
+
+    bl_idname = "openact.legacy_report"
+    bl_label = "Old Jev Nodes"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        text = migrate.notice()
+        if not text:
+            return {'CANCELLED'}
+        self.report({'INFO'}, text)
+        return {'FINISHED'}
+
+
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
            OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
-           OPENACT_OT_write_overrides)
+           OPENACT_OT_write_overrides, OPENACT_OT_upgrade_legacy, OPENACT_OT_legacy_report)
 
 
 def register():

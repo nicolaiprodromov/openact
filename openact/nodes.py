@@ -161,6 +161,9 @@ class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_idname = engine.PICK_ID
     bl_label = "Pick"
 
+    # Set by the upgrade from v0.1.0: the Items texts of the old answers keep v0.1.0's parsing (lists.py, §12.3)
+    items_parse_v0: bpy.props.BoolProperty(options={'HIDDEN'})
+
     def draw_settings(self, layout):
         layout.prop(self, "list_source", text="")
         super().draw_settings(layout)
@@ -243,6 +246,47 @@ class GeometryNodeOpenActRules(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
         super().draw_settings(layout)
 
 
+LEGACY_STATUS = "Old Jev node: upgrade in the OpenAct sidebar"
+
+
+class _LegacyNode:
+    """An old Jev node, loaded from a jev_nodes v0.1.0 file as a defined node (§12.3). Frozen: it keeps evaluating the
+    inner group it was saved with and is never asked anything, until openact.upgrade_legacy replaces it."""
+
+    bl_width_default = 240
+    bl_width_min = 160
+
+    uid: bpy.props.StringProperty(options={'HIDDEN'})
+    entries: bpy.props.StringProperty(options={'HIDDEN'}, default="[]")
+
+    @classmethod
+    def poll(cls, ntree):
+        return False  # never in the Add menu: only old files bring them
+
+    def poll_instance(self, ntree):
+        return True  # else the default, poll(), would make a node group that holds one invalid in its parent
+
+    def draw_buttons(self, context, layout):
+        layout.label(text=LEGACY_STATUS, icon='INFO')
+
+
+class GeometryNodeJevAsk(_LegacyNode, bpy.types.GeometryNodeCustomGroup):
+    """An old Ask Jev node: upgrade it in the OpenAct sidebar"""
+
+    bl_idname = "GeometryNodeJevAsk"
+    bl_label = "Ask Jev"
+
+    mode: bpy.props.EnumProperty(  # v0.1.0's items, in its order: files store the position
+        name="Answer", items=(('YES_NO', "Yes / No", ""), ('AMOUNT', "Amount", "")), default='YES_NO')
+
+
+class GeometryNodeJevPick(_LegacyNode, bpy.types.GeometryNodeCustomGroup):
+    """An old Jev Pick node: upgrade it in the OpenAct sidebar"""
+
+    bl_idname = "GeometryNodeJevPick"
+    bl_label = "Jev Pick"
+
+
 class NODE_MT_openact_add(bpy.types.Menu):
     bl_idname = "NODE_MT_openact_add"
     bl_label = "OpenAct"
@@ -272,15 +316,22 @@ def draw_add_menu(self, context):
 
 classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActDials, GeometryNodeOpenActMatch,
            GeometryNodeOpenActClassify, GeometryNodeOpenActRules, NODE_MT_openact_add)
+legacy_classes = (GeometryNodeJevAsk, GeometryNodeJevPick)
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    if P.jev_addon() is None:  # the enabled jev_nodes registers these bl_idnames itself (§12.2)
+        for cls in legacy_classes:
+            bpy.utils.register_class(cls)
     bpy.types.NODE_MT_add.append(draw_add_menu)
 
 
 def unregister():
     bpy.types.NODE_MT_add.remove(draw_add_menu)
+    for cls in reversed(legacy_classes):
+        if cls.is_registered:  # jev_nodes, enabled later, replaced it
+            bpy.utils.unregister_class(cls)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

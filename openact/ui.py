@@ -14,7 +14,7 @@ import time
 
 import bpy
 
-from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
+from . import csvfmt, engine, evaluator, inner, lists, migrate, pipeline, server, trust
 from . import prefs as P
 from .specs.base import UNSURE_BELOW, table_of
 from .watch import WATCH
@@ -414,9 +414,11 @@ def register():
     # UI state, not file data: which context's table the sidebar shows, and its page
     bpy.types.WindowManager.openact_context = bpy.props.IntProperty(name="Context", min=0)
     bpy.types.WindowManager.openact_page = bpy.props.IntProperty(name="Page", min=0)
+    LEGACY.append(migrate.banner)
 
 
 def unregister():
+    LEGACY.remove(migrate.banner)
     del bpy.types.WindowManager.openact_page
     del bpy.types.WindowManager.openact_context
     for cls in reversed(classes):

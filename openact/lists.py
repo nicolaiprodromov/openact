@@ -12,8 +12,8 @@ from dataclasses import dataclass, field, replace
 
 # csvfmt holds the inline format because the Settings CSV's answers column uses it too, and csvfmt may import only
 # the standard library.
-from . import csvfmt
-from .csvfmt import CsvSource, parse_inline  # noqa: F401
+from . import csvfmt, store
+from .csvfmt import CsvSource, parse_inline
 
 try:
     import bpy
@@ -170,7 +170,21 @@ def _text_items(node, ctx, spec):
     from . import sources  # sources imports this module
 
     raw = as_text(_word(node, "Items", ctx))
-    answers = sources.answer_set(node, ctx, "Items", "items", spec, "Type items separated by commas, or a .csv path")
+    hint = "Type items separated by commas, or a .csv path"
+    companion = find_input(node, "Items CSV")
+    if getattr(node, "items_parse_v0", False) and not (companion is not None and _linked(companion)):
+        # An upgraded Pick parses the Items texts of its stored answers as v0.1.0 did, which keeps their names and
+        # words keys (§12.3); another text is a change, and v1 parsing takes over for good.
+        if any(entry.gn[2:3] == (raw,) for entry in store.load(node).entries):
+            items = tuple(Item(name) for name, _when in parse_inline(raw, mode="v0"))
+            if not items:
+                raise Hint(hint)
+            return ItemList("TEXT", items, raw, fingerprint=("TEXT", raw, "v0"))
+        try:
+            node.items_parse_v0 = False
+        except AttributeError:  # read-only now: linked data, or while Blender draws
+            pass
+    answers = sources.answer_set(node, ctx, "Items", "items", spec, hint)
     doc, source = answers.doc, answers.source
     items = tuple(Item(o.name, o.when, dict(o.payload)) for o in answers.options)
     fingerprint = ("TEXT", raw) + ((doc.path, source.delimiter, doc.stamp) if doc is not None else ())
