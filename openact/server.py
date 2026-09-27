@@ -44,6 +44,8 @@ TOKEN_REFUSED = ("A model server started elsewhere is running on port {} without
                  "another port")
 CRASH_EXITS, CRASH_WINDOW = 3, 600.0  # unexpected exits of this Blender's server within 10 minutes that pause auto-start
 KEEPS_STOPPING = "The model server keeps stopping: see the log"
+PORT_TAKEN = 4  # openact_server.py's exit code when it can't bind its port: attach to the server that holds it
+SHARED = "Shared: started by another Blender"
 FAKE_ARGS: list[str] = []  # tests: more openact_server.py flags for the fake backend, e.g. --record <path.jsonl>
 
 SEMIF_COMMIT = "23cf1f39fc9534fe81437200959b6dfc7106e45a"
@@ -256,9 +258,10 @@ class Worker(threading.Thread):
                 half = len(chunk.cells) // 2
                 pipeline.requeue(dataclasses.replace(chunk, cells=chunk.cells[:half]),
                                  dataclasses.replace(chunk, cells=chunk.cells[half:]))
-        elif code == 403 and STATE.token != token:
-            # Sent with the token of a server that has gone, and taken by the one started since on the port (a refused
-            # connection takes seconds on Windows): asked again with its token
+        elif code == 403 and (STATE.token != token or _adopt_token()):
+            # Sent with a token that has changed since: that of a server that has gone, whose replacement took the
+            # request (a refused connection takes seconds on Windows), or one its token file no longer holds. Asked
+            # again with the new one
             pipeline.requeue(chunk)
         elif code == 403:  # a server whose token file is missing or wrong: nothing fails, asked again once it has gone
             _refused_by(STATE.health.get("pid"))
@@ -305,9 +308,10 @@ def _log_request(request, code, reply, seconds, rows):
     line = {"t": time.strftime("%Y-%m-%dT%H:%M:%S", now), "status": code, "state": request["state"],
             "questions": request["questions"], "answers": reply.get("answers"), "ms": round(seconds * 1000, 1),
             "rows": rows}
+    path = os.path.join(folder, time.strftime("requests-%Y%m%d.jsonl", now))
     try:
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, time.strftime("requests-%Y%m%d.jsonl", now)), "a", encoding="utf-8") as handle:
+        os.makedirs(folder, mode=0o700, exist_ok=True)  # prompts and CSV text: this user's only, on POSIX (§16.1)
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, ensure_ascii=False) + "\n")
     except OSError as error:  # the answers matter more than their log
         print(f"[OpenAct] could not write the request log: {error}")
@@ -377,6 +381,22 @@ def _read_token(port):
             return handle.read(256).strip()
     except (OSError, ValueError):
         return ""
+
+
+def attached():
+    """True while the server on the port is another Blender's (§10.5): its /health names another launching Blender.
+    Any thread."""
+    return bool(STATE.health) and STATE.health.get("parent_pid") != os.getpid()
+
+
+def _adopt_token():
+    """For another Blender's server: use the token its file holds, when that differs from the one in use, and forget a
+    refusal. True when the token changed. Any thread."""
+    token = _read_token(STATE.port) if attached() else STATE.token
+    if token == STATE.token:
+        return False
+    STATE.token, STATE.refused = token, None
+    return True
 
 
 def _child_env():
@@ -507,11 +527,7 @@ def refresh(prefs=None):
 
 def _apply_health(health):
     STATE.health = health
-    process = STATE.process  # read once: the main thread may forget it meanwhile
-    if process is None or process.poll() is not None:  # another Blender's server: share it (§10.5)
-        token = _read_token(STATE.port)
-        if token != STATE.token:  # a token file written since a refusal is tried
-            STATE.token, STATE.refused = token, None
+    _adopt_token()  # another Blender's server is shared through its token file (§10.5)
     if STATE.refused is not None and health.get("pid") == STATE.refused:  # still the server that refused the token
         STATE.set("error", STATE.conflict)
         return
@@ -546,24 +562,9 @@ def start(prefs=None):
             STATE.start_queued = True
             _check(root)
             return True
-    try:
-        code, health = http("GET", "/health", timeout=0.5)
-        if code == 200 and health.get("server") == SERVER_ID:
-            other = _other_backend(health)
-            if other:
-                _refuse_backend(other)
-                return False
-            _apply_health(health)
-            if health.get("status") == "loading":
-                _start_polling(None)
-            return True
-        if code == 200 and health.get("server") == LEGACY_SERVER_ID:
-            STATE.set("error", LEGACY_SERVER_MESSAGE)
-        else:
-            STATE.set("error", f"Port {STATE.port} is used by another program. Pick another port in the preferences")
-        return False
-    except Exception:
-        pass  # nothing is listening: start our own
+    found = _attach()
+    if found is not None:
+        return found
 
     python = os.environ.get("OPENACT_SERVER_PYTHON") or P.venv_python(root)
     folder = STATE.folder
@@ -600,6 +601,40 @@ def start(prefs=None):
     return True
 
 
+def _attach():
+    """Use what answers /health on the port: an OpenAct server with this session's backend (another Blender's is shared
+    through its token file, §10.5), else an error that names what holds the port. None when nothing listens, else what
+    start() returns. Main thread only."""
+    try:
+        code, health = http("GET", "/health", timeout=0.5)
+    except Exception:
+        return None
+    if code == 200 and health.get("server") == SERVER_ID:
+        other = _other_backend(health)
+        if other:
+            _refuse_backend(other)
+            return False
+        _apply_health(health)
+        if health.get("status") == "loading":
+            _start_polling(None)
+        return True
+    if code == 200 and health.get("server") == LEGACY_SERVER_ID:
+        STATE.set("error", LEGACY_SERVER_MESSAGE)
+    else:
+        STATE.set("error", f"Port {STATE.port} is used by another program. Pick another port in the preferences")
+    return False
+
+
+def _lost_port():
+    """The server this Blender started couldn't bind its port: one started meanwhile, e.g. by another Blender at the
+    same moment, holds it. Attach to that one at once; if nothing listens, the port can't be used. Main thread only."""
+    _reap()
+    if STATE.poll_thread is not None:
+        STATE.poll_thread.join(1.0)  # it posted this and ends: an attach to a loading server polls anew
+    if STATE.status == "starting" and _attach() is None:  # else a health probe attached meanwhile
+        STATE.set("error", "The model server exited: " + _log_tail())
+
+
 def _start_polling(process):
     if STATE.poll_thread and STATE.poll_thread.is_alive():
         return
@@ -609,8 +644,11 @@ def _start_polling(process):
         deadline = time.time() + 600
         while time.time() < deadline:
             if process is not None and process.poll() is not None:
-                STATE.set("error", "The model server exited: " + _log_tail())
-                post(_reap)
+                if process.poll() == PORT_TAKEN:
+                    post(_lost_port)
+                else:
+                    STATE.set("error", "The model server exited: " + _log_tail())
+                    post(_reap)
                 return
             try:
                 code, health = http("GET", "/health", port=port, timeout=1.0)
@@ -652,15 +690,16 @@ def _log_tail(lines=6):
 
 
 def _reap():
-    """Forget the server this Blender started once it has exited. An exit no /shutdown asked for (a code other than 0)
-    counts: the CRASH_EXITS-th within CRASH_WINDOW seconds pauses auto-start (§17.6), as the status becomes an error,
-    which auto-start leaves alone, until Start Model. True when it paused. Main thread only."""
+    """Forget the server this Blender started once it has exited. An exit that is neither a /shutdown's (0) nor a port
+    another server holds (PORT_TAKEN) counts: the CRASH_EXITS-th within CRASH_WINDOW seconds pauses auto-start
+    (§17.6), as the status becomes an error, which auto-start leaves alone, until Start Model. True when it paused.
+    Main thread only."""
     process = STATE.process
     code = process.poll() if process is not None else None
     if code is None:
         return False
     STATE.process = None
-    if code == 0:
+    if code in (0, PORT_TAKEN):
         return False
     now = time.monotonic()
     STATE.exits = [t for t in STATE.exits if now - t < CRASH_WINDOW] + [now]
@@ -672,8 +711,14 @@ def _reap():
 
 
 def stop():
-    """Stop the model server: the one this Blender started, or the one it attached to through its token file. One whose
-    token this Blender can't read refuses (/shutdown needs it) and keeps running, which the status then says."""
+    """Stop the server this Blender started (/shutdown needs its token: one that refuses keeps running, which the status
+    then says). Another Blender's server is never shut down from here (§10.5): this Blender only stops using it, and
+    forgets its token until it attaches again; one whose token it can't read keeps its error."""
+    if attached() or (STATE.process is None and not STATE.token):  # nothing of this Blender's to shut down
+        if STATE.refused is None:
+            STATE.health, STATE.token = {}, ""
+            STATE.set("stopped", "")
+        return
     try:
         code, _reply = http("POST", "/shutdown", body={}, timeout=2.0)
     except Exception:

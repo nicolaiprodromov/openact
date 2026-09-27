@@ -23,7 +23,7 @@ TRUST = {"opened": None}  # the .blend as load_post saw it: "" for a file create
 BLOCKED = "Blocked reading"  # how a blocked read's message starts, which the sidebar's trust banner looks for
 
 
-def _inside(path, folder):
+def inside(path, folder):
     """True when path is folder or lies under it (both from ident(), or both normcase'd absolute paths)."""
     try:
         return os.path.commonpath([path, folder]) == folder
@@ -53,7 +53,7 @@ def is_trusted() -> bool:
     own = ident(path)
     if any(p and ident(p) == own for p in _paths(prefs, "trusted_files")):
         return True
-    return any(p and _inside(own, ident(p)) for p in _paths(prefs, "trusted_folders"))
+    return any(p and inside(own, ident(p)) for p in _paths(prefs, "trusted_folders"))
 
 
 def blocked(path: str, writing: bool = False) -> str:
@@ -65,7 +65,7 @@ def blocked(path: str, writing: bool = False) -> str:
     # abspath: Blender 5 saves file paths relative ('//../x' arrives as '<folder>/../x'), and a bare path is read
     # from the working folder
     full, folder = os.path.abspath(path), os.path.abspath(os.path.dirname(bpy.data.filepath))
-    if _inside(os.path.normcase(full), os.path.normcase(folder)) and _inside(ident(full), ident(folder)):
+    if inside(os.path.normcase(full), os.path.normcase(folder)) and inside(ident(full), ident(folder)):
         return ""
     doing, verb = ("Blocked writing", "write") if writing else (BLOCKED, "read")
     return f"{doing} {full}: outside this file's folder. Allow this file (or trust its folder) to {verb} it"

@@ -7,6 +7,7 @@ import contextlib
 import csv
 import os
 import platform
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -28,6 +29,10 @@ TEMPLATES = {  # node type -> (input, file in TEMPLATE_DIR) of each CSV input th
     "GeometryNodeOpenActDials": (("Settings", "weather_dials.csv"),),
 }
 HEALTH = ("status", "requests", "questions", "rows_scored", "cache_hits", "ms_per_row", "load_seconds")  # §17.5
+# Diagnostics redact what an artist wrote (§16.3): a path (drive, UNC, '//' or '/' rooted) up to ': ' or the end, and
+# a quoted segment. A quote starts and ends at a word boundary, so apostrophes ("Can't", "file's") are no quotes.
+PATH = re.compile(r"(?<![\w/\\])(?:[A-Za-z]:[\\/]|\\\\|//?)(?=\S)[^\n]*?(?=: |$)")
+QUOTED = re.compile(r"""(?<!\w)(['"]).+?\1(?!\w)""")
 NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
               "code": "Decided by code (one option applies): never sent to the model",
               "error": "No outcome applies to this cell: never sent to the model"}
@@ -112,6 +117,13 @@ class OPENACT_OT_server_stop(bpy.types.Operator):
     bl_idname = "openact.server_stop"
     bl_label = "Stop Model"
     bl_description = "Stop the local model server and free its GPU memory. Answers already given stay"
+
+    @classmethod
+    def description(cls, context, properties):
+        if server.attached():  # the button reads "Detach" then (§10.5)
+            return ("Stop using the model server another Blender started: it keeps running for that Blender. Start "
+                    "Model, or Start Automatically, uses it again")
+        return cls.bl_description
 
     def execute(self, context):
         server.stop()
@@ -599,18 +611,25 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
 
 # ----------------------------------------------------------------------------- starter CSVs (§7.10)
 
-def copy_templates(node) -> list[tuple[str, str]]:
-    """Copy the node's starter CSVs next to the .blend, and return (input, path) of each copy. A copy never replaces
-    a file: when name.csv exists it becomes name 2.csv, then name 3.csv... An input that is empty and unlinked, and
-    whose '<input> CSV' companion is unlinked, then reads its copy. Raises ValueError, copying nothing, when the node
-    has no starter CSV or the .blend was never saved."""
-    templates = [(name, file) for name, file in TEMPLATES.get(node.bl_idname, ()) if lists.find_input(node, name)]
+def starter_files(node) -> list[tuple]:
+    """(input socket, file in TEMPLATE_DIR) of each of the node's CSV inputs that has a starter file, among the inputs
+    it has now: a Collection, Materials or Attributes list source has no Items input."""
+    return [(socket, file) for name, file in TEMPLATES.get(node.bl_idname, ())
+            if (socket := lists.find_input(node, name)) is not None]
+
+
+def copy_templates(node) -> list[str]:
+    """Copy the node's starter CSVs next to the .blend, and return the path of each copy. A copy never replaces a file:
+    when name.csv exists it becomes name 2.csv, then name 3.csv... An input that is empty and unlinked, and whose
+    '<input> CSV' companion is unlinked, then reads its copy. Raises ValueError, copying nothing, when the node has no
+    starter CSV or the .blend was never saved."""
+    templates = starter_files(node)
     if not templates:
         raise ValueError(f"No starter CSV for this {node.bl_label} node's inputs")
     if not bpy.data.filepath:
         raise ValueError("Save the .blend first: the starter CSVs are copied next to it")
     folder, copied = os.path.dirname(bpy.data.filepath), []
-    for name, file in templates:
+    for socket, file in templates:
         with open(os.path.join(TEMPLATE_DIR, file), "rb") as handle:
             data = handle.read()
         stem, number = file.removesuffix(".csv"), 1
@@ -622,8 +641,8 @@ def copy_templates(node) -> list[tuple[str, str]]:
                 break
             except FileExistsError:
                 number += 1
-        copied.append((name, path))
-        socket, companion = lists.find_input(node, name), lists.find_input(node, f"{name} CSV")
+        copied.append(path)
+        companion = lists.find_input(node, f"{socket.name} CSV")
         if not (socket.is_linked or socket.default_value.strip() or (companion is not None and companion.is_linked)):
             socket.default_value = bpy.path.relpath(path)
     engine.schedule(immediate=True, node=node)
@@ -648,16 +667,23 @@ class OPENACT_OT_new_csv_from_template(bpy.types.Operator):
         except (ValueError, OSError) as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
-        self.report({'INFO'}, "Wrote " + ", ".join(os.path.basename(path) for _name, path in copied))
+        self.report({'INFO'}, "Wrote " + ", ".join(os.path.basename(path) for path in copied))
         return {'FINISHED'}
 
 
 # ------------------------------------------------------------------------------ diagnostics (§17.5)
 
+def redact(text) -> str:
+    """A message as diagnostics copy it: its shape and numbers, with each path cut to its file name and each quoted
+    segment replaced by '…'."""
+    text = PATH.sub(lambda found: re.split(r"[\\/]", found.group().rstrip("\\/"))[-1], text)
+    return QUOTED.sub(lambda found: found.group(1) + "…" + found.group(1), text)
+
+
 def diagnostics() -> str:
     """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime, the
     model server's status and /health counters, the queue, the nodes and the first 10 problems, each cut to 200
-    characters. It holds no prompt and no CSV contents (§16.3)."""
+    characters. The server's message and the problems are redacted: it holds no prompt and no CSV contents (§16.3)."""
     from . import bl_info  # the package's
 
     prefs, health = P.get_prefs(), server.STATE.health
@@ -673,7 +699,7 @@ def diagnostics() -> str:
         f"{health.get('revision') or 'unknown'}",
         f"Runtime: {root}" + (" (the legacy Jev Nodes runtime)" if os.path.basename(root).casefold() == "jevnodes"
                               else ""),
-        f"Server: {state} on port {server.STATE.port}" + (f": {message[:200]}" if message else ""),
+        f"Server: {state} on port {server.STATE.port}" + (f": {redact(message)[:200]}" if message else ""),
         "Health: " + (", ".join(f"{key} {health[key]}" for key in HEALTH if health.get(key) is not None) or "none"),
         f"Queue: {per_class[0]}/{per_class[1]}/{per_class[2]} chunks (P0/P1/P2), {flight} cells in flight, "
         f"{len(pipeline.PENDING)} pending, {len(pipeline.FAILED)} failed",
@@ -688,7 +714,8 @@ def diagnostics() -> str:
                      f"{', '.join(str(len(job.rows)) for job in jobs) or 'none'}; "
                      f"{len(inner.materialised(entries, [job.gn for job in jobs]))} of {len(entries)} stored entries "
                      f"materialised; {len(node.node_tree.nodes) if node.node_tree else 0} nodes in the inner group")
-    problems = list(dict.fromkeys(problem.message for status in engine.STATUS.values() for problem in status.problems))
+    problems = list(dict.fromkeys(redact(problem.message) for status in engine.STATUS.values()
+                                  for problem in status.problems))
     lines.append(f"Problems: {len(problems)}")
     lines += [f"  {problem[:200]}" for problem in problems[:10]]
     return "\n".join(lines)
@@ -698,7 +725,8 @@ class OPENACT_OT_copy_diagnostics(bpy.types.Operator):
     bl_idname = "openact.copy_diagnostics"
     bl_label = "Copy Diagnostics"
     bl_description = ("Copy a report for a bug report to the clipboard: versions, GPU, the model server's status and "
-                      "counters, node counts and the first problems. It holds no prompts and no CSV contents")
+                      "counters, node counts and the first problems, with names and paths left out. It holds no "
+                      "prompts and no CSV contents")
 
     def execute(self, context):
         context.window_manager.clipboard = diagnostics()

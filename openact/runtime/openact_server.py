@@ -32,6 +32,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -39,6 +40,7 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Protocol
 
+PORT_TAKEN = 4  # the exit code when the port can't be bound: Blender attaches to the server that holds it
 SERVER_NAME = "openact-semif"
 SERVER_VERSION = "1.0.0"
 DEFAULT_SOURCE = "Qwen/Qwen3.5-4B"
@@ -288,6 +290,7 @@ class Engine:
             "cache_hits": self.cache_hits,
             "ms_per_row": None if self.ms_per_row is None else round(self.ms_per_row, 3),
             "pid": os.getpid(),
+            "parent_pid": self.args.parent_pid,  # the Blender that started it: a uv launcher hides it behind its pid
         }
 
     def capabilities(self):
@@ -681,19 +684,34 @@ def watch_parent(pid):
             os._exit(0)
 
 
+class Server(ThreadingHTTPServer):
+    # SO_REUSEADDR lets a second socket bind a port that one listens on, on Windows: only POSIX gets it, where it
+    # just skips TIME_WAIT
+    allow_reuse_address = os.name != "nt"
+
+
 def write_token(path, token):
     """--token-file: the launch token, for other Blenders of this user that attach to this server. Written once the
     server holds its port, so a server that lost the port never overwrites the winner's. Created new with mode 0600
     (POSIX) and moved into place: a reader never sees half of it, and no planted link or older mode is kept."""
-    temporary = f"{path}.{os.getpid()}.tmp"
     try:
-        if os.path.lexists(temporary):
-            os.remove(temporary)
-        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="ascii") as out:
+        fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="ascii") as out:
             out.write(token)
         os.replace(temporary, path)
     except OSError as error:  # only other Blenders lose: the one that started this server has the token
         log(f"cannot write --token-file {path}: {error}")
+
+
+def remove_token(path, token):
+    """On a clean exit: remove the token file, unless it holds another server's token by now."""
+    try:
+        with open(path, encoding="ascii") as handle:
+            if handle.read(256).strip() != token:
+                return
+        os.remove(path)
+    except (OSError, ValueError):
+        pass
 
 
 def main(argv=None):
@@ -738,12 +756,13 @@ def main(argv=None):
         return 3
     ENGINE = Engine(args, FakeBackend(args) if args.backend == "fake" else SemIfTorchBackend(args))
     try:
-        SERVER = ThreadingHTTPServer((args.host, args.port), Handler)
+        SERVER = Server((args.host, args.port), Handler)
     except OSError as error:
         log(f"cannot listen on {args.host}:{args.port}: {error}")
-        return 3
+        return PORT_TAKEN
     SERVER.daemon_threads = True
-    if TOKEN and args.token_file:
+    shares = bool(TOKEN and args.token_file)
+    if shares:
         write_token(args.token_file, TOKEN)
     log(f"{SERVER_NAME} {SERVER_VERSION} listening on http://{args.host}:{args.port} (pid {os.getpid()}, "
         f"backend {ENGINE.backend.name}, token {'required' if TOKEN else 'not required'})")
@@ -754,6 +773,8 @@ def main(argv=None):
         SERVER.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
+    if shares:
+        remove_token(args.token_file, TOKEN)
     log("server stopped")
     return 0
 

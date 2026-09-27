@@ -14,7 +14,7 @@ import itertools
 from .. import csvfmt, pipeline, rules_core
 from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, unsure_below, warnings
 
-FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
+FACTORS_HINT = "Set a Factors CSV (sidebar: New CSV from Template)"
 OUTCOMES_HINT = "Add outcomes"
 PAYLOAD = "pl_"  # table column prefix of a payload output, followed by its position
 SOCKETS = {"amount": 'NodeSocketFloat', "category": 'NodeSocketInt', "flag": 'NodeSocketBool'}

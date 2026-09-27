@@ -74,7 +74,7 @@ _plans_made = 0  # a pass that plans changes what nodes reading another's answer
 _pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
 _quiet_since = time.monotonic()  # the stall clock: since a chunk was last answered, or cells were first asked
-_slow_since = None  # since when /health's ms_per_row has been above SLOW_MS
+_slow_since = None  # since when /health's ms_per_row has been above SLOW_MS, cells asked all along
 
 
 @dataclass
@@ -510,11 +510,8 @@ def _submit(job, missing):
     """Ask for the missing cells once the model is ready, starting it if the preferences allow. True when they are
     asked: sent now, or sent by the pass that runs once the model is ready, as a start is under way, queued or begun
     here."""
-    global _quiet_since
     state, _message = server.status()
     if state == "ready":
-        if not pipeline.PENDING:  # a fill begins: the stall clock starts
-            _quiet_since = time.monotonic()
         pipeline.submit(job, missing, job.priority, on_rows=_answered)
         return True
     if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
@@ -535,7 +532,8 @@ def stalled():
 
 
 def slow_note():
-    """The Model box's note once /health's ms_per_row has been above SLOW_MS for SLOW_FOR seconds (§17.3), else ""."""
+    """The Model box's note once /health's ms_per_row has been above SLOW_MS for SLOW_FOR seconds while cells were
+    asked (§17.3), else ""."""
     return SLOW if _slow_since is not None and time.monotonic() - _slow_since >= SLOW_FOR else ""
 
 
@@ -705,10 +703,10 @@ def tick():
         _publish(server.Worker.render_running, rendering)  # for the worker, which never calls bpy (§5.5)
         _publish(server.Worker.playing, playing)
         now = time.monotonic()
-        ready = server.is_ready()
-        if rendering or not (ready and pipeline.PENDING):  # the stall clock runs only while the worker may send
+        asking = server.is_ready() and bool(pipeline.PENDING) and not rendering  # the worker sends: rows get scored
+        if not asking:  # both clocks run only then: an idle server's ms_per_row is its last fill's
             _quiet_since = now
-        ms_per_row = server.STATE.health.get("ms_per_row") if ready else None
+        ms_per_row = server.STATE.health.get("ms_per_row") if asking else None
         if ms_per_row is None or ms_per_row <= SLOW_MS:
             _slow_since = None
         elif _slow_since is None:

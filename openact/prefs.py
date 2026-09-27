@@ -122,6 +122,13 @@ class OpenActPath(bpy.types.PropertyGroup):
     path: bpy.props.StringProperty(name="Path", default="")
 
 
+def publish_log_requests(self, _context):
+    """The decision worker reads the preference from the server state: turning it off stops the log at once."""
+    from . import server  # imports this module
+
+    server.STATE.log_requests = self.log_requests
+
+
 class OpenActPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
@@ -165,7 +172,7 @@ class OpenActPreferences(bpy.types.AddonPreferences):
                     "sidebar's table and the unsure column of an exported Overrides CSV",
     )
     log_requests: bpy.props.BoolProperty(
-        name="Log Requests", default=False,
+        name="Log Requests", default=False, update=publish_log_requests,
         description="Write full requests and responses to <runtime>/logs/, one JSON line each. The prompts and CSV "
                     "text they hold stay on this computer until you delete them",
     )

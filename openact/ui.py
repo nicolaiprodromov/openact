@@ -17,7 +17,6 @@ import bpy
 from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
 from . import prefs as P
 from .specs.base import table_of, unsure_below
-from .specs.rules import RulesSpec
 from .watch import WATCH
 
 _ICONS = {
@@ -220,6 +219,9 @@ def draw_server(layout, banner=None):
             wrap(box, message, icon='BLANK1')
     if server.STATE.install_warning and server.STATE.install_warning not in message:  # "Runtime installed. <it>"
         wrap(box, server.STATE.install_warning, icon='ERROR')
+    shared = state in ("ready", "starting") and server.attached()
+    if shared:
+        box.label(text=server.SHARED, icon='LINKED')
     health = server.STATE.health
     if state == "ready" and health:
         col = box.column(align=True)
@@ -246,6 +248,8 @@ def draw_server(layout, banner=None):
         installed = state not in ("not_installed", "error") or P.runtime_installed(P.runtime_root())
         if not installed:
             row.operator("openact.install_runtime", icon='IMPORT')
+        elif shared:  # another Blender's server: Stop only stops using it (§10.5)
+            row.operator("openact.server_stop", text="Detach", icon='UNLINKED')
         elif state in ("ready", "starting"):
             row.operator("openact.server_stop", icon='PAUSE')
         else:
@@ -273,10 +277,10 @@ def draw_preferences(prefs, context, layout):
     row = col.row()
     row.label(text=root, icon='FILE_FOLDER')
     row.operator("openact.open_runtime_folder", text="", icon='FILEBROWSER')
-    home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
-    if prefs.runtime_dir and not trust._inside(os.path.normcase(os.path.abspath(root)), home):  # §10.5, §16.1
-        wrap(col, "This folder is outside your user folder: its permissions decide who else can read the model "
-                  "server's token", icon='ERROR')
+    folder = os.path.abspath(server.state_dir(root))  # where the token file is (OPENACT_STATE_DIR, else the runtime)
+    if not trust.inside(os.path.normcase(folder), os.path.normcase(os.path.abspath(os.path.expanduser("~")))):
+        wrap(col, f"The folder that holds the model server's token, {folder}, is outside your user folder: its "
+                  "permissions decide who else can read the token", icon='ERROR')
     col.prop(prefs, "log_requests")
     note = layout.box().column(align=True)
     note.label(text=f"Model: {P.MODEL_LABEL} ({P.MODEL_REVISION[:10]}), runs on this computer", icon='INFO')
@@ -315,16 +319,15 @@ def draw_table(layout, context, node, uses, index):
 
 
 def draw_files(layout, node):
-    """The files the node reads (§7.10): New CSV from Template where the node has starter files, then each file's
-    path, rows, text and payload columns, when read, the Import CSV note, and up to FILE_PROBLEMS problems, with Open
-    File."""
-    from .ops import TEMPLATES  # ops imports this module
+    """The files the node reads (§7.10): New CSV from Template where one of the node's inputs has a starter file, then
+    each file's path, rows, text and payload columns, when read, the Import CSV note, and up to FILE_PROBLEMS problems,
+    with Open File."""
+    from .ops import starter_files  # ops imports this module
 
-    if node.bl_idname in TEMPLATES:
+    if starter_files(node):
         row = layout.row()
         row.enabled = node.id_data.library is None  # a linked node's inputs are read-only
-        text = "New Rules Template" if node.bl_idname == RulesSpec.idname else "New CSV from Template"  # as its hint
-        row.operator("openact.new_csv_from_template", text=text, icon='FILE_NEW').uid = node.uid
+        row.operator("openact.new_csv_from_template", icon='FILE_NEW').uid = node.uid
     files = sorted(((ident, watched) for ident, watched in WATCH.files.items() if node.uid in watched.owners),
                    key=lambda item: item[1].path.casefold())
     if not files:

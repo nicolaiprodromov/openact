@@ -6,19 +6,25 @@ headless Blender, against the fake model server the add-on starts itself (OPENAC
 - the templates parse with their sockets' schemas without a problem; New CSV from Template never overwrites (it
   creates name 2.csv, or the next free number), fills only an input that is empty and unlinked (its Import CSV
   companion too), refuses a node without templates and an unsaved .blend, and the Rules templates plan and fill;
-- the diagnostics text has versions and counters but no prompt or CSV text, and cuts problems to 200 characters;
-- the JSONL request log appears only while log_requests is on;
+- the diagnostics text has versions and counters but no prompt or CSV text: problems keep their shape, with quoted
+  text replaced and paths cut to file names, and are cut to 200 characters;
+- the JSONL request log appears only while log_requests is on, which reaches the worker as it changes; its folder
+  and file are created 0700 and 0600;
 - the Unsure Below preference: its defaults, and it moves the status's unsure count, the sidebar's icons and the
   exported unsure column;
-- drawing: Copy Diagnostics in the Model box, the template button in the Files panel, the new preferences, and the
-  warning for a runtime folder outside the user folder;
-- server sharing: the server writes its token file once it holds the port (mode 0600 on POSIX); a second Blender,
-  which this suite starts, attaches through it without starting a server, and the one server answers it; a wrong
-  token file gives §10.5's message, and a token file put right is tried at the next health probe;
+- drawing: Copy Diagnostics in the Model box, the template button in the Files panel (only for a node with such an
+  input), the new preferences, and the warning for a token folder outside the user folder;
+- server sharing: the server writes its token file once it holds the port (mode 0600 on POSIX), keeps the port to
+  itself (a second server exits with the port-taken code, the file unchanged) and removes the file on a clean exit;
+  a second Blender, which this suite starts, attaches through it without starting a server, the one server answers
+  it, its Model box says the server is shared, and its Stop only detaches; a wrong token file gives §10.5's message,
+  and a token file put right is tried at the next health probe; a lost start race attaches to the winner at once,
+  and neither it nor a port some other program holds counts as a crash;
 - crash-loop protection, time-scaled: 3 unexpected exits within 10 minutes pause auto-start until Start Model, and
   exits further apart don't;
 - the stalled-fill alert, time-scaled, while the scripted question stalls; the queued chunk stays queued;
-- the slow-server note once a faked ms_per_row stays above 3 x 21 ms for a minute, time-scaled.
+- the slow-server note once a faked ms_per_row stays above 3 x 21 ms for a minute while cells are asked (never while
+  idle), time-scaled.
 
 Run:  blender -b --factory-startup --python tests/support_blender.py
 (The second Blender runs this file with -- attach <port>.)
@@ -56,6 +62,9 @@ from _harness import FAILURES, ROOT, check, drive, finish  # noqa: E402
 from openact import csvfmt, engine, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact.specs.rules import FACTORS_HINT  # noqa: E402
+
+HOME = os.path.expanduser("~")
+ELSEWHERE = os.path.abspath(os.sep + "OpenAct elsewhere")  # a folder outside the user folder
 
 RECORD, SCRIPT = os.path.join(TMP, "record.jsonl"), os.path.join(TMP, "script.json")
 STALL_DELAY = 8.0  # seconds the fake model takes over "Is it stalled?"
@@ -143,7 +152,11 @@ def asked(text):
 
 
 def health():
-    return server.http("GET", "/health", timeout=2.0)[1]
+    """This Blender's port's /health, {} when nothing answers."""
+    try:
+        return server.http("GET", "/health", timeout=2.0)[1]
+    except OSError:
+        return {}
 
 
 def listening(port):
@@ -154,11 +167,28 @@ def listening(port):
 
 
 def kill_server():
-    """End this Blender's server as a crash would, with an exit code other than 0; returns its pid."""
+    """End this Blender's server as a crash would, with an exit code other than 0; returns its pid (None: none ran)."""
     process = server.STATE.process
+    if process is None:
+        return None
     process.kill()
     process.wait(10)
     return process.pid
+
+
+def other_server(port, token, *flags):
+    """A fake server as another Blender starts it, writing its token file: /health names no launching Blender of this
+    process (no --parent-pid, so the suite ends it itself)."""
+    return subprocess.Popen([sys.executable, server.SERVER_SCRIPT, "--port", str(port), "--backend", "fake",
+                             "--token-file", os.path.join(STATE_DIR, f"server-{port}.token"), *flags],
+                            env=dict(server._child_env(), OPENACT_TOKEN=token), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+
+
+def ended(process):
+    if process.poll() is None:
+        process.kill()
+    process.wait(10)
 
 
 def read(path):
@@ -351,10 +381,17 @@ def phase_diagnostics():
         handle.write("answer,when\nokapi-sentinel,a quokka-sentinel of the forest\nzebra-sentinel,a striped grazer\n")
     node = used("Diagnosed", MATCH, Question="Is the aardvark-sentinel awake?", Context="dusk-sentinel",
                 Items="//savanna.csv")
-    missing = used("Missing", MATCH, Question="Is it there?", Items="//" + "m" * 170 + ".csv")
+    doubled = used("Doubled", MATCH, Question="Is it there twice?", Items="okapi-sentinel, okapi-sentinel")
+    missing = used("Missing", MATCH, Question="Is it there?", Items="//folder-sentinel/names.csv")
     engine.schedule(immediate=True)
-    done = settle(lambda: complete(node) and line(missing)[0] == "error", 60)
-    text = ops.diagnostics()
+    done = settle(lambda: complete(node) and line(missing)[0] == line(doubled)[0] == "error", 60)
+    quoted, pathed = line(doubled)[1], line(missing)[1]
+    engine.STATUS["long problem"] = engine.NodeStatus("error", "", problems=[
+        engine._problem(csvfmt.ERROR, "Line 9: " + "w" * 300)])  # one without names or paths to leave out
+    try:
+        text = ops.diagnostics()
+    finally:
+        del engine.STATUS["long problem"]
     version = ".".join(map(str, openact.bl_info["version"]))
     parts = [f"OpenAct {version}, Blender {bpy.app.version_string}, {platform.platform()}", "Backend: fake, model fake",
              f"Runtime: {P.runtime_root()}", f"Server: ready on port {PORT}", "Health: status ready, requests "]
@@ -367,10 +404,15 @@ def phase_diagnostics():
           and re.search(r"^Nodes: .*\b\d+ Match\b", text, re.M) is not None and re.search(
               r"^  Match: complete; rows per table 2; 1 of 1 stored entries materialised; \d+ nodes in the inner "
               r"group$", text, re.M) is not None, text)
-    cut = [row.strip() for row in text.splitlines() if "Can't find" in row and "mmm" in row]
+    check("diagnostics: a problem keeps its shape and numbers, with its quoted text replaced and its path cut to the "
+          "file name", "'okapi-sentinel' appears twice" in quoted and "folder-sentinel" in pathed
+          and re.search(r"^  Items: Entry 2: '…' appears twice$", text, re.M) is not None
+          and re.search(r"^  Can't find names\.csv$", text, re.M) is not None, (quoted, pathed, text))
+    cut = [row.strip() for row in text.splitlines() if row.startswith("  Line 9: w")]
     check("diagnostics: the problems, each cut to 200 characters", len(cut) == 1 and len(cut[0]) == 200, cut)
-    leaked = [word for word in ("aardvark", "dusk-sentinel", "okapi", "quokka", "zebra") if word in text]
-    check("diagnostics: no prompt, context, item name or other CSV text", not leaked, leaked)
+    leaked = [word for word in ("aardvark", "dusk-sentinel", "okapi", "quokka", "zebra", "folder-sentinel")
+              if word in text]
+    check("diagnostics: no prompt, context, item name, folder or other CSV text", not leaked, leaked)
     reports, wm = [], SimpleNamespace(clipboard="")  # a stand-in: the user's own clipboard is left alone
     got = ops.OPENACT_OT_copy_diagnostics.execute(SimpleNamespace(report=lambda _kind, message: reports.append(message)),
                                                   SimpleNamespace(window_manager=wm))
@@ -415,6 +457,44 @@ def phase_log():
     later = used("Unlogged again", MATCH, Question="Is it logged once the preference is off again?", Items="ledger")
     done = settle(lambda: complete(later))
     check("log: once it is off again, nothing more is written", done and len(logged()) == len(got), len(logged()))
+
+    # The preference as the add-on declares it, on a stand-in property group: its update reaches the worker at once
+    annotation = P.OpenActPreferences.__annotations__["log_requests"]  # prefs postpones annotations: a string
+    declared = eval(annotation, vars(P)) if isinstance(annotation, str) else annotation  # the add-on's own source
+    group = type("OpenActLogProbe", (bpy.types.PropertyGroup,), {"__annotations__": {"log_requests": declared}})
+    bpy.utils.register_class(group)
+    bpy.types.WindowManager.openact_log_probe = bpy.props.PointerProperty(type=group)
+    try:
+        probe, seen = bpy.context.window_manager.openact_log_probe, []
+        for value in (True, False):
+            probe.log_requests = value
+            seen.append(server.STATE.log_requests)
+    finally:
+        del bpy.types.WindowManager.openact_log_probe
+        bpy.utils.unregister_class(group)
+    check("log: switching Log Requests reaches the worker at once, not at the next refresh", seen == [True, False],
+          seen)
+
+    calls, makedirs, opener = [], os.makedirs, os.open
+
+    def made(path, mode=0o777, exist_ok=False):
+        calls.append(("folder", mode))
+        return makedirs(path, mode, exist_ok)
+
+    def opened(path, flags, mode=0o777, *args, **kwargs):
+        calls.append(("file", bool(flags & os.O_APPEND), mode))
+        return opener(path, flags, mode, *args, **kwargs)
+
+    os.makedirs, os.open = made, opened
+    try:
+        server._log_request({"state": "s", "questions": {}}, 200, {}, 0.0, 0)
+    finally:
+        os.makedirs, os.open = makedirs, opener
+    modes = [stat.S_IMODE(os.stat(path).st_mode) for path in (logs, os.path.join(
+        logs, time.strftime("requests-%Y%m%d.jsonl")))]
+    check("log: its folder is created 0700 and its file 0600, appended to: prompts and CSV text for this user only on "
+          "POSIX", calls == [("folder", 0o700), ("file", True, 0o600)]
+          and (sys.platform == "win32" or modes == [0o700, 0o600]), (calls, [oct(mode) for mode in modes]))
 
 
 # ---------------------------------------------------------------------------------------- unsure below
@@ -464,42 +544,64 @@ def phase_unsure():
 
 def phase_draw(rules, classify, ask):
     log = drawn(lambda layout: ui.draw_server(layout))
-    check("draw: the Model box has Copy Diagnostics, next to Open Log",
-          ("op", "openact.copy_diagnostics", "") in log and ("op", "openact.open_log", "") in log, log)
+    check("draw: the Model box has Copy Diagnostics next to Open Log; with this Blender's own server, Stop Model and no "
+          "shared line", ("op", "openact.copy_diagnostics", "") in log and ("op", "openact.open_log", "") in log
+          and ("op", "openact.server_stop", None) in log and server.SHARED not in text_of(log), log)
+    collection = used("Collection match", MATCH)
+    collection.list_source = 'COLLECTION'  # no Items input, so no starter file to copy
     buttons = {}
-    for node in (rules, classify, ask):
+    for node in (rules, classify, ask, collection):
         buttons[node.name] = [entry[2] for entry in drawn(lambda layout, node=node: ui.draw_files(layout, node))
                               if isinstance(entry, tuple) and entry[1] == "openact.new_csv_from_template"]
-    check("draw: the Files panel offers the templates: 'New Rules Template' on Rules, as its hint says, 'New CSV from "
-          "Template' on Classify, and nothing on Ask", "New Rules Template" in FACTORS_HINT and buttons == {
-              rules.name: ["New Rules Template"], classify.name: ["New CSV from Template"], ask.name: []}, buttons)
-    saved, warning = P._Defaults.runtime_dir, "This folder is outside your user folder"
+    check("draw: the Files panel offers New CSV from Template, the button the Rules hint names, on a node with an input "
+          "that has a starter file: Rules and Classify, not Ask, nor a Match whose list comes from a collection",
+          "(sidebar: New CSV from Template)" in FACTORS_HINT
+          and ops.OPENACT_OT_new_csv_from_template.bl_label == "New CSV from Template" and buttons == {
+              rules.name: [None], classify.name: [None], ask.name: [], collection.name: []}, buttons)
+
+    # The warning follows the folder that holds the token file: OPENACT_STATE_DIR when set, else the runtime folder
+    saved, warning, found = (os.environ.get("OPENACT_STATE_DIR"), P._Defaults.runtime_dir), \
+        "The folder that holds the model server's token", {}
     try:
-        P._Defaults.runtime_dir = os.path.join(os.path.expanduser("~"), "OpenAct runtime")
-        inside = drawn(lambda layout: ui.draw_preferences(P.get_prefs(), bpy.context, layout))
-        P._Defaults.runtime_dir = os.path.abspath(os.sep + "OpenAct runtime")
-        outside = drawn(lambda layout: ui.draw_preferences(P.get_prefs(), bpy.context, layout))
+        for name, state, runtime in (("state inside, runtime outside", os.path.join(HOME, "OpenAct state"), ELSEWHERE),
+                                     ("state outside, runtime inside", ELSEWHERE, os.path.join(HOME, "OpenAct")),
+                                     ("runtime outside", None, ELSEWHERE),
+                                     ("runtime inside", None, os.path.join(HOME, "OpenAct"))):
+            if state is None:
+                os.environ.pop("OPENACT_STATE_DIR", None)
+            else:
+                os.environ["OPENACT_STATE_DIR"] = state
+            P._Defaults.runtime_dir = runtime
+            log = drawn(lambda layout: ui.draw_preferences(P.get_prefs(), bpy.context, layout))
+            found[name] = warning in text_of(log)
     finally:
-        P._Defaults.runtime_dir = saved
-    check("draw: the preferences show Unsure Below and Log Requests, and warn when the runtime folder lies outside the "
-          "user folder, as the token file's readers then depend on its permissions",
-          {("prop", "unsure_below"), ("prop", "log_requests")} <= set(entry for entry in inside if isinstance(entry, tuple))
-          and warning not in text_of(inside) and warning in text_of(outside), (text_of(inside), text_of(outside)))
+        os.environ["OPENACT_STATE_DIR"], P._Defaults.runtime_dir = saved
+    check("draw: the preferences show Unsure Below and Log Requests, and warn when the folder that holds the token lies "
+          "outside the user folder", {("prop", "unsure_below"), ("prop", "log_requests")} <= set(
+              entry for entry in log if isinstance(entry, tuple)) and found == {
+              "state inside, runtime outside": False, "state outside, runtime inside": True, "runtime outside": True,
+              "runtime inside": False}, found)
 
 
 # ------------------------------------------------------------------------------------------- sharing
 
 def attach():
-    """The second Blender: it finds the suite's server on PORT, attaches through the token file, asks one question and
-    reports what it saw. It never stops the server: that would stop it for the first Blender too."""
+    """The second Blender: it finds the suite's server on PORT, attaches through the token file, asks one question,
+    looks at its Model box, presses Stop Model, which must only detach, and reports what it saw."""
     started = server.start()
     node = used("Second Blender", MATCH, Question="Is it asked by the second Blender?", Items="brick, feather")
     done = settle(lambda: complete(node), 90)
     process = server.STATE.process
-    print("ATTACHED " + json.dumps({
+    report = {
         "started": started, "process": None if process is None else process.pid, "pid": server.STATE.health.get("pid"),
         "status": list(server.status()), "complete": done,
-        "token": len(server.STATE.token) == 64 and server.STATE.token == server._read_token(PORT)}), flush=True)
+        "token": len(server.STATE.token) == 64 and server.STATE.token == server._read_token(PORT)}
+    box = drawn(lambda layout: ui.draw_server(layout))
+    report.update(shared=server.SHARED in text_of(box), detach=("op", "openact.server_stop", "Detach") in box,
+                  tooltip=ops.OPENACT_OT_server_stop.description(bpy.context, None))
+    server.stop()
+    report.update(stopped=list(server.status()), token_after=server.STATE.token, alive=listening(PORT))
+    print("ATTACHED " + json.dumps(report), flush=True)
 
 
 def phase_sharing():
@@ -514,7 +616,21 @@ def phase_sharing():
           "holds the port, mode 0600 on POSIX; argv names only the file",
           ready and written == server.STATE.token and (sys.platform == "win32" or mode == 0o600)
           and "--token-file" in argv and server.STATE.token not in argv, (written[:80], oct(mode or 0), argv))
-    before, pid = health(), server.STATE.process.pid
+    pid = server.STATE.process.pid
+    try:  # as when another Blender starts one at the same moment: the port is taken
+        second = subprocess.run([sys.executable, server.SERVER_SCRIPT, "--port", str(PORT), "--backend", "fake",
+                                 "--token-file", token_file], env=dict(server._child_env(),
+                                                                       OPENACT_TOKEN=secrets.token_hex(32)),
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+                                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        code, output = second.returncode, second.stdout + second.stderr
+    except subprocess.TimeoutExpired as error:  # it went on serving; run() killed it
+        code, output = None, str(error)
+    check("sharing: a second server on this port can't bind it: it exits with the port-taken code, and the token file "
+          "and /health are still this server's", code == server.PORT_TAKEN and "cannot listen" in output
+          and read(token_file).decode("ascii") == server.STATE.token and health().get("pid") == pid,
+          (code, output[-500:]))
+    before = health()
     try:
         result = subprocess.run([bpy.app.binary_path, "-b", "--factory-startup", "-t", "4", "--python",
                                  os.path.abspath(__file__), "--", "attach", str(PORT)], capture_output=True, text=True,
@@ -528,25 +644,34 @@ def phase_sharing():
     after = health()
     check("sharing: a second Blender attaches through the token file: it starts no server of its own, and its status "
           "is ready, with this Blender's server (the same pid) and its token",
-          report is not None and report["process"] is None and report["pid"] == pid == after["pid"]
+          report is not None and report["process"] is None and report["pid"] == pid == after.get("pid")
           and report["status"][0] == "ready" and report["token"], report or output[-3000:])
     statuses = asked("asked by the second Blender")
     check("sharing: ...and the one server answers its requests, with no second model loaded",
           report is not None and report["complete"] and statuses and set(statuses) == {200}
-          and after["requests"] > before["requests"] and after["load_seconds"] == before["load_seconds"]
-          and server.STATE.process.poll() is None, (report, statuses, before, after))
+          and after.get("requests", 0) > before["requests"] and after.get("load_seconds") == before["load_seconds"], (
+              report, statuses, before, after))
+    check("sharing: its Model box says the server is shared and its Stop button reads Detach, whose tooltip says the "
+          "server keeps running for the other Blender", report is not None and report["shared"] and report["detach"]
+          and "another Blender started: it keeps running" in report["tooltip"], report)
+    check("sharing: its Stop Model only detaches: its status is stopped and it forgets the token, while this Blender's "
+          "server runs on", report is not None and report["stopped"] == ["stopped", ""] and report["token_after"] == ""
+          and report["alive"] and server.STATE.process.poll() is None and health().get("pid") == pid, report)
 
 
 def phase_wrong_token():
     port, token = free_port(), secrets.token_hex(32)
-    foreign = subprocess.Popen([sys.executable, server.SERVER_SCRIPT, "--port", str(port), "--backend", "fake",
-                                "--parent-pid", str(os.getpid())], env=dict(server._child_env(), OPENACT_TOKEN=token),
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=NO_WINDOW)
+    foreign = subprocess.Popen([sys.executable, server.SERVER_SCRIPT, "--port", str(port), "--backend", "fake"],
+                               env=dict(server._child_env(), OPENACT_TOKEN=token), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
     token_file, message = os.path.join(STATE_DIR, f"server-{port}.token"), server.TOKEN_REFUSED.format(port)
     with open(token_file, "w", encoding="ascii") as handle:
         handle.write("0" * 64)  # another server's, or damaged
+    own_file = os.path.join(STATE_DIR, f"server-{PORT}.token")
+    kept = os.path.exists(own_file)
     server.stop()
+    check("sharing: a server this Blender stops removes its token file as it exits", kept and not os.path.exists(
+        own_file), (kept, os.path.exists(own_file)))
     P._Defaults.port = port
     try:
         up = drive(engine, lambda: listening(port), 20)
@@ -564,12 +689,96 @@ def phase_wrong_token():
         check("sharing: once the token file holds its token, the next health probe tries it, and the node is answered "
               "with no Ask Again", done, (server.status(), line(node)))
     finally:
-        server.stop()  # the other server, whose token this Blender now has
-        if foreign.poll() is None:
-            foreign.kill()
-        foreign.wait(10)
+        server.stop()  # only detaches from the other server, which the suite ends
+        ended(foreign)
         P._Defaults.port = PORT
     check("sharing: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
+def racing_start():
+    """server.start() whose /health check finds nothing listening: it checked a moment before the server of another
+    Blender, started at the same moment, listened."""
+    real, first = server.http, True
+
+    def http(method, path, body=None, port=None, timeout=10.0):
+        nonlocal first
+        if first and method == "GET" and path == "/health":
+            first = False
+            raise ConnectionRefusedError("nothing listened yet")
+        return real(method, path, body, port, timeout)
+
+    server.http = http
+    try:
+        return server.start()
+    finally:
+        server.http = real
+
+
+def phase_lost_race():
+    """§10.5: this Blender loses a start race for its port. Against another Blender's server (loading for 2 s) it
+    attaches at once, with no health probe; against a program that isn't OpenAct's it says the port can't be used.
+    Neither counts as a crash."""
+    port, token = free_port(), secrets.token_hex(32)
+    token_file = os.path.join(STATE_DIR, f"server-{port}.token")
+    winner = other_server(port, token, "--fake-load-seconds", "2")
+    server.stop()
+    P._Defaults.port, exits, seen, own = port, list(server.STATE.exits), [], None
+    try:
+        up = drive(engine, lambda: listening(port) and os.path.exists(token_file), 20)
+        started = racing_start()
+        own = server.STATE.process
+        engine._last_refresh = time.monotonic()  # no health probe for 5 s: only the lost port may attach it
+        node = used("Race", MATCH, Question="Who won the race?", Items="left, right")
+        engine.schedule(immediate=True)
+
+        def ready():
+            now = (server.status(), line(node))
+            if not seen or seen[-1] != now:
+                seen.append(now)
+            return server.is_ready()
+
+        quick = drive(engine, ready, 4.5)
+        done = settle(lambda: ready() and complete(node), 30)
+        try:
+            code = own.wait(10) if own is not None else None
+        except subprocess.TimeoutExpired:  # it is serving too: ended below
+            code = None
+        server.refresh()  # forgets its process, if nothing did yet
+        check("lost race: this Blender's server can't bind the port the other holds: it exits with the port-taken "
+              "code, and the token file keeps the other's token", up and started and code == server.PORT_TAKEN
+              and read(token_file).decode("ascii") == token, (up, started, code))
+        check("lost race: it attaches to the other at once (ready within 4.5 s with no health probe, the other loading "
+              "for 2 s) with its token, shows no error meanwhile, and the node is answered", quick and done
+              and server.STATE.token == token and not any(status[0] == "error" for status, _line in seen), seen)
+        check("lost race: losing the port is no crash", server.STATE.exits == exits and server.STATE.process is None,
+              (server.STATE.exits, exits, server.STATE.process))
+    finally:
+        server.stop()  # only detaches: the winner is another Blender's
+        ended(winner)
+        if own is not None:
+            ended(own)
+
+    blocker = socket.socket()  # a program that isn't OpenAct's holds the port
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    blocker.bind(("127.0.0.1", port))
+    blocker.listen(1)
+    try:
+        started = server.start()  # its /health check gets no answer: nothing OpenAct can use listens
+        failed = drive(engine, lambda: server.status()[0] == "error", 20)
+        check("lost race: when a program that isn't OpenAct's holds the port, the server exits with the port-taken "
+              "code, the status says it can't listen, and that is no crash either", started and failed
+              and "cannot listen" in server.status()[1] and server.STATE.process is None
+              and server.STATE.exits == exits, (server.status(), server.STATE.exits))
+    finally:
+        blocker.close()
+        if server.STATE.process is not None:  # it is serving too
+            ended(server.STATE.process)
+            server.STATE.process = None
+        server.STATE.set("stopped", "")
+        P._Defaults.port = PORT
+    check("lost race: this Blender's own server starts again on its port",
           server.start() and drive(engine, server.is_ready, 30), server.status())
 
 
@@ -657,17 +866,26 @@ def phase_slow():
         return engine.slow_note()
 
     try:
+        idle = reading(100.0, 1.5)  # nothing asked: the rate is the last fill's, not the GPU's now
+        node = used("Slow fill", MATCH, Question="Is it stalled? It is slow", Items="snail")
+        node.balance_order = False  # one scored row, which the fake model takes 8 s over: cells asked all along
+        engine.schedule(immediate=True)
+        asking = drive(engine, lambda: bool(pipeline.PENDING), 10)
         at_limit = reading(3 * 21.0, 1.5)
         early = reading(100.0, 0.4)
         late = reading(100.0, 1.0)
         box = text_of(drawn(lambda layout: ui.draw_server(layout)))
-        gone = reading(20.0, 0.2)
+        done = settle(lambda: complete(node), 30)
+        after = reading(100.0, 1.5)
     finally:
         engine.SLOW_FOR, server.STATE.health = slow_for, real
-    check("slow server: at 3 x 21 ms per row, no note", engine.SLOW_MS == 63.0 and at_limit == "", at_limit)
-    check("slow server: above it for a minute (time-scaled), and not before, the Model box notes 'Running slower than "
-          "expected: is the GPU busy (rendering, another app)?'; it goes once the rate is back",
-          early == "" and late == engine.SLOW and engine.SLOW in box and gone == "", (early, late, box, gone))
+    check("slow server: while nothing is asked, even a rate above 3 x 21 ms per row raises no note, before a fill and "
+          "after it", idle == "" and done and after == "", (idle, done, after))
+    check("slow server: while cells are asked, no note at 3 x 21 ms per row", asking and engine.SLOW_MS == 63.0
+          and at_limit == "", (asking, at_limit))
+    check("slow server: above it for a minute (time-scaled) of asking, and not before, the Model box notes 'Running "
+          "slower than expected: is the GPU busy (rendering, another app)?'", early == "" and late == engine.SLOW
+          and engine.SLOW in box, (early, late, box))
 
 
 # -------------------------------------------------------------------------------------------- run
@@ -683,6 +901,7 @@ def main():
         phase_draw(rules, classify, ask)
         phase_sharing()
         phase_wrong_token()
+        phase_lost_race()
         phase_crash_loop()
         phase_stall()
         phase_slow()
