@@ -30,7 +30,7 @@ from .csvfmt import CsvSource
 MAX_CONTEXTS = 64
 MAX_DEPTH = 64
 MEMO = None  # (output socket pointer, Ctx.key()) -> (value, depth read at) during engine.run_pass(); else None
-READS = None  # while Prepare for Playback reads words: (ID pointer, data path) -> (ID, data path, value) of each read
+READS = None  # while Prepare for Playback reads words: (ID pointer, data path) -> (struct, name, custom, value) read
 OVERRIDES = None  # while Prepare for Playback reads words: (ID pointer, data path) -> the value read instead
 
 
@@ -159,16 +159,17 @@ def is_field(sock):
     return inferred == 'FIELD' if inferred is not None else sock.display_shape == 'DIAMOND'
 
 
-def _animated(struct, name, value, custom=False):
-    """value, read from the property `name` of struct (a custom property with custom), which animation may change:
-    recorded in READS, and replaced by OVERRIDES, under the owning ID and the property's data path."""
+def _animated(struct, name, custom=False):
+    """The property `name` of struct (a custom property with custom), which animation may change: recorded in READS,
+    and replaced by OVERRIDES, under the owning ID and the property's data path."""
+    value = struct[name] if custom else getattr(struct, name)
     if READS is None and OVERRIDES is None:
         return value
     owner = struct.id_data
     path = f'{struct.path_from_id()}["{name}"]' if custom else struct.path_from_id(name)
     key = (owner.as_pointer(), path)
     if READS is not None:
-        READS.setdefault(key, (owner, path, value))
+        READS.setdefault(key, (struct, name, custom, value))
     return value if OVERRIDES is None else OVERRIDES.get(key, value)
 
 
@@ -184,7 +185,7 @@ def eval_input(sock, ctx, depth=0):
         if not links:
             if multi or not hasattr(sock, "default_value"):
                 return [] if multi else None
-            return _animated(sock, "default_value", sock.default_value)
+            return _animated(sock, "default_value")
         if multi:  # Join Strings joins the most recently connected link first
             ordered = sorted(links, key=lambda link: -link.multi_input_sort_id)
             return [eval_output(link.from_node, link.from_socket, ctx, depth + 1) for link in ordered]
@@ -256,7 +257,7 @@ def _group_input(identifier, ctx, depth):
         if ctx.mod.get(identifier + "_use_attribute"):
             raise Unresolvable("a modifier input is set to use an attribute")
         try:
-            value = _animated(ctx.mod, identifier, ctx.mod[identifier], custom=True)
+            value = _animated(ctx.mod, identifier, custom=True)
         except KeyError:
             pass
         else:
@@ -385,10 +386,9 @@ HANDLERS = {  # node bl_idname -> handler(node, out, ctx, depth); the engine add
     "FunctionNodeInputString": lambda node, out, ctx, depth: node.string,
     "GeometryNodeInputCollection": lambda node, out, ctx, depth: node.collection,
     "GeometryNodeInputObject": lambda node, out, ctx, depth: node.object,
-    "ShaderNodeValue": lambda node, out, ctx, depth: _animated(node.outputs[0], "default_value",
-                                                               node.outputs[0].default_value),
-    "FunctionNodeInputInt": lambda node, out, ctx, depth: _animated(node, "integer", node.integer),
-    "FunctionNodeInputBool": lambda node, out, ctx, depth: _animated(node, "boolean", node.boolean),
+    "ShaderNodeValue": lambda node, out, ctx, depth: _animated(node.outputs[0], "default_value"),
+    "FunctionNodeInputInt": lambda node, out, ctx, depth: _animated(node, "integer"),
+    "FunctionNodeInputBool": lambda node, out, ctx, depth: _animated(node, "boolean"),
     "GeometryNodeStringJoin": _h_join,
     "FunctionNodeValueToString": _h_value_to_string,
     "FunctionNodeReplaceString": _h_replace,

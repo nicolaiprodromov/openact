@@ -93,7 +93,7 @@ class NodeStatus:
     problems: list = field(default_factory=list)  # csvfmt.Problem records: the errors, then the warnings
     uses: list = field(default_factory=list)  # (context label, Job, entry shown or None) of each planned context
     asking: frozenset = frozenset()  # keys of the cells the pass asks: sent, or sent once the starting model is ready
-    pins: list = field(default_factory=list)  # (words key, frames, words) of each pinned entry, in pin order (§5.5)
+    pins: list = field(default_factory=list)  # the pinned entries, in pin order (§5.5)
 
     @property
     def icon(self) -> str:
@@ -139,8 +139,8 @@ def _plan(spec, node, ctx):
     """The node's Job in ctx with its Overrides CSV applied, planned again only when its fingerprint changed (§5.3).
     Raises Hint, Pending or Unresolvable."""
     global _plans_made
-    if _reading:  # words of another frame: the plan cache and the generations are the live words'
-        return spec.locked(node, ctx, spec.plan(node, ctx))
+    if evaluator.READS is not None or evaluator.OVERRIDES is not None:  # Prepare for Playback reads other frames
+        return spec.locked(node, ctx, spec.plan(node, ctx))  # the plan cache and generations are the live words'
     key = (node.uid, ctx.key())
     if _pass_plans is not None:
         _pass_plans.add(key)
@@ -272,12 +272,14 @@ def run_pass(everything=True):
         CONTEXTS.clear()
         NOTES.clear()
         DUE.clear()
+        REBAKES.clear()
         WATCH.retain(())
         tables.collect_garbage(nodes)
         return
     ensure_owned(nodes)
     tables.collect_garbage(nodes)  # after ensure_owned(), which gives copies their own table objects
-    dirty |= _pin_pending()  # a Prepare for Playback run whose last answer came: its pins are written now
+    pinned = _pin_pending()  # a Prepare for Playback run whose last answer came: its pins are written now
+    dirty |= pinned
     uses = find_uses()
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
@@ -316,10 +318,13 @@ def run_pass(everything=True):
         schedule(immediate=True)
     for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
         pipeline.cancel(uid, below=math.inf)
-    for cache in (LIVE, STATUS, NOTES):  # nodes that disappeared: undo and deleting a node group call no node's free()
+    # nodes that disappeared: undo and deleting a node group call no node's free()
+    for cache in (LIVE, STATUS, NOTES, REBAKES):
         for uid in [uid for uid in cache if uid not in contexts]:
             del cache[uid]
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
+    if pinned:  # written after their operator's undo step: in a step of their own, which only its undo removes
+        _undo_push("Pin for Playback")
     redraw()
 
 
@@ -404,11 +409,10 @@ def _process(tree, node, contexts):
         legacy = found is not None and found.legacy and found.answer_type == job.answer_type
         # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
         entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=not legacy)
-        if entry is not None and found is not None and entry is not found:  # a pin holds its words, whatever they mean
-            entry.pinned, entry.frames = found.pinned, found.frames
-        if entry is not None and found is not None and entry is not found and dataclasses.replace(
-                entry, t=found.t) == found:
-            entry = found  # the partial table as stored already
+        if entry is not None and found is not None and entry is not found:
+            entry.pinned, entry.frames = found.pinned, found.frames  # a pin holds its words, whatever they mean
+            if dataclasses.replace(entry, t=found.t) == found:
+                entry = found  # the partial table as stored already
         if entry is not None:  # the table shown: the sidebar and the counts describe it, not a hidden entry
             shown.append(entry)
             resolved[job.gn] = entry
@@ -484,6 +488,8 @@ def _process(tree, node, contexts):
         inactive -= sum(entry.pinned for entry in inner.materialised(graph.entries, live, default))
     if inactive:
         warnings.append(INACTIVE.format(inactive, "ies are" if inactive > 1 else "y is", inner.MATERIALISED_MAX))
+    if node.uid in REBAKES:  # until the next Prepare for Playback run
+        warnings.append(REBAKES[node.uid])
     warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
     state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
@@ -491,8 +497,7 @@ def _process(tree, node, contexts):
         state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings]
         + [_problem(INFO, note) for note in (NOTES.get(node.uid),) if note],
-        asking=frozenset(sent), pins=[(entry.words_key, entry.frames, entry.gn) for entry in pins],
-        **_counts(jobs, resolved, asked))
+        asking=frozenset(sent), pins=pins, **_counts(jobs, resolved, asked))
     return changed
 
 
@@ -650,8 +655,17 @@ def reask(node):
         return
     jobs = [job for _ctx, job in _jobs(node)]
     node_store = store.load(node)
-    words = {job.gn for job in jobs}
-    node_store.entries = [entry for entry in node_store.entries if entry.gn not in words]
+    spec, words = SPECS[node.bl_idname], {job.gn: job for job in jobs}
+    kept = []
+    for entry in node_store.entries:
+        job = words.get(entry.gn)
+        if job is None:
+            kept.append(entry)
+        elif entry.pinned:  # a pin holds its words (§14.2): they wait for their new answers, none known yet
+            asking = spec.entry(job, spec.stale(job, list(job.rows), None))
+            asking.pinned, asking.frames = True, entry.frames
+            kept.append(asking)
+    node_store.entries = kept
     store.save(node, node_store)  # no live set: nothing is evicted (§13.3)
     pipeline.forget(row.cell.key for job in jobs for row in job.rows if row.cell is not None)
     for key in [key for key in LAST_SHOWN if key[0] == node.uid]:
@@ -678,10 +692,21 @@ PIN_LIMIT = "'{}': {} distinct word sets over frames {}–{}; the limit is {}"
 PIN_CAP = "'{}': {} word sets live now and {} more over frames {}–{}; live plus pinned is limited to {}: split the tree"
 INACTIVE = ("{} pinned entr{} inactive: this tree is now used by more objects (live + pinned > {}). Re-run Prepare "
             "for Playback, or split the tree")
-PLAYBACK = None  # node uid -> [(Job, frames)] of the run waiting for its answers, to pin them; None: no run waits
-PLAYBACK_NOTE = ""  # how the last run ended, for the sidebar
-_reading = False  # a run reads the words of other frames: planning leaves the plan cache alone
+REBAKE = "Re-bake {} if baked: rules changed for frames {}"
+RUN_KEY = "_openact_playback"  # the scene's custom property naming its last run; "_" hides it in the sidebar
+PLAYBACK = None  # the Run waiting for its answers, to pin them, or None
+PLAYBACK_NOTE = ""  # why the last run stopped or was refused, and what to re-bake, for the sidebar
+REBAKES = {}  # node uid -> which of its modifiers to re-bake, as its pins changed their rules; until the next run
 _stepping = False  # the fallback holds the scene at other frames: no pass runs
+
+
+@dataclass
+class Run:
+    """A Prepare for Playback run waiting for its answers."""
+
+    id: str  # also its scene's RUN_KEY, written inside the operator's undo step: undoing that leaves the run dormant
+    scene: str  # that scene's name
+    sets: dict  # node uid -> [(Job, frames)] of the word sets to pin
 
 
 class Playback:
@@ -694,66 +719,64 @@ class Playback:
         uses = find_uses()
         self.uses = [(node, SPECS[node.bl_idname], uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)])
                      for tree, node in iter_nodes() if tree.library is None and node.uid]  # linked nodes stay as saved
-        self.live = {(node.uid, ctx.key()): gn for node, _spec, ctx, gn in self._words()[0]}
+        self.live = {(node.uid, ctx.key()): words for node, spec, ctx in self._contexts()
+                     if (words := _read(node, spec, ctx)[0]) is not None}  # the words each context has now
         self.seen = {}  # (uid, ctx key) -> {words: the frames the context has them at}
         self.origin = {}  # (uid, words) -> (the first frame, the context) they occur at, where they are planned
         self.values = {}  # frame -> the values the words read there (evaluator.OVERRIDES)
         self.problems = {}  # why some words can't be read -> the first frame
         self.fallback = ""  # why the frames must be set, found by read_curves()
 
-    def _words(self):
-        """(node, spec, ctx, words) of each context whose words can be read now, the values they read (READS), and why
-        the others' can't be read."""
-        global _reading
-        words, problems = [], []
-        _reading, evaluator.READS = True, {}
-        try:
-            for node, spec, contexts in self.uses:
-                for ctx in contexts:
-                    try:
-                        words.append((node, spec, ctx, spec.gn(node, ctx)))
-                    except Hint:
-                        continue  # nothing to ask
-                    except (Pending, Unresolvable) as error:
-                        problems.append(_unread(node, error))
-            return words, evaluator.READS, problems
-        finally:
-            _reading, evaluator.READS = False, None
+    def _contexts(self):
+        return [(node, spec, ctx) for node, spec, contexts in self.uses for ctx in contexts]
 
-    def _record(self, frame, words, problems):
-        for node, _spec, ctx, gn in words:
-            self.seen.setdefault((node.uid, ctx.key()), {}).setdefault(gn, []).append(frame)
-            self.origin.setdefault((node.uid, gn), (frame, ctx))
-        for problem in problems:
+    def _record(self, frame, node, ctx, words, problem):
+        if words is not None:
+            self.seen.setdefault((node.uid, ctx.key()), {}).setdefault(words, []).append(frame)
+            self.origin.setdefault((node.uid, words), (frame, ctx))
+        if problem:
             self.problems.setdefault(problem, frame)
 
     def read_curves(self):
-        """The F-curve path: at each frame, every value the words read that an F-curve animates takes that F-curve's
-        value there (evaluate() applies its modifiers), and the words are read again, purely in Python. False as soon
-        as a value needs the fallback: self.fallback says why."""
-        curves, checked = {}, set()  # (ID pointer, data path) -> (its F-curve, its value now); the keys looked at
+        """The F-curve path, purely in Python: each context's words are read at the first frame, and at a later one
+        only when they read a value an F-curve animates, which then takes that F-curve's value there (evaluate()
+        applies its modifiers). False as soon as a value needs the fallback: self.fallback says why."""
+        render = self.scene.render
+        stretched = render.frame_map_old != render.frame_map_new  # Time Stretching plays animation at other times
+        curves, checked = {}, set()  # read key -> (its F-curve, its value now, its hard range); the keys looked at
+        last = {}  # (uid, ctx key) -> (words, the keys they read, why they can't be read) at the last frame read
         try:
             for frame in range(self.first, self.last + 1):
-                while True:  # a value read only at this frame (down another Switch branch) may be animated too
-                    evaluator.OVERRIDES = {key: _as(value, curve.evaluate(frame))
-                                           for key, (curve, value) in curves.items()}
-                    words, reads, problems = self._words()
-                    new = [key for key in reads if key not in checked]
-                    checked.update(new)
-                    for key in new:
-                        owner, path, value = reads[key]
-                        curve, why = _animation(owner, path)
-                        if curve is not None and isinstance(value, str):  # a menu socket: its F-curve holds identifiers
-                            why = f"a menu socket of '{owner.name}' is keyframed"
-                        if why:
-                            self.fallback = why
-                            return False
-                        if curve is not None:
-                            curves[key] = (curve, value)
-                    if not any(key in curves for key in new):
-                        break
-                self.values[frame] = evaluator.OVERRIDES
-                self._record(frame, words, problems)
+                values = evaluator.OVERRIDES = {key: _as(value, curve.evaluate(frame), limits)
+                                                for key, (curve, value, limits) in curves.items()}
+                for node, spec, ctx in self._contexts():
+                    at = (node.uid, ctx.key())
+                    if at in last and last[at][1].isdisjoint(curves):  # it reads nothing animated: its words stay
+                        self._record(frame, node, ctx, last[at][0], last[at][2])
+                        continue
+                    while True:  # a value read only at this frame (down another Switch branch) may be animated too
+                        words, reads, problem = _read(node, spec, ctx)
+                        new = reads.keys() - checked
+                        checked |= new
+                        for key in new:
+                            struct, name, custom, value = reads[key]
+                            curve, why = _animation(struct.id_data, key[1])
+                            if curve is not None and stretched:
+                                why = "Time Stretching is on"
+                            elif curve is not None and isinstance(value, str):  # a menu socket: its F-curve holds ids
+                                why = f"a menu socket of '{struct.id_data.name}' is keyframed"
+                            if why:
+                                self.fallback = why
+                                return False
+                            if curve is not None:
+                                limits = None if isinstance(value, bool) else _range(struct, name, custom)
+                                curves[key] = (curve, value, limits)
+                                values[key] = _as(value, curve.evaluate(frame), limits)
+                        if new.isdisjoint(curves):
+                            break
+                    last[at] = (words, set(reads), problem)
+                    self._record(frame, node, ctx, words, problem)
+                self.values[frame] = values
         finally:
             evaluator.OVERRIDES = None
         return True
@@ -769,9 +792,11 @@ class Playback:
         try:
             for frame in range(self.first, self.last + 1):
                 scene.frame_set(frame)
-                words, reads, problems = self._words()
-                self.values[frame] = {key: value for key, (_owner, _path, value) in reads.items()}
-                self._record(frame, words, problems)
+                values = self.values[frame] = {}
+                for node, spec, ctx in self._contexts():
+                    words, reads, problem = _read(node, spec, ctx)
+                    values.update((key, read[3]) for key, read in reads.items())
+                    self._record(frame, node, ctx, words, problem)
                 yield frame
         finally:
             scene.frame_set(current, subframe=subframe)
@@ -779,9 +804,10 @@ class Playback:
 
     def finish(self):
         """Check the limits, then ask for the word sets of the contexts whose words over the range aren't only the
-        ones they have now, and pin them once all are answered, replacing every earlier pin. Returns the report, the
-        projected size first; raises ValueError, having asked nothing, when a node would pass a limit."""
-        global PLAYBACK, PLAYBACK_NOTE, _reading
+        ones they have now, and pin them once all are answered, replacing every earlier pin. A new run is how a
+        question that failed is asked again. Returns the report, the size of the pins first; raises ValueError, having
+        asked nothing, when a node would pass a limit."""
+        global PLAYBACK, PLAYBACK_NOTE
         chosen = {}  # uid -> {words: the frames they occur at}
         for node, _spec, contexts in self.uses:
             sets = {}
@@ -793,20 +819,24 @@ class Playback:
                 for gn, frames in seen.items():
                     sets.setdefault(gn, set()).update(frames)
             live = {gn for (uid, _key), gn in self.live.items() if uid == node.uid}
+            refused = ""
             if len(sets) > PIN_MAX:
-                raise ValueError(PIN_LIMIT.format(node.name, len(sets), self.first, self.last, PIN_MAX))
-            if sets and len(live | sets.keys()) > inner.MATERIALISED_MAX:
-                raise ValueError(PIN_CAP.format(node.name, len(live), len(sets.keys() - live), self.first, self.last,
-                                                inner.MATERIALISED_MAX))
+                refused = PIN_LIMIT.format(node.name, len(sets), self.first, self.last, PIN_MAX)
+            elif sets and len(live | sets.keys()) > inner.MATERIALISED_MAX:
+                refused = PIN_CAP.format(node.name, len(live), len(sets.keys() - live), self.first, self.last,
+                                         inner.MATERIALISED_MAX)
+            if refused:
+                PLAYBACK_NOTE = refused
+                raise ValueError(refused)
             chosen[node.uid] = sets
+        REBAKES.clear()  # the last run's: this one flags its own
         pending, size = {}, 0
-        _reading = True
         try:
             for node, spec, _contexts in self.uses:
                 entries = None
                 for gn, frames in chosen[node.uid].items():
                     frame, ctx = self.origin[(node.uid, gn)]
-                    evaluator.OVERRIDES = self.values.get(frame)  # the values its words read at that frame
+                    evaluator.OVERRIDES = self.values[frame]  # the values its words read at that frame
                     try:
                         job = spec.locked(node, ctx, spec.plan(node, ctx))
                     except Hint:
@@ -816,18 +846,25 @@ class Playback:
                         continue
                     entries = store.load(node).entries if entries is None else entries
                     size += _size(spec, job, entries)
+                    for row in job.rows:
+                        if row.cell is not None:
+                            pipeline.FAILED.pop(row.cell.key, None)
                     pending.setdefault(node.uid, []).append((job, _spans(sorted(frames))))
         finally:
-            evaluator.OVERRIDES, _reading = None, False
+            evaluator.OVERRIDES = None
         count = sum(len(sets) for sets in pending.values())
-        text = (f"{count} word set{'s' if count != 1 else ''} over frames {self.first}–{self.last}: pinning {count} "
-                f"entr{'ies' if count != 1 else 'y'} adds about {store._mb(size)} MB to the file" if count else
+        text = (f"{count} word set{'s' if count != 1 else ''} over frames {self.first}–{self.last}: the pinned "
+                f"entr{'ies take' if count != 1 else 'y takes'} about {store._mb(size)} MB in the file" if count else
                 f"No OpenAct words change over frames {self.first}–{self.last}: nothing to pin")
-        PLAYBACK, PLAYBACK_NOTE = pending, ""
+        run = uuid.uuid4().hex
+        self.scene[RUN_KEY] = run  # inside the operator's undo step: undoing that step leaves the run dormant
+        PLAYBACK, PLAYBACK_NOTE = Run(run, self.scene.name, pending), ""
         if _pin_pending() and not count:
             text += ", and the earlier pins are removed"
         if PLAYBACK is not None:
             text += ". They are pinned once the model has answered them"
+        elif PLAYBACK_NOTE:  # what to re-bake, or why nothing was pinned
+            text += f". {PLAYBACK_NOTE}"
         if self.problems:
             problem, frame = next(iter(self.problems.items()))
             text += f". Words that can't be read are left out, e.g. at frame {frame}: {problem}"
@@ -836,14 +873,16 @@ class Playback:
 
 
 def _pin_pending():
-    """Ask for what the waiting Prepare for Playback run still misses; once every word set is answered, pin them all
-    and unpin every other entry. Saved without the live set: nothing is evicted, and each node's next pass applies the
-    limits (§13.3). Returns the uids of the nodes whose pins changed."""
+    """Ask for what the waiting run still misses; once every word set is answered, pin them all and unpin every other
+    entry, saved without the live set: nothing is evicted, and each node's next pass applies the limits (§13.3). The
+    modifiers with bakes whose rules that changes are flagged (REBAKES). Returns the uids of the nodes whose pins
+    changed."""
     global PLAYBACK, PLAYBACK_NOTE
-    if PLAYBACK is None:
+    run = _waiting()
+    if run is None:
         return set()
     ready, waiting = {}, False
-    for uid, sets in PLAYBACK.items():
+    for uid, sets in run.sets.items():
         _tree, node = find_node(uid)
         if node is None:  # deleted meanwhile
             continue
@@ -852,9 +891,10 @@ def _pin_pending():
         for job, frames in sets:
             entry, missing, failed = spec.resolve(job, node_store.entries)
             if entry is None and not missing and not failed:  # e.g. Dials settings its contexts don't agree on
-                failed = [f"'{node.name}' can't answer its words at frame {frames[0][0]}"]
-            if failed:  # not asked again until the words change or Ask Again
-                PLAYBACK, PLAYBACK_NOTE = None, f"Prepare for Playback stopped: {failed[0]}. Nothing was pinned"
+                failed = ["its words can't be answered"]
+            if failed:  # not asked again in this run: a new run asks again
+                PLAYBACK, PLAYBACK_NOTE = None, (f"Prepare for Playback stopped: '{node.name}' at frame {frames[0][0]}:"
+                                                 f" {failed[0]}. Nothing was pinned: run it again to retry")
                 return set()
             if entry is None:
                 waiting = True
@@ -864,15 +904,15 @@ def _pin_pending():
                 ready[uid][1].append((entry, frames))
     if waiting:
         return set()
-    count = sum(len(sets) for sets in PLAYBACK.values())
-    PLAYBACK, PLAYBACK_NOTE = None, f"Pinned {count} word set{'s' if count != 1 else ''} for playback" if count else ""
-    changed = set()
+    PLAYBACK = None
+    changed, errors, uses = set(), [], find_uses()
     for tree, node in iter_nodes():
         if tree.library is not None:
             continue
         node_store, pins = ready.get(node.uid) or (store.load(node), [])
         entries = node_store.entries
-        if not pins and not any(entry.pinned for entry in entries):
+        before = {entry.words_key: entry.frames for entry in entries if entry.pinned}
+        if not pins and not before:
             continue
         for entry in entries:
             entry.pinned, entry.frames = False, []
@@ -886,33 +926,93 @@ def _pin_pending():
         try:
             store.save(node, node_store)  # no live set: nothing is evicted (§13.3)
         except ValueError as error:  # a newer OpenAct's answers, or a table too large to store
-            PLAYBACK_NOTE = f"'{node.name}': {error}"
+            errors.append(f"'{node.name}': {error}")
             continue
         DUE.add(node.uid)
         changed.add(node.uid)
+        after = {entry.words_key: frames for entry, frames in pins}
+        frames = {frame for key in before.keys() ^ after.keys() for start, end in before.get(key, after.get(key))
+                  for frame in range(start, end + 1)}  # where the pins that came or went decide the rules now
+        # RNA can't tell a baked simulation or Bake node from an unbaked one, so every modifier with bakes is named
+        baked = sorted({f"'{ctx.obj.name} > {ctx.mod.name}'" for ctx in uses.get(tree.as_pointer(), ())
+                        if ctx.mod is not None and len(ctx.mod.bakes)})
+        if frames and baked:
+            REBAKES[node.uid] = REBAKE.format(", ".join(baked), frames_text(_spans(sorted(frames))))
+    PLAYBACK_NOTE = " ".join([*errors, *(REBAKES[uid] for uid in changed if uid in REBAKES)])
     return changed
 
 
-def unpin(uid="", words_key=""):
-    """Unpin one entry of a node (by words key), every pin of the node, or with uid "" every pin in the file. The
-    entries stay stored, saved without the live set, so nothing is evicted now: the node's next pass applies the
-    limits (§13.3). Returns how many entries were unpinned."""
-    count = 0
-    for tree, node in iter_nodes():
-        if tree.library is not None or (uid and node.uid != uid):
-            continue
-        node_store = store.load(node)
-        found = [entry for entry in node_store.entries if entry.pinned and words_key in ("", entry.words_key)]
-        if not found:
-            continue
-        for entry in found:
-            entry.pinned, entry.frames = False, []
+def _waiting():
+    """The run waiting for its answers, or None: none waits, or undoing its operator step left it dormant (a redo
+    wakes it)."""
+    run = PLAYBACK
+    scene = bpy.data.scenes.get(run.scene) if run is not None else None
+    return run if scene is not None and scene.get(RUN_KEY) == run.id else None
+
+
+def pinning():
+    """How many word sets the waiting run pins once they are answered; 0 when none waits."""
+    run = _waiting()
+    return sum(len(sets) for sets in run.sets.values()) if run is not None else 0
+
+
+def cancel_playback(note="Prepare for Playback cancelled: nothing more was pinned"):
+    """Stop the run waiting for its answers: nothing more is pinned. False when none waits."""
+    global PLAYBACK, PLAYBACK_NOTE
+    live = _waiting() is not None
+    PLAYBACK = None  # a dormant one too: after another undo step, no redo can wake it
+    if live:
+        PLAYBACK_NOTE = note
+    return live
+
+
+def unpin(uid, words_key=""):
+    """Unpin one of the node's entries (by words key), or with "" all its pins. They stay stored, saved without the
+    live set, so nothing is evicted now: the node's next pass applies the limits (§13.3). A run waiting for its answers
+    is cancelled, as it would replace these pins. Returns how many entries were unpinned."""
+    tree, node = find_node(uid) if uid else (None, None)
+    if node is None or tree.library is not None:
+        return 0
+    node_store = store.load(node)
+    found = [entry for entry in node_store.entries if entry.pinned and words_key in ("", entry.words_key)]
+    for entry in found:
+        entry.pinned, entry.frames = False, []
+    if found:
         store.save(node, node_store)  # no live set: nothing is evicted (§13.3)
-        DUE.add(node.uid)
-        count += len(found)
-    if count:
+        DUE.add(uid)
+        cancel_playback("Prepare for Playback cancelled by Unpin: nothing more was pinned")
         schedule(immediate=True)
-    return count
+    return len(found)
+
+
+def frames_text(spans):
+    """[start, end] spans as the sidebar and the notes write them: "1–10, 21, 31–40"."""
+    return ", ".join(str(start) if start == end else f"{start}–{end}" for start, end in spans)
+
+
+def _undo_push(message):
+    """An undo step for what the pass wrote on its own, when there is a window to push it from."""
+    wm = getattr(bpy.context, "window_manager", None)
+    window = bpy.context.window or (wm.windows[0] if wm and wm.windows else None)
+    if window is None:
+        return
+    with bpy.context.temp_override(window=window):
+        if bpy.ops.ed.undo_push.poll():
+            bpy.ops.ed.undo_push(message=message)
+
+
+def _read(node, spec, ctx):
+    """(words, or None when there are none to ask about; the values they read, as evaluator.READS records them; why
+    they can't be read, or "") of one context now."""
+    evaluator.READS = reads = {}
+    try:
+        return spec.gn(node, ctx), reads, ""
+    except Hint:
+        return None, reads, ""
+    except (Pending, Unresolvable) as error:
+        return None, reads, _unread(node, error)
+    finally:
+        evaluator.READS = None
 
 
 def _animation(owner, path):
@@ -935,12 +1035,24 @@ def _animation(owner, path):
     return (curve if curve is not None and not curve.mute else None), ""
 
 
-def _as(value, number):
-    """An F-curve's number as Blender writes it into a property that holds `value`: a bool from 0.5 up, an int
-    truncated (an integer property's F-curve rounds already), a float as it is."""
+def _as(value, number, limits):
+    """An F-curve's number as Blender writes it into a property that holds `value`: a bool from 0.5 up; an int
+    truncated (an integer property's F-curve rounds already), then clamped to limits, the hard range; a float
+    clamped."""
     if isinstance(value, bool):
         return number >= 0.5
-    return int(number) if isinstance(value, int) else number
+    low, high = limits
+    return min(max(int(number) if isinstance(value, int) else number, low), high)
+
+
+def _range(struct, name, custom):
+    """The hard range Blender clamps an animated number to: a custom property's own (id_properties_ui()), else the RNA
+    property's."""
+    if custom:
+        ui = struct.id_properties_ui(name).as_dict()
+        return ui.get("min", -math.inf), ui.get("max", math.inf)
+    prop = struct.bl_rna.properties[name]
+    return prop.hard_min, prop.hard_max
 
 
 def _spans(frames):
@@ -1038,6 +1150,7 @@ def on_load_post(*_args):
     CONTEXTS.clear()
     NOTES.clear()
     DUE.clear()
+    REBAKES.clear()
     PLAYBACK, PLAYBACK_NOTE = None, ""  # the closed file's run
     schedule(immediate=True)
 

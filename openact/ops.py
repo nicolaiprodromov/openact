@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 
 import bpy
 
@@ -134,7 +135,11 @@ class OPENACT_OT_prepare_playback(bpy.types.Operator):
     bl_label = "Prepare for Playback"
     bl_description = ("Answer every set of words the OpenAct nodes see over the scene's frame range, and pin those "
                       "answers, so animated words (a keyframed dropdown, say) never wait for the model during playback")
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'UNDO'}  # not REGISTER: Repeat Last would run the frame loop without progress or Esc
+
+    @classmethod
+    def poll(cls, context):
+        return not (engine._stepping or engine._rendering())  # either would move the frame under the other
 
     def execute(self, context):  # run from a script, the fallback sets every frame here without a modal loop
         run = engine.Playback(context.scene)
@@ -148,7 +153,7 @@ class OPENACT_OT_prepare_playback(bpy.types.Operator):
         if self.run.read_curves():
             return self.finish(self.run)
         # The fallback: one scene evaluation per frame, with progress, and Esc cancels
-        self.steps, self.done, self.total = self.run.step_frames(), 0, max(self.run.last - self.run.first + 1, 0)
+        self.steps, self.total = self.run.step_frames(), self.run.last - self.run.first + 1
         self.started = time.monotonic()
         wm = context.window_manager
         wm.progress_begin(0, self.total)
@@ -167,14 +172,19 @@ class OPENACT_OT_prepare_playback(bpy.types.Operator):
         if event.type != 'TIMER':
             return {'RUNNING_MODAL'}  # no edits while the scene is at another frame
         try:
-            next(self.steps)
+            frame = next(self.steps)
         except StopIteration:
             self.end(context)
             return self.finish(self.run)
-        self.done += 1
-        left = (time.monotonic() - self.started) / self.done * (self.total - self.done)
-        context.window_manager.progress_update(self.done)
-        context.workspace.status_text_set(f"Prepare for Playback ({self.run.fallback}): frame {self.done} of "
+        except Exception as error:  # the timer, progress and status text must go; the generator set the frame back
+            traceback.print_exc()
+            self.end(context)
+            self.report({'ERROR'}, f"Prepare for Playback stopped: {error}")
+            return {'CANCELLED'}
+        done = frame - self.run.first + 1
+        left = (time.monotonic() - self.started) / done * (self.total - done)
+        context.window_manager.progress_update(done)
+        context.workspace.status_text_set(f"Prepare for Playback ({self.run.fallback}): frame {done} of "
                                           f"{self.total}, about {math.ceil(left)} s left. Esc cancels")
         return {'RUNNING_MODAL'}
 
@@ -199,6 +209,15 @@ class OPENACT_OT_prepare_playback(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OPENACT_OT_cancel_playback(bpy.types.Operator):
+    bl_idname = "openact.cancel_playback"
+    bl_label = "Cancel Pinning"
+    bl_description = "Stop the Prepare for Playback run that waits for the model: nothing more is pinned"
+
+    def execute(self, context):
+        return {'FINISHED'} if engine.cancel_playback() else {'CANCELLED'}
+
+
 class OPENACT_OT_unpin(bpy.types.Operator):
     bl_idname = "openact.unpin"
     bl_label = "Unpin"
@@ -206,7 +225,7 @@ class OPENACT_OT_unpin(bpy.types.Operator):
                       "and old stored answers may be dropped to keep the file small")
     bl_options = {'REGISTER', 'UNDO'}
 
-    uid: bpy.props.StringProperty(options={'HIDDEN'})  # "": every node
+    uid: bpy.props.StringProperty(options={'HIDDEN'})
     words_key: bpy.props.StringProperty(options={'HIDDEN'})  # "": every pin of the node
 
     def execute(self, context):
@@ -680,7 +699,7 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
            OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
-           OPENACT_OT_write_overrides, OPENACT_OT_prepare_playback, OPENACT_OT_unpin)
+           OPENACT_OT_write_overrides, OPENACT_OT_prepare_playback, OPENACT_OT_cancel_playback, OPENACT_OT_unpin)
 
 
 def register():

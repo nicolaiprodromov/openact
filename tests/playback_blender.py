@@ -4,19 +4,28 @@ the add-on starts itself (OPENACT_BACKEND=fake), whose --record log counts every
   Prepare for Playback asks the two tables not known yet and pins all three with their frames; then playback sends 0
   requests, writes no table, and every frame shows its rule set's table, never a fallback;
 - the F-curve path over a 250-frame range: under 1 s, with no scene evaluation (no frame change, no depsgraph update);
+  with 64 contexts of which 4 are animated, each static context is read once;
 - a keyframed Int modifier input, on 4.5 and 5.1: its F-curve is found through the action slot's channelbag
-  (Action.fcurves is gone in 5.x), evaluate() gives the keyed values, and the words read equal the scene's;
-- a driven input takes the fallback. Its frame loop, the modal operator's core, is driven here through
-  Playback.step_frames(), as a headless Blender has no window to run a modal operator in: cancelled, it sets the
-  current frame again, pins nothing and asks nothing, and no pass runs meanwhile. Run from the operator (which steps
-  every frame without a modal loop when a script runs it), it pins, and the current frame is set again;
+  (Action.fcurves is gone in 5.x), evaluate() gives the keyed values, and the words read equal the scene's; a keyed
+  value beyond the property's hard range is clamped as the scene clamps it; under Time Stretching the fallback runs;
+- a driven input takes the fallback. Its frame loop, cancelled, sets the current frame again, pins nothing and asks
+  nothing, and no pass runs meanwhile, nor can another run start. Run from the operator (which steps every frame
+  without a modal loop when a script runs it), it pins, sets the current frame again and flags the modifier's bakes;
+  Ask Again keeps its pins, and a run that changes no pin clears the flag;
+- the modal operator's own functions, called on a stand-in instance with a stand-in window manager and workspace, as a
+  headless Blender runs no modal loop: Esc mid-way, a run to the end, an internal error mid-way and cancel() each
+  leave no timer, progress or status text behind, and set the current frame again;
 - an NLA-animated input (a strip on an NLA track) takes the fallback, and pins the word tuples the NLA gives;
-- 13 distinct word sets are refused with the limit message, and nothing is asked;
+- 13 distinct word sets are refused with the limit message, which the sidebar keeps, and nothing is asked;
 - pins survive save and reload (pinned: true, frames); the sidebar lists them with Unpin and Unpin All; openact.unpin
-  removes one, then the rest;
+  removes one, then the rest, and without a node unpins nothing;
+- undo, for real (a first ed.undo_push() gives a headless Blender its undo stack): pins that a pass writes after their
+  operator's step have a step of their own, which only its undo removes, and the sidebar then claims no pin; undoing
+  the operator's step while its run waits leaves the run dormant, and a redo wakes it; Cancel and Unpin stop a waiting
+  run; a question that failed is asked again by the next run;
 - pin order: with 12 pins, objects added until live plus pinned exceeds 16 leave out the pins whose words start latest
   in the frame range (ties by their words), the same ones after a rebuild; a new run is then refused, asking nothing;
-- pins above 2 MB are kept, with the size note, and Prepare for Playback reported the projected size first.
+- pins above 2 MB are kept, with the size note, and Prepare for Playback reported the size of the pins first.
 
 Run:  blender -b --factory-startup --python tests/playback_blender.py
 """
@@ -30,6 +39,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 from types import SimpleNamespace
 
 TMP = tempfile.mkdtemp(prefix="openact_playback_")
@@ -88,7 +98,7 @@ def records():
 def settle(timeout=90):
     """Tick until nothing is queued or in flight, no pass is due, no node waits for the model and no Prepare for
     Playback run waits."""
-    return drive(engine, lambda: not pipeline.PENDING and not engine._dirty and engine.PLAYBACK is None and not any(
+    return drive(engine, lambda: not pipeline.PENDING and not engine._dirty and not engine.pinning() and not any(
         status.state in ("starting", "waiting", "filling") for status in engine.STATUS.values()), timeout)
 
 
@@ -221,12 +231,64 @@ def spans(frames):
     return runs
 
 
-def prepare():
-    """openact.prepare_playback as a script runs it: (its result, the error it reported or "")."""
+def prepare(undo=False):
+    """openact.prepare_playback as a script runs it, with undo as a button runs it: (its result, the error it reported
+    or "")."""
     try:
-        return bpy.ops.openact.prepare_playback(), ""
+        return bpy.ops.openact.prepare_playback('EXEC_DEFAULT', undo), ""
     except RuntimeError as error:  # the operator reported an error
         return {'CANCELLED'}, str(error)
+
+
+def constant(curve):
+    """Each key's value holds until the next key."""
+    for point in curve.keyframe_points:
+        point.interpolation = 'CONSTANT'
+    return curve
+
+
+TIMER, ESC = SimpleNamespace(type='TIMER', value='NOTHING'), SimpleNamespace(type='ESC', value='PRESS')
+
+
+def modal_operator(scene):
+    """The Prepare for Playback operator's own functions on a stand-in instance, with a stand-in window manager and
+    workspace that record their calls, as a headless Blender runs no modal loop: (instance, context, calls)."""
+    calls = []
+
+    def record(name):
+        return lambda *args, **_kwargs: calls.append((name, *args)) or name
+
+    op = SimpleNamespace(reports=[])
+    op.report = lambda kind, text: op.reports.append((next(iter(kind)), text))
+    for name in ("invoke", "modal", "cancel", "end", "finish"):
+        setattr(op, name, types.MethodType(getattr(ops.OPENACT_OT_prepare_playback, name), op))
+    wm = SimpleNamespace(**{name: record(name) for name in ("progress_begin", "progress_update", "progress_end",
+                                                            "event_timer_add", "event_timer_remove",
+                                                            "modal_handler_add")})
+    context = SimpleNamespace(scene=scene, window=None, window_manager=wm,
+                              workspace=SimpleNamespace(status_text_set=record("status_text_set")))
+    return op, context, calls
+
+
+def cleaned(calls):
+    """True once the stand-in window manager and workspace saw the timer, the progress and the status text go."""
+    names = [call[0] for call in calls]
+    return "event_timer_remove" in names and "progress_end" in names and calls[-1] == ("status_text_set", None)
+
+
+def said(log, text):
+    """True when a drawn panel shows the text, which wrap() may have split over several labels."""
+    return text in " ".join(line for line in log if isinstance(line, str))
+
+
+def undo(redo=False):
+    """ed.undo() or ed.redo(), then the passes it schedules: False when there was no step to go to."""
+    try:
+        done = (bpy.ops.ed.redo if redo else bpy.ops.ed.undo)() == {'FINISHED'}
+    except RuntimeError:  # its poll(): no step that way
+        done = False
+    settle()
+    return done
 
 
 class FakeLayout:
@@ -336,22 +398,27 @@ def phase_menu_switch():
         keyframes(obj, "Rule set", [(frame, menu_value(obj, "Rule set", name))])
     start = len(records())
     result, error = prepare()
-    waiting = engine.PLAYBACK is not None and not pinned(rules)
+    waiting = engine.pinning() == 3 and not pinned(rules)
+    log = drawn(ui.NODE_PT_openact, rules)
     done = settle()
     pins = pinned(rules)
     sent = {record["request"]["state"].split("\n")[0] for record in records()[start:] if record["request"]}
     check("menu switch: Prepare for Playback asks the two rule sets not known yet, and pins the three once answered, "
-          "each with its frames", result == {'FINISHED'} and not error and waiting and done
+          "each with its frames; meanwhile the sidebar says it waits, with Cancel", result == {'FINISHED'}
+          and not error and waiting and done and said(log, "Pinning 3 word sets once the model has answered them")
+          and "[openact.cancel_playback]" in log
           and [(rule_set(e), e.frames) for e in pins] == [("Life", [[1, 10]]), ("HighLife", [[11, 20]]),
                                                           ("Day & Night", [[21, 30]])]
-          and sent == {f"Rules from {os.path.join(TMP, RULE_SETS[name])}" for name in ("HighLife", "Day & Night")}
-          and engine.PLAYBACK_NOTE == "Pinned 3 word sets for playback", (result, error, [e.frames for e in pins], sent))
+          and sent == {f"Rules from {os.path.join(TMP, RULE_SETS[name])}" for name in ("HighLife", "Day & Night")},
+          (result, error, [e.frames for e in pins], sent, log))
     check("menu switch: each rule set has a table of its own (the fake answers depend on the state)",
           len({tuple(e.rows.v["outcome"]) for e in pins}) == 3, [e.rows.v["outcome"] for e in pins])
-    status = engine.STATUS[rules.uid]
-    check("menu switch: the pass lays out the three pins, and the status lists them in pin order, none inactive",
-          len(in_graph(rules)) == 3 and [key for key, _frames, _gn in status.pins] == [e.words_key for e in pins]
-          and status.state == "complete", (status.state, status.text, len(in_graph(rules))))
+    status, log = engine.STATUS[rules.uid], drawn(ui.NODE_PT_openact, rules)
+    check("menu switch: the pass lays out the three pins, and the status lists them in pin order, none inactive; the "
+          "sidebar counts them from the entries, and a tree without bakes has nothing to re-bake",
+          len(in_graph(rules)) == 3 and [e.words_key for e in status.pins] == [e.words_key for e in pins]
+          and status.state == "complete" and said(log, "3 word sets pinned for playback") and not engine.REBAKES
+          and not engine.PLAYBACK_NOTE, (status.state, status.text, len(in_graph(rules)), log))
     count, before = len(records()), rules.entries
     playing, engine._animation_playing = engine._animation_playing, lambda: True
     bad = []
@@ -410,9 +477,45 @@ def phase_timing(rules, obj):
     life = [[f, f + 9] for f in range(1, 251, 30)]
     check("timing: its answers are all known, so it pins at once, asking nothing, each rule set with its 8 or 9 "
           "frame runs", engine.PLAYBACK is None and len(records()) == start and len(pins) == 3
-          and pins[0].frames == life and text.startswith("3 word sets over frames 1–250: pinning 3 entries adds about"),
+          and pins[0].frames == life and text.startswith("3 word sets over frames 1–250: the pinned entries take about"),
           (text, [e.frames for e in pins]))
     settle()
+
+
+def phase_static():
+    """The F-curve path reads a context whose words read nothing animated once (§5.5): 16 objects on a tree with 4 Asks,
+    one object animated, over 250 frames."""
+    scene = reset(1, 250)
+    tree, gi, go = new_tree("Many", ("Level", 'NodeSocketInt'))
+    switch = tree.nodes.new("GeometryNodeIndexSwitch")
+    switch.data_type = 'STRING'
+    for i, slot in enumerate(s for s in switch.inputs if s.identifier not in ("Index", "__extend__")):
+        slot.default_value = f"Question {i}?"
+    tree.links.new(gi.outputs["Level"], switch.inputs["Index"])
+    for k in range(4):
+        ask = tree.nodes.new(ASK.idname)
+        ask.inputs["Context"].default_value = f"Room {k}"
+        tree.links.new(switch.outputs[0], ask.inputs["Question"])
+    tree.links.new(gi.outputs["Geometry"], go.inputs["Geometry"])
+    objects = [user(f"Many {i}", tree, Level=0) for i in range(16)]
+    keyframes(objects[0], "Level", [(1, 0), (125, 1), (250, 0)])
+    settle()
+    reads, read = [], engine._read
+    engine._read = lambda *args: reads.append(args) or read(*args)
+    try:
+        started = time.perf_counter()
+        run = engine.Playback(scene)
+        fcurves = run.read_curves()
+        seconds = time.perf_counter() - started
+    finally:
+        engine._read = read
+    print(f"TIMING Prepare for Playback: F-curve path over 250 frames, 64 contexts, 4 animated: {seconds:.3f}s "
+          f"(budget 1 s)", flush=True)
+    live = len(run.live)
+    check("static contexts: over 250 frames the F-curve path reads each of the 60 contexts whose words read nothing "
+          "animated once, and the 4 animated ones at every frame (the first again once its F-curve is found), in "
+          "under 1 s", fcurves and live == 64 and len(reads) - live == 64 + 1 + 249 * 4 and seconds < 1.0,
+          (len(reads) - live, f"{seconds:.3f}s"))
 
 
 # ------------------------------------------------------------------------------ save, reload, unpin
@@ -437,7 +540,11 @@ def phase_reload():
           and rows[0][1].startswith("Frames 1–10, 31–40") and "life_outcomes.csv" in rows[0][1]
           and "highlife_outcomes.csv" in rows[1][1], (rows, log))
     log = drawn(ui.NODE_PT_openact, rules)
-    check("reload: the OpenAct panel has Prepare for Playback", "[openact.prepare_playback]" in log, log)
+    check("reload: the OpenAct panel has Prepare for Playback, and counts the pins", "[openact.prepare_playback]" in log
+          and "3 word sets pinned for playback" in log, log)
+    result = bpy.ops.openact.unpin()
+    check("unpin: without a node, nothing is unpinned (Unpin All is per node)", result == {'CANCELLED'}
+          and len(pinned(rules)) == 3, result)
     one = next(e for e in pins if rule_set(e) == "HighLife")
     result = bpy.ops.openact.unpin(uid=rules.uid, words_key=one.words_key)
     left = pinned(rules)
@@ -449,17 +556,18 @@ def phase_reload():
           and any(e.words_key == one.words_key and not e.frames for e in S.load(rules).entries), [e.frames for e in left])
     result = bpy.ops.openact.unpin(uid=rules.uid)
     settle()
-    again = bpy.ops.openact.unpin(uid=rules.uid)
-    check("unpin: Unpin All unpins the rest; then there is nothing to unpin", result == {'FINISHED'}
-          and again == {'CANCELLED'} and not pinned(rules) and not engine.STATUS[rules.uid].pins
-          and len(S.load(rules).entries) == 3 and '"pinned":true' not in rules.entries, (result, again))
+    again, log = bpy.ops.openact.unpin(uid=rules.uid), drawn(ui.NODE_PT_openact, rules)
+    check("unpin: Unpin All unpins the rest; then there is nothing to unpin, and the sidebar claims no pin",
+          result == {'FINISHED'} and again == {'CANCELLED'} and not pinned(rules) and not engine.STATUS[rules.uid].pins
+          and len(S.load(rules).entries) == 3 and '"pinned":true' not in rules.entries
+          and not any("pinned for playback" in str(line) for line in log), (result, again, log))
 
 
 # ------------------------------------------------------------------------------ the channelbag
 
 def phase_channelbag():
     scene = reset(1, 11)
-    tree, _ask, _gi = question_tree("Levels", 6)
+    tree, ask, _gi = question_tree("Levels", 6)
     obj = user("Levels", tree, Level=0)
     curve = keyframes(obj, "Level", [(1, 0), (11, 5)])
     found, why = engine._animation(obj, path_of(obj, "Level"))
@@ -479,6 +587,53 @@ def phase_channelbag():
     check("channelbag: the F-curve path reads the words through evaluate(), with no fallback, and at every frame they "
           "are the words the scene has there", fcurves and words == truth
           and all(words[f] == f"Question {int(curve.evaluate(f))}?" for f in truth), (run.fallback, words, truth))
+    op, context, calls = modal_operator(scene)
+    result = op.invoke(context, None)
+    done = settle()
+    check("modal: on the F-curve path invoke finishes at once, with no timer, progress or status text",
+          result == {'FINISHED'} and not calls and done and len(pinned(ask)) == 6, (result, calls, op.reports))
+
+
+def scene_words(scene, obj, frames):
+    """{words: frames} as Blender sets the Level input at each frame, from 'Question <Level>?'."""
+    found = {}
+    for frame in frames:
+        scene.frame_set(frame)
+        level = obj.modifiers["OpenAct"][ident(obj.modifiers["OpenAct"].node_group, "Level")]
+        found.setdefault(f"Question {level}?", []).append(frame)
+    scene.frame_set(frames[0])
+    return found
+
+
+def phase_ranges():
+    """A keyed value beyond the property's hard range, and Time Stretching, which plays animation at other times."""
+    scene = reset(1, 10)
+    tree, _ask, _gi = question_tree("Ranges", 11)
+    obj = user("Ranges", tree, Level=0)
+    obj.modifiers["OpenAct"].id_properties_ui(ident(tree, "Level")).update(min=0, max=3)
+    keyframes(obj, "Level", [(1, 0), (10, 9)])
+    run = engine.Playback(scene)
+    fcurves = run.read_curves()
+    words = {gn[0]: frames for seen in run.seen.values() for gn, frames in seen.items()}
+    truth = scene_words(scene, obj, list(range(1, 11)))
+    check("ranges: a keyed value beyond the input's hard range (0-3) is read clamped, as the scene sets it",
+          fcurves and words == truth and max(truth) == "Question 3?", (words, truth))
+    obj.modifiers["OpenAct"].id_properties_ui(ident(tree, "Level")).update(min=-2 ** 31, max=2 ** 31 - 1)
+    keyframes(obj, "Level", [(1, 1), (10, 10)])
+    render = scene.render
+    render.frame_map_old, render.frame_map_new = 100, 50
+    try:
+        truth = scene_words(scene, obj, list(range(1, 11)))
+        run = engine.Playback(scene)
+        fell = not run.read_curves()
+        for _frame in run.step_frames():
+            pass
+        words = {gn[0]: frames for seen in run.seen.values() for gn, frames in seen.items()}
+    finally:
+        render.frame_map_old = render.frame_map_new = 100
+    check("ranges: under Time Stretching (100 -> 50) the words come from setting each frame, as the scene has them "
+          "there", fell and run.fallback == "Time Stretching is on" and words == truth and "Question 2?" in truth,
+          (run.fallback, words, truth))
 
 
 # ------------------------------------------------------------------------------ the fallback
@@ -486,6 +641,7 @@ def phase_channelbag():
 def phase_driver():
     scene = reset(1, 29)
     tree, ask, _gi = question_tree("Driven", 3)
+    tree.nodes.new("GeometryNodeBake")  # the modifier has a bake: new pins change the rules it may have baked
     obj = user("Driven", tree, Level=0)
     driver = obj.driver_add(path_of(obj, "Level")).driver
     driver.type, driver.expression = 'SCRIPTED', "frame // 10"
@@ -499,7 +655,7 @@ def phase_driver():
     try:
         steps = run.step_frames()
         stepped = [next(steps) for _ in range(5)]
-        inside, holding = scene.frame_current, engine._stepping
+        inside, holding, other = scene.frame_current, engine._stepping, bpy.ops.openact.prepare_playback.poll()
         engine.schedule(immediate=True)
         engine.tick()
         steps.close()  # Esc
@@ -507,11 +663,12 @@ def phase_driver():
         engine.run_pass = run_pass
     back = scene.frame_current
     settle()
-    check("driver: a driven input takes the fallback, which sets frames 1-5 in turn with no pass meanwhile; "
-          "cancelled, it sets frame 7 again, pins nothing and asks nothing", fell and "driven" in run.fallback
-          and stepped == [1, 2, 3, 4, 5] and inside == 5 and holding and not passes and back == 7
-          and not engine._stepping and engine.PLAYBACK is None and not pinned(ask) and len(records()) == start,
-          (run.fallback, stepped, inside, passes, back))
+    check("driver: a driven input takes the fallback, which sets frames 1-5 in turn with no pass meanwhile, nor can "
+          "another run start; cancelled, it sets frame 7 again, pins nothing and asks nothing", fell
+          and "driven" in run.fallback and stepped == [1, 2, 3, 4, 5] and inside == 5 and holding and not passes
+          and not other and back == 7 and not engine._stepping and engine.PLAYBACK is None and not pinned(ask)
+          and len(records()) == start and bpy.ops.openact.prepare_playback.poll()
+          and 'REGISTER' not in ops.OPENACT_OT_prepare_playback.bl_options, (run.fallback, stepped, inside, passes, back))
     result, error = prepare()
     back = scene.frame_current
     done = settle()
@@ -519,6 +676,76 @@ def phase_driver():
     check("driver: run from the operator, the fallback steps every frame, sets frame 7 again and pins the driven "
           "words", result == {'FINISHED'} and not error and back == 7 and done and pins == [
               ("Question 0?", [[1, 9]]), ("Question 1?", [[10, 19]]), ("Question 2?", [[20, 29]])], (error, back, pins))
+    flag = "Re-bake 'Driven > OpenAct' if baked: rules changed for frames 1–29"
+    status = engine.STATUS[ask.uid]
+    check("re-bake: the pins change the rules of a modifier with a bake: its status and the sidebar say which to "
+          "re-bake, and for which frames", engine.REBAKES.get(ask.uid) == flag and engine.PLAYBACK_NOTE == flag
+          and status.state == "warning" and flag in status.text and said(drawn(ui.NODE_PT_openact, ask), flag),
+          (engine.REBAKES, engine.PLAYBACK_NOTE, status.text))
+    start = len(records())
+    result = bpy.ops.openact.reask(uid=ask.uid)
+    asking = [(e.gn[0], e.frames, e.rows.src) for e in pinned(ask)]
+    done = settle()
+    pins = [(e.gn[0], e.frames, e.rows.src) for e in pinned(ask)]
+    check("Ask Again keeps the pins: the live words' pin waits for its new answer, and gets it", result == {'FINISHED'}
+          and done and asking == [("Question 0?", [[1, 9]], "p"), ("Question 1?", [[10, 19]], "m"),
+                                  ("Question 2?", [[20, 29]], "m")]
+          and pins == [(words, frames, "m") for words, frames, _src in asking] and len(records()) == start + 1,
+          (asking, pins, len(records()) - start))
+    result, error = prepare()
+    settle()
+    check("re-bake: a run that changes no pin clears the flag", result == {'FINISHED'} and not engine.REBAKES
+          and "Re-bake" not in engine.STATUS[ask.uid].text and len(pinned(ask)) == 3, (error, engine.REBAKES))
+    return scene
+
+
+def phase_modal(scene):
+    """The modal operator's own functions on stand-ins, over the driven scene of phase_driver (29 frames, at frame 7)."""
+    op, context, calls = modal_operator(scene)
+    started = op.invoke(context, None)
+    steps = [op.modal(context, TIMER) for _ in range(2)]
+    frame, stopped = scene.frame_current, op.modal(context, ESC)
+    check("modal: invoke starts the fallback with progress, a status text and a timer; Esc after two frames sets "
+          "frame 7 again, leaves no timer, progress or status text, and says nothing was pinned",
+          started == {'RUNNING_MODAL'} and ("progress_begin", 0, 29) in calls and ("modal_handler_add", op) in calls
+          and steps == [{'RUNNING_MODAL'}] * 2 and frame == 2 and stopped == {'CANCELLED'}
+          and scene.frame_current == 7 and not engine._stepping and cleaned(calls)
+          and op.reports == [('INFO', "Prepare for Playback cancelled: nothing was pinned")], (calls, op.reports))
+    op, context, calls = modal_operator(scene)
+    op.invoke(context, None)
+    results = [op.modal(context, TIMER) for _ in range(30)]
+    check("modal: run to the end, a timer event per frame, then finish(): it reports, sets frame 7 again and leaves "
+          "nothing behind", results == [{'RUNNING_MODAL'}] * 29 + [{'FINISHED'}] and scene.frame_current == 7
+          and cleaned(calls) and ("progress_update", 29) in calls and op.reports[-1][0] == 'INFO'
+          and op.reports[-1][1].startswith("3 word sets over frames 1–29"), (results[-2:], op.reports))
+    op, context, calls = modal_operator(scene)
+    op.invoke(context, None)
+    read, count = engine._read, [0]
+
+    def failing(*args):
+        count[0] += 1
+        if count[0] == 3:
+            raise RuntimeError("simulated internal error")
+        return read(*args)
+
+    engine._read = failing
+    try:
+        results = [op.modal(context, TIMER) for _ in range(3)]
+    except RuntimeError as error:  # escaped modal()
+        results = [f"escaped: {error}"]
+    finally:
+        engine._read = read
+    check("modal: an internal error at the third frame stops it: CANCELLED with the error, frame 7 again, no timer, "
+          "progress or status text left behind", results == [{'RUNNING_MODAL'}] * 2 + [{'CANCELLED'}]
+          and scene.frame_current == 7 and not engine._stepping and cleaned(calls)
+          and op.reports == [('ERROR', "Prepare for Playback stopped: simulated internal error")], (results, calls))
+    op, context, calls = modal_operator(scene)
+    op.invoke(context, None)
+    op.modal(context, TIMER)
+    op.cancel(context)
+    check("modal: cancel(), when Blender ends the loop itself, sets frame 7 again and leaves nothing behind",
+          scene.frame_current == 7 and not engine._stepping and cleaned(calls), calls)
+    settle()
 
 
 def phase_nla():
@@ -571,10 +798,115 @@ def phase_limit():
     result, error = prepare()
     settle()
     message = engine.PIN_LIMIT.format(ask.name, 13, 1, 13, engine.PIN_MAX)
-    check("limit: 13 distinct word sets are refused with the limit message, and nothing is asked or pinned",
-          refused == message == "'Ask': 13 distinct word sets over frames 1–13; the limit is 12" and message in error
-          and result == {'CANCELLED'} and len(records()) == start and not pipeline.PENDING
-          and engine.PLAYBACK is None and ask.entries == entries, (refused, error, len(records()) - start))
+    check("limit: 13 distinct word sets are refused with the limit message, which the sidebar keeps, and nothing is "
+          "asked or pinned", refused == message == "'Ask': 13 distinct word sets over frames 1–13; the limit is 12"
+          and message in error and result == {'CANCELLED'} and len(records()) == start and not pipeline.PENDING
+          and engine.PLAYBACK is None and ask.entries == entries and engine.PLAYBACK_NOTE == message
+          and said(drawn(ui.NODE_PT_openact, ask), message), (refused, error, len(records()) - start))
+
+
+# ------------------------------------------------------------------------------ undo, Cancel, Unpin and retry
+
+def phase_undo():
+    """Undo for real: a first ed.undo_push() gives a headless Blender its undo stack, and the operators run with undo,
+    as their buttons run them. Question <n> occurs at frames 10n+1 to 10n+10; each run widens the range."""
+    reset(1, 20)
+    tree, ask, _gi = question_tree("Undo", 7)
+    ask.inputs["Context"].default_value = "A room where things are undone."  # questions MEMORY holds no answer to
+    obj = user("Undo", tree, Level=0)
+    constant(keyframes(obj, "Level", [(10 * n + 1, n) for n in range(7)]))
+    settle()
+    name = ask.name
+
+    def node():  # an undo rebuilds every data-block: every reference is looked up again after one
+        return bpy.data.node_groups["Undo"].nodes[name]
+
+    def words():
+        return [(e.gn[0], e.frames) for e in pinned(node())]
+
+    bpy.ops.ed.undo_push(message="OpenAct test")
+    pushes, push = [], engine._undo_push
+    engine._undo_push = lambda message: pushes.append(message) or push(message)
+    try:
+        result, _error = prepare(undo=True)
+        waiting = engine.pinning() == 2 and not pinned(node())
+        settle()
+    finally:
+        engine._undo_push = push
+    first = words()
+    unpinned = bpy.ops.openact.unpin('EXEC_DEFAULT', True, uid=node().uid, words_key=pinned(node())[1].words_key)
+    settle()
+    steps = [undo()]  # the Unpin
+    kept = words()
+    steps.append(undo())  # the pins' own step
+    gone, listed, log = words(), engine.STATUS[node().uid].pins, drawn(ui.NODE_PT_openact, node())
+    steps.append(undo(redo=True))
+    check("undo: pins that a pass writes after their operator's step have a step of their own: undoing a later Unpin "
+          "keeps them, undoing that step removes them and the sidebar claims none, and a redo brings them back",
+          result == {'FINISHED'} and waiting and pushes == ["Pin for Playback"] and steps == [True] * 3
+          and first == [("Question 0?", [[1, 10]]), ("Question 1?", [[11, 20]])] and unpinned == {'FINISHED'}
+          and kept == first and not gone and not listed and not said(log, "pinned for playback") and words() == first,
+          (result, waiting, pushes, steps, first, unpinned, kept, gone, listed, words(), log))
+
+    bpy.context.scene.frame_end = 40  # Questions 2 and 3 are new: the run waits for them
+    result, _error = prepare(undo=True)
+    live = engine.pinning()
+    try:
+        steps = [bpy.ops.ed.undo() == {'FINISHED'}]  # its step, while it waits: no pass may pin before
+    except RuntimeError:
+        steps = [False]
+    dormant, log = engine.pinning(), drawn(ui.NODE_PT_openact, node())
+    settle()  # the answers come in, and the dormant run pins nothing
+    asleep = words()
+    steps.append(undo(redo=True))
+    check("undo: undoing Prepare for Playback while its run waits leaves the run dormant: the sidebar shows no run "
+          "waiting and nothing is pinned when the answers come in; a redo wakes it, and it pins",
+          result == {'FINISHED'} and live == 4 and steps == [True] * 2 and dormant == 0 and not said(log, "Pinning")
+          and asleep == first and [w for w, _frames in words()] == [f"Question {n}?" for n in range(4)],
+          (live, steps, dormant, asleep, words()))
+
+    bpy.context.scene.frame_end = 50  # Question 4 is new
+    prepare()
+    waiting = engine.pinning()
+    result = bpy.ops.openact.cancel_playback()
+    settle()
+    check("cancel: Cancel stops the waiting run: its answers come in, and nothing more is pinned", waiting == 5
+          and result == {'FINISHED'} and len(words()) == 4 and not engine.pinning()
+          and engine.PLAYBACK_NOTE == "Prepare for Playback cancelled: nothing more was pinned", (waiting, words()))
+
+    bpy.context.scene.frame_end = 60  # Question 5 is new
+    prepare()
+    waiting = engine.pinning()
+    result = bpy.ops.openact.unpin(uid=node().uid, words_key=pinned(node())[3].words_key)
+    settle()
+    check("cancel: Unpin cancels the waiting run, which would pin over it: the other pins stay as they were",
+          waiting == 6 and result == {'FINISHED'} and [w for w, _frames in words()] == [
+              f"Question {n}?" for n in range(3)] and engine.PLAYBACK_NOTE.startswith(
+              "Prepare for Playback cancelled by Unpin"), (waiting, words(), engine.PLAYBACK_NOTE))
+
+    bpy.context.scene.frame_end = 70  # Question 6 is new, and the model refuses it once
+    http = server.http
+
+    def refusing(method, path, body=None, port=None, timeout=10.0):
+        if path == "/v1/systemone" and "Question 6?" in json.dumps(body):
+            return 500, {"error": "simulated model failure"}
+        return http(method, path, body, port, timeout)
+
+    server.http = refusing
+    try:
+        prepare()
+        settle()
+    finally:
+        server.http = http
+    stopped, note = words(), engine.PLAYBACK_NOTE
+    result, error = prepare()
+    settle()
+    check("retry: a question the model refused stops the run, naming the node and frame, with nothing pinned; the "
+          "next run asks it again and pins", note == ("Prepare for Playback stopped: 'Ask' at frame 61: The model "
+                                                      "refused: simulated model failure. Nothing was pinned: run it "
+                                                      "again to retry") and len(stopped) == 3
+          and result == {'FINISHED'} and [w for w, _frames in words()] == [f"Question {n}?" for n in range(7)],
+          (note, stopped, error, words()))
 
 
 def phase_pin_order():
@@ -666,17 +998,17 @@ def phase_size():
         run = engine.Playback(scene)
         run.read_curves()
         text = run.finish()
-        first = not pinned(rules) and engine.PLAYBACK is not None
+        first = not pinned(rules) and engine.pinning() == 7
         answer(asked.values())
-        done = drive(engine, lambda: engine.PLAYBACK is None and not engine._dirty, 120)
+        done = drive(engine, lambda: not engine.pinning() and not engine._dirty, 120)
     finally:
         engine._submit = submit
     size, pins = len(rules.entries.encode("utf-8")), pinned(rules)
-    projected = float(re.search(r"adds about ([\d.]+) MB", text).group(1)) if "adds about" in text else 0.0
+    projected = float(re.search(r"take about ([\d.]+) MB", text).group(1)) if "take about" in text else 0.0
     notes = [p.message for p in engine.STATUS[rules.uid].problems if p.severity == "info"]
-    check("size: Prepare for Playback reports the projected size first, before anything is pinned (about the size "
-          "the pins then take)", live and first and text.startswith(
-              "7 word sets over frames 1–7: pinning 7 entries adds about") and projected > 2.0
+    check("size: Prepare for Playback reports the size of the pins first, before anything is pinned (about the size "
+          "they then take)", live and first and text.startswith(
+              "7 word sets over frames 1–7: the pinned entries take about") and projected > 2.0
           and abs(projected * S.MB - size) < 0.25 * size, (text, size))
     check("size: pins above 2 MB are all kept, with the size note in the status",
           done and len(pins) == 7 and size > S.SOFT_CAP and notes == [
@@ -693,9 +1025,12 @@ def main():
         phase_timing(rules, obj)
         phase_reload()
         phase_channelbag()
-        phase_driver()
+        phase_ranges()
+        phase_static()
+        phase_modal(phase_driver())
         phase_nla()
         phase_limit()
+        phase_undo()
         phase_pin_order()
         phase_size()
     except Exception:

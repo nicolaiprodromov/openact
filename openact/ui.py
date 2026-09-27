@@ -116,13 +116,12 @@ def table_page(rows, page=0):
 def pin_rows(pins) -> list[tuple[str, str]]:
     """(words key, text) of each pinned entry (NodeStatus.pins, in pin order): the frames its words occur at, and the
     words that tell it from the node's other pins, a CSV path by its file name."""
-    varying = [j for j in range(len(pins[0][2]) if pins else 0) if len({gn[j] for _key, _frames, gn in pins}) > 1]
+    varying = [j for j in range(len(pins[0].gn) if pins else 0) if len({entry.gn[j] for entry in pins}) > 1]
     rows = []
-    for key, frames, gn in pins:
+    for entry in pins:
         words = [os.path.basename(word) if lists.is_csv_path(word) else word
-                 for j, word in enumerate(gn) if word and (j in varying or not varying)]
-        spans = ", ".join(str(start) if start == end else f"{start}–{end}" for start, end in frames)
-        rows.append((key, f"Frames {spans}: {' · '.join(words)}"))
+                 for j, word in enumerate(entry.gn) if word and (j in varying or not varying)]
+        rows.append((entry.words_key, f"Frames {engine.frames_text(entry.frames)}: {' · '.join(words)}"))
     return rows
 
 
@@ -323,7 +322,6 @@ def draw_pins(layout, node):
     if not rows:
         return
     box = layout.box()
-    box.enabled = node.id_data.library is None  # a linked node's answers come from its library file
     head = box.row(align=True)
     head.label(text=f"Pinned for playback: {len(rows)}", icon='PINNED')
     head.operator("openact.unpin", text="Unpin All", icon='UNPINNED').uid = node.uid
@@ -402,12 +400,16 @@ class NODE_PT_openact(bpy.types.Panel):
         if engine.STATUS:  # the file has OpenAct nodes
             col = layout.column(align=True)
             col.operator("openact.prepare_playback", icon='PLAY')
-            if engine.PLAYBACK is not None:
-                count = sum(len(sets) for sets in engine.PLAYBACK.values())
-                wrap(col, f"Pinning {count} word set{'s' if count != 1 else ''} once the model has answered them",
+            waiting = engine.pinning()
+            if waiting:
+                wrap(col, f"Pinning {waiting} word set{'s' if waiting != 1 else ''} once the model has answered them",
                      icon='SORTTIME')
-            elif engine.PLAYBACK_NOTE:
+                col.operator("openact.cancel_playback", icon='CANCEL')
+            if engine.PLAYBACK_NOTE:
                 wrap(col, engine.PLAYBACK_NOTE, icon='INFO')
+            pinned = sum(len(status.pins) for status in engine.STATUS.values())  # as the entries hold them
+            if pinned:
+                col.label(text=f"{pinned} word set{'s' if pinned != 1 else ''} pinned for playback", icon='PINNED')
         if _active(context) is None:
             col = layout.column(align=True)
             col.label(text="Add nodes with Shift A > OpenAct", icon='INFO')
