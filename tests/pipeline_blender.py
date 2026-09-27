@@ -10,7 +10,8 @@ starts itself (OPENACT_BACKEND=fake), whose --record log holds every request it 
 - priorities: a P0 job overtakes a P2 fill after the chunk in flight; the jobs of one class take turns; the pass's
   classes;
 - cancellation: queued chunks go and the one in flight completes; a node's new words drop its old queued chunks; so
-  do deleting the node and opening another file;
+  do deleting the node, opening another file and one of its contexts going away (an object deleted), whose words are
+  then never asked while the other's cells are each asked once;
 - 422 isolation: the question the server names fails alone, else the chunk is halved until it travels alone;
 - the render pause (no new chunk) and the playback pause (the worker finishes, no pass writes a table), driven by the
   render_running and playing events tick() publishes; the worker never touches bpy;
@@ -792,6 +793,42 @@ def phase_gone():
               and not any(pipeline.cached(cell.key) for cell in asked[32:]), (len(left), len(sent)))
 
 
+def phase_lost():
+    """A context that goes away while its node stays (§5.5): one of the two objects whose modifiers give a node its
+    Question is deleted while the worker holds the node's first chunk. The chunks queued for its words go and none is
+    sent; the chunk in flight completes, and the other object's cells are queued again, each asked once."""
+    tree = bpy.data.node_groups.new("Lost", 'GeometryNodeTree')
+    tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    question = tree.interface.new_socket("Question", in_out='INPUT', socket_type='NodeSocketString').identifier
+    tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    group_in, node = tree.nodes.new("NodeGroupInput"), tree.nodes.new(MATCH.idname)
+    node.inputs["Items"].default_value = ", ".join(f"sound {i}" for i in range(100))
+    tree.links.new(group_in.outputs["Question"], node.inputs["Question"])
+    tree.links.new(store(tree, group_in.outputs["Geometry"], node.outputs["Probability"], "p0", 'FLOAT'),
+                   tree.nodes.new("NodeGroupOutput").inputs["Geometry"])
+    loud, quiet = user("Lost A", tree), user("Lost B", tree)  # A's context comes first: its first chunk is in flight
+    loud.modifiers["OpenAct"][question], quiet.modifiers["OpenAct"][question] = "Is it loud?", "Is it quiet?"
+    start = len(records())
+    TAP.delay = 2.0
+    TAP.started.clear()
+    try:
+        engine.run_pass()  # 4 chunks for each object's words
+        TAP.started.wait(10)
+        bpy.data.objects.remove(quiet)
+        engine.run_pass()
+        left = queued(node.uid)
+    finally:
+        TAP.delay = 0.0
+    settle()
+    sent = Counter(text for text, _debias in questions(start))
+    about = [sum(count for text, count in sent.items() if text.endswith(f"\n{words}"))
+             for words in ("Is it loud?", "Is it quiet?")]
+    check("a context gone mid-fill (one of the node's two objects deleted): the next pass drops the chunks queued for "
+          "its words, and none is sent; the chunk in flight completes, and each of the other's 100 cells is asked once",
+          not left and about == [100, 0] and max(sent.values(), default=0) == 1 and whole(node, 100),
+          (len(left), about, max(sent.values(), default=0)))
+
+
 # ------------------------------------------------------------------------------ the plan cache
 
 def plain_tree(name, idname, **words):
@@ -900,6 +937,7 @@ def main():
         phase_cold_load()
         phase_reregister()
         phase_gone()
+        phase_lost()
         phase_token_audit()
         phase_timing()
     except Exception:

@@ -263,9 +263,15 @@ def run_pass(everything=True):
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
     contexts = {node.uid: {ctx.key() for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]}
                 for tree, node in nodes}
+    # Nothing shows the words of a context that has gone (its object deleted, its modifier removed or re-pointed, a
+    # group node on its path muted): its node's queued chunks go, and the next pass queues the other contexts' again
+    lost = {uid for uid, key in PLANS if uid in contexts and key not in contexts[uid]}
     for cache in (PLANS, LAST_SHOWN):  # contexts that disappeared, and nodes that did
         for key in [key for key in cache if key[1] not in contexts.get(key[0], ())]:
             del cache[key]
+    for uid in lost:
+        _bump(uid)
+        schedule(immediate=True)
     for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
         del LIVE[uid]
         pipeline.cancel(uid, below=math.inf)

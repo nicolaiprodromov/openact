@@ -910,8 +910,14 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
   apply.
 
 **Cancellation.**
-- When a node's words change, its generation is bumped and `pipeline.cancel(uid, below=generation)`
-  removes the queued chunks.
+- A node's generation is bumped, and `pipeline.cancel(uid, below=generation)` removes its queued
+  chunks, when:
+  - a context's words change: a new fingerprint, or a text edit of a CSV it reads (§7.8);
+  - a context goes away while the node stays: its object is deleted, its modifier is removed,
+    renamed or pointed at another group, or a group node on its path is muted. The next pass
+    queues the missing cells of the contexts left again, at the new generation.
+- A deleted node's queued chunks all go (`cancel(uid, below=inf)`), and so does every queued chunk
+  when another file is opened or the add-on unregisters (`cancel_all()`).
 - The in-flight chunk always completes. Its answers land in `MEMORY`, where they remain useful:
   undo, or switching back to the previous words.
 
