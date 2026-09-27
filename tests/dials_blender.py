@@ -615,9 +615,10 @@ def phase_hold():
     check("export: both CSVs back, a checkmark", got[0][0] == 'CHECKMARK' and got[1:] == (good, links, []), got)
 
     # A context whose Settings come through an Import CSV node without a Path shows a hint that leaves its words, so
-    # its last table shows: it holds the outputs as an error does. passes() reads this scene now
+    # its last table shows: it holds the outputs as an error does, and its hint shows before I0's, which holds nothing
+    # (an empty Prompt names no entry). passes() reads this scene now
     path_a, path_b = weather("hint_a.csv"), weather("hint_b.csv")
-    tree, node, users = scene("DialsHint", [("IA", STORM, path_a), ("IB", CALM, path_b)])
+    tree, node, users = scene("DialsHint", [("I0", "", path_b), ("IA", STORM, path_a), ("IB", CALM, path_b)])
     reader = tree.nodes.new("GeometryNodeImportCSV")  # the modifier's Settings path is its Path now
     tree.links.remove(node.inputs["Settings"].links[0])
     tree.links.new(next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput").outputs["Settings"],
@@ -626,13 +627,13 @@ def phase_hold():
     answer(passes(lambda: None)[3])
     passes(lambda: None)
     wire(tree, node)
-    good, links = (read(users["IA"]), read(users["IB"])), linked(node)
+    good, links = tuple(read(obj) for obj in users.values()), linked(node)
     got = (passes(lambda: words(users["IA"], Settings="")),
            passes(lambda: weather("hint_b.csv", ("Wind speed,amount", "Gust,amount"))),
            passes(lambda: words(users["IA"], Settings=path_a)))
     check("hold: while a context's Import CSV node has no Path (a hint that leaves its words), another context's "
-          "rename waits: every output keeps its link and both objects their tables, with 0 requests, the hint as the "
-          "status and no rename warning; the Path back, the error is back",
+          "rename waits: every output keeps its link and each object its table, with 0 requests, that hint as the "
+          "status (not I0's, although I0 comes first) and no rename warning; the Path back, the error is back",
           [g[1:] for g in got] == [(good, links, [])] * 3
           and got[0][0] == ('CHECKMARK', "5 settings · lowest confidence 0.50")
           and got[1][0] == ('INFO', "Settings CSV: type a Path on 'Import CSV'")

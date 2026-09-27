@@ -82,6 +82,7 @@ class NodeStatus:
     contexts: int = 0  # distinct live word sets; above inner.MATERIALISED_MAX the node shows the over-cap error (§8.1)
     problems: list = field(default_factory=list)  # csvfmt.Problem records: the errors, then the warnings
     uses: list = field(default_factory=list)  # (context label, Job, entry shown or None) of each planned context
+    asking: frozenset = frozenset()  # keys of the cells the pass asks: sent, or sent once the starting model is ready
 
     @property
     def icon(self) -> str:
@@ -292,8 +293,9 @@ def _process(tree, node, contexts):
     contexts = contexts or [Ctx(None, None, (), tree)]
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
     hidden = set()  # (gn, words key) of stored entries whose words mean something else now: kept for their rows
-    problems, warnings, hints, failed = [], [], [], []
-    uses, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells asked
+    problems, warnings, failed = [], [], []
+    uses, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells missing
+    sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
     upstream = waiting = changed = False
     planned = _scan(spec, node, contexts)
     # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
@@ -303,6 +305,7 @@ def _process(tree, node, contexts):
     # wait (None) until that context plans again or goes away; jobs that fit them are answered
     gns = {entry.gn for entry in entries}
     hinted = {ctx.key(): gn for ctx, job in planned if isinstance(job, Hint) and (gn := _gn(spec, node, ctx)) in gns}
+    hints = [str(job) for ctx, job in planned if ctx.key() in hinted]  # first: they are the hints that hold the node
     unknown = bool(hinted) or any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
     conflict = spec.agree(node, [(ctx, job) for ctx, job in planned if not isinstance(job, Exception)], unknown,
                           entries) if hasattr(spec, "agree") else ""
@@ -318,9 +321,10 @@ def _process(tree, node, contexts):
                 live.append(last.gn)
             continue
         if isinstance(job, Hint):
-            hints.append(str(job))
             gn = hinted.get(ctx.key())
-            if gn is not None and gn not in live:  # the stored entry its words name still shows: kept, as for an error
+            if gn is None:
+                hints.append(str(job))
+            elif gn not in live:  # the stored entry its words name still shows: kept, as for an error
                 live.append(gn)
             continue
         if isinstance(job, Unresolvable):  # e.g. a CSV with errors: its words stay live, so the last good table shows
@@ -370,7 +374,8 @@ def _process(tree, node, contexts):
         if missing:
             waiting = True
             asked.update(cell.key for cell in missing)
-            _submit(job, missing)
+            if _submit(job, missing):
+                sent.update(cell.key for cell in missing)
     if len(live) > inner.MATERIALISED_MAX:  # the first contexts stay materialised, the others show neutral values
         problems.append(OVER_CAP.format(len(live), inner.MATERIALISED_MAX))
     rows = changed  # entries were added or replaced: the table object's rows change too
@@ -406,7 +411,7 @@ def _process(tree, node, contexts):
     STATUS[node.uid] = NodeStatus(
         state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings],
-        **_counts(jobs, resolved, asked))
+        asking=frozenset(sent), **_counts(jobs, resolved, asked))
     return changed
 
 
@@ -438,12 +443,16 @@ def _scan(spec, node, contexts):
 
 
 def _submit(job, missing):
-    """Ask for the missing cells once the model is ready, starting it if the preferences allow."""
+    """Ask for the missing cells once the model is ready, starting it if the preferences allow. True when they are
+    asked: sent now, or sent by the pass that runs once the model is ready, as a start is under way, queued or begun
+    here."""
     state, _message = server.status()
     if state == "ready":
         pipeline.submit(job, missing, job.priority, on_rows=lambda _job: schedule(immediate=True))
-    elif state in ("stopped", "unknown") and P.get_prefs().auto_start:
-        server.start()  # asked by the pass that runs when the server is ready
+        return True
+    if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
+        return server.start()  # asked by the pass that runs when the server is ready; an install starts it as it ends
+    return state == "starting" or server.STATE.start_queued
 
 
 def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):

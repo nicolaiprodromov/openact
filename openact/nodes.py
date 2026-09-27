@@ -83,12 +83,9 @@ class _OpenActNode:
     def draw_answers(self, layout, uses, selected):
         """One summary per context; with several, each one a button that shows its table."""
         spec = engine.SPECS[self.bl_idname]
-        # "Asking..." only while cells of this node are asked; else nothing asks for that context: it waits (§6.0),
-        # disagrees or failed, which the status line names
-        status = engine.STATUS.get(self.uid)
-        asking = status is not None and status.state in ("filling", "starting") and status.pending > 0
+        sent = getattr(engine.STATUS.get(self.uid), "asking", frozenset())  # the cells the last pass asks the model
         box = layout.box()
-        for i, (label, _job, answer) in enumerate(uses):
+        for i, (label, job, answer) in enumerate(uses):
             col = box.column(align=True)
             icon = 'MODIFIER' if not label.startswith("(") else 'NODETREE'
             if len(uses) > 1:
@@ -96,7 +93,8 @@ class _OpenActNode:
                 op.context_index, op.page = i, 0
             else:
                 col.label(text=label, icon=icon)
-            if answer is None:
+            if answer is None:  # "Asking..." while the pass asks one of its cells, else it waits, disagrees or failed
+                asking = bool(sent) and any(row.cell is not None and row.cell.key in sent for row in job.rows)
                 col.label(text="Asking..." if asking else "Not asked: see the status above",
                           icon='SORTTIME' if asking else 'INFO')
                 continue

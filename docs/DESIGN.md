@@ -1965,8 +1965,9 @@ The watcher (`engine.WATCH: {path_id: (stamp, CsvDoc)}`) behaves as follows:
 ### 7.9 Validation and error reporting
 
 `Problem(severity, file, line, column, message)` has three severities:
-- **error**: the node keeps its last good table and sends nothing that depends on the file. Its
-  status shows the first error with file and line.
+- **error**: that context keeps its last good table, and nothing that depends on the file is sent;
+  the node's other contexts are still answered while they fit its shape (§6.0). The node's status
+  shows the first error with file and line.
 - **warning**: the file is used. `⚠` plus the first warning appears in the status line once the
   table is complete and there are no errors.
 - **info**: shown in the sidebar only.
@@ -3823,11 +3824,18 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 - **Active node.**
   - The status record, and one summary line per context: the object and modifier label, as in the
     prototype's `answers_for`.
+  - **A context with no table to show** says "Asking..." while the pass asks one of its cells (sent,
+    or sent once the model that is starting is ready), else "Not asked: see the status above": the
+    model is stopped, not installed or in error, the context waits or disagrees (§6.0), or its cell
+    failed. A context that waits or disagrees shows its stored entry while that entry's words key is
+    its plan's; a Dials context shows its last good table, each row matched to the plan's by wkey.
   - **Table view**, 50 rows per page. Paging uses a `WindowManager` IntProperty, which is UI state,
     not file data. Each row shows its name, answer, a confidence bar and a source icon:
     - `QUESTION`: unsure;
     - `LOCKED`: lock;
     - `CHECKBOX_HLT`: decided by code;
+    - `CANCEL`: in error: a Rules cell no outcome applies to, or a cell whose ask failed (Show
+      Question says so, and Ask Again asks it again);
     - greyed out: stale or pending.
   - Pick also shows its top 5 items with probabilities, as today.
   - **Show Question** (`openact.show_question`) on the selected row rebuilds that row's request

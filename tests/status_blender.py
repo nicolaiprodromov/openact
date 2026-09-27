@@ -1,14 +1,14 @@
 """Node status, the sidebar's data and Show Question (§17.1-§17.3), in a headless Blender. The add-on starts the fake
 model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record, so every request it sends is logged:
 - a fill: waiting -> filling -> complete; n/N and an ETA only when pipeline.progress() exists, else "Asking...";
-- the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to and an outcome never
-  offered, more than 16 live word sets;
+- the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to (its other cells say
+  "Asking..." while they are asked) and an outcome never offered, more than 16 live word sets;
 - table_page(): rows, icons and paging; table_rows() of answered and pending tables, of an entry whose rows are in
   another order (by wkey, Show Question's ask key too) and of an empty material slot;
 - while a Classify context's CSV has errors or the contexts disagree, a context whose words didn't change shows its
   stored answer and one without says it is not asked, as does one whose job waits while another context waits for
-  another node, where a context whose cells are asked says "Asking..."; a failed cell is in error in the table, the
-  counts and Show Question, and not asked again;
+  another node, where a context whose cells are asked says "Asking...", also while another context's CSV is missing;
+  a failed cell is in error in the table, the counts and Show Question, and not asked again;
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
   trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
   node reads the blocked node's answer, a sidebar draw that resolves no path while nothing is blocked, an Import CSV
@@ -358,7 +358,8 @@ def phase_held():
     """A Classify node used by two objects, each with its own Labels CSV (§6.0). While one CSV has errors, or their
     payload columns disagree, nothing is asked: a context whose words didn't change shows its stored answer, and one
     without it says it is not asked, where the sidebar said "Asking...". So does a context whose job waits while
-    another waits for another node's answer; "Asking..." is for a context whose cells are asked."""
+    another waits for another node's answer; "Asking..." is for a context whose cells are asked, also while another
+    context's CSV is missing."""
     folder = os.path.join(TMP, "held")
     os.makedirs(folder)
     body = "answer,when,roughness\nmetal,steel or iron,{}\nwood,planks or bark,0.6\n"
@@ -398,6 +399,15 @@ def phase_held():
           got[0].text.startswith("Classify: 'CA > OpenAct' and 'CB > OpenAct' use Labels CSVs with different payload")
           and got[1] == [("CA > OpenAct", False), ("CB > OpenAct", True)] and not got[2] and summary in got[3]
           and "Not asked: see the status above" in got[3] and "Asking..." not in got[3], got)
+    os.remove(os.path.join(folder, "ca.csv"))
+    classify.inputs["Items"].default_value = "pan, spoon, kettle"
+    engine.run_pass()  # CB's new item fits the outputs, so it is asked; no tick, so no answer arrives meanwhile
+    got, log = status(classify), sidebar(classify)
+    check("asking: while CA's Labels CSV is missing, CB's new item is asked, and CB's line says 'Asking...' although "
+          "the status is CA's error",
+          got.state == "error" and got.text.startswith("Can't find ") and got.text.endswith("ca.csv")
+          and got.pending == 1 and [label for label, _job, _entry in got.uses] == ["CB > OpenAct"]
+          and log[log.index("CB > OpenAct") + 1] == "Asking...", (got, log))
     bpy.data.node_groups.remove(tree)
     engine.run_pass()
 
@@ -495,6 +505,12 @@ def phase_lines():
     rules.inputs["Factors"].default_value = factors
     rules.inputs["Outcomes"].default_value = outcomes
     user("Liner", tree)
+    engine.run_pass()  # asks the Rules node's model cells; no tick, so no answer arrives meanwhile
+    got, log = status(rules), sidebar(rules)
+    check("asking: while a Rules node's cells that an outcome applies to are asked, its line says 'Asking...' although "
+          "its status is the error of the cells no outcome applies to",
+          got.state == "error" and got.text.startswith("No outcome applies to ") and got.pending == 9
+          and log[log.index("Liner > OpenAct") + 1] == "Asking...", (got, log))
     engine.schedule(immediate=True)
     done, _seen = settle(lambda: state(warned) == "warning" and state(broken) == "error"
                          and bool(S.load(rules).entries), 60)
