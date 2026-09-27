@@ -407,6 +407,9 @@ class NODE_PT_openact(bpy.types.Panel):
                 col.operator("openact.cancel_playback", icon='CANCEL')
             if engine.PLAYBACK_NOTE:
                 wrap(col, engine.PLAYBACK_NOTE, icon='INFO')
+            for flag in dict.fromkeys(filter(None, (engine.rebake(uid, status.pins)
+                                                    for uid, status in engine.STATUS.items()))):
+                wrap(col, flag, icon='ERROR')
             pinned = sum(len(status.pins) for status in engine.STATUS.values())  # as the entries hold them
             if pinned:
                 col.label(text=f"{pinned} word set{'s' if pinned != 1 else ''} pinned for playback", icon='PINNED')

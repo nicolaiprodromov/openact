@@ -22,7 +22,11 @@ the add-on starts itself (OPENACT_BACKEND=fake), whose --record log counts every
 - undo, for real (a first ed.undo_push() gives a headless Blender its undo stack): pins that a pass writes after their
   operator's step have a step of their own, which only its undo removes, and the sidebar then claims no pin; undoing
   the operator's step while its run waits leaves the run dormant, and a redo wakes it; Cancel and Unpin stop a waiting
-  run; a question that failed is asked again by the next run;
+  run; a question that failed is asked again by the next run; a run keeps waiting while its scene is renamed;
+- history: pins a pass writes wait while a redo is possible (after an undo, or while redoing through a waking run), in
+  Edit Mode and while a modal operator that pushes undo steps runs (a stand-in), so no redo step is cut and no step
+  that can't hold them takes them; re-bake flags show only while their node holds the pins that raised them, and a
+  report joins them with "; "; a Dials stop says what to fix; pins that can't be saved are named in the note;
 - pin order: with 12 pins, objects added until live plus pinned exceeds 16 leave out the pins whose words start latest
   in the frame range (ties by their words), the same ones after a rebuild; a new run is then refused, asking nothing;
 - pins above 2 MB are kept, with the size note, and Prepare for Playback reported the size of the pins first.
@@ -281,12 +285,17 @@ def said(log, text):
     return text in " ".join(line for line in log if isinstance(line, str))
 
 
-def undo(redo=False):
-    """ed.undo() or ed.redo(), then the passes it schedules: False when there was no step to go to."""
+def step(redo=False):
+    """ed.undo() or ed.redo(): False when there was no step to go to (its poll() failed)."""
     try:
-        done = (bpy.ops.ed.redo if redo else bpy.ops.ed.undo)() == {'FINISHED'}
-    except RuntimeError:  # its poll(): no step that way
-        done = False
+        return (bpy.ops.ed.redo if redo else bpy.ops.ed.undo)() == {'FINISHED'}
+    except RuntimeError:
+        return False
+
+
+def undo(redo=False):
+    """step(), then the passes it schedules."""
+    done = step(redo)
     settle()
     return done
 
@@ -679,7 +688,7 @@ def phase_driver():
     flag = "Re-bake 'Driven > OpenAct' if baked: rules changed for frames 1–29"
     status = engine.STATUS[ask.uid]
     check("re-bake: the pins change the rules of a modifier with a bake: its status and the sidebar say which to "
-          "re-bake, and for which frames", engine.REBAKES.get(ask.uid) == flag and engine.PLAYBACK_NOTE == flag
+          "re-bake, and for which frames", engine.rebake(ask.uid, pinned(ask)) == flag and not engine.PLAYBACK_NOTE
           and status.state == "warning" and flag in status.text and said(drawn(ui.NODE_PT_openact, ask), flag),
           (engine.REBAKES, engine.PLAYBACK_NOTE, status.text))
     start = len(records())
@@ -909,6 +918,211 @@ def phase_undo():
           (note, stopped, error, words()))
 
 
+def phase_history():
+    """Pins a pass writes land only where their own undo step cuts no history: not while a redo is possible (after an
+    undo, or while redoing), not in Edit Mode, not while a modal operator that pushes undo steps runs. The answers are
+    given by hand, so each landing can come only when the test lets it. Question <n> occurs at frames 10n+1 to 10n+10."""
+    reset(1, 10)
+    tree, ask, _gi = question_tree("History", 6)
+    ask.inputs["Context"].default_value = "A room with a history."
+    obj = user("History", tree, Level=0)
+    constant(keyframes(obj, "Level", [(10 * n + 1, n) for n in range(6)]))
+    name, asked, pushes = ask.name, {}, []
+    submit, push = engine._submit, engine._undo_push
+
+    def passes():
+        for _ in range(3):
+            engine.run_pass()
+
+    def words():  # an undo rebuilds every data-block: the node is looked up again each time
+        return [e.gn[0] for e in pinned(bpy.data.node_groups["History"].nodes[name])]
+
+    def x():
+        return bpy.data.objects["History"].location.x
+
+    def move(to):  # an action of the user's, with its undo step
+        bpy.data.objects["History"].location.x = to
+        bpy.ops.ed.undo_push(message="Move")
+
+    questions = [f"Question {n}?" for n in range(6)]
+    engine._submit = lambda job, missing: asked.update((cell.key, cell) for cell in missing) or True
+    engine._undo_push = lambda message: pushes.append(message) or push(message)
+    try:
+        passes()
+        answer(asked.values())
+        passes()
+        bpy.ops.ed.undo_push(message="OpenAct test")
+
+        bpy.context.scene.frame_end = 20  # Question 1 is new
+        prepare(undo=True)
+        move(5.0)
+        steps = [step()]  # the move
+        answer(asked.values())
+        passes()
+        held = (words(), engine.pinning(), bpy.ops.ed.redo.poll(), x())
+        steps.append(step(redo=True))  # the move again
+        moved = x()
+        passes()
+        check("history: pins whose answers come in after an undo wait while a redo is possible, and the redo survives; "
+              "at the newest step they land, with a step of their own", steps == [True, True]
+              and held == ([], 2, True, 0.0) and moved == 5.0 and words() == questions[:2]
+              and pushes == ["Pin for Playback"], (steps, held, moved, words(), pushes))
+
+        bpy.context.scene.frame_end = 30  # Question 2 is new
+        prepare(undo=True)
+        move(3.0)
+        steps = [step(), step()]  # the move, then Prepare for Playback: the run is dormant
+        answer(asked.values())
+        passes()
+        asleep = (words(), engine.pinning())
+        steps.append(step(redo=True))  # Prepare for Playback again: the run wakes while the move can still be redone
+        passes()
+        held = (words(), engine.pinning(), bpy.ops.ed.redo.poll())
+        steps.append(step(redo=True))  # the move again
+        moved = x()
+        passes()
+        check("history: a run that wakes while redoing waits while a redo is possible, and the rest of the redo "
+              "survives; at the newest step its pins land", steps == [True] * 4 and asleep == (questions[:2], 0)
+              and held == (questions[:2], 3, True) and moved == 3.0 and words() == questions[:3],
+              (steps, asleep, held, moved, words()))
+
+        bpy.context.scene.frame_end = 40  # Question 3 is new
+        prepare(undo=True)
+        other = bpy.data.objects.new("Other", bpy.data.meshes.new("Other"))
+        other.data.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+        bpy.context.scene.collection.objects.link(other)
+        bpy.context.view_layer.objects.active = other
+        other.select_set(True)
+        entered = bpy.ops.object.mode_set('EXEC_DEFAULT', True, mode='EDIT') == {'FINISHED'}
+        answer(asked.values())
+        passes()
+        in_edit = (words(), engine.pinning(), bpy.context.mode)
+        left = bpy.ops.object.mode_set('EXEC_DEFAULT', True, mode='OBJECT') == {'FINISHED'}
+        passes()
+        landed = words()
+        steps = [step(), step()]  # the pins' step, then leaving Edit Mode
+        back = (words(), bpy.context.mode)
+        steps += [step(redo=True), step(redo=True)]
+        check("history: pins whose answers come in during Edit Mode wait for Object Mode, then land in a step that "
+              "holds them: undoing it and the exit, then redoing both, loses none", entered and left
+              and in_edit == (questions[:3], 4, 'EDIT_MESH') and landed == questions[:4] and steps == [True] * 4
+              and back == (questions[:3], 'EDIT_MESH') and words() == questions[:4] and bpy.context.mode == 'OBJECT',
+              (in_edit, landed, steps, back, words(), bpy.context.mode))
+
+        bpy.context.scene.frame_end = 50  # Question 4 is new
+        prepare()
+        answer(asked.values())
+        modal, engine._modal_undo = engine._modal_undo, lambda: True  # as if a transform or a stroke were mid-way
+        try:
+            passes()
+            during = (words(), engine.pinning())
+        finally:
+            engine._modal_undo = modal
+        passes()
+        check("history: while a modal operator that pushes undo steps runs (a stand-in: a headless Blender runs "
+              "none), the pins wait; after it they land", during == (questions[:4], 5) and words() == questions[:5],
+              (during, words()))
+    finally:
+        engine._submit, engine._undo_push = submit, push
+
+
+def phase_rename():
+    """A run keeps waiting, and lands, while its scene is renamed: any scene holding its id wakes it."""
+    reset(1, 20)
+    tree, ask, _gi = question_tree("Rename", 3)
+    ask.inputs["Context"].default_value = "A room whose scene is renamed."
+    constant(keyframes(user("Rename", tree, Level=0), "Level", [(1, 0), (11, 1)]))
+    settle()
+    scene = bpy.context.scene
+    name = scene.name
+    prepare()
+    try:
+        scene.name = "Renamed"
+        waiting = engine.pinning()
+        settle()
+        landed = [e.gn[0] for e in pinned(ask)]
+    finally:
+        scene.name = name
+    check("rename: a run keeps waiting while its scene is renamed, and lands", waiting == 2
+          and landed == ["Question 0?", "Question 1?"], (waiting, landed))
+
+
+def phase_rebake():
+    """The re-bake flags of two modifiers with bakes: shown while their nodes hold the pins that raised them, and in
+    the report of a run that lands at once, joined with "; "."""
+    reset(1, 20)
+    trees = ("Kiln", "Oven")
+    for name in trees:
+        tree, ask, _gi = question_tree(name, 3)
+        ask.inputs["Context"].default_value = f"A {name.lower()} whose bake must follow."
+        tree.nodes.new("GeometryNodeBake")
+        constant(keyframes(user(name, tree, Level=0), "Level", [(1, 0), (11, 1)]))
+    settle()
+
+    def asks():  # an undo rebuilds every data-block: the nodes are looked up again each time
+        return [next(n for n in bpy.data.node_groups[name].nodes if n.bl_idname == ASK.idname) for name in trees]
+
+    def flags():
+        return [engine.rebake(node.uid, pinned(node)) for node in asks()]
+
+    result, _error = prepare(undo=True)
+    settle()  # the pins land from a pass, in a step of their own
+    raised = [f"Re-bake '{name} > OpenAct' if baked: rules changed for frames 1–20" for name in trees]
+    shown, log = flags(), drawn(ui.NODE_PT_openact, asks()[0])
+    undo()  # the pins' own step
+    hidden = (flags(), [engine.STATUS[node.uid].text for node in asks()], drawn(ui.NODE_PT_openact, asks()[0]))
+    undo(redo=True)
+    check("re-bake: a flag shows while its node holds the pins it was raised for: undoing their step hides it from "
+          "the status and the sidebar, and a redo shows it again", result == {'FINISHED'} and shown == raised
+          and all(said(log, flag) for flag in raised) and hidden[0] == [None, None]
+          and not any("Re-bake" in text for text in hidden[1]) and not said(hidden[2], "Re-bake")
+          and flags() == raised, (shown, hidden, flags()))
+    bpy.context.scene.frame_end = 10  # each context keeps its live words: the run lands at once, removing the pins
+    run = engine.Playback(bpy.context.scene)
+    run.read_curves()
+    text = run.finish()
+    check("re-bake: the report of a run that lands at once gives every flag, joined with '; '",
+          text == "No OpenAct words change over frames 1–10: nothing to pin, and the earlier pins are removed. "
+          + "; ".join(raised), text)
+
+
+def phase_dials():
+    """A Dials node whose settings change over the frame range: its outputs can't show the other settings' pins."""
+    reset(1, 20)
+    tree, gi, go = new_tree("Weather", ("Kind", 'NodeSocketMenu'))
+    menu = menu_switch(tree, {"Rain": "Rain (yes/no): Is it raining?", "Wind": "Wind (amount): How windy is it?"})
+    tree.links.new(gi.outputs["Kind"], menu.inputs["Menu"])
+    dials = tree.nodes.new(SPECS["GeometryNodeOpenActDials"].idname)
+    dials.inputs["Prompt"].default_value = "A stormy night by the sea."
+    tree.links.new(menu.outputs[0], dials.inputs["Settings"])
+    tree.links.new(gi.outputs["Geometry"], go.inputs["Geometry"])
+    obj = user("Weather", tree)
+    keyframes(obj, "Kind", [(1, menu_value(obj, "Kind", "Rain")), (11, menu_value(obj, "Kind", "Wind"))])
+    settle()
+    result, _error = prepare()
+    check("dials: a run whose Dials settings change over the range stops, saying what to fix, not to run it again",
+          result == {'FINISHED'} and engine.PLAYBACK_NOTE == (
+              f"Prepare for Playback stopped: '{dials.name}' at frame 11: its settings there aren't the ones its "
+              f"outputs show. Keep the setting names and types the same over the frame range. Nothing was pinned")
+          and not pinned(dials) and engine.pinning() == 0, (engine.PLAYBACK_NOTE, engine.STATUS.get(dials.uid)))
+
+
+def phase_newer():
+    """Two nodes whose answers a newer OpenAct saved: their pins can't be written, and the note says so for each."""
+    reset(1, 20)
+    for name in ("Newer A", "Newer B"):
+        tree, ask, _gi = question_tree(name, 3)
+        ask.inputs["Context"].default_value = f"A room that {name} left."
+        ask.entries = '{"schema": 3, "entries": []}'
+        constant(keyframes(user(name, tree, Level=0), "Level", [(1, 0), (11, 1)]))
+    settle()
+    prepare()
+    settle()
+    newer = "These answers were saved by a newer OpenAct (schema 3): update OpenAct to change them"
+    check("notes: pins that can't be saved (a newer OpenAct's answers) are named in the note, joined with '; '",
+          engine.PLAYBACK_NOTE == f"'Ask': {newer}; 'Ask': {newer}", engine.PLAYBACK_NOTE)
+
+
 def phase_pin_order():
     """Two animated objects, 6 levels each: 12 pins whose first frames pair up, so ties are broken by the words."""
     reset(1, 6)
@@ -964,6 +1178,9 @@ SETS = ("grows; stays; shrinks", "rises; holds; falls", "blooms; rests; wilts", 
 def answer(cells):
     """Made-up answers, as pipeline.parse() gives them, with confidences of a real length."""
     for cell in cells:
+        if cell.question["type"] == "noul":
+            pipeline.remember(cell.key, {"p": 0.61803398875, "model": "fake"})
+            continue
         count = len(cell.question["criteria"])
         pipeline.remember(cell.key, {"probabilities": [0.61803398875] + [0.38196601125 / (count - 1)] * (count - 1),
                                      "model": "fake"})
@@ -1031,6 +1248,11 @@ def main():
         phase_nla()
         phase_limit()
         phase_undo()
+        phase_history()
+        phase_rename()
+        phase_rebake()
+        phase_dials()
+        phase_newer()
         phase_pin_order()
         phase_size()
     except Exception:

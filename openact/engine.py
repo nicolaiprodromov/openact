@@ -488,8 +488,8 @@ def _process(tree, node, contexts):
         inactive -= sum(entry.pinned for entry in inner.materialised(graph.entries, live, default))
     if inactive:
         warnings.append(INACTIVE.format(inactive, "ies are" if inactive > 1 else "y is", inner.MATERIALISED_MAX))
-    if node.uid in REBAKES:  # until the next Prepare for Playback run
-        warnings.append(REBAKES[node.uid])
+    if flag := rebake(node.uid, pins):  # while it holds the pins that changed the rules, until the next run
+        warnings.append(flag)
     warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
     state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
@@ -695,8 +695,8 @@ INACTIVE = ("{} pinned entr{} inactive: this tree is now used by more objects (l
 REBAKE = "Re-bake {} if baked: rules changed for frames {}"
 RUN_KEY = "_openact_playback"  # the scene's custom property naming its last run; "_" hides it in the sidebar
 PLAYBACK = None  # the Run waiting for its answers, to pin them, or None
-PLAYBACK_NOTE = ""  # why the last run stopped or was refused, and what to re-bake, for the sidebar
-REBAKES = {}  # node uid -> which of its modifiers to re-bake, as its pins changed their rules; until the next run
+PLAYBACK_NOTE = ""  # why the last run stopped or was refused, or what it couldn't save, for the sidebar
+REBAKES = {}  # node uid -> (which of its modifiers to re-bake, the words keys of the pins that changed their rules)
 _stepping = False  # the fallback holds the scene at other frames: no pass runs
 
 
@@ -705,7 +705,6 @@ class Run:
     """A Prepare for Playback run waiting for its answers."""
 
     id: str  # also its scene's RUN_KEY, written inside the operator's undo step: undoing that leaves the run dormant
-    scene: str  # that scene's name
     sets: dict  # node uid -> [(Job, frames)] of the word sets to pin
 
 
@@ -719,16 +718,14 @@ class Playback:
         uses = find_uses()
         self.uses = [(node, SPECS[node.bl_idname], uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)])
                      for tree, node in iter_nodes() if tree.library is None and node.uid]  # linked nodes stay as saved
-        self.live = {(node.uid, ctx.key()): words for node, spec, ctx in self._contexts()
+        self.contexts = [(node, spec, ctx) for node, spec, contexts in self.uses for ctx in contexts]
+        self.live = {(node.uid, ctx.key()): words for node, spec, ctx in self.contexts
                      if (words := _read(node, spec, ctx)[0]) is not None}  # the words each context has now
         self.seen = {}  # (uid, ctx key) -> {words: the frames the context has them at}
         self.origin = {}  # (uid, words) -> (the first frame, the context) they occur at, where they are planned
         self.values = {}  # frame -> the values the words read there (evaluator.OVERRIDES)
         self.problems = {}  # why some words can't be read -> the first frame
         self.fallback = ""  # why the frames must be set, found by read_curves()
-
-    def _contexts(self):
-        return [(node, spec, ctx) for node, spec, contexts in self.uses for ctx in contexts]
 
     def _record(self, frame, node, ctx, words, problem):
         if words is not None:
@@ -749,7 +746,7 @@ class Playback:
             for frame in range(self.first, self.last + 1):
                 values = evaluator.OVERRIDES = {key: _as(value, curve.evaluate(frame), limits)
                                                 for key, (curve, value, limits) in curves.items()}
-                for node, spec, ctx in self._contexts():
+                for node, spec, ctx in self.contexts:
                     at = (node.uid, ctx.key())
                     if at in last and last[at][1].isdisjoint(curves):  # it reads nothing animated: its words stay
                         self._record(frame, node, ctx, last[at][0], last[at][2])
@@ -793,7 +790,7 @@ class Playback:
             for frame in range(self.first, self.last + 1):
                 scene.frame_set(frame)
                 values = self.values[frame] = {}
-                for node, spec, ctx in self._contexts():
+                for node, spec, ctx in self.contexts:
                     words, reads, problem = _read(node, spec, ctx)
                     values.update((key, read[3]) for key, read in reads.items())
                     self._record(frame, node, ctx, words, problem)
@@ -856,15 +853,16 @@ class Playback:
         text = (f"{count} word set{'s' if count != 1 else ''} over frames {self.first}–{self.last}: the pinned "
                 f"entr{'ies take' if count != 1 else 'y takes'} about {store._mb(size)} MB in the file" if count else
                 f"No OpenAct words change over frames {self.first}–{self.last}: nothing to pin")
-        run = uuid.uuid4().hex
+        run = new_uid()
         self.scene[RUN_KEY] = run  # inside the operator's undo step: undoing that step leaves the run dormant
-        PLAYBACK, PLAYBACK_NOTE = Run(run, self.scene.name, pending), ""
-        if _pin_pending() and not count:
+        PLAYBACK, PLAYBACK_NOTE = Run(run, pending), ""
+        if _pin_pending(guard=False) and not count:  # pins it writes now are in the operator's own undo step
             text += ", and the earlier pins are removed"
         if PLAYBACK is not None:
             text += ". They are pinned once the model has answered them"
-        elif PLAYBACK_NOTE:  # what to re-bake, or why nothing was pinned
-            text += f". {PLAYBACK_NOTE}"
+        notes = [note for note in (PLAYBACK_NOTE, *(flag for flag, _keys in REBAKES.values())) if note]
+        if notes:  # why nothing was pinned, or what it couldn't save, then what to re-bake
+            text += f". {'; '.join(notes)}"
         if self.problems:
             problem, frame = next(iter(self.problems.items()))
             text += f". Words that can't be read are left out, e.g. at frame {frame}: {problem}"
@@ -872,9 +870,10 @@ class Playback:
         return text
 
 
-def _pin_pending():
+def _pin_pending(guard=True):
     """Ask for what the waiting run still misses; once every word set is answered, pin them all and unpin every other
-    entry, saved without the live set: nothing is evicted, and each node's next pass applies the limits (§13.3). The
+    entry, saved without the live set: nothing is evicted, and each node's next pass applies the limits (§13.3). With
+    guard, the pins wait until an undo step can hold them without cutting the user's history (_can_land()). The
     modifiers with bakes whose rules that changes are flagged (REBAKES). Returns the uids of the nodes whose pins
     changed."""
     global PLAYBACK, PLAYBACK_NOTE
@@ -890,11 +889,14 @@ def _pin_pending():
         ready[uid] = (node_store, [])
         for job, frames in sets:
             entry, missing, failed = spec.resolve(job, node_store.entries)
-            if entry is None and not missing and not failed:  # e.g. Dials settings its contexts don't agree on
-                failed = ["its words can't be answered"]
+            stop = f"Prepare for Playback stopped: '{node.name}' at frame {frames[0][0]}"
+            if entry is None and not missing and not failed:  # Dials: other settings than its contexts agreed on
+                PLAYBACK, PLAYBACK_NOTE = None, (f"{stop}: its settings there aren't the ones its outputs show. Keep "
+                                                 f"the setting names and types the same over the frame range. Nothing "
+                                                 f"was pinned")
+                return set()
             if failed:  # not asked again in this run: a new run asks again
-                PLAYBACK, PLAYBACK_NOTE = None, (f"Prepare for Playback stopped: '{node.name}' at frame {frames[0][0]}:"
-                                                 f" {failed[0]}. Nothing was pinned: run it again to retry")
+                PLAYBACK, PLAYBACK_NOTE = None, f"{stop}: {failed[0]}. Nothing was pinned: run it again to retry"
                 return set()
             if entry is None:
                 waiting = True
@@ -902,7 +904,7 @@ def _pin_pending():
                                             generation=GENERATIONS.get(uid, 0)), missing)
             else:
                 ready[uid][1].append((entry, frames))
-    if waiting:
+    if waiting or (guard and not _can_land()):
         return set()
     PLAYBACK = None
     changed, errors, uses = set(), [], find_uses()
@@ -937,8 +939,8 @@ def _pin_pending():
         baked = sorted({f"'{ctx.obj.name} > {ctx.mod.name}'" for ctx in uses.get(tree.as_pointer(), ())
                         if ctx.mod is not None and len(ctx.mod.bakes)})
         if frames and baked:
-            REBAKES[node.uid] = REBAKE.format(", ".join(baked), frames_text(_spans(sorted(frames))))
-    PLAYBACK_NOTE = " ".join([*errors, *(REBAKES[uid] for uid in changed if uid in REBAKES)])
+            REBAKES[node.uid] = (REBAKE.format(", ".join(baked), frames_text(_spans(sorted(frames)))), frozenset(after))
+    PLAYBACK_NOTE = "; ".join(errors)
     return changed
 
 
@@ -946,8 +948,14 @@ def _waiting():
     """The run waiting for its answers, or None: none waits, or undoing its operator step left it dormant (a redo
     wakes it)."""
     run = PLAYBACK
-    scene = bpy.data.scenes.get(run.scene) if run is not None else None
-    return run if scene is not None and scene.get(RUN_KEY) == run.id else None
+    return run if run is not None and any(scene.get(RUN_KEY) == run.id for scene in bpy.data.scenes) else None
+
+
+def rebake(uid, pins):
+    """The node's re-bake flag while it holds the pins (entries) the flag was raised for, else None: an undo can take
+    them away, and a redo bring them back."""
+    flag = REBAKES.get(uid)
+    return flag[0] if flag is not None and flag[1] == {entry.words_key for entry in pins} else None
 
 
 def pinning():
@@ -990,15 +998,39 @@ def frames_text(spans):
     return ", ".join(str(start) if start == end else f"{start}–{end}" for start, end in spans)
 
 
+def _window():
+    """The window an undo step is pushed from: the context's, else the first one (a timer has no window)."""
+    wm = getattr(bpy.context, "window_manager", None)
+    return bpy.context.window or (wm.windows[0] if wm and wm.windows else None)
+
+
 def _undo_push(message):
     """An undo step for what the pass wrote on its own, when there is a window to push it from."""
-    wm = getattr(bpy.context, "window_manager", None)
-    window = bpy.context.window or (wm.windows[0] if wm and wm.windows else None)
+    window = _window()
     if window is None:
         return
     with bpy.context.temp_override(window=window):
         if bpy.ops.ed.undo_push.poll():
             bpy.ops.ed.undo_push(message=message)
+
+
+def _modal_undo():
+    """True while a window runs a modal operator that pushes an undo step when it ends (a transform, a stroke)."""
+    wm = getattr(bpy.context, "window_manager", None)
+    return wm is not None and any('UNDO' in op.bl_options for window in wm.windows for op in window.modal_operators)
+
+
+def _can_land():
+    """True where an undo step for the pins a pass writes can hold them without cutting the user's history: there is
+    nothing to redo (a push would delete it), the context is in Object Mode (an Edit or Paint mode step doesn't hold
+    them) and no modal operator is mid-way (its own step would take them)."""
+    window = _window()
+    if window is None:  # no undo step to push, and none to cut
+        return True
+    if _modal_undo():
+        return False
+    with bpy.context.temp_override(window=window):
+        return bpy.context.mode == 'OBJECT' and not bpy.ops.ed.redo.poll()
 
 
 def _read(node, spec, ctx):
