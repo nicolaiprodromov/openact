@@ -42,6 +42,7 @@ on your GPU. Nothing leaves your computer.
 
 - `openact/`: the add-on (extension) package.
 - `tests/`: headless Blender tests.
+- `demos/`: the demo scenes' build script and CSV files.
 - `docs/DESIGN.md`: the v1 design.
 
 ## Tests
@@ -74,6 +75,33 @@ blender -b --factory-startup --python tests/e2e_blender.py -- reopen-bumped <fil
 The e2e phases drive the add-on with the real model. `tests/migrate_blender.py` builds its v0.1.0
 file with `tests/fixtures/jev_nodes-0.1.0.zip`, the release of the Jev Nodes prototype that OpenAct
 grew from (same author, GPL-3.0-or-later), so it needs nothing outside the repository.
+
+## Demos
+
+`demos/build_demos.py` builds the six demo scenes headlessly, one `.blend` each, beside copies of
+their CSV files, which the scenes read through `//` paths:
+
+```
+blender -b --factory-startup --python demos/build_demos.py -- <out folder> --model [PORT GPU]
+blender -b --factory-startup --python demos/build_demos.py -- <out folder> --noaddon
+```
+
+| Demo | What it shows |
+|---|---|
+| `life.blend` | The hero, Life from a CSV. A Rules node in a Simulation Zone updates a 64 × 64 grid that wraps around at its edges. The modifier's *Rule set* dropdown picks the Outcomes CSV: Conway, HighLife, Seeds or Day & Night. The dropdown is keyframed over frames 1–120 and pinned by Prepare for Playback. `life_overrides.csv` locks one cell: a live cell with five neighbours dies |
+| `biome.blend` | Rules One-of picks one of 7 plants from habitat descriptions of temperature, moisture and altitude, with Dither 0.3, and instances it. A second Rules node, in Amount mode, lays snow |
+| `kitchen.blend` | Match and Classify on a collection of 40 props: "Would you find it in a kitchen?" keeps the kitchen's props, "How heavy is it?" scales them, and their rooms place them |
+| `materials.blend` | Classify gives each material slot a family. An Import CSV node plugged into *Labels CSV* supplies each family's roughness and metallic, and Match asks "Is this material metal?" |
+| `weather.blend` | Dials: the modifier's prompt sets rain, wind, time of day, street lights and fog |
+| `ask_pick.blend` | The prototype's scene rebuilt with OpenAct nodes: Ask "Is it night?" and Pick from a furniture collection, on two objects with their own prompts |
+
+With `--model` the add-on starts the model on PORT and GPU (by default, the preferences' port and
+GPU). Every table fills, and each demo's acceptance checks run (design §18.4). The files are saved
+with their answers, so they open, play and render without the model and without the add-on.
+Without `--model` the scenes are only laid out, and nothing is asked. The build also writes
+`evaluated.json` next to the files, which records what every demo object evaluates to. `--noaddon`
+opens each demo in a Blender without OpenAct and checks that it evaluates to exactly the same
+attributes.
 
 ## Credits
 
