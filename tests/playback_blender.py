@@ -25,8 +25,10 @@ the add-on starts itself (OPENACT_BACKEND=fake), whose --record log counts every
   run; a question that failed is asked again by the next run; a run keeps waiting while its scene is renamed;
 - history: pins a pass writes wait while a redo is possible (after an undo, or while redoing through a waking run), in
   Edit Mode and while a modal operator that pushes undo steps runs (a stand-in), so no redo step is cut and no step
-  that can't hold them takes them; re-bake flags show only while their node holds the pins that raised them, and a
-  report joins them with "; "; a Dials stop says what to fix; pins that can't be saved are named in the note;
+  that can't hold them takes them, and the sidebar says what they wait for; in Pose Mode, Weight Paint and Vertex
+  Paint they land, and an undo and a redo show that their step holds them; re-bake flags show only while their node
+  holds the pins that raised them, and a report joins them with "; "; a Dials stop says what to fix; pins that can't
+  be saved are named in the note;
 - pin order: with 12 pins, objects added until live plus pinned exceeds 16 leave out the pins whose words start latest
   in the frame range (ties by their words), the same ones after a rebuild; a new run is then refused, asking nothing;
 - pins above 2 MB are kept, with the size note, and Prepare for Playback reported the size of the pins first.
@@ -919,14 +921,22 @@ def phase_undo():
 
 
 def phase_history():
-    """Pins a pass writes land only where their own undo step cuts no history: not while a redo is possible (after an
-    undo, or while redoing), not in Edit Mode, not while a modal operator that pushes undo steps runs. The answers are
-    given by hand, so each landing can come only when the test lets it. Question <n> occurs at frames 10n+1 to 10n+10."""
+    """Pins a pass writes land only where their own undo step holds them and cuts no history: not while a redo is
+    possible (after an undo, or while redoing), not in Edit Mode, not while a modal operator that pushes undo steps
+    runs; but in Pose Mode, Weight Paint and Vertex Paint, whose steps hold the whole file. Meanwhile the sidebar says
+    what they wait for. The answers are given by hand, so each landing can come only when the test lets it. Question
+    <n> occurs at frames 10n+1 to 10n+10."""
     reset(1, 10)
-    tree, ask, _gi = question_tree("History", 6)
+    tree, ask, _gi = question_tree("History", 8)
     ask.inputs["Context"].default_value = "A room with a history."
     obj = user("History", tree, Level=0)
-    constant(keyframes(obj, "Level", [(10 * n + 1, n) for n in range(6)]))
+    constant(keyframes(obj, "Level", [(10 * n + 1, n) for n in range(8)]))
+    rig = bpy.data.objects.new("Rig", bpy.data.armatures.new("Rig"))  # an armature with a bone, for Pose Mode
+    bpy.context.scene.collection.objects.link(rig)
+    bpy.context.view_layer.objects.active = rig
+    bpy.ops.object.mode_set(mode='EDIT')
+    rig.data.edit_bones.new("Bone").tail = (0, 0, 1)
+    bpy.ops.object.mode_set(mode='OBJECT')
     name, asked, pushes = ask.name, {}, []
     submit, push = engine._submit, engine._undo_push
 
@@ -934,8 +944,11 @@ def phase_history():
         for _ in range(3):
             engine.run_pass()
 
-    def words():  # an undo rebuilds every data-block: the node is looked up again each time
-        return [e.gn[0] for e in pinned(bpy.data.node_groups["History"].nodes[name])]
+    def node():  # an undo rebuilds every data-block: the node is looked up again each time
+        return bpy.data.node_groups["History"].nodes[name]
+
+    def words():
+        return [e.gn[0] for e in pinned(node())]
 
     def x():
         return bpy.data.objects["History"].location.x
@@ -944,7 +957,17 @@ def phase_history():
         bpy.data.objects["History"].location.x = to
         bpy.ops.ed.undo_push(message="Move")
 
-    questions = [f"Question {n}?" for n in range(6)]
+    def line(text):  # the sidebar says what the pins wait for, and never that the model hasn't answered
+        log = drawn(ui.NODE_PT_openact, node())
+        return said(log, text) and (text.startswith("Pinning") or not said(log, "once the model has answered"))
+
+    def mode(target, to):  # the user's mode switch, with its undo step
+        bpy.context.view_layer.objects.active = bpy.data.objects[target]
+        bpy.data.objects[target].select_set(True)
+        return bpy.ops.object.mode_set('EXEC_DEFAULT', True, mode=to) == {'FINISHED'}
+
+    questions = [f"Question {n}?" for n in range(8)]
+    redo = "answered: they are pinned once nothing is left to redo (redo it, or make any change)"
     engine._submit = lambda job, missing: asked.update((cell.key, cell) for cell in missing) or True
     engine._undo_push = lambda message: pushes.append(message) or push(message)
     try:
@@ -955,18 +978,19 @@ def phase_history():
 
         bpy.context.scene.frame_end = 20  # Question 1 is new
         prepare(undo=True)
+        asking = line("Pinning 2 word sets once the model has answered them")
         move(5.0)
         steps = [step()]  # the move
         answer(asked.values())
         passes()
-        held = (words(), engine.pinning(), bpy.ops.ed.redo.poll(), x())
+        held = (words(), engine.pinning(), bpy.ops.ed.redo.poll(), x(), line(f"2 word sets {redo}"))
         steps.append(step(redo=True))  # the move again
         moved = x()
         passes()
-        check("history: pins whose answers come in after an undo wait while a redo is possible, and the redo survives; "
-              "at the newest step they land, with a step of their own", steps == [True, True]
-              and held == ([], 2, True, 0.0) and moved == 5.0 and words() == questions[:2]
-              and pushes == ["Pin for Playback"], (steps, held, moved, words(), pushes))
+        check("history: pins whose answers come in after an undo wait while a redo is possible, and the sidebar says "
+              "so; the redo survives, and at the newest step they land, with a step of their own", asking
+              and steps == [True, True] and held == ([], 2, True, 0.0, True) and moved == 5.0
+              and words() == questions[:2] and pushes == ["Pin for Playback"], (asking, steps, held, moved, words()))
 
         bpy.context.scene.frame_end = 30  # Question 2 is new
         prepare(undo=True)
@@ -977,13 +1001,13 @@ def phase_history():
         asleep = (words(), engine.pinning())
         steps.append(step(redo=True))  # Prepare for Playback again: the run wakes while the move can still be redone
         passes()
-        held = (words(), engine.pinning(), bpy.ops.ed.redo.poll())
+        held = (words(), engine.pinning(), bpy.ops.ed.redo.poll(), line(f"3 word sets {redo}"))
         steps.append(step(redo=True))  # the move again
         moved = x()
         passes()
         check("history: a run that wakes while redoing waits while a redo is possible, and the rest of the redo "
               "survives; at the newest step its pins land", steps == [True] * 4 and asleep == (questions[:2], 0)
-              and held == (questions[:2], 3, True) and moved == 3.0 and words() == questions[:3],
+              and held == (questions[:2], 3, True, True) and moved == 3.0 and words() == questions[:3],
               (steps, asleep, held, moved, words()))
 
         bpy.context.scene.frame_end = 40  # Question 3 is new
@@ -991,23 +1015,22 @@ def phase_history():
         other = bpy.data.objects.new("Other", bpy.data.meshes.new("Other"))
         other.data.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
         bpy.context.scene.collection.objects.link(other)
-        bpy.context.view_layer.objects.active = other
-        other.select_set(True)
-        entered = bpy.ops.object.mode_set('EXEC_DEFAULT', True, mode='EDIT') == {'FINISHED'}
+        entered = mode("Other", 'EDIT')
         answer(asked.values())
         passes()
-        in_edit = (words(), engine.pinning(), bpy.context.mode)
-        left = bpy.ops.object.mode_set('EXEC_DEFAULT', True, mode='OBJECT') == {'FINISHED'}
+        in_edit = (words(), engine.pinning(), bpy.context.mode,
+                   line("4 word sets answered: they are pinned once you leave Edit Mode"))
+        left = mode("Other", 'OBJECT')
         passes()
         landed = words()
         steps = [step(), step()]  # the pins' step, then leaving Edit Mode
         back = (words(), bpy.context.mode)
         steps += [step(redo=True), step(redo=True)]
-        check("history: pins whose answers come in during Edit Mode wait for Object Mode, then land in a step that "
-              "holds them: undoing it and the exit, then redoing both, loses none", entered and left
-              and in_edit == (questions[:3], 4, 'EDIT_MESH') and landed == questions[:4] and steps == [True] * 4
-              and back == (questions[:3], 'EDIT_MESH') and words() == questions[:4] and bpy.context.mode == 'OBJECT',
-              (in_edit, landed, steps, back, words(), bpy.context.mode))
+        check("history: pins whose answers come in during Edit Mode wait until it is left, and the sidebar says so; "
+              "then they land in a step that holds them: undoing it and the exit, then redoing both, loses none",
+              entered and left and in_edit == (questions[:3], 4, 'EDIT_MESH', True) and landed == questions[:4]
+              and steps == [True] * 4 and back == (questions[:3], 'EDIT_MESH') and words() == questions[:4]
+              and bpy.context.mode == 'OBJECT', (in_edit, landed, steps, back, words(), bpy.context.mode))
 
         bpy.context.scene.frame_end = 50  # Question 4 is new
         prepare()
@@ -1015,13 +1038,33 @@ def phase_history():
         modal, engine._modal_undo = engine._modal_undo, lambda: True  # as if a transform or a stroke were mid-way
         try:
             passes()
-            during = (words(), engine.pinning())
+            during = (words(), engine.pinning(),
+                      line("5 word sets answered: they are pinned once the running tool finishes"))
         finally:
             engine._modal_undo = modal
         passes()
         check("history: while a modal operator that pushes undo steps runs (a stand-in: a headless Blender runs "
-              "none), the pins wait; after it they land", during == (questions[:4], 5) and words() == questions[:5],
-              (during, words()))
+              "none), the pins wait, and the sidebar says so; after it they land",
+              during == (questions[:4], 5, True) and words() == questions[:5], (during, words()))
+
+        for n, (target, to, context_mode, title) in enumerate((("Rig", 'POSE', 'POSE', "Pose Mode"),
+                                                               ("Other", 'WEIGHT_PAINT', 'PAINT_WEIGHT', "Weight Paint"),
+                                                               ("Other", 'VERTEX_PAINT', 'PAINT_VERTEX', "Vertex Paint")),
+                                                              start=5):
+            bpy.context.scene.frame_end = 10 * (n + 1)  # Question n is new
+            prepare(undo=True)
+            entered, before = mode(target, to), len(pushes)
+            answer(asked.values())
+            passes()
+            landed = (words(), bpy.context.mode, pushes[before:])
+            undone = (step(), words(), bpy.context.mode)
+            redone = (step(redo=True), words())
+            left = mode(target, 'OBJECT')
+            check(f"history: in {title} the pins land, in a step of its own that holds them: an undo removes them and "
+                  f"a redo brings them back", entered and left and landed == (questions[:n + 1], context_mode,
+                                                                                ["Pin for Playback"])
+                  and undone == (True, questions[:n], context_mode) and redone == (True, questions[:n + 1]),
+                  (landed, undone, redone))
     finally:
         engine._submit, engine._undo_push = submit, push
 

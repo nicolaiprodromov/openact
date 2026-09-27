@@ -693,6 +693,7 @@ PIN_CAP = "'{}': {} word sets live now and {} more over frames {}–{}; live plu
 INACTIVE = ("{} pinned entr{} inactive: this tree is now used by more objects (live + pinned > {}). Re-run Prepare "
             "for Playback, or split the tree")
 REBAKE = "Re-bake {} if baked: rules changed for frames {}"
+LAND_MODES = ('OBJECT', 'POSE', 'PAINT_WEIGHT', 'PAINT_VERTEX')  # whole-file undo steps: a push there holds pins
 RUN_KEY = "_openact_playback"  # the scene's custom property naming its last run; "_" hides it in the sidebar
 PLAYBACK = None  # the Run waiting for its answers, to pin them, or None
 PLAYBACK_NOTE = ""  # why the last run stopped or was refused, or what it couldn't save, for the sidebar
@@ -706,6 +707,7 @@ class Run:
 
     id: str  # also its scene's RUN_KEY, written inside the operator's undo step: undoing that leaves the run dormant
     sets: dict  # node uid -> [(Job, frames)] of the word sets to pin
+    held: str = ""  # once every answer is in, why its pins still wait (_hold()), as the last pass found
 
 
 class Playback:
@@ -873,7 +875,7 @@ class Playback:
 def _pin_pending(guard=True):
     """Ask for what the waiting run still misses; once every word set is answered, pin them all and unpin every other
     entry, saved without the live set: nothing is evicted, and each node's next pass applies the limits (§13.3). With
-    guard, the pins wait until an undo step can hold them without cutting the user's history (_can_land()). The
+    guard, the pins wait until an undo step can hold them without cutting the user's history (_hold()). The
     modifiers with bakes whose rules that changes are flagged (REBAKES). Returns the uids of the nodes whose pins
     changed."""
     global PLAYBACK, PLAYBACK_NOTE
@@ -904,7 +906,8 @@ def _pin_pending(guard=True):
                                             generation=GENERATIONS.get(uid, 0)), missing)
             else:
                 ready[uid][1].append((entry, frames))
-    if waiting or (guard and not _can_land()):
+    run.held = "" if waiting or not guard else _hold()
+    if waiting or run.held:
         return set()
     PLAYBACK = None
     changed, errors, uses = set(), [], find_uses()
@@ -964,6 +967,13 @@ def pinning():
     return sum(len(sets) for sets in run.sets.values()) if run is not None else 0
 
 
+def held():
+    """Why the waiting run's pins still wait once every answer is in, for the sidebar; "" while answers are missing, or
+    when none waits."""
+    run = _waiting()
+    return run.held if run is not None else ""
+
+
 def cancel_playback(note="Prepare for Playback cancelled: nothing more was pinned"):
     """Stop the run waiting for its answers: nothing more is pinned. False when none waits."""
     global PLAYBACK, PLAYBACK_NOTE
@@ -1020,17 +1030,23 @@ def _modal_undo():
     return wm is not None and any('UNDO' in op.bl_options for window in wm.windows for op in window.modal_operators)
 
 
-def _can_land():
-    """True where an undo step for the pins a pass writes can hold them without cutting the user's history: there is
-    nothing to redo (a push would delete it), the context is in Object Mode (an Edit or Paint mode step doesn't hold
-    them) and no modal operator is mid-way (its own step would take them)."""
+def _hold():
+    """Why pins a pass writes must wait, or "" when an undo step can hold them without cutting the user's history: a
+    modal operator is mid-way (its own step would take them), the mode's undo steps hold only its own data (Edit Mode,
+    Sculpt Mode, Texture Paint...), or there are steps to redo (a push would delete them)."""
     window = _window()
     if window is None:  # no undo step to push, and none to cut
-        return True
+        return ""
     if _modal_undo():
-        return False
+        return "they are pinned once the running tool finishes"
     with bpy.context.temp_override(window=window):
-        return bpy.context.mode == 'OBJECT' and not bpy.ops.ed.redo.poll()
+        if bpy.context.mode not in LAND_MODES:
+            obj = bpy.context.active_object
+            mode = obj.bl_rna.properties["mode"].enum_items[obj.mode].name if obj is not None else bpy.context.mode
+            return f"they are pinned once you leave {mode}"
+        if bpy.ops.ed.redo.poll():
+            return "they are pinned once nothing is left to redo (redo it, or make any change)"
+    return ""
 
 
 def _read(node, spec, ctx):

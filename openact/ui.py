@@ -400,9 +400,10 @@ class NODE_PT_openact(bpy.types.Panel):
         if engine.STATUS:  # the file has OpenAct nodes
             col = layout.column(align=True)
             col.operator("openact.prepare_playback", icon='PLAY')
-            waiting = engine.pinning()
+            waiting, held = engine.pinning(), engine.held()
             if waiting:
-                wrap(col, f"Pinning {waiting} word set{'s' if waiting != 1 else ''} once the model has answered them",
+                sets = f"{waiting} word set{'s' if waiting != 1 else ''}"
+                wrap(col, f"{sets} answered: {held}" if held else f"Pinning {sets} once the model has answered them",
                      icon='SORTTIME')
                 col.operator("openact.cancel_playback", icon='CANCEL')
             if engine.PLAYBACK_NOTE:
