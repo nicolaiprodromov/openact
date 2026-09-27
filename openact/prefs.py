@@ -13,6 +13,7 @@ DEFAULT_PORT = 18765
 MODEL_SOURCE = "Qwen/Qwen3.5-4B"
 MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 MODEL_LABEL = "Qwen3.5-4B via SemIf"
+JEV_SETTINGS = ("runtime_dir", "port", "device", "gpu", "auto_start", "debias")  # what OpenAct takes from jev_nodes
 
 
 def default_runtime_root() -> str:
@@ -41,6 +42,34 @@ class _Defaults:
 def get_prefs():
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     return addon.preferences if addon else _Defaults()
+
+
+def is_jev(module: str) -> bool:
+    """True for jev_nodes' module name: a legacy install, or an extension (bl_ext.<repo>.jev_nodes)."""
+    return module == "jev_nodes" or module.endswith(".jev_nodes")
+
+
+def jev_addon():
+    """The enabled jev_nodes add-on, or None."""
+    addons = bpy.context.preferences.addons
+    return next((addons[name] for name in addons.keys() if is_jev(name)), None)
+
+
+def import_jev():
+    """On OpenAct's first registration, take jev_nodes' settings while that add-on is enabled, so a custom runtime
+    folder or port carries over (§12.2). Once: the preferences remember it, and later changes are the user's own."""
+    prefs = getattr(bpy.context.preferences.addons.get(ADDON_ID), "preferences", None)
+    if prefs is None or prefs.jev_imported:
+        return
+    prefs.jev_imported = True
+    old = getattr(jev_addon(), "preferences", None)  # None until jev_nodes has registered its preferences
+    if old is None:
+        return
+    for name in JEV_SETTINGS:
+        try:
+            setattr(prefs, name, getattr(old, name))
+        except (AttributeError, TypeError, ValueError):  # a setting it lacks, or a value OpenAct refuses
+            pass
 
 
 def runtime_root(prefs=None) -> str:
@@ -164,6 +193,7 @@ class OpenActPreferences(bpy.types.AddonPreferences):
         type=OpenActPath, name="Trusted Files",
         description=".blend files that may read files outside their own folder (Allow this file adds to it)",
     )
+    jev_imported: bpy.props.BoolProperty(options={'HIDDEN'})  # import_jev() ran
 
     def draw(self, context):
         from . import ui

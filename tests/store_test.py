@@ -25,7 +25,7 @@ from _harness import ROOT, check, finish  # noqa: E402
 _package = types.ModuleType("openact")
 _package.__path__ = [os.path.join(ROOT, "openact")]
 sys.modules["openact"] = _package
-from openact import pipeline, store  # noqa: E402
+from openact import csvfmt, pipeline, store  # noqa: E402
 from openact.specs import ask, base, pick  # noqa: E402
 
 NodeStore, MB, SOFT_CAP = store.NodeStore, store.MB, store.SOFT_CAP
@@ -57,6 +57,11 @@ def words(entries):
 
 def gn(first):
     return (first, "", "//factors.csv", "//outcomes.csv", "", "")
+
+
+def parse_v0(text):
+    """Items as an upgraded Pick parses its Items text while it keeps v0.1.0's rule (§12.3)."""
+    return csvfmt.parse_inline(text, mode="v0")
 
 
 def saving(node, kept, live_gns=None):
@@ -123,13 +128,18 @@ def phase_conversion():
                   (True, 0, "jev_nodes 0.1.0", ["jev_nodes 0.1.0"], o["t"], False) for e, o in pairs))
         if case.startswith("ask"):
             mode = "YES_NO" if case == "ask_yes_no" else "AMOUNT"
+            column = "amount" if mode == "AMOUNT" else "p"
             check(f"{case}: gn (Question, Context) becomes (Question, Context, '', '', '')",
                   all(e.gn == (o["gn"][0], o["gn"][1], "", "", "") for e, o in pairs), [e.gn for e in new])
-            check(f"{case}: kind ask, answer type {mode}, no rows",
-                  all((e.kind, e.answer_type, e.rows) == ("ask", mode, store.Rows()) for e in new))
+            check(f"{case}: kind ask, answer type {mode}, one model row with the answer, as v1 stores it",
+                  all((e.kind, e.answer_type, e.rows.name, e.rows.src, e.rows.ask, e.rows.v)
+                      == ("ask", mode, [o["gn"][0].strip()], "m", [0],
+                          {column: [o["a"]["value"]], "c": [o["a"]["confidence"]]}) for e, o in pairs),
+                  [(e.rows.name, e.rows.v) for e in new])
             check(f"{case}: single holds Answer, Yes and Confidence",
                   all(e.single == {"Answer": o["a"]["value"], "Yes": o["a"]["value"] >= 0.5,
                                    "Confidence": o["a"]["confidence"]} for e, o in pairs), [e.single for e in new])
+            plans = [[ASK.job(e.gn, mode, debias) for debias in (True, False)] for e in new]
         else:
             check(f"{case}: gn (Prompt, Items) becomes (Prompt, '', Items, '', ''), with no Items for a collection",
                   all(e.gn == (o["gn"][0], "", "" if o["a"]["collection"] else o["gn"][1], "", "") for e, o in pairs),
@@ -140,10 +150,21 @@ def phase_conversion():
                   all(e.single == {"Index": o["a"]["index"], "Item": o["a"]["item"],
                                    "Confidence": o["a"]["confidence"]} for e, o in pairs), [e.single for e in new])
             check(f"{case}: one model row per item, with its probability",
-                  all((e.rows.name, e.rows.v, e.rows.src, e.rows.ask, len(e.rows.wkey)) ==
+                  all((e.rows.name, e.rows.v, e.rows.src, e.rows.ask) ==
                       (o["a"]["items"], {"prob": o["a"]["probabilities"]}, "m" * len(o["a"]["items"]),
-                       [0] * len(o["a"]["items"]), len(o["a"]["items"])) for e, o in pairs),
+                       [0] * len(o["a"]["items"])) for e, o in pairs),
                   [(e.rows.name, e.rows.src) for e in new])
+            # the items the upgraded node plans: a collection's children, or its Items text parsed as v0.1.0 did
+            items = [o["a"]["items"] if o["a"]["collection"] else [name for name, _ in parse_v0(o["gn"][1])]
+                     for o in old]
+            if case == "pick_text":
+                check(f"{case}: legacy parsing of the Items text gives the stored items",
+                      items == [o["a"]["items"] for o in old], items)
+            plans = [[PICK.job(e.gn, names, debias) for debias in (True, False)] for e, names in zip(new, items)]
+        check(f"{case}: the words key, wkeys and shape are the ones the spec plans for the same words, with either "
+              "Balance Option Order (§14.4)",
+              all((e.words_key, e.rows.wkey, e.shape) == (job.words_key, wkeys(job), job.shape.as_dict())
+                  for e, jobs in zip(new, plans) for job in jobs), [e.words_key for e in new])
         saved = Node()
         store.save(saved, store.load(node))
         data = json.loads(saved.entries)
@@ -160,6 +181,18 @@ def phase_conversion():
         check(f"{case}: the Items text {text!r} is left out, and the rows are the collection's children",
               stored == text and new == [((prompt, "", "", "", ""),
                                           ["Armchair", "Bookshelf", "Floor Lamp", "Rug", "Table"])], new)
+
+    # As set_entries() writes it: v0.1.0 split this Items text on commas only, and kept ": " in the names
+    text, names = "Chair: comfy; Stool, Bench: long", ["Chair: comfy; Stool", "Bench: long"]
+    entry = store.load(Node(json.dumps([{"key": "k", "gn": ["somewhere to rest", text], "t": 1.0, "a": {
+        "index": 1, "item": names[1], "confidence": 0.5, "probabilities": [0.25, 0.75], "items": names,
+        "collection": ""}}], ensure_ascii=False))).entries[0]
+    v1 = [name for name, _when in csvfmt.parse_inline(text)]
+    check("Items with ';' and ': ': legacy parsing keeps v0.1.0's names, and with them the words key; v1's parsing "
+          "would not",
+          [name for name, _ in parse_v0(text)] == names == entry.rows.name
+          and entry.words_key == PICK.job(entry.gn, names, True).words_key
+          and entry.words_key != PICK.job(entry.gn, v1, True).words_key, (entry.rows.name, v1))
 
 
 def phase_round_trip():
