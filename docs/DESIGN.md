@@ -3833,10 +3833,10 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
   - **A context with no table to show** says "Asking..." while the pass asks one of its cells (sent,
     or sent once the model that is starting is ready), else "Not asked: see the status above": the
     model is stopped, not installed or in error, the context waits or disagrees (§6.0), or its cell
-    failed. Once a row is known, a context being filled shows its table so far (§5.4), and its line
-    sums it up. A context that waits or disagrees shows its stored entry while that entry's words
-    key is its plan's; a Dials context shows its last good table, each row matched to the plan's by
-    wkey.
+    failed. Once a row has an answer (a model or stale one), a context being filled shows its table so
+    far (§5.4), and its line sums it up. A context that waits or disagrees shows its stored entry,
+    also a table so far, while that entry's words key is its plan's; a Dials context shows its last
+    good table, each row matched to the plan's by wkey.
   - **Table view**, 50 rows per page. Paging uses a `WindowManager` IntProperty, which is UI state,
     not file data. Each row shows its name, answer, a confidence bar and a source icon:
     - `QUESTION`: unsure;

@@ -93,7 +93,9 @@ class _OpenActNode:
                 op.context_index, op.page = i, 0
             else:
                 col.label(text=label, icon=icon)
-            if answer is None:  # "Asking..." while the pass asks one of its cells, else it waits, disagrees or failed
+            # no table, or a table so far with no answer yet (a Pick's Index is -1): "Asking..." while the pass asks one
+            # of its cells, else it waits, disagrees or failed
+            if answer is None or ("p" in answer.rows.src and not {"m", "s"} & set(answer.rows.src)):
                 asking = bool(sent) and any(row.cell is not None and row.cell.key in sent for row in job.rows)
                 col.label(text="Asking..." if asking else "Not asked: see the status above",
                           icon='SORTTIME' if asking else 'INFO')

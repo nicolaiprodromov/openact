@@ -1,15 +1,17 @@
 """Node status, the sidebar's data and Show Question (§17.1-§17.3), in a headless Blender. The add-on starts the fake
 model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record, so every request it sends is logged:
-- a fill: waiting -> filling -> complete; n/N and an ETA only when pipeline.progress() exists, else "Asking...";
-- the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to (while its other cells
-  are asked, its line sums up its table so far) and an outcome never offered, more than 16 live word sets;
+- a fill: waiting -> filling -> complete, with n/N and an ETA from pipeline.progress();
+- the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to (its other cells say
+  "Asking..." while they are asked) and an outcome never offered, more than 16 live word sets;
 - table_page(): rows, icons and paging; table_rows() of answered and pending tables, of an entry whose rows are in
   another order (by wkey, Show Question's ask key too) and of an empty material slot;
 - while a Classify context's CSV has errors or the contexts disagree, a context whose words didn't change shows its
   stored answer and one without says it is not asked, as does one whose job waits while another context waits for
-  another node, where a context whose cells are asked with no row known yet says "Asking...", also while another
-  context's CSV is missing, and one with a table so far sums it up, its pending rows with no answer; a failed cell is
-  in error in the table, the counts and Show Question, and not asked again;
+  another node, where a context whose cells are asked with no answer yet says "Asking...", also while another
+  context's CSV is missing, and one with a table so far sums it up, its pending rows with no answer, also while the
+  contexts disagree; a Pick of material slots before its first answer says "Asking...", with no top items; a failed
+  cell is in error in the table, the counts and Show Question, and not asked again;
+- the Model box's queue: the chunks waiting in each class and the cells in flight;
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
   trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
   node reads the blocked node's answer, a sidebar draw that resolves no path while nothing is blocked, an Import CSV
@@ -190,12 +192,8 @@ def phase_fill():
           and {text for found, text in seen[ask.name] if found == "waiting"} == {"Waiting for another OpenAct node..."},
           seen[ask.name])
     filling = [text for lines in seen.values() for found, text in lines if found == "filling"]
-    if getattr(pipeline, "progress", None) is not None:
-        check("fill: with pipeline.progress(), the filling line shows n/N and an ETA",
-              any(re.fullmatch(r"Filling \d+/\d+ · ~\d+ (s|min)", text) for text in filling), filling)
-    else:
-        check("fill: without pipeline.progress(), the filling line is 'Asking...', with no n/N and no ETA",
-              filling and set(filling) == {"Asking..."}, filling)
+    check("fill: with pipeline.progress(), the filling line shows n/N and an ETA",
+          any(re.fullmatch(r"Filling \d+/\d+ · ~\d+ (s|min)", text) for text in filling), filling)
     picked, asked = status(pick), status(ask)
     check("complete: Pick's record: its summary as the line, 3 rows answered, none pending, no ETA, one context",
           picked.icon == 'CHECKMARK' and picked.text == engine.SPECS[pick.bl_idname].summary(picked.uses[0][2])
@@ -208,18 +206,22 @@ def phase_fill():
 
 
 def phase_eta():
-    saved = getattr(pipeline, "progress", None)
+    saved = pipeline.progress
     pipeline.progress = lambda uid: {"a": (12, 50, 40.0), "b": (0, 3000, 40.0), "c": (0, 0, None)}.get(uid)
     try:
         got = [engine._filling(uid) for uid in "abcd"]
+        del pipeline.progress
+        try:
+            gone = engine._filling("a")
+        except AttributeError as error:
+            gone = type(error).__name__
     finally:
-        if saved is None:
-            del pipeline.progress
-        else:
-            pipeline.progress = saved
+        pipeline.progress = saved
     check("ETA: n/N and the remaining rows at ms_per_row (38 x 40 ms = ~2 s, 3000 x 40 ms = ~2 min); no progress: "
           "'Asking...'", got == [("Filling 12/50 · ~2 s", 1.52), ("Filling 0/3000 · ~2 min", 120.0),
                                 ("Asking...", None), ("Asking...", None)], got)
+    check("ETA: the filling line reads pipeline.progress() itself, with no fallback that would draw 'Asking...' "
+          "without it", gone == "AttributeError", gone)
     rows = ui.status_rows(engine.NodeStatus("filling", "Filling 12/50 · ~2 s", rows=50, answered=12, pending=38,
                                             eta_s=1.52))
     check("status_rows: the filling line with its ETA, then the row counts",
@@ -420,6 +422,18 @@ def phase_held():
           and line == engine.SPECS[classify.bl_idname].summary(entry) and line.endswith(f" {got.unsure} unsure")
           and ui.table_rows(engine.SPECS[classify.bl_idname], job, entry)[2] == ("kettle", "", None, "pending"),
           (got, log))
+    write(folder, "ca.csv", "answer,when,hardness\nmetal,steel or iron,9\nwood,planks or bark,3\n")
+    engine.run_pass()  # the contexts disagree, so nothing is answered; kettle's answer hasn't arrived either
+    got, log = status(classify), sidebar(classify)
+    job, entry = next((job, entry) for label, job, entry in got.uses if label == "CB > OpenAct")
+    lines = [log[i + 1] for i, found in enumerate(log) if found == ("openact.table_view", "page", 0)]
+    check("conflict, table so far: while the contexts disagree, CB shows its stored table so far, whose words key is "
+          "its plan's (§17.2): its line sums it up, and its table view keeps pan's and spoon's answers, kettle pending",
+          got.text.startswith("Classify: 'CA > OpenAct' and 'CB > OpenAct'") and entry is not None
+          and entry.rows.src == "mmp"
+          and lines == ["Not asked: see the status above", engine.SPECS[classify.bl_idname].summary(entry)]
+          and [row[1] != "" for row in ui.table_rows(engine.SPECS[classify.bl_idname], job, entry)]
+          == [True, True, False], (got, log))
     bpy.data.node_groups.remove(tree)
     engine.run_pass()
 
@@ -496,6 +510,60 @@ def phase_failed():
     engine.run_pass()
 
 
+def phase_slots():
+    """A Pick of material slots, one of them empty, before its first answer: its table so far knows only the empty
+    slot, so it has no answer yet (Index -1). Its line says "Asking...", not a summary, with no top items, and its
+    table lists the materials with no answer and the empty slot as one."""
+    tree = new_tree("Slots")
+    pick = tree.nodes.new(engine.PICK_ID)
+    pick.list_source = 'MATERIALS'
+    pick.inputs["Prompt"].default_value = "Something shiny"
+    obj = user("Shiny", tree)
+    for material in (bpy.data.materials.new("Steel"), bpy.data.materials.new("Gold"), None):
+        obj.data.materials.append(material)
+    pick.inputs["Object"].default_value = obj
+    engine.run_pass()  # asks its one cell; no tick, so no answer arrives meanwhile
+    got, log = status(pick), sidebar(pick)
+    _label, job, entry = got.uses[0]
+    check("slots: before its first answer, a Pick of material slots with an empty slot shows a table so far with no "
+          "answer yet (Index -1): its line says 'Asking...', with no top items, and its table lists the materials "
+          "with no answer and the empty slot as one",
+          entry is not None and entry.rows.src == "ppc" and entry.single["Index"] == -1
+          and log[log.index("Shiny > OpenAct") + 1] == "Asking..." and "0.0%" not in log
+          and ui.table_rows(engine.SPECS[pick.bl_idname], job, entry) == [
+              ("Steel", "", None, "pending"), ("Gold", "", None, "pending"), (ui.EMPTY_SLOT, "", None, "code")],
+          (got, log))
+    bpy.data.node_groups.remove(tree)
+    bpy.data.objects.remove(obj)
+    engine.run_pass()
+
+
+def phase_queue():
+    """The Model box's queue (§17.2): the chunks waiting in each class and the cells in flight. With the worker held
+    as during a render job, a 100-item Match is queued in chunks, and no cell is in flight."""
+    tree = new_tree("Queue")
+    match = tree.nodes.new(MatchSpec.idname)
+    match.inputs["Question"].default_value = "Is it heavy?"
+    match.inputs["Items"].default_value = ", ".join(f"load {n:03}" for n in range(100))
+    user("Queuer", tree)
+    server.Worker.render_running.set()  # the worker takes no chunk, as during a render job
+    time.sleep(0.3)  # a turn of its loop, so it sees that before anything is queued
+    try:
+        engine.run_pass()
+        job = status(match).uses[0][1]
+        chunks = len(pipeline.chunked([row.cell for row in job.rows if row.cell is not None]))
+        log = drawn(lambda layout: ui.draw_server(layout))
+    finally:
+        server.Worker.render_running.clear()
+    check("queue: the Model box counts the chunks waiting in each class (a 100-item table in the background is P2) and "
+          "no cell in flight, where it said every queued cell was in flight",
+          chunks > 1 and f"Queue: 0/0/{chunks} chunks (P0/P1/P2)" in log and "In flight: 0 cells" in log
+          and len(pipeline.PENDING) == 100, (chunks, log))
+    settle(lambda: state(match) == "complete", 60)
+    bpy.data.node_groups.remove(tree)
+    engine.run_pass()
+
+
 # --------------------------------------------------------------------------------- warning and error lines
 
 def phase_lines():
@@ -520,12 +588,12 @@ def phase_lines():
     engine.run_pass()  # asks the Rules node's model cells; no tick, so no answer arrives meanwhile
     got, log = status(rules), sidebar(rules)
     entry = got.uses[0][2]
-    check("table so far: while a Rules node's cells that an outcome applies to are asked, it shows its table so far "
-          "(the cells no outcome applies to are known): its line is that table's summary, not 'Not asked', although "
-          "its status is the error of those cells",
+    check("asking: while a Rules node's cells that an outcome applies to are asked, its table so far has no answer yet "
+          "(only the cells no outcome applies to are known), so its line says 'Asking...', although its status is the "
+          "error of those cells",
           got.state == "error" and got.text.startswith("No outcome applies to ") and got.pending == 9
           and entry is not None and entry.rows.src == "p" * 9 + "e" * 9
-          and log[log.index("Liner > OpenAct") + 1] == engine.SPECS[rules.bl_idname].summary(entry), (got, log))
+          and log[log.index("Liner > OpenAct") + 1] == "Asking...", (got, log))
     engine.schedule(immediate=True)
     done, _seen = settle(lambda: state(warned) == "warning" and state(broken) == "error"
                          and bool(S.load(rules).entries), 60)
@@ -941,12 +1009,14 @@ try:
     phase_table(picked, asked)
     phase_held()
     phase_failed()
+    phase_slots()
     lines_tree, warned_node, answers_csv = phase_lines()
     phase_crowd()
     phase_banners()
     phase_import_csv(lines_tree, answers_csv)
     phase_jev_nodes()
     phase_draw(picked, warned_node)
+    phase_queue()
     phase_open_file(answers_csv)
     phase_trust()
 except Exception:

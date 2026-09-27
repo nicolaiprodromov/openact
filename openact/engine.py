@@ -376,8 +376,8 @@ def _process(tree, node, contexts):
             live.append(job.gn)
         if conflict or held:  # nothing is answered: the sidebar shows the stored entry resolve() keeps, if any
             found = next((entry for entry in entries if entry.gn == job.gn), None)
-            kept = spec.resolve(job, entries, LAST_SHOWN.get(key, ""))[0] if found is not None else None
-            if kept is not None and kept.words_key == found.words_key:  # it, or a copy with refreshed payload
+            kept = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)[0] if found is not None else None
+            if kept is not None and kept.words_key == found.words_key:  # it, its table so far or a refreshed copy
                 resolved[job.gn] = found
             continue
         other = jobs.setdefault(job.gn, (job, ctx))
@@ -398,6 +398,9 @@ def _process(tree, node, contexts):
         if entry is not None and found is not None and entry is not found and dataclasses.replace(
                 entry, t=found.t) == found:
             entry = found  # the partial table as stored already
+        if entry is not None:  # the table shown: the sidebar and the counts describe it, not a hidden entry
+            shown.append(entry)
+            resolved[job.gn] = entry
         # Words that mean something else now never show the old answer, but its rows carry over until the new table is
         # whole, also after a reload: the old entry stays stored, and the partial table shows in its place unstored.
         # LAST_SHOWN keeps naming the stored entry its stale rows come from.
@@ -405,13 +408,9 @@ def _process(tree, node, contexts):
                 entry is None or missing or errors):
             hidden[(found.gn, found.words_key)] = entry
             if entry is not None:
-                shown.append(entry)
                 instead[key] = entry.words_key
-                resolved[job.gn] = entry  # the sidebar and the counts describe the table shown, not the hidden entry
         elif entry is not None:
             LAST_SHOWN[key] = entry.words_key
-            shown.append(entry)
-            resolved[job.gn] = entry
             if entry is not found:
                 if found is not None:  # in place: the graph keeps its entry order, so values only (§8.8)
                     entries[entries.index(found)] = entry
@@ -564,8 +563,7 @@ def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
 
 def _filling(uid):
     """The filling line and its ETA: n/N once the decision worker reports the node's progress, else "Asking..."."""
-    progress = getattr(pipeline, "progress", None)
-    found = progress(uid) if progress is not None else None
+    found = pipeline.progress(uid)
     if not found or not found[1]:
         return "Asking...", None
     done, total, ms_per_row = found  # ms_per_row: per remaining cell, /health's rate and the §5.4 default folded in

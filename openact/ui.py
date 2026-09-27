@@ -226,7 +226,9 @@ def draw_server(layout, banner=None):
              icon='BLANK1')
         if health.get("load_seconds") is not None:
             col.label(text=f"Loaded in {health['load_seconds']:.1f} s", icon='BLANK1')
-        col.label(text=f"Queue: {len(pipeline.PENDING)} cells in flight", icon='BLANK1')
+        per_class, flight = pipeline.queue_counts()
+        col.label(text="Queue: {}/{}/{} chunks (P0/P1/P2)".format(*per_class), icon='BLANK1')
+        col.label(text=f"In flight: {flight} cells", icon='BLANK1')
         throughput = [f"{health['ms_per_row']:.1f} ms per row"] if health.get("ms_per_row") is not None else []
         if health.get("questions"):
             throughput.append(f"cache hits {health.get('cache_hits', 0) / health['questions']:.0%}")

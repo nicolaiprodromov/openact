@@ -79,8 +79,7 @@ class PerItemSpec(Spec):
 
     def unsure(self, entry) -> int:
         """Model rows below UNSURE_BELOW: a pending or stale row of a table so far is no answer (§5.4)."""
-        rows = entry.rows
-        return sum(c < UNSURE_BELOW for name, c, src in zip(rows.name, rows.v["c"], rows.src) if name and src == "m")
+        return sum(src == "m" and c < UNSURE_BELOW for src, c in zip(entry.rows.src, entry.rows.v["c"]))
 
 
 class MatchSpec(PerItemSpec):

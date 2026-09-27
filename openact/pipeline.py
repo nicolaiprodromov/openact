@@ -349,3 +349,12 @@ def progress(uid: str) -> tuple[int, int, float] | None:
     done, total, rows_done, rows_total = fill
     scored = server.STATE.health.get("ms_per_row") or MS_PER_ROW
     return done, total, scored * (rows_total - rows_done) / (total - done)
+
+
+def queue_counts() -> tuple[list[int], int]:
+    """The queue as the Model box shows it (§17.2): the chunks waiting in each class (P0, P1, P2), and the cells in
+    flight, the pending ones that no queued chunk holds. Main thread only."""
+    with _QUEUED:
+        per_class = [sum(len(chunks) for chunks in jobs) for jobs in QUEUE]
+        queued = {cell.key for jobs in QUEUE for chunks in jobs for chunk in chunks for cell in chunk.cells}
+    return per_class, len(PENDING.keys() - queued)
