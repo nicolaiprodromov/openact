@@ -940,7 +940,7 @@ def phase_model(port, gpu):
         table = [names[o] if o >= 0 else "?" for o in entry.rows.v["outcome"]] if entry else []
         reference = [outcome_name(s, n, birth, survive) for s in (0, 1) for n in range(9)]
         exact = sum(t == r for t, r in zip(table, reference))
-        unsure = sum(1 for s, c in zip(entry.rows.src, entry.rows.v["c"]) if s == "m" and c < R.UNSURE_BELOW) \
+        unsure = sum(1 for s, c in zip(entry.rows.src, entry.rows.v["c"]) if s == "m" and c < R.unsure_below()) \
             if entry else -1
         print(f"TIMING {outcomes}: {time.time() - t0:.1f}s; {engine.STATUS.get(rules.uid)}", flush=True)
         check(f"model: {outcomes} is {exact}/18 exact with {unsure} unsure", answered and exact == 18 and unsure == 0,

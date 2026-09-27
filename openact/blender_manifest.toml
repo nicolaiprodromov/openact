@@ -15,6 +15,7 @@ tags = ["Geometry Nodes", "Node"]
 [permissions]
 network = "Download the model runtime once, then talk to it on localhost"
 files = "Store the model runtime; read text and CSV files; write CSVs"
+clipboard = "Copy a diagnostics report for bug reports"
 
 [build]
 paths_exclude_pattern = ["__pycache__/", "*.pyc", "/.git/", "*.zip"]

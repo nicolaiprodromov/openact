@@ -19,18 +19,21 @@ Additions on top of SemIf:
 * Backends: SemIf on PyTorch, or a deterministic fake that needs neither torch nor a GPU (tests).
 * Only local clients: a request with an Origin header, or a Host other than 127.0.0.1:<port> or
   localhost:<port>, gets 403. Every POST must send OPENACT_TOKEN as X-OpenAct-Token; without OPENACT_TOKEN
-  the server refuses to start, except with the test-only fake backend.
+  the server refuses to start, except with the test-only fake backend. Other Blenders that share the server read
+  the token from --token-file.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import json
 import math
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -38,6 +41,7 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Protocol
 
+PORT_TAKEN = 4  # the exit code when the port can't be bound: Blender attaches to the server that holds it
 SERVER_NAME = "openact-semif"
 SERVER_VERSION = "1.0.0"
 DEFAULT_SOURCE = "Qwen/Qwen3.5-4B"
@@ -187,7 +191,8 @@ class FakeBackend(Backend):
     --fake-script is a JSON list of rules: the first rule whose "state" and "question" texts (both
     optional) occur in a row's state and question decides that row, with its "answer": an option
     id, or a map of option ids to weights. A row with no matching rule, or none of whose options
-    the answer names, keeps the hash weights.
+    the answer names, keeps the hash weights. A rule's optional "delay" is the seconds scoring
+    its row takes: a model that stalls or runs slow.
     """
 
     name = "fake"
@@ -231,6 +236,7 @@ class FakeBackend(Backend):
         state = row["state"] if isinstance(row["state"], str) else json.dumps(row["state"], ensure_ascii=False)
         for rule in self.script:
             if rule.get("state", "") in state and rule.get("question", "") in row["question"]:
+                time.sleep(float(rule.get("delay", 0)))
                 answer = rule["answer"]
                 named = answer if isinstance(answer, dict) else {str(answer): 1.0}
                 weights = [float(named.get(oid, 0.0)) for oid in ids]
@@ -285,6 +291,7 @@ class Engine:
             "cache_hits": self.cache_hits,
             "ms_per_row": None if self.ms_per_row is None else round(self.ms_per_row, 3),
             "pid": os.getpid(),
+            "parent_pid": self.args.parent_pid,  # the Blender that started it: a uv launcher hides it behind its pid
         }
 
     def capabilities(self):
@@ -678,6 +685,25 @@ def watch_parent(pid):
             os._exit(0)
 
 
+class Server(ThreadingHTTPServer):
+    # SO_REUSEADDR lets a second socket bind a port that one listens on, on Windows: only POSIX gets it, where it
+    # just skips TIME_WAIT
+    allow_reuse_address = os.name != "nt"
+
+
+def write_token(path, token):
+    """--token-file: the launch token, for other Blenders of this user that attach to this server. Written once the
+    server holds its port, so a server that lost the port never overwrites the winner's. Created new with mode 0600
+    (POSIX) and moved into place: a reader never sees half of it, and no planted link or older mode is kept."""
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="ascii") as out:
+            out.write(token)
+        os.replace(temporary, path)
+    except OSError as error:  # only other Blenders lose: the one that started this server has the token
+        log(f"cannot write --token-file {path}: {error}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
@@ -690,6 +716,8 @@ def main(argv=None):
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--gpu", type=int, default=None, help="CUDA device index to use")
     parser.add_argument("--parent-pid", type=int, default=None)
+    parser.add_argument("--token-file", default=None, metavar="PATH",
+                        help="once listening, write OPENACT_TOKEN to this file for other Blenders (mode 0600)")
     parser.add_argument("--no-debias", action="store_true", help="score each question once")
     parser.add_argument("--record", default=None, metavar="PATH.jsonl",
                         help="append every /v1/systemone request, with its answers, to this file")
@@ -718,11 +746,14 @@ def main(argv=None):
         return 3
     ENGINE = Engine(args, FakeBackend(args) if args.backend == "fake" else SemIfTorchBackend(args))
     try:
-        SERVER = ThreadingHTTPServer((args.host, args.port), Handler)
+        SERVER = Server((args.host, args.port), Handler)
     except OSError as error:
         log(f"cannot listen on {args.host}:{args.port}: {error}")
-        return 3
+        return PORT_TAKEN
     SERVER.daemon_threads = True
+    shares = bool(TOKEN and args.token_file)
+    if shares:
+        write_token(args.token_file, TOKEN)
     log(f"{SERVER_NAME} {SERVER_VERSION} listening on http://{args.host}:{args.port} (pid {os.getpid()}, "
         f"backend {ENGINE.backend.name}, token {'required' if TOKEN else 'not required'})")
     threading.Thread(target=ENGINE.load, name="load", daemon=True).start()
@@ -732,6 +763,10 @@ def main(argv=None):
         SERVER.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
+    if shares:  # while the port is still this server's: only the server that holds it writes the file
+        with contextlib.suppress(OSError):
+            os.remove(args.token_file)
+    SERVER.server_close()  # the port is free at once, not after the interpreter's teardown
     log("server stopped")
     return 0
 

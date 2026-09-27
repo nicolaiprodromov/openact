@@ -697,10 +697,10 @@ def test_one_definition():
     default Amount levels (sources, which the node sends) and the cost of a question (pipeline)."""
     from openact.specs import base, rules
 
-    copies = [name for name, copy in (("UNSURE_BELOW", rules.UNSURE_BELOW is not base.UNSURE_BELOW),
+    copies = [name for name, copy in (("unsure_below", rules.unsure_below is not base.unsure_below),
                                       ("AMOUNT_LEVELS", hasattr(rc, "AMOUNT_LEVELS")),
                                       ("cell_cost", hasattr(rc, "cell_cost"))) if copy]
-    check("one definition: no Rules copy of UNSURE_BELOW, AMOUNT_LEVELS or the question cost", not copies, copies)
+    check("one definition: no Rules copy of unsure_below, AMOUNT_LEVELS or the question cost", not copies, copies)
 
 
 LEVELS = range(2, 17)

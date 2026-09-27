@@ -12,9 +12,9 @@ import dataclasses
 import itertools
 
 from .. import csvfmt, pipeline, rules_core
-from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, named, number_text, overrides_inputs, warnings
+from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, unsure_below, warnings
 
-FACTORS_HINT = "Set a Factors CSV (sidebar: New Rules Template)"
+FACTORS_HINT = "Set a Factors CSV (sidebar: New CSV from Template)"
 OUTCOMES_HINT = "Add outcomes"
 PAYLOAD = "pl_"  # table column prefix of a payload output, followed by its position
 SOCKETS = {"amount": 'NodeSocketFloat', "category": 'NodeSocketInt', "flag": 'NodeSocketBool'}
@@ -301,8 +301,8 @@ class RulesSpec(Spec):
         return {"Confidence": sum(row.values["c"] for row in rows) / len(rows) if rows else 0.0}
 
     def summary(self, entry):
-        src, confidences = entry.rows.src, entry.rows.v.get("c", [])
-        unsure = sum(1 for s, c in zip(src, confidences) if s == "m" and c < UNSURE_BELOW)
+        src, confidences, below = entry.rows.src, entry.rows.v.get("c", []), unsure_below()
+        unsure = sum(1 for s, c in zip(src, confidences) if s == "m" and c < below)
         text = f"{len(src)} cells · {unsure} unsure"
         if "e" in src:
             text += f" · {src.count('e')} with no outcome"

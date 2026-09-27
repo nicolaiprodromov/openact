@@ -1,6 +1,6 @@
-"""Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; show
-what a row asks; open files; trust a .blend's file reads; prepare animated words for playback, and unpin them; upgrade
-the old Jev nodes of a v0.1.0 file."""
+"""Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; start
+its CSVs from templates; show what a row asks; open files; trust a .blend's file reads; copy diagnostics; prepare
+animated words for playback, and unpin them; upgrade the old Jev nodes of a v0.1.0 file."""
 
 from __future__ import annotations
 
@@ -8,19 +8,35 @@ import contextlib
 import csv
 import math
 import os
+import platform
+import re
 import subprocess
 import sys
 import time
 import traceback
+from collections import Counter
 
 import bpy
 
-from . import csvfmt, engine, lists, migrate, server, store, trust, ui
+from . import csvfmt, engine, inner, lists, migrate, pipeline, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
-from .specs.base import UNSURE_BELOW, stored_rows, table_of
+from .specs.base import stored_rows, table_of, unsure_below
 
 PERMISSION = "Close the file in the other program (e.g. Excel) and try again."
+TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+TEMPLATES = {  # node type -> (input, file in TEMPLATE_DIR) of each CSV input that has a starter file (§7.10)
+    "GeometryNodeOpenActRules": (("Factors", "life_factors.csv"), ("Outcomes", "life_outcomes.csv")),
+    "GeometryNodeOpenActClassify": (("Items", "items.csv"), ("Labels", "labels.csv")),
+    "GeometryNodeOpenActMatch": (("Items", "items.csv"),),
+    "GeometryNodeOpenActPick": (("Items", "items.csv"),),
+    "GeometryNodeOpenActDials": (("Settings", "weather_dials.csv"),),
+}
+HEALTH = ("status", "requests", "questions", "rows_scored", "cache_hits", "ms_per_row", "load_seconds")  # §17.5
+# The server's message in the diagnostics (§17.5): a path (drive, UNC, '//' or '/' rooted) up to ': ' or the end, and a
+# quoted segment. A quote starts and ends at a word boundary, so apostrophes ("runtime's", "can't") are no quotes.
+PATH = re.compile(r"(?<![\w/\\])(?:[A-Za-z]:[\\/]|\\\\|//?)(?=\S)[^\n]*?(?=: |$)")
+QUOTED = re.compile(r"""(?<!\w)(['"]).+?\1(?!\w)""")
 NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
               "code": "Decided by code (one option applies): never sent to the model",
               "error": "No outcome applies to this cell: never sent to the model"}
@@ -105,6 +121,13 @@ class OPENACT_OT_server_stop(bpy.types.Operator):
     bl_idname = "openact.server_stop"
     bl_label = "Stop Model"
     bl_description = "Stop the local model server and free its GPU memory. Answers already given stay"
+
+    @classmethod
+    def description(cls, context, properties):
+        if server.attached():  # the button reads "Detach" then (§10.5)
+            return ("Stop using the model server another Blender started: it keeps running for that Blender. Start "
+                    "Model uses it again")
+        return cls.bl_description
 
     def execute(self, context):
         server.stop()
@@ -565,7 +588,7 @@ def merged_rows(spec, answered, doc=None):
         key = csvfmt.lock_key(cells.get(k.casefold(), "") for k in keys)
         if key not in taken or (locked(cells) and not locked(old[taken[key]])):
             taken[key] = i
-    rows, seen, left = [], set(), set(range(len(old)))
+    rows, seen, left, below = [], set(), set(range(len(old))), unsure_below()
     for job, entry in answered:
         table = table_of(job, entry)
         for unit, indices in spec.override_units(job):
@@ -580,7 +603,7 @@ def merged_rows(spec, answered, doc=None):
                 answer, c, source = spec.export_unit(job, indices, table)
                 cells.update({k.casefold(): cell for k, cell in zip(keys, unit)})
                 cells.update(answer=answer, lock="0", model_answer=answer, confidence="" if c is None else f"{c:.2f}",
-                             unsure="" if c is None else str(int(c < UNSURE_BELOW)), source=source)
+                             unsure="" if c is None else str(int(c < below)), source=source)
             rows.append(line(cells))
     return header, rows + [line(old[i]) for i in sorted(left)]
 
@@ -697,6 +720,139 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ----------------------------------------------------------------------------- starter CSVs (§7.10)
+
+def starter_files(node) -> list[tuple]:
+    """(input socket, file in TEMPLATE_DIR) of each of the node's CSV inputs that has a starter file, among the inputs
+    it has now: a Collection, Materials or Attributes list source has no Items input."""
+    return [(socket, file) for name, file in TEMPLATES.get(node.bl_idname, ())
+            if (socket := lists.find_input(node, name)) is not None]
+
+
+def copy_templates(node) -> list[str]:
+    """Copy the node's starter CSVs next to the .blend, and return the path of each copy. A copy never replaces a file:
+    when name.csv exists it becomes name 2.csv, then name 3.csv... An input that is empty and unlinked, and whose
+    '<input> CSV' companion is unlinked, then reads its copy. Raises ValueError, copying nothing, when the node has no
+    starter CSV or the .blend was never saved."""
+    templates = starter_files(node)
+    if not templates:
+        raise ValueError(f"No starter CSV for this {node.bl_label} node's inputs")
+    if not bpy.data.filepath:
+        raise ValueError("Save the .blend first: the starter CSVs are copied next to it")
+    folder, copied = os.path.dirname(bpy.data.filepath), []
+    for socket, file in templates:
+        with open(os.path.join(TEMPLATE_DIR, file), "rb") as handle:
+            data = handle.read()
+        stem, number = file.removesuffix(".csv"), 1
+        while True:
+            path = os.path.join(folder, file if number == 1 else f"{stem} {number}.csv")
+            try:
+                with open(path, "xb") as handle:  # created new: an existing file or link is never written
+                    handle.write(data)
+                break
+            except FileExistsError:
+                number += 1
+        copied.append(path)
+        companion = lists.find_input(node, f"{socket.name} CSV")
+        if not (socket.is_linked or socket.default_value.strip() or (companion is not None and companion.is_linked)):
+            socket.default_value = bpy.path.relpath(path)
+    engine.schedule(immediate=True, node=node)
+    return copied
+
+
+class OPENACT_OT_new_csv_from_template(bpy.types.Operator):
+    bl_idname = "openact.new_csv_from_template"
+    bl_label = "New CSV from Template"
+    bl_description = ("Copy this node's starter CSV files next to the .blend, never over an existing file, and use "
+                      "each one in its input if that input is empty")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    uid: bpy.props.StringProperty(options={'HIDDEN'})
+
+    def execute(self, context):
+        _tree, node = engine.find_node(self.uid)
+        if node is None or node.id_data.library is not None:  # a linked node's inputs are read-only
+            return {'CANCELLED'}
+        try:
+            copied = copy_templates(node)
+        except (ValueError, OSError) as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Wrote " + ", ".join(os.path.basename(path) for path in copied))
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------------------------ diagnostics (§17.5)
+
+def redact(text) -> str:
+    """A message as diagnostics copy it: its shape and numbers, with each path cut to its file name and each quoted
+    segment replaced by '…'."""
+    text = PATH.sub(lambda found: re.split(r"[\\/]", found.group().rstrip("\\/"))[-1], text)
+    return QUOTED.sub(r"\1…\1", text)
+
+
+def diagnostics() -> str:
+    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime's folder (the
+    home folder as ~) and the name of its venv's Python folder, the model server's status and /health counters, the
+    queue, the nodes and the first 10 problems. A problem is given by its node type and severity, never its text; the
+    server's message is redacted. So the report holds no words of the artist's (§16.3)."""
+    from . import bl_info  # the package's
+
+    prefs, health = P.get_prefs(), server.STATE.health
+    root, home = P.runtime_root(prefs), os.path.expanduser("~")
+    legacy = " (the legacy Jev Nodes runtime)" if os.path.basename(root).casefold() == "jevnodes" else ""
+    # The folder's name only: the Jev Nodes runtime's venv uses the user's uv Python (§12.2), which a roaming profile
+    # can put on a server
+    python = re.split(r"[\\/]", P.venv_home(root).rstrip("\\/"))[-1]
+    if os.path.normcase(root + os.sep).startswith(os.path.normcase(home) + os.sep):  # the home folder itself too
+        root = "~" + root[len(home):]
+    state, message = server.status()
+    per_class, flight = pipeline.queue_counts()
+    nodes = list(engine.iter_nodes())
+    lines = [
+        f"OpenAct {'.'.join(map(str, bl_info['version']))}, Blender {bpy.app.version_string}, "
+        f"{platform.platform()}, Python {platform.python_version()}",
+        f"GPU: {health.get('device') or 'unknown'} (device {prefs.device}, GPU {prefs.gpu})",
+        f"Backend: {health.get('backend') or 'unknown'}, model {health.get('model_id') or 'unknown'}, revision "
+        f"{health.get('revision') or 'unknown'}",
+        f"Runtime: {root}{legacy}" + (f"; Python from {python}" if python else ""),
+        f"Server: {state} on port {server.STATE.port}" + (f": {redact(message)[:200]}" if message else ""),
+        "Health: " + (", ".join(f"{key} {health[key]}" for key in HEALTH if health.get(key) is not None) or "none"),
+        f"Queue: {per_class[0]}/{per_class[1]}/{per_class[2]} chunks (P0/P1/P2), {flight} cells in flight, "
+        f"{len(pipeline.PENDING)} pending, {len(pipeline.FAILED)} failed",
+        "Nodes: " + (", ".join(f"{n} {label}" for label, n in Counter(node.bl_label for _tree, node in nodes).items())
+                     or "none"),
+    ]
+    problems = Counter()
+    for _tree, node in nodes:  # counts only: a label or a word could be the artist's text
+        status = engine.STATUS.get(node.uid)
+        for problem in status.problems if status else ():  # its node type and severity, never its text (§16.3)
+            problems[f"{node.bl_label} {problem.severity}"] += 1
+        jobs = [job for _label, job, _entry in status.uses] if status else []
+        entries = store.load(node).entries
+        lines.append(f"  {node.bl_label}: {status.state if status else 'no pass yet'}; rows per table "
+                     f"{', '.join(str(len(job.rows)) for job in jobs) or 'none'}; "
+                     f"{len(inner.materialised(entries, [job.gn for job in jobs]))} of {len(entries)} stored entries "
+                     f"materialised; {len(node.node_tree.nodes) if node.node_tree else 0} nodes in the inner group")
+    lines.append(f"Problems: {problems.total()}")
+    lines += [f"  {kind}" + (f" (x{count})" if count > 1 else "") for kind, count in list(problems.items())[:10]]
+    return "\n".join(lines)
+
+
+class OPENACT_OT_copy_diagnostics(bpy.types.Operator):
+    bl_idname = "openact.copy_diagnostics"
+    bl_label = "Copy Diagnostics"
+    bl_description = ("Copy a report for a bug report to the clipboard: versions, GPU, the model server's status and "
+                      "counters, node counts, each problem's node type and severity, the runtime's folder (the home "
+                      "folder as ~) and the name of its Python's folder. It holds no content of yours: no prompts, CSV "
+                      "text or paths, and no node, item or factor names")
+
+    def execute(self, context):
+        context.window_manager.clipboard = diagnostics()
+        self.report({'INFO'}, "Copied the diagnostics to the clipboard")
+        return {'FINISHED'}
+
+
 # ---------------------------------------------------------------------------- the upgrade from v0.1.0 (§12.3)
 
 class OPENACT_OT_upgrade_legacy(bpy.types.Operator):
@@ -746,8 +902,9 @@ class OPENACT_OT_legacy_report(bpy.types.Operator):
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
            OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
-           OPENACT_OT_write_overrides, OPENACT_OT_prepare_playback, OPENACT_OT_cancel_playback, OPENACT_OT_unpin,
-           OPENACT_OT_upgrade_legacy, OPENACT_OT_legacy_report)
+           OPENACT_OT_write_overrides, OPENACT_OT_new_csv_from_template, OPENACT_OT_copy_diagnostics,
+           OPENACT_OT_prepare_playback, OPENACT_OT_cancel_playback, OPENACT_OT_unpin, OPENACT_OT_upgrade_legacy,
+           OPENACT_OT_legacy_report)
 
 
 def register():

@@ -35,7 +35,7 @@ from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
-from .specs.base import UNSURE_BELOW, orphaned
+from .specs.base import orphaned, unsure_below
 from .specs.pick import PickSpec
 from .watch import WATCH
 
@@ -46,6 +46,10 @@ SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; i
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
 OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
+STALL = 60.0  # seconds with cells asked of a ready model and no chunk answered: the stalled-fill alert (§17.6)
+STALLED = "No answers for {:g} s: see the log"
+SLOW_MS, SLOW_FOR = 3 * pipeline.MS_PER_ROW, 60.0  # /health's ms_per_row above this for so long: the slow note (§17.3)
+SLOW = "Running slower than expected: is the GPU busy (rendering, another app)?"
 ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
          "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
@@ -72,6 +76,8 @@ _group_count = -1  # number of node groups at the last pass that found no OpenAc
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
 _pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
+_quiet_since = time.monotonic()  # the stall clock: since a chunk was last answered, or cells were first asked
+_slow_since = None  # since when /health's ms_per_row has been above SLOW_MS, cells asked all along
 
 
 @dataclass
@@ -533,11 +539,29 @@ def _submit(job, missing):
     here."""
     state, _message = server.status()
     if state == "ready":
-        pipeline.submit(job, missing, job.priority, on_rows=lambda _job: schedule(immediate=True))
+        pipeline.submit(job, missing, job.priority, on_rows=_answered)
         return True
-    if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
+    if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start and not server.STATE.detached:
         return server.start()  # asked by the pass that runs when the server is ready; an install starts it as it ends
     return state == "starting" or server.STATE.start_queued
+
+
+def _answered(_job):
+    """A chunk came back, answered or failed: the stall clock starts again, and a pass shows the answers."""
+    global _quiet_since
+    _quiet_since = time.monotonic()
+    schedule(immediate=True)
+
+
+def stalled():
+    """True when cells are asked of a ready model and no chunk has come back for STALL seconds (§17.6)."""
+    return bool(pipeline.PENDING) and server.is_ready() and time.monotonic() - _quiet_since >= STALL
+
+
+def slow_note():
+    """The Model box's note once /health's ms_per_row has been above SLOW_MS for SLOW_FOR seconds while cells were
+    asked (§17.3), else ""."""
+    return SLOW if _slow_since is not None and time.monotonic() - _slow_since >= SLOW_FOR else ""
 
 
 def _priority(spec, node, missing):
@@ -570,10 +594,12 @@ def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
             return "starting", "Starting the model...", None
         if message == server.CHECKING:  # a start waits for the runtime probe
             return "starting", message, None
-        if state in ("stopped", "unknown") and not P.get_prefs().auto_start:
+        if state in ("stopped", "unknown") and (not P.get_prefs().auto_start or server.STATE.detached):
             return "paused", "Model server is stopped (OpenAct tab)", None
         if upstream and not waiting:
             return "waiting", "Waiting for another OpenAct node...", None
+        if stalled():  # its chunks stay queued
+            return "warning", STALLED.format(STALL), None
         return ("filling", *_filling(uid))
     if not jobs:
         return "hint", hints[0] if hints else spec.empty_hint, None
@@ -604,6 +630,7 @@ def _counts(jobs, resolved, asked):
     plan's rows, whose cells are asked (pending), failed (errors) or answered this session."""
     counts = dict.fromkeys(("rows", "answered", "pending", "stale", "unsure", "locked", "code", "errors"), 0)
     letters = {"m": "answered", "p": "pending", "s": "stale", "l": "locked", "c": "code", "e": "errors"}
+    below = unsure_below()
     for gn, (job, _ctx) in jobs.items():
         counts["rows"] += len(job.rows)
         entry = resolved.get(gn)
@@ -611,7 +638,7 @@ def _counts(jobs, resolved, asked):
             for letter in entry.rows.src:
                 counts[letters.get(letter, "answered")] += 1
             confidences = entry.rows.v.get("c") or ()
-            counts["unsure"] += sum(src == "m" and c < UNSURE_BELOW for src, c in zip(entry.rows.src, confidences))
+            counts["unsure"] += sum(src == "m" and c < below for src, c in zip(entry.rows.src, confidences))
             continue
         for row in job.rows:
             if row.cell is None:
@@ -1007,20 +1034,12 @@ def frames_text(spans):
     return ", ".join(str(start) if start == end else f"{start}–{end}" for start, end in spans)
 
 
-def _window():
-    """The window an undo step is pushed from: the context's, else the first one (a timer has no window)."""
-    wm = getattr(bpy.context, "window_manager", None)
-    return bpy.context.window or (wm.windows[0] if wm and wm.windows else None)
-
-
 def _undo_push(message):
-    """An undo step for what the pass wrote on its own, when there is a window to push it from."""
-    window = _window()
-    if window is None:
-        return
-    with bpy.context.temp_override(window=window):
-        if bpy.ops.ed.undo_push.poll():
-            bpy.ops.ed.undo_push(message=message)
+    """An undo step for what the pass wrote on its own, in the context as it is (a timer's has the first window): under
+    temp_override, Blender 4.5 reads the override without the GIL during bpy.ops, which crashes while a thread of
+    OpenAct's runs Python."""
+    if bpy.ops.ed.undo_push.poll():
+        bpy.ops.ed.undo_push(message=message)
 
 
 def _modal_undo():
@@ -1033,18 +1052,14 @@ def _hold():
     """Why pins a pass writes must wait, or "" when an undo step can hold them without cutting the user's history: a
     modal operator is mid-way (its own step would take them), the mode's undo steps hold only its own data (Edit Mode,
     Sculpt Mode, Texture Paint...), or there are steps to redo (a push would delete them)."""
-    window = _window()
-    if window is None:  # no undo step to push, and none to cut
-        return ""
     if _modal_undo():
         return "they are pinned once the running tool finishes"
-    with bpy.context.temp_override(window=window):
-        if bpy.context.mode not in LAND_MODES:
-            obj = bpy.context.active_object
-            mode = obj.bl_rna.properties["mode"].enum_items[obj.mode].name if obj is not None else bpy.context.mode
-            return f"they are pinned once you leave {mode}"
-        if bpy.ops.ed.redo.poll():
-            return "they are pinned once nothing is left to redo (redo it, or make any change)"
+    if bpy.context.mode not in LAND_MODES:
+        obj = bpy.context.active_object
+        mode = obj.bl_rna.properties["mode"].enum_items[obj.mode].name if obj is not None else bpy.context.mode
+        return f"they are pinned once you leave {mode}"
+    if bpy.ops.ed.redo.poll():
+        return "they are pinned once nothing is left to redo (redo it, or make any change)"
     return ""
 
 
@@ -1152,7 +1167,7 @@ def _publish(event, value):
 
 
 def tick():
-    global _last_refresh, _dirty
+    global _last_refresh, _dirty, _quiet_since, _slow_since
     try:
         if server.pump():
             redraw()
@@ -1160,6 +1175,14 @@ def tick():
         _publish(server.Worker.render_running, rendering)  # for the worker, which never calls bpy (§5.5)
         _publish(server.Worker.playing, playing)
         now = time.monotonic()
+        asking = server.is_ready() and bool(pipeline.PENDING) and not rendering  # the worker sends: rows get scored
+        if not asking:  # both clocks run only then: an idle server's ms_per_row is its last fill's
+            _quiet_since = now
+        ms_per_row = server.STATE.health.get("ms_per_row") if asking else None
+        if ms_per_row is None or ms_per_row <= SLOW_MS:
+            _slow_since = None
+        elif _slow_since is None:
+            _slow_since = now
         if now - _last_refresh > 5.0 and (_has_nodes or server.STATE.status in ("unknown", "ready", "starting")):
             _last_refresh = now
             server.refresh()

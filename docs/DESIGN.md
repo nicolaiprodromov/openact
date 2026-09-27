@@ -565,7 +565,8 @@ flowchart TB
 - `server.start()` launches `venv/python -u runtime/openact_server.py`, with the script taken
   from the add-on folder;
 - arguments: `--port <port> --backend semif --device <auto|cuda> [--gpu N] --parent-pid
-  <blender pid>`. v1 has no CPU device option at all: only NVIDIA/CUDA is built (NG9).
+  <blender pid> --token-file <state>/server-<port>.token`. v1 has no CPU device option at all:
+  only NVIDIA/CUDA is built (NG9).
   - **In v1, `auto` means CUDA only.** The prototype's `Engine.load` resolved `auto` to `"cpu"`
     whenever `torch.cuda.is_available()` was False, and switched bf16 to fp32. `openact_server.py`
     instead reports `status: "error"` with "CUDA is not available to PyTorch (is the NVIDIA driver
@@ -987,6 +988,14 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
   in-flight chunk completes.
 - **Undo and redo.** Entries JSON, inner groups and table objects are ordinary data inside undo
   steps. `on_undo_redo` schedules an immediate pass, and `MEMORY` makes re-applying answers free.
+- **Operators take the context as it is.** A timer's context has the first window, so the pins'
+  own undo step (`ed.undo_push`) and the old-nodes report (`openact.legacy_report`) need no
+  `temp_override`, and OpenAct calls none. Under one, Blender 4.5 and 5.0 (Python 3.11) read the
+  override without the GIL during `bpy.ops`, which crashes while the worker or a probe runs Python
+  (`playback_blender.py` stresses it). Blender's own calls of that kind (the node editor's viewer
+  shortcuts, Ctrl+1…9 and 1…9; Quick Effects) and other add-ons' can still crash those versions
+  when they meet one of those brief moments; OpenAct can't change them (README, *Known issues*).
+  Blender 5.1 (Python 3.13) is not affected.
 
 **Headless and tests.** With `bpy.app.background` set, as in a render farm's `blender -b -f`,
 OpenAct renders the saved answers and does not re-plan or re-bake from files (§7.8, R23). Headless
@@ -1420,7 +1429,7 @@ one input per factor declared in the Factors CSV, and a tail that exists only in
 |---|---|---|---|---|
 | Question | word | String | "" | "What happens to this cell in the next generation?" |
 | Context | word | String | "" | Shared situation: "A cellular automaton on a square grid; every cell has eight neighbours." |
-| Factors | word | String (`.csv` path) | "" | **Required.** Factor declarations (below). Empty → hint "Set a Factors CSV (sidebar: New Rules Template)" |
+| Factors | word | String (`.csv` path) | "" | **Required.** Factor declarations (below). Empty → hint "Set a Factors CSV (sidebar: New CSV from Template)" |
 | Outcomes | word | String | "" | Answer set: inline or CSV `answer,when[,if][,payload…]`. **Required** for One-of. Optional for Yes/No (`yes`/`no` whens) and Amount (ordered levels; default the five `AMOUNT_LEVELS`) |
 | Overrides | word | String | "" | Overrides CSV keyed by level names, one column per factor (§7) |
 | *one per factor* | field | Float / Int / Bool | 0 / 0 / False | Named after the factor, in CSV order (table below) |
@@ -2874,16 +2883,49 @@ def decide(self, request):
   the server's message, and the status shows the error. It is never requeued forever.
 
 **Launch token and sharing a server.** `start()` generates `secrets.token_hex(32)`, passes it as
-`OPENACT_TOKEN`, and writes `<runtime>/server-<port>.token`.
-- That folder is per-user by default (`%LOCALAPPDATA%`). An explicitly chosen `runtime_dir` passes
-  on its own permissions, and the preferences warn when it lies outside the user's profile
-  (§16.1). On POSIX the file gets mode 0600.
-- A second Blender that finds a healthy `openact-semif` on the port reads the token file and
-  attaches, so two Blender sessions share **one** 8.4 GB model instead of loading two.
+`OPENACT_TOKEN`, and has `<runtime>/server-<port>.token` written: the server writes it
+(`--token-file`) once it holds the port, so a Blender whose server lost a start race for the port
+never overwrites the winner's file. The server binds its port exclusively (no `SO_REUSEADDR` on
+Windows, where it would let a second server listen on the same port), and removes the file on a
+clean exit, before it frees the port.
+- That folder (`OPENACT_STATE_DIR` when set, §5.2) is per-user by default (`%LOCALAPPDATA%`). An
+  explicitly chosen one passes on its own permissions, and the preferences warn when the folder
+  that holds the token lies outside the user's profile (§16.1). On POSIX the file gets mode 0600.
+- **Whose server it is.** `/health` reports `parent_pid`, the Blender that started the server
+  (`--parent-pid`; a uv launcher's own pid differs from the server's). A server is this Blender's
+  own when that is its pid; any other `openact-semif` is **another Blender's**.
+- A second Blender that finds another Blender's healthy `openact-semif` on the port reads the
+  token file and attaches, so two Blender sessions share **one** 8.4 GB model instead of loading
+  two. It reads the file again at each `/health` probe and on a 403, and tries a token that
+  changed since.
+- **A lost start race.** A server that can't bind its port exits with its own code (4), which is
+  no crash (§17.6): its Blender attaches at once to the server that holds the port, or, when
+  nothing OpenAct can use answers there, says the port can't be used.
 - If the token file is missing or wrong, the status says "A model server started elsewhere is
   running on port 18765 without a readable token: stop it or choose another port."
+- A request that a server refuses (403) after this Blender's token changed, such as one sent to
+  a server that crashed and taken by the one auto-start started in its place, is asked again with
+  the new token.
+- **Stop Model only detaches from another Blender's server:** this Blender stops using it and
+  forgets its token, and it runs on for the Blender that started it. The Model box says "Shared:
+  started by another Blender", and the Stop button reads *Detach* there. Detach lasts: health probes
+  and the start poller don't attach, also once a server that was loading is ready, and auto-start
+  waits, until *Start Model*, or until that server goes away. A Detach in a lost start race also
+  ends this Blender's losing server process, with no `/shutdown`. A server of this Blender's own is
+  always shut down by *Stop Model*, and a start forgets the health of a server that has gone, so
+  its own new server never looks shared.
+- **The client's state follows from what it observes**, in one place (`_observe()`): its own
+  process, what a `/health` probe of the port found, whose server answered (`parent_pid`), the
+  token file, a Detach and a refusal.
+  - A probe that times out is no verdict. Only a refused connection means that nothing listens
+    (the probe waits 3 s, longer than a refused connection takes on Windows).
+  - A result from before the last start, Stop or Detach is dropped.
+  - A request carries the token of the server in use as it leaves, or it doesn't leave. After a
+    Detach, a chunk the worker had already taken goes back unsent.
+  - *Stop Model* releases this Blender's process before ending it, so the exit it asked for is
+    never reported (§17.6).
 - The watchdog still ties the server's life to the Blender that launched it. Attached sessions
-  see *stopped* when it exits, and can start their own.
+  see *stopped* when it exits, also during its load, and can start their own.
 
 **Installer.** Pre-checks run before anything is downloaded:
 - free disk space of at least 15 GB;
@@ -3061,7 +3103,8 @@ all of which are already installed. `openact_server.py` needs no new packages.
 - **Sidebar and preferences** show "Using the Jev Nodes runtime at …\JevNodes; Python from <home>"
   in the Model box, which the preferences show too, while the runtime is that folder. An *Open
   Runtime Folder* button is next to it. It gives no size: walking 13 GB of files while drawing is
-  too slow. Diagnostics (§17.5, PR-23) include the same two paths.
+  too slow. Diagnostics (§17.5, PR-23) include the runtime folder, with the home folder as `~`,
+  and the name of its Python's folder.
 - **Deleting the old runtime.** Users can delete `JevNodes` after installing a fresh `OpenAct`
   runtime. The external uv-managed Python it used may be shared with other tools, so the README
   says to remove it only with `uv python uninstall` and only if nothing else uses it. OpenAct
@@ -3249,7 +3292,7 @@ still work):
 | Code | When | Client reaction (`server.Worker`) |
 |---|---|---|
 | 200 | answered | fill `MEMORY`, post to the main thread |
-| 403 | missing or wrong token, `Origin` present, bad `Host` | status *error* "A model server started by another Blender holds port N: close that Blender or choose another port" while `/health` reports that server's pid; the cells stay unanswered (not `FAILED`) and are asked again once it has gone. A refused *Stop Model* (`/shutdown`) is reported the same way |
+| 403 | missing or wrong token, `Origin` present, bad `Host` | status *error* "A model server started elsewhere is running on port N without a readable token: stop it or choose another port" (§10.5) while `/health` reports that server's pid; the cells stay unanswered (not `FAILED`) and are asked again once it has gone. A refused *Stop Model* (`/shutdown`) is reported the same way. A request sent with a token that has changed since, or whose token another Blender's token file no longer holds, is asked again |
 | 413 | body over 4 MB | should never happen, because chunks stay far below it; log, then split the chunk |
 | 422 | invalid question; `question` names it | mark that cell `FAILED`; resend the rest of the chunk (§10.3) |
 | 503 `loading` | model still loading (returned immediately, no blocking) | requeue at the head, poll `/health` until `ready` |
@@ -3802,8 +3845,10 @@ records which file was opened).
   - `server.log` holds status lines, timings and error messages.
   - `log_requests` (off by default) writes full requests and responses to `<runtime>/logs/`. Its
     tooltip says exactly that.
-  - `openact.copy_diagnostics` copies versions, GPU, status, counters and the last errors
-    (truncated to 200 characters). It never includes CSV contents or prompts.
+  - `openact.copy_diagnostics` copies versions, GPU, status, counters, node counts, the problems
+    (each as node type and severity) and two system paths: the runtime's folder, with the home
+    folder as `~`, and the name of its Python's folder (§17.5). It holds no user content: no
+    prompts, CSV text or paths, and no node, item or factor names.
 
 ### 16.4 Licences and naming
 
@@ -3844,7 +3889,7 @@ class NodeStatus:
 
 | State | Icon | Example line |
 |---|---|---|
-| hint | `INFO` | "Type a question" / "Set a Factors CSV (sidebar: New Rules Template)" |
+| hint | `INFO` | "Type a question" / "Set a Factors CSV (sidebar: New CSV from Template)" |
 | paused | `PAUSE` | "Model server is stopped (OpenAct tab)" (auto-start off) |
 | starting | `SORTTIME` | "Starting the model…" / "Installing the model… 3/5 PyTorch" |
 | waiting | `SORTTIME` | "Waiting for another OpenAct node…" |
@@ -3907,8 +3952,9 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 `rows_scored`, `cache_hits`, and `ms_per_row` (EMA over the last 64 scoring calls).
 - The Blender side polls every 5 s while nodes exist, as `tick()` does today.
 - `ms_per_row` feeds every ETA.
-- If `ms_per_row` exceeds 3× its 3090 default (21 ms) for a minute, the Model box shows "Running
-  slower than expected: is the GPU busy (rendering, another app)?".
+- If `ms_per_row` exceeds 3× its 3090 default (21 ms) for a minute while cells are being asked,
+  the Model box shows "Running slower than expected: is the GPU busy (rendering, another app)?".
+  While nothing is asked the clock stops: an idle server's `ms_per_row` is its last fill's.
 
 ### 17.4 Logs
 
@@ -3917,7 +3963,7 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 | `<runtime>/server.log` | Start line (backend, device, load time); one line per request, e.g. `12:03:44 req q=18 rows=36 812ms cached=0/18 debias`; tracebacks on 500 | Overwritten on each start |
 | `<runtime>/install.log` | Every installer command and its output | Appended |
 | Blender console | `[OpenAct]` prefix; tracebacks for internal errors only (per-node errors go to the status record) | Session |
-| `<runtime>/logs/requests-YYYYMMDD.jsonl` | Only when `log_requests` is on. One JSON line per request with `t`, `state`, `questions`, `answers`, `ms`, `rows` | Local only; the user deletes it |
+| `<runtime>/logs/requests-YYYYMMDD.jsonl` | Only when `log_requests` is on (it takes effect at once). One JSON line per request with `t`, `status` (the HTTP code), `state`, `questions`, `answers`, `ms`, `rows`. On POSIX the folder is 0700 and the file 0600 | Local only; the user deletes it |
 
 ### 17.5 Diagnostics for bug reports
 
@@ -3925,23 +3971,31 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 - OpenAct, Blender and OS versions;
 - GPU and device;
 - backend, `model_id` and revision;
-- the runtime root, marked when it is the legacy folder;
+- the runtime root, marked when it is the legacy folder, and the name of the folder of the base
+  Python its venv uses (§12.2: outside the runtime for the Jev Nodes one);
 - server status and `/health` counters;
 - a node count per type, with rows per table, materialised entries and inner-group node counts;
 - queue state;
-- the last 10 problems, each truncated to 200 characters.
+- the last 10 problems, each as node type and severity (never its text).
 
-It contains **no prompts and no CSV contents** (§16.3).
+It contains **no prompts and no CSV contents** (§16.3): problems keep no text, the runtime root
+shows the home folder as `~` (also when it is the home folder), and the server's message has every
+quoted segment as `'…'` and every path cut to its file name. The Python is named by its folder
+only, e.g. `cpython-3.12.11-windows-x86_64-none`: uv keeps its Pythons in `%APPDATA%`, which a
+roaming profile can put on a server, so its full path could show the server and the account. The
+two runtime paths locate the model runtime on the machine; they are not the artist's content.
 
 ### 17.6 Alerts (local)
 
 There is no remote alerting. The "alerts" are user-facing messages that name the fix:
 - the status line and the sidebar banners above;
-- **crash-loop protection:** if the server exits unexpectedly 3 times within 10 minutes, auto-start
-  pauses and the Model box shows "The model server keeps stopping: see the log"; *Start Model*
-  re-enables it;
+- **crash-loop protection:** if the server this Blender started exits unexpectedly (an exit code
+  other than 0, which a `/shutdown` gives) 3 times within 10 minutes, auto-start pauses: the status
+  becomes an error, so the Model box and the nodes show "The model server keeps stopping: see the
+  log"; *Start Model* re-enables it. An exit that *Stop Model* asked for, also during the load,
+  never counts and never shows as an error;
 - **a filling table that stalls** (no answered chunk for 60 s while the server is `ready`) shows
-  "No answers for 60 s: see the log", and its queued chunks stay queued.
+  "No answers for 60 s: see the log" as its node's warning line, and its queued chunks stay queued.
 
 ### 17.7 Test and benchmark output
 
@@ -3994,7 +4048,9 @@ A later run can diff these lines to spot performance regressions.
 | `tests/csv_probe_blender.py` | Blender | none | **Import CSV parity** per fixture: point count equals `csvfmt` data rows; kept attributes equal `csvfmt` numeric columns with the same INT/FLOAT types and values. It records Blender's behaviour for blank lines, quoted line breaks, BOM and `;` in `tests/fixtures/import_csv_behaviour.json`. It re-asserts the path-cache fact (an edited file still returns old rows), so a future Blender change is noticed |
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
 | `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick, an upgraded collection Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
-| `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses; two Blender processes share one server through the token file. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
+| `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
+| `tests/playback_blender.py` | Blender + fake server | fake | **Prepare for Playback and pins (§5.5, §8.1, §14.7):** a keyframed Menu Switch cycling through three rule sets is answered and pinned, and playing the range then sends 0 requests and never shows a fallback; the F-curve path reads 250 frames in under 1 s with no scene evaluation, reads a context whose words read nothing animated once, finds the F-curves through the action slot's channelbag on 4.5 and 5.1, and clamps to the hard range; drivers, NLA tracks and Time Stretching take the `frame_set` fallback, which restores the frame and can be cancelled (the modal operator's functions on stand-ins); 13 word sets are refused, asking nothing; pins survive save and reload, and *Unpin* and *Unpin All* remove them. **Undo, for real:** pins a pass writes get a step of their own, and wait while a redo is possible, in Edit Mode and during a modal tool, but land in Pose Mode, Weight Paint and Vertex Paint; re-bake flags follow undo and redo. Pin order once live plus pinned exceeds 16; pins above 2 MB are kept, with the size note. **Stress:** the pins' undo step is checked and pushed for 3 s while another thread runs Python, and OpenAct's code calls no `temp_override` (§5.5) |
+| `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
 | **`tests/migrate_blender.py`** | Blender 4.5 and 5.1 | none | §12.5: a v0.1.0 file built with the prototype's own 0.1.0 release (`tests/fixtures/jev_nodes-0.1.0.zip`) → `openact.upgrade_legacy` → identical outputs, 0 requests, inner groups renamed and owned, links kept, and undo restores the old nodes. It covers the prototype's **collection Pick** (the e2e scene's `lamp` node), which must **match its converted entry through the joined key**, with the absent Items position joined as `""` (§8.2), a Pick whose Items text contains `;` and `": "` (legacy parsing keeps its names), and a Pick with both Items text and a Collection (collection wins, its answers kept). It also imports custom `jev_nodes` preferences (§12.2) |
 | `tests/e2e_blender.py` (extended) | Blender + real model | real | The existing `build` / `noaddon` / `reopen` phases, now covering all six nodes. **Game of Life acceptance:** Conway, HighLife, Seeds and Day & Night, each 18/18 exact with 0 unsure. Biome: mean confidence ≥ 0.55 with all 7 outcomes used. Sanity checks for Match, Classify and Dials; Pick's Probability field; `noaddon` with table objects and entry-level Index Switches; `reopen` sends 0 requests. TIMING lines are compared with §3.2 |
 
@@ -5229,9 +5285,10 @@ flowchart LR
       makes the pins whose tuples start latest in the frame range go inactive, the same ones on
       every run;
     - pins whose total size exceeds 2 MB are kept, the size note appears, and Prepare for Playback
-      showed the projected size first (§14.7);
+      showed the projected size first (§14.7).
+  - `tests/support_blender.py` (new, so it doesn't meet the playback work in pipeline):
     - two Blender processes share one server through the token file, and the second attaches
-      without loading a second model;
+      without loading a second model; its Stop Model only detaches;
     - a template copy never overwrites (it creates `name 2.csv`) and fills an empty, unlinked
       socket;
     - the diagnostics text has versions and counters but no prompt or CSV text;

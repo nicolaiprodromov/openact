@@ -13,6 +13,7 @@ DEFAULT_PORT = 18765
 MODEL_SOURCE = "Qwen/Qwen3.5-4B"
 MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 MODEL_LABEL = "Qwen3.5-4B via SemIf"
+UNSURE_BELOW = 0.30  # 4.e: the Unsure Below preference's default
 JEV_SETTINGS = ("runtime_dir", "port", "device", "gpu", "auto_start", "debias")  # what OpenAct takes from jev_nodes
 
 
@@ -35,6 +36,8 @@ class _Defaults:
     device = "auto"
     auto_start = True
     debias = True
+    unsure_below = UNSURE_BELOW
+    log_requests = False
     trusted_folders = []  # plain path strings here; PropertyGroups with a path in the preferences
     trusted_files = []
 
@@ -148,6 +151,13 @@ class OpenActPath(bpy.types.PropertyGroup):
     path: bpy.props.StringProperty(name="Path", default="")
 
 
+def publish_log_requests(self, _context):
+    """The decision worker reads the preference from the server state: turning it off stops the log at once."""
+    from . import server  # imports this module
+
+    server.STATE.log_requests = self.log_requests
+
+
 class OpenActPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
@@ -184,6 +194,16 @@ class OpenActPreferences(bpy.types.AddonPreferences):
         name="Balance Option Order for New Nodes", default=True,
         description="The Balance Option Order setting that new OpenAct nodes start with: every question asked with "
                     "the options in both orders, at twice the cost. Existing nodes keep their own setting",
+    )
+    unsure_below: bpy.props.FloatProperty(
+        name="Unsure Below", default=UNSURE_BELOW, min=0.0, max=1.0,
+        description="Flag the model's answers whose confidence is below this: in the node's status line, the "
+                    "sidebar's table and the unsure column of an exported Overrides CSV",
+    )
+    log_requests: bpy.props.BoolProperty(
+        name="Log Requests", default=False, update=publish_log_requests,
+        description="Write full requests and responses to <runtime>/logs/, one JSON line each. The prompts and CSV "
+                    "text they hold stay on this computer until you delete them",
     )
     trusted_folders: bpy.props.CollectionProperty(
         type=OpenActPath, name="Trusted Folders",

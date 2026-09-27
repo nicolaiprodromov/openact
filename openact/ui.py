@@ -17,7 +17,7 @@ import bpy
 
 from . import csvfmt, engine, evaluator, inner, lists, migrate, pipeline, server, trust
 from . import prefs as P
-from .specs.base import UNSURE_BELOW, table_of
+from .specs.base import table_of, unsure_below
 from .watch import WATCH
 
 _ICONS = {
@@ -102,12 +102,12 @@ def table_rows(spec, job, entry=None) -> list[tuple]:
 def table_page(rows, page=0):
     """One page of a table view (§17.2): (lines, page, pages), page clamped to the table. rows: table_rows(); lines:
     (name, answer, confidence, icon, active) of up to PAGE_ROWS rows. The icon tells a lock, a code row, a row in error
-    and an unsure model row (confidence below UNSURE_BELOW); stale and pending rows are not active (greyed out)."""
+    and an unsure model row (confidence below unsure_below()); stale and pending rows are not active (greyed out)."""
     pages = max(1, -(-len(rows) // PAGE_ROWS))
     page = min(max(page, 0), pages - 1)
-    lines = []
+    lines, below = [], unsure_below()
     for name, answer, confidence, source in rows[page * PAGE_ROWS:(page + 1) * PAGE_ROWS]:
-        unsure = source == "model" and confidence is not None and confidence < UNSURE_BELOW
+        unsure = source == "model" and confidence is not None and confidence < below
         icon = ROW_ICONS.get(source, 'QUESTION' if unsure else 'BLANK1')
         lines.append((name, answer, confidence, icon, source not in ("stale", "pending")))
     return lines, page, pages
@@ -243,6 +243,9 @@ def draw_server(layout, banner=None):
             wrap(box, message, icon='BLANK1')
     if server.STATE.install_warning and server.STATE.install_warning not in message:  # "Runtime installed. <it>"
         wrap(box, server.STATE.install_warning, icon='ERROR')
+    shared = state in ("ready", "starting") and server.attached()
+    if shared:
+        box.label(text=server.SHARED, icon='LINKED')
     line = runtime_line()
     if line:
         row = box.row()
@@ -263,6 +266,9 @@ def draw_server(layout, banner=None):
             throughput.append(f"cache hits {health.get('cache_hits', 0) / health['questions']:.0%}")
         if throughput:
             col.label(text=" · ".join(throughput), icon='BLANK1')
+        note = engine.slow_note()
+        if note:
+            wrap(col, note, icon='ERROR')
     row = box.row(align=True)
     if state == "installing":
         row.operator("openact.open_log", icon='TEXT')
@@ -271,11 +277,14 @@ def draw_server(layout, banner=None):
         installed = state not in ("not_installed", "error") or P.runtime_installed(P.runtime_root())
         if not installed:
             row.operator("openact.install_runtime", icon='IMPORT')
+        elif shared:  # another Blender's server: Stop only stops using it (§10.5)
+            row.operator("openact.server_stop", text="Detach", icon='UNLINKED')
         elif state in ("ready", "starting"):
             row.operator("openact.server_stop", icon='PAUSE')
         else:
             row.operator("openact.server_start", icon='PLAY')
     row.operator("openact.open_log", text="", icon='TEXT')
+    row.operator("openact.copy_diagnostics", text="", icon='COPYDOWN')
 
 
 def draw_preferences(prefs, context, layout):
@@ -290,11 +299,18 @@ def draw_preferences(prefs, context, layout):
     sub.active = prefs.device != 'cpu'
     sub.prop(prefs, "gpu")
     col.prop(prefs, "debias")
+    col.prop(prefs, "unsure_below")
     col.prop(prefs, "port")
     col.prop(prefs, "runtime_dir")
+    root = P.runtime_root(prefs)
     row = col.row()
-    row.label(text=P.runtime_root(prefs), icon='FILE_FOLDER')
+    row.label(text=root, icon='FILE_FOLDER')
     row.operator("openact.open_runtime_folder", text="", icon='FILEBROWSER')
+    folder = os.path.abspath(server.state_dir(root))  # where the token file is (OPENACT_STATE_DIR, else the runtime)
+    if not trust.inside(os.path.normcase(folder), os.path.normcase(os.path.abspath(os.path.expanduser("~")))):
+        wrap(col, f"The folder that holds the model server's token, {folder}, is outside your user folder: its "
+                  "permissions decide who else can read the token", icon='ERROR')
+    col.prop(prefs, "log_requests")
     note = layout.box().column(align=True)
     note.label(text=f"Model: {P.MODEL_LABEL} ({P.MODEL_REVISION[:10]}), runs on this computer", icon='INFO')
     note.label(text="SemIf (formerly OpenJev), MIT - github.com/TheoLeeCJ/SemIf-OpenJev", icon='BLANK1')
@@ -349,8 +365,15 @@ def draw_pins(layout, node):
 
 
 def draw_files(layout, node):
-    """The files the node reads (§7.10): path, rows, text and payload columns, when read, the Import CSV note, and up
-    to FILE_PROBLEMS problems, with Open File."""
+    """The files the node reads (§7.10): New CSV from Template where one of the node's inputs has a starter file, then
+    each file's path, rows, text and payload columns, when read, the Import CSV note, and up to FILE_PROBLEMS problems,
+    with Open File."""
+    from .ops import starter_files  # ops imports this module
+
+    if starter_files(node):
+        row = layout.row()
+        row.enabled = node.id_data.library is None  # a linked node's inputs are read-only
+        row.operator("openact.new_csv_from_template", icon='FILE_NEW').uid = node.uid
     files = sorted(((ident, watched) for ident, watched in WATCH.files.items() if node.uid in watched.owners),
                    key=lambda item: item[1].path.casefold())
     if not files:
