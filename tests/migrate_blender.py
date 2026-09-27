@@ -230,6 +230,12 @@ class Stand:
     def __init__(self, entries):
         self.entries = entries
 
+
+def disable(module, default_set, handle_error=print):
+    """addon_utils.disable() without its extensions refresh: that syncs the wheels of the Blender profile in use to this
+    session's extensions (none under --factory-startup), and these add-ons are no extensions."""
+    addon_utils.disable(module, default_set=default_set, refresh_handled=True, handle_error=handle_error)
+
 # ------------------------------------------------------------------------------ the v0.1.0 file
 
 def build_scene():
@@ -413,14 +419,14 @@ def phase_both_enabled():
     check("both enabled: the sidebar says to disable Jev Nodes",
           banners == [("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ())], banners)
 
-    addon_utils.disable("openact", default_set=False)  # its preferences stay, as across a restart
+    disable("openact", default_set=False)  # its preferences stay, as across a restart
     old.port = free_port()
     addon_utils.enable("openact", default_set=False, handle_error=print)
     check("the import runs once: registering OpenAct again keeps its own settings",
           P.get_prefs().port == custom["port"], P.get_prefs().port)
 
-    addon_utils.disable("openact", default_set=False)
-    addon_utils.disable("jev_nodes", default_set=True)  # as the banner says
+    disable("openact", default_set=False)
+    disable("jev_nodes", default_set=True)  # as the banner says
     addon_utils.enable("openact", default_set=False, handle_error=print)
     registered = bpy.types.Node.bl_rna_get_subclass_py("GeometryNodeJevAsk")
     check("OpenAct alone: the legacy node types are its frozen aliases",
@@ -617,7 +623,7 @@ def phase_jev_later():
     addon_utils.enable("jev_nodes", default_set=True, handle_error=print)  # its default runtime is not installed here
     registered = bpy.types.Node.bl_rna_get_subclass_py("GeometryNodeJevAsk")
     errors = []
-    addon_utils.disable("openact", default_set=True, handle_error=errors.append)
+    disable("openact", default_set=True, handle_error=errors.append)
     check("jev_nodes enabled after OpenAct takes its node types back, and OpenAct still disables cleanly",
           registered is not None and registered.__module__.startswith("jev_nodes") and not errors, (registered, errors))
 
