@@ -177,8 +177,11 @@ def live_banners(context) -> list[tuple]:
     """banners() for this session: the server and the runtime probe, this file's trust, the add-ons, the nodes."""
     state, message = server.status()
     records = list(engine.STATUS.values())
-    blocked = 0 if trust.is_trusted() else len(
-        {problem.message for status in records for problem in status.problems if trust.BLOCKED in problem.message})
+    # from BLOCKED on: a node that reads a blocked node's answer repeats its read behind a breadcrumb
+    blocked = {problem.message[problem.message.index(trust.BLOCKED):] for status in records
+               for problem in status.problems if trust.BLOCKED in problem.message}
+    if blocked and trust.is_trusted():  # allowed since the pass; asked only then, as it resolves paths
+        blocked = set()
     over = []
     if any(status.contexts > inner.MATERIALISED_MAX for status in records):
         over = [f"{node.name}: {engine.OVER_CAP.format(status.contexts, inner.MATERIALISED_MAX)}"
@@ -187,7 +190,7 @@ def live_banners(context) -> list[tuple]:
     notes = [f"{os.path.basename(WATCH.files[ident].path)}: {note}" for ident, note in import_csv_notes().items()
              if ident in WATCH.files]
     legacy = [found for hook in LEGACY if (found := hook()) is not None]
-    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", blocked,
+    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", len(blocked),
                    context.preferences.addons.keys(), notes, legacy, over)
 
 

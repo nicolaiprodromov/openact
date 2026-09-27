@@ -136,11 +136,25 @@ def stored_rows(entry) -> list[pipeline.Row]:
 
 def table_of(job, entry=None) -> list[tuple[str, dict]]:
     """(source, values) of each row of a context's table, as the table view, Show Question and the Overrides CSV show
-    it: from the entry it shows once it is answered, else from its plan, whose pending rows have no values yet."""
-    if entry is not None and len(entry.rows.name) == len(job.rows):
+    it. From the entry it shows: row by row while the entry has the plan's words key, else from the entry's row with
+    the same wkey, as resolve() carries rows. Other rows are the plan's: a pending one has no values yet, and one
+    whose cell failed is in error."""
+    if entry is not None and entry.words_key == job.words_key:
         return [(KINDS.get(entry.rows.src[i], "model"), {column: v[i] for column, v in entry.rows.v.items()})
                 for i in range(len(job.rows))]
-    return [(row.source, dict(row.values)) for row in job.rows]
+    carried = {}
+    for row in stored_rows(entry) if entry is not None else ():
+        carried.setdefault(row.wkey, row)
+    table = []
+    for row in job.rows:
+        old = carried.get(row.wkey) if row.source != "lock" else None  # a lock wins over any stored answer
+        if old is not None:
+            table.append((old.source, dict(old.values)))
+        elif row.cell is not None and row.cell.key in pipeline.FAILED:  # not asked again until Ask Again
+            table.append(("error", {}))
+        else:
+            table.append((row.source, dict(row.values)))
+    return table
 
 
 class Spec:

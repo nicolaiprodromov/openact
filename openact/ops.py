@@ -14,7 +14,7 @@ import bpy
 from . import csvfmt, engine, lists, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
-from .specs.base import UNSURE_BELOW, table_of
+from .specs.base import UNSURE_BELOW, stored_rows, table_of
 
 PERMISSION = "Close the file in the other program (e.g. Excel) and try again."
 NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
@@ -223,7 +223,10 @@ def row_question(node, context=0, row=0) -> dict:
     if not 0 <= row < len(job.rows):
         raise ValueError(f"The table has no row {row + 1}")
     planned, source = job.rows[row], table_of(job, entry)[row][0]
-    ask = entry.asks[entry.rows.ask[row]] if source == "model" and entry is not None else ""
+    ask = ""
+    if source == "model" and entry is not None:  # the entry row table_of() read: this one, or the one with its wkey
+        ask = (entry.asks[entry.rows.ask[row]] if entry.words_key == job.words_key
+               else next(old.ask for old in stored_rows(entry) if old.wkey == planned.wkey))
     now, cell = engine.ask_key_now(engine.SPECS[node.bl_idname], job.debias), planned.cell
     return {"name": planned.name, "source": source, "debias": job.debias, "ask": ask,
             "older": bool(ask and now and ask != now), "state": cell and cell.state,
@@ -249,6 +252,8 @@ def question_text(found) -> str:
     if found["older"]:  # the templates, Balance Option Order or backend changed since it was answered
         lines.append(f"Answered with older settings (templates, Balance Option Order or backend; ask key "
                      f"{found['ask'][:12]}): this is what would be sent now. Ask Again re-asks it")
+    elif found["source"] == "error":  # its cell failed, and no pass sends it again
+        lines.append("Asking it failed (see the status): this is what was sent. Ask Again asks it again")
     else:
         lines.append(f"Answered with ask key {found['ask'][:12]}" if found["ask"] else
                      "Not answered yet: this is what would be sent")

@@ -5,7 +5,8 @@ their outputs exist before the first answer, showing their fallbacks; the one-ro
 output its setting's answer, Amount mapped into min-max; a min/max edit is a values-only update with 0 requests; two
 contexts with different ranges each get their own values; contexts with other setting names give the status error
 naming both, and every context keeps its last good table and every output its link, whichever context changed, also
-after an object rename, while the same settings in another order agree; an output drives Grid's Vertices X through a
+after an object rename, while the same settings in another order agree; meanwhile the sidebar's table and the export
+of a context whose settings moved give each setting its own answer; an output drives Grid's Vertices X through a
 valid link; renaming a setting warns (in the CSV or inline) until its new socket is linked, or it comes back linked
 (File > Revert), and typed back it warns until linked again; after Ask Again, or while an edited question is asked
 again, the outputs and their links stay; a CSV whose rows only move keeps each output on its own setting; a new
@@ -30,7 +31,7 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import ROOT, check, drive, finish, store  # noqa: E402
-from openact import engine, inner, nodes, ops, pipeline, server, tables  # noqa: E402  (bpy must be imported first)
+from openact import engine, inner, nodes, ops, pipeline, server, tables, ui  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.specs import dials  # noqa: E402
@@ -294,6 +295,23 @@ def phase_nomodel():
         header, rain, wind, time_, street, fog = handle.read().split("\n")[:6]
     rewrite(csv_b, [header, rain, fog, wind, time_, street])  # each entry fills the outputs by name
     settled("the same settings in another order agree")
+    rewrite(csv_b, [header, wind, rain, time_, street, fog.replace("Fog,", "Mist,")])  # moved, and one renamed
+    settled("B moves Wind speed first and renames Fog",
+            "Dials: 'A > Dials' and 'B > Dials' use different settings ('Fog' (amount) vs 'Mist' (amount))" + tail)
+    label, job, entry = engine.answers_for(node)[1]
+    table = [row[:2] for row in ui.table_rows(engine.SPECS[DIALS], job, entry)]
+    target = os.path.join(TMP, "b_overrides.csv")
+    ops.write_overrides(node, 1, target)
+    node.inputs["Overrides"].default_value = ""  # the export filled the empty socket: the words stay as they were
+    with open(target, encoding="utf-8") as handle:
+        written = [line.split(",")[:2] for line in handle.read().splitlines()[1:]]
+    check("shape agreement: meanwhile B's table and its export give each setting its own answer, from B's last good "
+          "table by wkey (Mist asks what Fog asked)",
+          label == "B > Dials" and table == [("Wind speed", "75"), ("Rain", "yes"), ("Time of day", "night"),
+                                             ("Street lights", "no"), ("Mist", "0.5")]
+          and written[-1] == ["Mist", "0.5"], (label, table, written))
+    rewrite(csv_b, [header, rain, fog, wind, time_, street])
+    settled("B agrees again, in its own order")
 
     # with two entries too: the pass replaces the entry in place, so the graph's entry order holds
     before, rebuilt = pointers(node), []

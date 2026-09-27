@@ -96,11 +96,6 @@ def _error(text):
     return NodeStatus("error", text, problems=[_problem(ERROR, text)])
 
 
-def eta_text(seconds: float) -> str:
-    """"~2 s" or "~3 min", as status lines write an ETA."""
-    return f"~{max(math.ceil(seconds), 1)} s" if seconds < 60 else f"~{math.ceil(seconds / 60)} min"
-
-
 # ----------------------------------------------------------------------------- plans
 
 
@@ -337,10 +332,11 @@ def _process(tree, node, contexts):
         problems += job.errors  # rows in error in a table that still shows, e.g. cells no outcome applies to
         if job.gn not in live:
             live.append(job.gn)
-        if conflict or held:  # nothing is answered: the sidebar shows the stored entry resolve() gives it, if any
-            entry = spec.resolve(job, entries, LAST_SHOWN.get(key, ""))[0]
-            if any(entry is stored for stored in entries):
-                resolved[job.gn] = entry
+        if conflict or held:  # nothing is answered: the sidebar shows the stored entry resolve() keeps, if any
+            found = next((entry for entry in entries if entry.gn == job.gn), None)
+            kept = spec.resolve(job, entries, LAST_SHOWN.get(key, ""))[0] if found is not None else None
+            if kept is not None and kept.words_key == found.words_key:  # it, or a copy with refreshed payload
+                resolved[job.gn] = found
             continue
         other = jobs.setdefault(job.gn, (job, ctx))
         if other[0] is not job and other[0].words_key != job.words_key:
@@ -487,7 +483,8 @@ def _filling(uid):
         return "Asking...", None
     done, total, ms_per_row = found  # ms_per_row: per remaining cell, /health's rate and the §5.4 default folded in
     eta = (total - done) * ms_per_row / 1000
-    return f"Filling {done}/{total} · {eta_text(eta)}", eta
+    left = f"~{max(math.ceil(eta), 1)} s" if eta < 60 else f"~{math.ceil(eta / 60)} min"
+    return f"Filling {done}/{total} · {left}", eta
 
 
 def _counts(jobs, resolved, asked):

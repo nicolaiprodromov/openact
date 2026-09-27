@@ -83,6 +83,8 @@ class _OpenActNode:
     def draw_answers(self, layout, uses, selected):
         """One summary per context; with several, each one a button that shows its table."""
         spec = engine.SPECS[self.bl_idname]
+        # else nothing is asked: a hold, a conflict or a failed cell, which the status line names
+        asking = getattr(engine.STATUS.get(self.uid), "state", "") in ("filling", "starting", "waiting")
         box = layout.box()
         for i, (label, _job, answer) in enumerate(uses):
             col = box.column(align=True)
@@ -93,7 +95,8 @@ class _OpenActNode:
             else:
                 col.label(text=label, icon=icon)
             if answer is None:
-                col.label(text="Asking...", icon='SORTTIME')
+                col.label(text="Asking..." if asking else "Not asked: see the status above",
+                          icon='SORTTIME' if asking else 'INFO')
                 continue
             col.label(text=spec.summary(answer), icon='CHECKMARK')
             if engine.older_settings(self, answer):

@@ -3,10 +3,15 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 - a fill: waiting -> filling -> complete; n/N and an ETA only when pipeline.progress() exists, else "Asking...";
 - the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to and an outcome never
   offered, more than 16 live word sets;
-- table_page(): rows, icons and paging; table_rows() of answered and pending tables and of an empty material slot;
+- table_page(): rows, icons and paging; table_rows() of answered and pending tables, of an entry whose rows are in
+  another order (by wkey, Show Question's ask key too) and of an empty material slot;
+- while a Classify context's CSV has errors or the contexts disagree, a context whose words didn't change shows its
+  stored answer and one without says it is not asked; a failed cell is in error in the table, the counts and Show
+  Question, and not asked again;
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
-  trust button lets every node make and a deleted node stops counting in, an Import CSV node on a file a node reads,
-  the old Jev nodes hook, over-cap, and jev_nodes enabled (in stand-in preferences);
+  trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
+  node reads the blocked node's answer, a sidebar draw that resolves no path while nothing is blocked, an Import CSV
+  node on a file a node reads, the old Jev nodes hook, over-cap, and jev_nodes enabled (in stand-in preferences);
 - show_question returns exactly the state, instructions and options that the --record log shows for that row, and
   asks nothing; a row answered with older settings says so;
 - the pass drops the status records of nodes that are gone;
@@ -17,6 +22,7 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 Run:  blender -b --factory-startup --python tests/status_blender.py
 """
 
+import dataclasses
 import json
 import os
 import re
@@ -305,7 +311,7 @@ def phase_table(pick, ask):
           and below[0] == lines, (len(last[0]), beyond[1:], below[1:]))
     check("table_page: an empty table is one empty page", ui.table_page([], 4) == ([], 0, 1), ui.table_page([], 4))
 
-    _label, job, entry = status(pick).uses[0]
+    label, job, entry = status(pick).uses[0]
     got = ui.table_rows(engine.SPECS[pick.bl_idname], job, entry)
     check("table_rows: an answered Pick lists each item with its probability, from the stored entry",
           got == [(name, f"{p * 100:.0f}%", None, "model") for name, p in
@@ -314,6 +320,21 @@ def phase_table(pick, ask):
     check("table_rows: before its answer, a table lists its plan's rows, pending, with no answer, greyed out",
           [row[1:] for row in pending] == [("", None, "pending")] * 3
           and [line[4] for line in ui.table_page(pending)[0]] == [False] * 3, pending)
+    order, record = [2, 0, 1], status(pick)  # the entry of other words, whose rows are in another order
+    moved = dataclasses.replace(entry, words_key="other", asks=["ask0", "ask1", "ask2"], rows=dataclasses.replace(
+        entry.rows, name=[entry.rows.name[i] for i in order], wkey=[entry.rows.wkey[i] for i in order], ask=[0, 1, 2],
+        src="".join(entry.rows.src[i] for i in order), v={c: [v[i] for i in order] for c, v in entry.rows.v.items()}))
+    engine.STATUS[pick.uid] = dataclasses.replace(record, uses=[(label, job, moved)])
+    try:
+        got = ui.table_rows(engine.SPECS[pick.bl_idname], job, moved), [ops.row_question(pick, 0, row)["ask"]
+                                                                        for row in range(3)]
+    finally:
+        engine.STATUS[pick.uid] = record
+    check("table_rows and Show Question: an entry whose words key isn't the plan's gives each row the answer and the "
+          "ask key of its row with the same wkey, as resolve() carries rows, whatever their order",
+          got == ([(name, f"{p * 100:.0f}%", None, "model") for name, p in zip(["table", "lamp", "armchair"],
+                                                                               entry.rows.v["prob"])],
+                  ["ask1", "ask2", "ask0"]), got)
     _label, job, entry = status(ask).uses[0]
     got = ui.table_rows(engine.SPECS[ask.bl_idname], job, entry)
     check("table_rows: an answered Ask lists its question, its answer as the Overrides CSV writes it (the probability "
@@ -328,6 +349,85 @@ def phase_table(pick, ask):
           and text == f"Row: {ui.EMPTY_SLOT}\n{ops.NEVER_OFFERED}", (got, text))
     kept = [each.label for each in engine.SPECS.values() if hasattr(each, "preview")]
     check("table: it replaced the Match and Classify previews, so no spec keeps a preview()", not kept, kept)
+
+
+# ------------------------------------------------------------------------- held, in conflict, failed
+
+def phase_held():
+    """A Classify node used by two objects, each with its own Labels CSV (§6.0). While one CSV has errors, or their
+    payload columns disagree, nothing is asked: a context whose words didn't change shows its stored answer, and one
+    without it says it is not asked, where the sidebar said "Asking..."."""
+    folder = os.path.join(TMP, "held")
+    os.makedirs(folder)
+    body = "answer,when,roughness\nmetal,steel or iron,{}\nwood,planks or bark,0.6\n"
+    tree = new_tree("Held")
+    tree.interface.new_socket("Labels", in_out='INPUT', socket_type='NodeSocketString')
+    classify = tree.nodes.new(ClassifySpec.idname)
+    classify.inputs["Items"].default_value = "pan, spoon"
+    tree.links.new(tree.nodes.new("NodeGroupInput").outputs["Labels"], classify.inputs["Labels"])
+    user("CA", tree, Labels=write(folder, "ca.csv", body.format(0.3)))
+    user("CB", tree, Labels=write(folder, "cb.csv", body.format(0.4)))
+    engine.schedule(immediate=True)
+    done, _seen = settle(lambda: state(classify) == "complete", 60)
+    summary = engine.SPECS[classify.bl_idname].summary(status(classify).uses[1][2])
+
+    def after(text, until):
+        """Write CA's Labels CSV and run the passes: (the status, each context's label and whether it shows its stored
+        entry of its plan's words, the requests sent, what the Active Node panel draws)."""
+        before = len(recorded())
+        write(folder, "ca.csv", text)
+        engine.schedule(immediate=True)
+        settle(lambda: until(status(classify)), 30)
+        for _ in range(3):
+            engine.run_pass()
+        got = status(classify)
+        return (got, [(label, entry is not None and entry.words_key == job.words_key) for label, job, entry in got.uses],
+                len(recorded()) - before, sidebar(classify))
+
+    got = after("answer,Answer\nx,y\n", lambda found: found.state == "error")
+    check("held: while CA's Labels CSV has errors, nothing is asked, and CB, whose words didn't change, shows its "
+          "stored answer, not 'Asking...'",
+          done and got[0].text == "ca.csv: Two columns are named 'Answer'" and got[1] == [("CB > OpenAct", True)]
+          and not got[2] and summary in got[3] and "Asking..." not in got[3], got)
+    got = after("answer,when,hardness\nmetal,steel or iron,9\nwood,planks or bark,3\n",
+                lambda found: found.text.startswith("Classify: "))
+    check("conflict: while the payload columns disagree, nothing is asked; CB still shows its stored answer, and CA, "
+          "whose words changed, says it is not asked instead of 'Asking...'",
+          got[0].text.startswith("Classify: 'CA > OpenAct' and 'CB > OpenAct' use Labels CSVs with different payload")
+          and got[1] == [("CA > OpenAct", False), ("CB > OpenAct", True)] and not got[2] and summary in got[3]
+          and "Not asked: see the status above" in got[3] and "Asking..." not in got[3], got)
+    bpy.data.node_groups.remove(tree)
+    engine.run_pass()
+
+
+def phase_failed():
+    """A cell whose ask failed is not sent again until Ask Again: the table has its row in error, as the counts do,
+    the sidebar says it is not asked, and Show Question that asking it failed."""
+    tree = new_tree("Failed")
+    ask = tree.nodes.new(engine.ASK_ID)
+    ask.inputs["Question"].default_value = "Is it made of glass?"
+    user("Failer", tree)
+    key = engine._jobs(ask)[0][1].rows[0].cell.key
+    pipeline.FAILED[key] = "The model refused: no"  # as a refused answer leaves it
+    before = len(recorded())
+    engine.schedule(immediate=True)
+    settle(lambda: state(ask) == "error", 30)
+    for _ in range(3):
+        engine.run_pass()
+    got = status(ask)
+    _label, job, entry = got.uses[0]
+    log, text = sidebar(ask), ops.question_text(ops.row_question(ask, 0, 0))
+    check("failed cell: nothing is sent again; its row is in error in the table as in the counts, the sidebar says "
+          "it is not asked, and Show Question that asking it failed",
+          len(recorded()) == before and got.text == "The model refused: no" and entry is None
+          and ui.table_rows(engine.SPECS[ask.bl_idname], job) == [("Is it made of glass?", "", None, "error")]
+          and ('BLANK1', "1 row: 1 in error") in ui.status_rows(got) and "Not asked: see the status above" in log
+          and "Asking..." not in log
+          and text.endswith("Asking it failed (see the status): this is what was sent. Ask Again asks it again"),
+          (got, log, text))
+    pipeline.FAILED.pop(key, None)
+    bpy.data.node_groups.remove(tree)
+    engine.run_pass()
 
 
 # --------------------------------------------------------------------------------- warning and error lines
@@ -527,6 +627,21 @@ def phase_trust():
     found = [banner for banner in ui.live_banners(bpy.context) if banner[0] == "trust"]
     check("trust banner: a deleted node's blocked read no longer counts: the pass drops its status record",
           uid not in engine.STATUS and found == trust_banner(2), (found, uid in engine.STATUS))
+    chain = new_tree("Chain")  # an Ask reading the Item of a Pick whose Items CSV is blocked
+    picker = chain.nodes.new(engine.PICK_ID)
+    picker.inputs["Prompt"].default_value = "something far away"
+    picker.inputs["Items"].default_value = write(OUTSIDE, "far_items.csv", "answer\nboat\ncar\n")
+    asker = chain.nodes.new(engine.ASK_ID)
+    asker.inputs["Question"].default_value = "Is it fast?"
+    chain.links.new(picker.outputs["Item"], asker.inputs["Context"])
+    user("Chainer", chain)
+    engine.run_pass()
+    found = [banner for banner in ui.live_banners(bpy.context) if banner[0] == "trust"]
+    check("trust banner: a node that reads a blocked node's answer doesn't count its blocked read again",
+          status(asker).text.startswith("Context ← ") and trust.BLOCKED in status(asker).text
+          and found == trust_banner(3), (found, status(asker)))
+    bpy.data.node_groups.remove(chain)
+    engine.run_pass()
 
     bpy.ops.openact.allow_file()
     check("trust banner: gone once the file is allowed", trust.is_trusted() and "trust" not in banner_kinds(),
@@ -549,6 +664,16 @@ def phase_trust():
     settle(lambda: state(reader) == state(rules) == "complete", 30)
     check("Trust This Folder: the pass plans them again too, and each reads its CSV, the Rules node's too",
           state(reader) == state(rules) == "complete", (status(reader), status(rules)))
+    ui.import_csv_notes()  # worked out once per pass, on its first draw
+    touched, real_realpath = [], os.path.realpath
+    os.path.realpath = lambda path, *args, **kwargs: touched.append(path) or real_realpath(path, *args, **kwargs)
+    try:
+        engine.answers_for(reader)
+        ui.live_banners(bpy.context)
+    finally:
+        os.path.realpath = real_realpath
+    check("sidebar draw: with no read blocked, answers_for() and the banners resolve no path (os.path.realpath), "
+          "although is_trusted() would, for a file trusted by its folder", trust.is_trusted() and not touched, touched)
     P._Defaults.trusted_folders.clear()
     trust.TRUST["opened"] = ""  # created in this session again
 
@@ -615,6 +740,13 @@ def drawn(draw):
     log = []
     draw(FakeLayout(log))
     return log
+
+
+def sidebar(node):
+    """What the Active Node panel draws for the node (drawn())."""
+    ctx = SimpleNamespace(window_manager=bpy.context.window_manager, preferences=bpy.context.preferences,
+                          space_data=SimpleNamespace(tree_type='GeometryNodeTree', edit_tree=node.id_data))
+    return drawn(lambda layout: type(node).draw_buttons_ext(node, ctx, layout))
 
 
 def phase_draw(pick, warned):
@@ -732,6 +864,8 @@ try:
     phase_eta()
     phase_question(picked, asked)
     phase_table(picked, asked)
+    phase_held()
+    phase_failed()
     lines_tree, warned_node, answers_csv = phase_lines()
     phase_crowd()
     phase_banners()
