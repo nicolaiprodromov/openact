@@ -1,8 +1,9 @@
 """The sidebar (Geometry Node editor > N > OpenAct) and the preferences panel (§17.2): banners, the Model box, the
-active node's status, contexts and table, and the files it reads. Inspection only: every change goes through a file,
-a socket or an operator.
+active node's status, contexts, table and pins, and the files it reads. Inspection only: every change goes through a
+file, a socket or an operator.
 
-status_rows(), table_rows(), table_page() and banners() are plain data, so the tests check them without drawing.
+status_rows(), table_rows(), table_page(), pin_rows() and banners() are plain data, so the tests check them without
+drawing.
 Drawing plans and writes nothing: Blender refuses changes to nodes and data while it draws.
 """
 
@@ -14,7 +15,7 @@ import time
 
 import bpy
 
-from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
+from . import csvfmt, engine, evaluator, inner, lists, migrate, pipeline, server, trust
 from . import prefs as P
 from .specs.base import table_of, unsure_below
 from .watch import WATCH
@@ -112,6 +113,18 @@ def table_page(rows, page=0):
     return lines, page, pages
 
 
+def pin_rows(pins) -> list[tuple[str, str]]:
+    """(words key, text) of each pinned entry (NodeStatus.pins, in pin order): the frames its words occur at, and the
+    words that tell it from the node's other pins, a CSV path by its file name."""
+    varying = [j for j in range(len(pins[0].gn) if pins else 0) if len({entry.gn[j] for entry in pins}) > 1]
+    rows = []
+    for entry in pins:
+        words = [os.path.basename(word) if lists.is_csv_path(word) else word
+                 for j, word in enumerate(entry.gn) if word and (j in varying or not varying)]
+        rows.append((entry.words_key, f"Frames {engine.frames_text(entry.frames)}: {' · '.join(words)}"))
+    return rows
+
+
 def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(), over=()) -> list[tuple]:
     """The sidebar's banners (§17.2), most urgent first: (kind, icon, text, operator idnames of its buttons). Plain
     data: live_banners() passes the live state. state, message: server.status(); probe: the runtime probe's failure;
@@ -132,12 +145,23 @@ def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(),
         found.append(("trust", 'ERROR', f"This file is not trusted, so {blocked} read{'s' if blocked > 1 else ''} "
                       f"outside its folder {'were' if blocked > 1 else 'was'} blocked",
                       ("openact.allow_file", "openact.trust_folder")))
-    if any(name == "jev_nodes" or name.endswith(".jev_nodes") for name in addons):
+    if any(map(P.is_jev, addons)):
         found.append(("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ()))
     found += [("legacy", 'INFO', text, (idname,)) for text, idname in legacy]
     found += [("over_cap", 'CANCEL', text, ()) for text in over]
     found += [("import_csv", 'INFO', text, ()) for text in notes]
     return found
+
+
+def runtime_line(prefs=None) -> str:
+    """§12.2's line while the runtime is the Jev Nodes one, used in place, else "": its folder, and the base Python its
+    venv uses, which can live outside it. No size: walking 13 GB of files while drawing is too slow."""
+    root = P.runtime_root(prefs)
+    legacy = os.path.normpath(os.path.join(os.path.dirname(P.default_runtime_root()), "JevNodes"))
+    if os.path.normcase(root) != os.path.normcase(legacy):
+        return ""
+    home = P.venv_home(root)
+    return f"Using the Jev Nodes runtime at {root}" + (f"; Python from {home}" if home else "")
 
 
 def import_csv_notes() -> dict:
@@ -222,6 +246,11 @@ def draw_server(layout, banner=None):
     shared = state in ("ready", "starting") and server.attached()
     if shared:
         box.label(text=server.SHARED, icon='LINKED')
+    line = runtime_line()
+    if line:
+        row = box.row()
+        wrap(row.column(), line, icon='FILE_FOLDER')
+        row.operator("openact.open_runtime_folder", text="", icon='FILEBROWSER')
     health = server.STATE.health
     if state == "ready" and health:
         col = box.column(align=True)
@@ -318,6 +347,23 @@ def draw_table(layout, context, node, uses, index):
         op.uid, op.context_index, op.row = node.uid, index, page * PAGE_ROWS + i
 
 
+def draw_pins(layout, node):
+    """The node's pinned entries (§5.5), each with Unpin, and Unpin All."""
+    status = engine.STATUS.get(node.uid)
+    rows = pin_rows(status.pins) if status is not None else []
+    if not rows:
+        return
+    box = layout.box()
+    head = box.row(align=True)
+    head.label(text=f"Pinned for playback: {len(rows)}", icon='PINNED')
+    head.operator("openact.unpin", text="Unpin All", icon='UNPINNED').uid = node.uid
+    for key, text in rows:
+        row = box.row(align=True)
+        row.label(text=text, icon='BLANK1')
+        op = row.operator("openact.unpin", text="", icon='UNPINNED')
+        op.uid, op.words_key = node.uid, key
+
+
 def draw_files(layout, node):
     """The files the node reads (§7.10): New CSV from Template where one of the node's inputs has a starter file, then
     each file's path, rows, text and payload columns, when read, the Import CSV note, and up to FILE_PROBLEMS problems,
@@ -390,6 +436,23 @@ class NODE_PT_openact(bpy.types.Panel):
             if banner[0] not in SERVER_BANNERS:
                 draw_banner(layout.box(), banner)
         draw_server(layout, next((banner for banner in found if banner[0] in SERVER_BANNERS), None))
+        if engine.STATUS:  # the file has OpenAct nodes
+            col = layout.column(align=True)
+            col.operator("openact.prepare_playback", icon='PLAY')
+            waiting, held = engine.pinning(), engine.held()
+            if waiting:
+                sets = f"{waiting} word set{'s' if waiting != 1 else ''}"
+                wrap(col, f"{sets} answered: {held}" if held else f"Pinning {sets} once the model has answered them",
+                     icon='SORTTIME')
+                col.operator("openact.cancel_playback", icon='CANCEL')
+            if engine.PLAYBACK_NOTE:
+                wrap(col, engine.PLAYBACK_NOTE, icon='INFO')
+            for flag in dict.fromkeys(filter(None, (engine.rebake(uid, status.pins)
+                                                    for uid, status in engine.STATUS.items()))):
+                wrap(col, flag, icon='ERROR')
+            pinned = sum(len(status.pins) for status in engine.STATUS.values())  # as the entries hold them
+            if pinned:
+                col.label(text=f"{pinned} word set{'s' if pinned != 1 else ''} pinned for playback", icon='PINNED')
         if _active(context) is None:
             col = layout.column(align=True)
             col.label(text="Add nodes with Shift A > OpenAct", icon='INFO')
@@ -412,6 +475,7 @@ class NODE_PT_openact_node(bpy.types.Panel):
         node = _active(context)
         self.layout.label(text=node.name, icon='NODE')
         node.draw_buttons_ext(context, self.layout)
+        draw_pins(self.layout, node)
 
 
 class NODE_PT_openact_files(bpy.types.Panel):
@@ -437,9 +501,11 @@ def register():
     # UI state, not file data: which context's table the sidebar shows, and its page
     bpy.types.WindowManager.openact_context = bpy.props.IntProperty(name="Context", min=0)
     bpy.types.WindowManager.openact_page = bpy.props.IntProperty(name="Page", min=0)
+    LEGACY.append(migrate.banner)
 
 
 def unregister():
+    LEGACY.remove(migrate.banner)
     del bpy.types.WindowManager.openact_page
     del bpy.types.WindowManager.openact_context
     for cls in reversed(classes):

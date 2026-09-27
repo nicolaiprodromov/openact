@@ -456,7 +456,7 @@ def _table_rows(node, entries, columns):
 
 def _k(entries, default):
     """k of the entry with words_key `default`, 0 when there is none: k_default (§8.2). The words key "" names
-    no entry: every entry converted from v0.1.0 has it, so it can't tell which one a context showed."""
+    no entry."""
     return next((k for k, entry in enumerate(entries, start=1) if default and entry.words_key == default), 0)
 
 

@@ -7,13 +7,14 @@ picks a CSV-capable input's route: an Import CSV node linked to the '<Input> CSV
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field, replace
 
 # csvfmt holds the inline format because the Settings CSV's answers column uses it too, and csvfmt may import only
 # the standard library.
 from . import csvfmt
-from .csvfmt import CsvSource, parse_inline  # noqa: F401
+from .csvfmt import CsvSource, parse_inline
 
 try:
     import bpy
@@ -170,11 +171,34 @@ def _text_items(node, ctx, spec):
     from . import sources  # sources imports this module
 
     raw = as_text(_word(node, "Items", ctx))
-    answers = sources.answer_set(node, ctx, "Items", "items", spec, "Type items separated by commas, or a .csv path")
+    hint = "Type items separated by commas, or a .csv path"
+    companion = find_input(node, "Items CSV")
+    if getattr(node, "items_parse_v0", False) and not (companion is not None and _linked(companion)):
+        # An upgraded Pick parses its old Items texts, kept at the upgrade, as v0.1.0 did: their names and words keys
+        # hold, also after Ask Again (§12.3). Another text is a change, and v1 parsing takes over for good.
+        if raw in _v0_texts(node):
+            items = tuple(Item(name) for name, _when in parse_inline(raw, mode="v0"))
+            if not items:
+                raise Hint(hint)
+            return ItemList("TEXT", items, raw, fingerprint=("TEXT", raw, "v0"))
+        try:
+            node.items_parse_v0, node.items_v0_texts = False, "[]"
+        except AttributeError:  # read-only now: linked data, or while Blender draws
+            pass
+    answers = sources.answer_set(node, ctx, "Items", "items", spec, hint)
     doc, source = answers.doc, answers.source
     items = tuple(Item(o.name, o.when, dict(o.payload)) for o in answers.options)
     fingerprint = ("TEXT", raw) + ((doc.path, source.delimiter, doc.stamp) if doc is not None else ())
     return ItemList("TEXT", items, raw, doc, source, None, fingerprint, answers.problems)
+
+
+def _v0_texts(node):
+    """The Items texts an upgraded Pick keeps v0.1.0's parsing for: its items_v0_texts, a JSON list."""
+    try:
+        texts = json.loads(node.items_v0_texts)
+    except (AttributeError, ValueError):
+        return ()
+    return texts if isinstance(texts, list) else ()
 
 
 def _collection_items(node, ctx):

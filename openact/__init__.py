@@ -17,9 +17,9 @@ bl_info = {  # legacy add-on installs (the extension manifest is used on Blender
 
 import bpy
 
-from . import engine, nodes, ops, prefs, server, trust, ui, watch
+from . import engine, migrate, nodes, ops, prefs, server, trust, ui, watch
 
-_modules = (ops, nodes, ui, trust, watch)
+_modules = (ops, nodes, ui, trust, watch, migrate)
 
 
 def register():
@@ -29,6 +29,7 @@ def register():
         raise RuntimeError("OpenAct needs Blender 4.5 or newer")
     for cls in prefs.classes:
         bpy.utils.register_class(cls)
+    prefs.import_jev()
     for module in _modules:
         module.register()
     engine.register()

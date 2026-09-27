@@ -1,20 +1,24 @@
 """Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; start
-its CSVs from templates; show what a row asks; open files; trust a .blend's file reads; copy diagnostics."""
+its CSVs from templates; show what a row asks; open files; trust a .blend's file reads; copy diagnostics; prepare
+animated words for playback, and unpin them; upgrade the old Jev nodes of a v0.1.0 file."""
 
 from __future__ import annotations
 
 import contextlib
 import csv
+import math
 import os
 import platform
 import re
 import subprocess
 import sys
+import time
+import traceback
 from collections import Counter
 
 import bpy
 
-from . import csvfmt, engine, inner, lists, pipeline, server, store, trust, ui
+from . import csvfmt, engine, inner, lists, migrate, pipeline, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
 from .specs.base import stored_rows, table_of, unsure_below
@@ -147,6 +151,113 @@ class OPENACT_OT_reask(bpy.types.Operator):
         except ValueError as error:  # a newer OpenAct's answers
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class OPENACT_OT_prepare_playback(bpy.types.Operator):
+    bl_idname = "openact.prepare_playback"
+    bl_label = "Prepare for Playback"
+    bl_description = ("Answer every set of words the OpenAct nodes see over the scene's frame range, and pin those "
+                      "answers, so animated words (a keyframed dropdown, say) never wait for the model during playback")
+    bl_options = {'UNDO'}  # not REGISTER: Repeat Last would run the frame loop without progress or Esc
+
+    @classmethod
+    def poll(cls, context):
+        return not (engine._stepping or engine._rendering())  # either would move the frame under the other
+
+    def execute(self, context):  # run from a script, the fallback sets every frame here without a modal loop
+        run = engine.Playback(context.scene)
+        if not run.read_curves():
+            for _frame in run.step_frames():
+                pass
+        return self.finish(run)
+
+    def invoke(self, context, event):
+        self.run = engine.Playback(context.scene)
+        if self.run.read_curves():
+            return self.finish(self.run)
+        # The fallback: one scene evaluation per frame, with progress, and Esc cancels
+        self.steps, self.total = self.run.step_frames(), self.run.last - self.run.first + 1
+        self.started = time.monotonic()
+        wm = context.window_manager
+        wm.progress_begin(0, self.total)
+        context.workspace.status_text_set(f"Prepare for Playback ({self.run.fallback}): {self.total} frames to set, "
+                                          f"one scene evaluation each. Esc cancels")
+        self.timer = wm.event_timer_add(0.001, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC' and event.value == 'PRESS':
+            self.steps.close()  # sets the frame it started at again
+            self.end(context)
+            self.report({'INFO'}, "Prepare for Playback cancelled: nothing was pinned")
+            return {'CANCELLED'}
+        if event.type != 'TIMER':
+            return {'RUNNING_MODAL'}  # no edits while the scene is at another frame
+        try:
+            frame = next(self.steps)
+        except StopIteration:
+            self.end(context)
+            return self.finish(self.run)
+        except Exception as error:  # the timer, progress and status text must go; the generator set the frame back
+            traceback.print_exc()
+            self.end(context)
+            self.report({'ERROR'}, f"Prepare for Playback stopped: {error}")
+            return {'CANCELLED'}
+        done = frame - self.run.first + 1
+        left = (time.monotonic() - self.started) / done * (self.total - done)
+        context.window_manager.progress_update(done)
+        context.workspace.status_text_set(f"Prepare for Playback ({self.run.fallback}): frame {done} of "
+                                          f"{self.total}, about {math.ceil(left)} s left. Esc cancels")
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):  # Blender ends the modal loop itself, e.g. when its window closes
+        self.steps.close()  # else no pass would run again
+        self.end(context)
+
+    def end(self, context):
+        wm = context.window_manager
+        wm.event_timer_remove(self.timer)
+        wm.progress_end()
+        if context.workspace is not None:
+            context.workspace.status_text_set(None)
+
+    def finish(self, run):
+        try:
+            text = run.finish()
+        except ValueError as error:  # a limit: nothing was asked
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        self.report({'WARNING'} if run.problems else {'INFO'}, text)
+        return {'FINISHED'}
+
+
+class OPENACT_OT_cancel_playback(bpy.types.Operator):
+    bl_idname = "openact.cancel_playback"
+    bl_label = "Cancel Pinning"
+    bl_description = "Stop the Prepare for Playback run that waits for the model: nothing more is pinned"
+
+    def execute(self, context):
+        return {'FINISHED'} if engine.cancel_playback() else {'CANCELLED'}
+
+
+class OPENACT_OT_unpin(bpy.types.Operator):
+    bl_idname = "openact.unpin"
+    bl_label = "Unpin"
+    bl_description = ("Stop keeping this answer (Unpin All: every answer of the node) for playback. It stays stored, "
+                      "and old stored answers may be dropped to keep the file small")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    uid: bpy.props.StringProperty(options={'HIDDEN'})
+    words_key: bpy.props.StringProperty(options={'HIDDEN'})  # "": every pin of the node
+
+    def execute(self, context):
+        count = engine.unpin(self.uid, self.words_key)
+        if not count:
+            self.report({'WARNING'}, "Nothing to unpin")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Unpinned {count} answer{'s' if count != 1 else ''}")
         return {'FINISHED'}
 
 
@@ -738,10 +849,58 @@ class OPENACT_OT_copy_diagnostics(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------- the upgrade from v0.1.0 (§12.3)
+
+class OPENACT_OT_upgrade_legacy(bpy.types.Operator):
+    bl_idname = "openact.upgrade_legacy"
+    bl_label = "Upgrade"
+    bl_description = ("Replace this file's old Jev nodes with OpenAct nodes, keeping their words, links and answers. "
+                      "One undo step")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        upgraded, trees, problems, changed = migrate.upgrade_all()
+        if not (upgraded or problems):
+            self.report({'INFO'}, "This file has no old Jev nodes")
+            return {'CANCELLED'}
+        self.report({'WARNING'} if problems else {'INFO'}, migrate.report(upgraded, trees, problems))
+        return {'FINISHED'} if changed else {'CANCELLED'}  # the undo step also reverts what an internal error left
+
+
+class OPENACT_OT_legacy_report(bpy.types.Operator):
+    """Say that the file just opened has old Jev nodes, and where to upgrade them"""
+
+    bl_idname = "openact.legacy_report"
+    bl_label = "Old Jev Nodes"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        # The window manager keeps a modal step's report, for the status bar and the Info editor: a report made while
+        # bpy.ops runs the operator stays with its Python caller
+        self.timer = context.window_manager.event_timer_add(0.0, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        context.window_manager.event_timer_remove(self.timer)
+        return self.execute(context)
+
+    def execute(self, context):
+        text = migrate.notice()
+        if not text:
+            return {'CANCELLED'}
+        self.report({'INFO'}, text)
+        return {'FINISHED'}
+
+
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
            OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
-           OPENACT_OT_write_overrides, OPENACT_OT_new_csv_from_template, OPENACT_OT_copy_diagnostics)
+           OPENACT_OT_write_overrides, OPENACT_OT_new_csv_from_template, OPENACT_OT_copy_diagnostics,
+           OPENACT_OT_prepare_playback, OPENACT_OT_cancel_playback, OPENACT_OT_unpin, OPENACT_OT_upgrade_legacy,
+           OPENACT_OT_legacy_report)
 
 
 def register():

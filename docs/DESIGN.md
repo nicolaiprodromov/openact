@@ -960,12 +960,16 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
        - the action is in **tweak mode** (`animation_data.use_tweak_mode`);
        - the action is **blended** (`action_blend_type != 'REPLACE'` or `action_influence < 1`).
 
+       It also falls back when an animated value is read while **Time Stretching** is on
+       (`render.frame_map_old != frame_map_new`), which plays animation at remapped times.
+
        The fallback runs as a **modal operator** with progress in the status bar and **Esc to
        cancel**. Cost is frames × one scene evaluation, e.g. 250 × 50 ms ≈ 12 s, shown up front as
        an estimate. Cancelling pins nothing.
     4. **Afterwards.** The current frame is restored. Pinning changes the inner group, which
        invalidates unbaked simulation caches. Baked simulations are flagged "re-bake: rules changed
-       for frames …".
+       for frames …". Python can't tell a baked simulation or Bake node from an unbaked one, so every
+       modifier with bakes whose rules the new pins change is named.
   - **Limits and overflow.**
     - At most 12 pinned entries, and live plus pinned at most 16 (§8.1).
     - If the range yields more distinct word tuples, it **refuses without asking anything**: "40
@@ -3078,18 +3082,20 @@ Consequences:
   Checking only `Scripts\python.exe` and the model shards would call a broken runtime
   "installed".
 - **Custom locations.** If `jev_nodes` preferences are available at first registration, OpenAct
-  imports `runtime_dir`, `port`, `device`, `gpu`, `auto_start` and `debias`. Otherwise the sidebar
-  offers **Locate Existing Runtime…** (`openact.locate_runtime`, PR-07), a folder picker that sets
-  `runtime_dir` and runs the background probe.
+  imports `runtime_dir`, `port`, `device`, `gpu`, `auto_start` and `debias`. It does so once: a
+  hidden preference (`jev_imported`) remembers it, so later changes are the user's. Otherwise the
+  sidebar offers **Locate Existing Runtime…** (`openact.locate_runtime`, PR-07), a folder picker
+  that sets `runtime_dir` and runs the background probe.
   A user with a custom `runtime_dir` is therefore never pushed into a fresh 13 GB install.
 
 Using the folder in place costs nothing. The server script ships inside the add-on (`SERVER_SCRIPT`
 is resolved from the package folder), and the venv needs only torch, SemIf and huggingface_hub,
 all of which are already installed. `openact_server.py` needs no new packages.
 
-- **Sidebar and preferences** show "Using the Jev Nodes runtime at …\JevNodes (13 GB); Python from
-  <home>". An *Open Runtime Folder* button is next to it. Diagnostics (§17.5) include the same two
-  paths.
+- **Sidebar and preferences** show "Using the Jev Nodes runtime at …\JevNodes; Python from <home>"
+  in the Model box, which the preferences show too, while the runtime is that folder. An *Open
+  Runtime Folder* button is next to it. It gives no size: walking 13 GB of files while drawing is
+  too slow. Diagnostics (§17.5, PR-23) include the same two paths.
 - **Deleting the old runtime.** Users can delete `JevNodes` after installing a fresh `OpenAct`
   runtime. The external uv-managed Python it used may be shared with other tools, so the README
   says to remove it only with `uv python uninstall` and only if nothing else uses it. OpenAct
@@ -3098,8 +3104,10 @@ all of which are already installed. `openact_server.py` needs no new packages.
   (17 GB of VRAM). OpenAct therefore:
   1. detects `jev_nodes` (or `bl_ext.<repo>.jev_nodes`) in `bpy.context.preferences.addons`;
   2. shows a persistent sidebar banner: "Disable Jev Nodes: OpenAct replaces it";
-  3. does **not** register the legacy alias classes while it is enabled, because the bl_idnames
-     would clash (§12.3).
+  3. registers the legacy alias classes only while no class holds those bl_idnames (§12.3), so
+     jev_nodes' own classes win while it runs. When it unregisters, or is listed but failed to
+     load, a one-second timer registers the aliases: the old nodes are defined again and the
+     upgrade is offered, with no restart.
 - **An old server on the port.** If the old add-on started one, the status reports it (§5.2).
 
 ### 12.3 Old .blend files
@@ -3110,38 +3118,49 @@ all of which are already installed. `openact_server.py` needs no new packages.
 - They are **frozen**. They keep evaluating their stored inner groups (`.Jev Ask <uid>`,
   `.Jev Pick <uid>`) and are never asked anything.
 - Their status line reads "Old Jev node: upgrade in the OpenAct sidebar".
-- They are skipped when the `jev_nodes` add-on is enabled (§12.2). In that case, and on Blender
-  4.5+ without any add-on, the old nodes still evaluate from their saved inner groups.
+- They are registered only while no class holds those bl_idnames: jev_nodes' own classes win while
+  it is enabled (§12.2). Then, and on Blender 4.5+ without any add-on, the old nodes still evaluate
+  from their saved inner groups.
 
 **Upgrade.** `openact.upgrade_legacy` is offered by the sidebar banner "This file has 9 old Jev
-nodes: Upgrade". After `load_post`, a one-line INFO report points to it. It is explicit, not
-automatic, so opening a file never silently rewrites it. For each legacy node, inside a single
-undo step:
+nodes: Upgrade". After `load_post`, a one-line INFO report points to it: a timer runs the report's
+operator modal in a window, as only a modal step's report reaches the status bar and the Info
+editor, while a report made during a `bpy.ops` call stays with its Python caller. In background
+mode it goes to the console. The upgrade is explicit, not automatic, so opening a file never
+silently rewrites it. For each legacy node, inside a single undo step:
 
 1. **Create** the new node (`GeometryNodeOpenActAsk` or `…Pick`) in the same tree. Copy `name`,
-   `label`, `location`, `width`, `parent` frame, `mute`, `hide` and `color`.
+   `label`, `location`, `width`, `parent` frame, `mute`, `hide`, `select` and `color`, and keep it
+   the active node if it was.
 2. **Copy settings.**
    - Ask: `mode` → `answer_type`.
    - Pick: the prototype's precedence is kept, a set Collection winning over the Items text
-     (`collection_items(coll) if coll is not None else parse_items(items)`):
-     - `list_source = COLLECTION` if the Collection socket is set or linked; its Items text is
-       ignored;
+     (`collection_items(coll) if coll is not None else parse_items(items)`), so old files keep
+     their answers:
+     - an old Pick with a collection becomes `list_source = COLLECTION` (the Collection socket
+       is set, or has an unmuted link: v0.1.0 ignored muted links), and its Items text is ignored;
      - otherwise `TEXT`.
    - Pick nodes also get the hidden property `items_parse_v0 = True` (below).
    - `balance_order` is seeded from the `debias` preference. The imported value of `jev_nodes`'
      global `debias`, when available, keeps the prototype's behaviour (§10.3, §12.2).
    - `uid` is kept.
-3. **Inputs, by socket name.** Copy unlinked default values and re-create links for Question and
-   Context (Ask), and for Prompt, Items and Collection (Pick). The new optional inputs (Answers,
-   Pick's Context, ID, Overrides) stay at their defaults, so the words are unchanged.
+3. **Inputs, by socket name.** Copy default values and re-create links (muted ones stay muted) for
+   Question and Context (Ask), and for Prompt and, by the list source, Items or Collection (Pick):
+   the Items text of a collection Pick is dropped, as v0.1.0 ignored it. The new optional inputs
+   (Answers, Pick's Context, ID, Overrides) stay at their defaults, so the words are unchanged.
    - **Legacy item parsing.** v1 splits inline items on newlines, else `;`, else `,`, and separates
      `name: when`. The prototype split on newlines, else commas, with no descriptions.
    - While `items_parse_v0` is set, `lists.parse_inline(text, mode="v0")` parses the Items text
      with the prototype's rule, so an item string containing `;` or `": "` keeps its v0.1.0 item
      names, and its words key.
-   - The flag is cleared the first time the Items text changes, and the node then uses v1 parsing.
+   - The upgrade keeps the node's old Items texts, its typed text and those of its converted
+     answers, in the hidden `items_v0_texts`. The flag is cleared the first time the Items text
+     changes, that is, when the node meets a text outside them; the node then uses v1 parsing.
+     Ask Again and eviction don't clear it: they remove answers, not texts. An Import CSV linked
+     to *Items CSV* wins over the text, as always.
 4. **Outputs, by name.** Re-link Answer, Yes and Confidence (Ask), and Index, Item, Confidence and
-   Instance (Pick). The names are identical by design.
+   Instance (Pick). The names are identical by design. A multi-input socket they feed (Join
+   Strings, Join Geometry) keeps its links' order, which decides the joined result.
 5. **Answers.**
    - Convert `entries` from schema 1 to schema 2 (§14.4), and save them with
      `store.save(node, store)` (`live_gns=None`, no eviction, §13.3).
@@ -3151,13 +3170,22 @@ undo step:
 6. **Remove** the legacy node. Its old inner group is now used by the new node, so nothing is
    orphaned.
 
-The operator reports a count, e.g. "Upgraded 9 nodes in 3 node groups; 0 problems". A problem, such
-as an unexpected link type, leaves that node as a frozen legacy node and names it.
+The operator reports a count, e.g. "Upgraded 9 nodes in 3 node groups; 0 problems". A problem
+leaves that node as a frozen legacy node and names it, so no output changes silently:
+- a linked output the new node lacks (the Instance of a Pick that picks from text);
+- a muted Pick whose Index or Confidence is linked. Blender passes a muted node's inputs to outputs
+  of their type, so a muted OpenAct Pick outputs its new ID input there, where v0.1.0's gave 0.
+  "Unmute or unlink it, then upgrade". A muted Pick without such links upgrades, muted.
+
+An internal error is named too. It may leave its node half done, so the operator then still ends
+with FINISHED, and its undo step reverts it. Legacy nodes in linked (library) trees are upgraded in
+their library file.
 
 ### 12.4 Answers survive the upgrade
 
-- Converted entries are marked `legacy: true` and keep their v0.1.0 `gn` strings (the raw words).
-- The conversion (§14.4) computes each entry's `words_key`, and each Pick row's `wkey`, with v1's
+- Converted entries are marked `legacy: true` and keep their v0.1.0 words (the raw `gn` strings),
+  except the Items text that a collection Pick ignored, which becomes `""` (§14.4).
+- The conversion (§14.4) computes each entry's `words_key`, and each row's `wkey`, with v1's
   own definition (§5.4), using the stored words and item names. The live plan of the upgraded node
   produces the same `words_key`, so the entry is reused under the validity rule. The rows' ask key
   is `jev_nodes 0.1.0`, and they are labelled "asked with older settings". **Reopening an upgraded
@@ -3180,14 +3208,18 @@ as an unexpected link type, leaves that node as a frozen legacy node and names i
 which Blender 4.5+ still evaluates from their stored answers.
 
 **Test.** `tests/migrate_blender.py` (§18) runs these steps:
-1. Build a v0.1.0 file with the prototype package, reusing `tests/e2e_blender.py build` from the
-   untouched `jev_nodes` folder.
+1. Build a v0.1.0 file with the prototype's own 0.1.0 release, vendored as
+   `tests/fixtures/jev_nodes-0.1.0.zip` (GPL-3.0-or-later, same author) and extracted to a
+   temporary folder, so the suite needs nothing outside the repository: the scene of the
+   prototype's `tests/e2e_blender.py build` plus the upgrade's other cases, answered by the
+   prototype through a fake Jev server (that `build` phase itself needs the real model).
 2. Reopen it with OpenAct and run `openact.upgrade_legacy`.
 3. Assert, on 4.5 and 5.1:
    - evaluated outputs equal the v0.1.0 values;
    - 0 requests were sent;
    - inner groups are renamed and owned;
-   - undo restores the legacy nodes.
+   - undo restores the legacy nodes (a real `ed.undo`: `ed.undo_push` starts the undo system in
+     background mode).
 
 ## 13. API / Interface Changes
 
@@ -3278,7 +3310,7 @@ def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]: ...   # §
 
 # lists.py
 def resolve_items(node, ctx) -> ItemList: ...                   # §6.0; raises Hint / Unresolvable
-def parse_inline(text: str) -> list[tuple[str, str]]: ...       # newline, then ";", then "," (§6.0)
+def parse_inline(text: str, mode: str = "v1") -> list[tuple[str, str]]: ...  # newline, then ";", then "," (§6.0); "v0": v0.1.0's Items rule (§12.3)
 def is_csv_path(text: str) -> bool: ...
 def csv_source(node, input_name: str, ctx) -> CsvSource | None: ...   # the linked "<input> CSV" wins, else the String path (§6.0)
 
@@ -3499,7 +3531,7 @@ Schema 1 is the v0.1.0 list `[{"key", "gn", "a", "t"}]`. `store.load` converts i
 
 | v0.1.0 `a` | Schema-2 entry |
 |---|---|
-| Ask `{"mode", "value", "confidence", "levels"?}` | `kind "ask"`, `answer_type = mode`, `single = {"Answer": value, "Yes": value ≥ 0.5, "Confidence": confidence}`, no rows |
+| Ask `{"mode", "value", "confidence", "levels"?}` | `kind "ask"`, `answer_type = mode`, `single = {"Answer": value, "Yes": value ≥ 0.5, "Confidence": confidence}`. One row, as v1 stores an Ask: `name` = the stripped Question, `v.p` (Yes/No) or `v.amount` (Amount) = value, `v.c` = confidence, `src = "m"`, so the sidebar table, Show Question, the Overrides CSV and carry-over by `wkey` work as for any Ask entry |
 | Pick `{"index", "item", "confidence", "probabilities", "items", "collection"}` | `kind "pick"`, `single = {"Index", "Item", "Confidence"}`. Rows: `name = items`, `v.prob = probabilities`, `src = "m" × N` |
 
 In both cases `gn` is re-ordered to v1's fixed-length `spec.words()` tuple (§8.2):
@@ -3508,16 +3540,20 @@ In both cases `gn` is re-ordered to v1's fixed-length `spec.words()` tuple (§8.
 - Pick `(Prompt, Items)` becomes `(Prompt, "", Items, "", "")`. The `""` are the new empty Context,
   Overrides and Key words.
   - For a collection Pick, the collection applied because it was set, not because the Items text
-    was empty: the prototype ignored any Items text then (§12.3). The conversion therefore writes
-    `""` at the Items position. Under `COLLECTION` the absent Items socket also contributes `""`,
-    so the converted tuple matches the live words exactly.
-  - Item names are re-derived with legacy parsing (`items_parse_v0`, §12.3), so the words key
-    matches too.
+    was empty: the prototype ignored any Items text then (§12.3). A set Collection wins over the
+    Items text, so the conversion writes `""` at the Items position, and the upgraded node picks
+    from the collection. Under `COLLECTION` the absent Items socket also contributes `""`, so the
+    converted tuple matches the live words exactly.
+  - The row names are the stored `items`: for a text Pick, what the prototype's parser made of
+    the Items text. The upgraded node parses its old Items texts the same way (`items_parse_v0`,
+    §12.3), so the words key matches too.
 
 Every converted entry gets:
 - `legacy = true`, `pv = 0` and `model = "jev_nodes 0.1.0"`;
 - `asks = ["jev_nodes 0.1.0"]`, so its rows are labelled "asked with older settings";
-- a `words_key`, and for Pick a `wkey` per item row, computed with **v1's own definition** (§5.4).
+- a `words_key`, its `shape`, and a `wkey` per row (Ask's one row, Pick's item rows), from the
+  spec's own plan of the same words (`AskSpec.job()`, `PickSpec.job()`): **v1's own definition**
+  (§5.4).
 
 The words-key inputs come from the stored raw words, the answer type and the stored item names
 (for a collection Pick, the prototype stored the child names in `items`). The upgraded node's live
@@ -3999,7 +4035,7 @@ A later run can diff these lines to spot performance regressions.
 | `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick, an upgraded collection Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions and counters but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
-| **`tests/migrate_blender.py`** | Blender 4.5 and 5.1 | none | §12.5: a v0.1.0 file built with the untouched `jev_nodes` → `openact.upgrade_legacy` → identical outputs, 0 requests, inner groups renamed and owned, links kept, and undo restores the old nodes. It covers the prototype's **collection Pick** (the e2e scene's `lamp` node), which must **match its converted entry through the joined key**, with the absent Items position joined as `""` (§8.2), a Pick whose Items text contains `;` and `": "` (legacy parsing keeps its names), and a Pick with both Items text and a Collection (collection wins, its answers kept). It also imports custom `jev_nodes` preferences (§12.2) |
+| **`tests/migrate_blender.py`** | Blender 4.5 and 5.1 | none | §12.5: a v0.1.0 file built with the prototype's own 0.1.0 release (`tests/fixtures/jev_nodes-0.1.0.zip`) → `openact.upgrade_legacy` → identical outputs, 0 requests, inner groups renamed and owned, links kept, and undo restores the old nodes. It covers the prototype's **collection Pick** (the e2e scene's `lamp` node), which must **match its converted entry through the joined key**, with the absent Items position joined as `""` (§8.2), a Pick whose Items text contains `;` and `": "` (legacy parsing keeps its names), and a Pick with both Items text and a Collection (collection wins, its answers kept). It also imports custom `jev_nodes` preferences (§12.2) |
 | `tests/e2e_blender.py` (extended) | Blender + real model | real | The existing `build` / `noaddon` / `reopen` phases, now covering all six nodes. **Game of Life acceptance:** Conway, HighLife, Seeds and Day & Night, each 18/18 exact with 0 unsure. Biome: mean confidence ≥ 0.55 with all 7 outcomes used. Sanity checks for Match, Classify and Dials; Pick's Probability field; `noaddon` with table objects and entry-level Index Switches; `reopen` sends 0 requests. TIMING lines are compared with §3.2 |
 
 **Timing checks.** They print always and fail only above 2× the §3.2 target, so a busy GPU does
@@ -4104,8 +4140,9 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
     README.md
   ```
 - **The prototype folder `X:\interzis\CHUMP_KIT\jev_nodes\` stays untouched.**
-  `tests/migrate_blender.py` builds v0.1.0 files from it (§12.5), and it remains the fallback for
-  Blender 4.2 users (§11).
+  `tests/migrate_blender.py` builds v0.1.0 files from its 0.1.0 release, vendored as
+  `tests/fixtures/jev_nodes-0.1.0.zip` (§12.5), and it remains the fallback for Blender 4.2 users
+  (§11).
 - **One PR per PR Plan entry**, built by parallel worker subagents under an orchestrator (§20.6)
   and merged into `main` in dependency order. Each merge must pass its gates (§18.3). A build step
   turns any commit into `dist/openact-<version>.zip`.
@@ -4208,7 +4245,7 @@ agent, the orchestrator** (user decision).
 | GPUs: two RTX 3090 | At most **two concurrent real-model test runs**, one per GPU. Each gets a lease from the orchestrator (`--gpu 0` or `--gpu 1`) and its **own server port** (18765 on GPU 0, 18767 on GPU 1) |
 | Installed runtime at `%LOCALAPPDATA%\JevNodes` | Shared **read-only**. Workers never modify or reinstall it, and set `OPENACT_STATE_DIR` to a per-worker temporary folder for logs, probe cache and token files (§5.2). Installer tests use a temporary runtime folder with mocked downloads |
 | Headless Blender processes | At most **4** concurrent, across all workers. The machine has 128 GB RAM |
-| Prototype folder `X:\interzis\CHUMP_KIT\jev_nodes\` | **Read-only**; `migrate_blender.py` copies from it into a temporary folder |
+| Prototype folder `X:\interzis\CHUMP_KIT\jev_nodes\` | **Read-only**; `migrate_blender.py` uses its 0.1.0 release zip, vendored as `tests/fixtures/jev_nodes-0.1.0.zip` and extracted to a temporary folder |
 | GPUs shared with the user's other jobs | Tests must not assume exclusive GPU use. Before starting a server they check free VRAM (≥ 9 GB) and wait if it is short. Real-model timeouts are generous, and timing checks fail only above 2× target (§18.2), so slower runs pass |
 
 **Schedule: parallel waves.** The S/M/L/XL sizes remain relative effort (§PR Plan). A wave contains
@@ -5247,25 +5284,28 @@ flowchart LR
 ### PR-24: Migration from jev_nodes
 - **Files/components:**
   - `openact/nodes.py`: legacy aliases `GeometryNodeJevAsk` / `GeometryNodeJevPick`, frozen, with
-    `poll()` False, and not registered while `jev_nodes` is enabled;
-  - `openact/migrate.py` (new: `find_legacy()`, `upgrade_all()`). It saves converted entries with
-    `live_gns=None` (no eviction, §13.3);
+    `poll()` False, registered only while no class holds those bl_idnames (a one-second timer
+    re-checks, §12.2);
+  - `openact/migrate.py` (new: `find_legacy()`, `upgrade_all()`, the `load_post` INFO report). It
+    saves converted entries with `live_gns=None` (no eviction, §13.3);
   - `openact/ops.py` (`openact.upgrade_legacy`, one undo step, with a report);
-  - `openact/ui.py` (the legacy and `jev_nodes` banners);
-  - `openact/engine.py` (frozen legacy nodes in `iter_nodes()`; the `load_post` INFO report);
+  - `openact/ui.py` (the legacy and `jev_nodes` banners; §12.2's Jev Nodes runtime line);
+  - `openact/engine.py` (frozen legacy nodes in `iter_nodes()`);
   - `openact/prefs.py` (a one-time import of `jev_nodes` preferences, §12.1–§12.2);
   - `openact/lists.py` (`parse_inline(mode="v0")` and the `items_parse_v0` node flag, §12.3);
-  - `tests/migrate_blender.py` (new).
+  - `tests/migrate_blender.py` (new), with `tests/fixtures/jev_nodes-0.1.0.zip`, the prototype's own
+    release.
 - **Depends on:** PR-22. **Parallel with:** PR-23.
 - **Changes:** §12.2–§12.4, including the six upgrade steps and keeping answers through the schema
   1 → 2 conversion.
   - The conversion computes v1 `words_key`s with fixed-length word tuples (§8.2, §14.4), so the
     upgraded nodes' live plans reuse the converted entries.
-  - Pick keeps the prototype's precedence (a set Collection over the Items text, §12.3) and legacy
-    item parsing.
+  - Pick keeps the prototype's precedence: a set Collection wins over the Items text, so an old
+    Pick with a collection becomes Source = Collection and its Items text is ignored, and old files
+    keep their answers (§12.3). Pick also keeps legacy item parsing for its old Items texts.
 - **Tests to merge:**
-  - `tests/migrate_blender.py` on 4.5 and 5.1: a v0.1.0 file built with the untouched prototype
-    is upgraded, then:
+  - `tests/migrate_blender.py` on 4.5 and 5.1: a v0.1.0 file built with the prototype's own 0.1.0
+    release is upgraded, then:
     - outputs are identical;
     - 0 requests are sent;
     - inner groups are renamed and owned;
