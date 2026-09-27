@@ -202,27 +202,32 @@ def _known(cls, data):
 
 
 def _from_v010(item):
-    """A v0.1.0 entry {"key", "gn", "a", "t"}, in schema 2. Its words go to their positions in the
-    fixed word tuples; the old key is dropped."""
+    """A v0.1.0 entry {"key", "gn", "a", "t"}, as v1 stores the same words and answer (§14.4): its words at their
+    positions in the fixed word tuples, and its words key, rows and wkeys from the spec's own plan of those words, so
+    an upgraded node's plan reuses it. The old key is dropped."""
+    from .specs.ask import AskSpec  # the specs import this module
+    from .specs.pick import PickSpec
+
     if not _list_of(item["gn"], str):  # else a string or an object would unpack into wrong words
         raise TypeError("gn must be a list of strings")
     first, second = item["gn"]
     answer = item["a"]
-    entry = Entry(asks=[V010], pv=0, t=float(item.get("t", 0.0)), legacy=True, model=V010)
     if "mode" in answer:  # Ask: (Question, Context) -> Question, Context, Answers, Overrides, Key
-        value = float(answer["value"])
-        entry.gn = (first, second, "", "", "")
-        entry.kind, entry.answer_type = "ask", answer["mode"]
-        entry.shape = {"rows": 0, "columns": {}}
-        entry.single = {"Answer": value, "Yes": value >= 0.5, "Confidence": float(answer["confidence"])}
+        spec, value, confidence = AskSpec(), float(answer["value"]), float(answer["confidence"])
+        job = spec.job((first, second, "", "", ""), answer["mode"], True)
+        values = {"amount" if answer["mode"] == 'AMOUNT' else "p": [value], "c": [confidence]}
+        single = {"Answer": value, "Yes": value >= 0.5, "Confidence": confidence}
     else:  # Pick: (Prompt, Items) -> Prompt, Context, Items, Overrides, Key
-        names = answer["items"]
+        spec, names = PickSpec(), answer["items"]
+        if not _list_of(names, str):  # else a string would plan one item per character
+            raise TypeError("items must be a list of strings")
         # v0.1.0 ignored the Items text when a collection was set, and a live COLLECTION Pick has "" there
-        entry.gn = (first, "", "" if answer.get("collection") else second, "", "")
-        entry.kind, entry.answer_type = "pick", "ONE_OF"
-        entry.shape = {"rows": len(names), "columns": {"prob": "FLOAT"}}
-        entry.rows = Rows(name=names, wkey=[""] * len(names), ask=[0] * len(names), src="m" * len(names),
-                          v={"prob": answer["probabilities"]})
-        entry.single = {"Index": int(answer["index"]), "Item": str(answer["item"]),
-                        "Confidence": float(answer["confidence"])}
-    return entry
+        job = spec.job((first, "", "" if answer.get("collection") else second, "", ""), names, True)
+        values = {"prob": answer["probabilities"]}
+        single = {"Index": int(answer["index"]), "Item": str(answer["item"]), "Confidence": float(answer["confidence"])}
+    count = len(job.rows)
+    return Entry(words_key=job.words_key, asks=[V010], t=float(item.get("t", 0.0)), legacy=True, gn=job.gn,
+                 model=V010, kind=spec.name, answer_type=job.answer_type, shape=job.shape.as_dict(),
+                 rows=Rows(name=[row.name for row in job.rows], wkey=[row.wkey for row in job.rows], ask=[0] * count,
+                           src="m" * count, v=values),
+                 single=single)

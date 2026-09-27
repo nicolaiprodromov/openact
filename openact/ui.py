@@ -14,7 +14,7 @@ import time
 
 import bpy
 
-from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
+from . import csvfmt, engine, evaluator, inner, lists, migrate, pipeline, server, trust
 from . import prefs as P
 from .specs.base import UNSURE_BELOW, table_of
 from .watch import WATCH
@@ -132,12 +132,23 @@ def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(),
         found.append(("trust", 'ERROR', f"This file is not trusted, so {blocked} read{'s' if blocked > 1 else ''} "
                       f"outside its folder {'were' if blocked > 1 else 'was'} blocked",
                       ("openact.allow_file", "openact.trust_folder")))
-    if any(name == "jev_nodes" or name.endswith(".jev_nodes") for name in addons):
+    if any(map(P.is_jev, addons)):
         found.append(("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ()))
     found += [("legacy", 'INFO', text, (idname,)) for text, idname in legacy]
     found += [("over_cap", 'CANCEL', text, ()) for text in over]
     found += [("import_csv", 'INFO', text, ()) for text in notes]
     return found
+
+
+def runtime_line(prefs=None) -> str:
+    """§12.2's line while the runtime is the Jev Nodes one, used in place, else "": its folder, and the base Python its
+    venv uses, which can live outside it. No size: walking 13 GB of files while drawing is too slow."""
+    root = P.runtime_root(prefs)
+    legacy = os.path.normpath(os.path.join(os.path.dirname(P.default_runtime_root()), "JevNodes"))
+    if os.path.normcase(root) != os.path.normcase(legacy):
+        return ""
+    home = P.venv_home(root)
+    return f"Using the Jev Nodes runtime at {root}" + (f"; Python from {home}" if home else "")
 
 
 def import_csv_notes() -> dict:
@@ -219,6 +230,11 @@ def draw_server(layout, banner=None):
             wrap(box, message, icon='BLANK1')
     if server.STATE.install_warning and server.STATE.install_warning not in message:  # "Runtime installed. <it>"
         wrap(box, server.STATE.install_warning, icon='ERROR')
+    line = runtime_line()
+    if line:
+        row = box.row()
+        wrap(row.column(), line, icon='FILE_FOLDER')
+        row.operator("openact.open_runtime_folder", text="", icon='FILEBROWSER')
     health = server.STATE.health
     if state == "ready" and health:
         col = box.column(align=True)
@@ -414,9 +430,11 @@ def register():
     # UI state, not file data: which context's table the sidebar shows, and its page
     bpy.types.WindowManager.openact_context = bpy.props.IntProperty(name="Context", min=0)
     bpy.types.WindowManager.openact_page = bpy.props.IntProperty(name="Page", min=0)
+    LEGACY.append(migrate.banner)
 
 
 def unregister():
+    LEGACY.remove(migrate.banner)
     del bpy.types.WindowManager.openact_page
     del bpy.types.WindowManager.openact_context
     for cls in reversed(classes):
