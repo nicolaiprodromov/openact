@@ -773,9 +773,9 @@ def main(argv=None):
         SERVER.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
-    SERVER.server_close()  # the port is free at once, not after the interpreter's teardown
-    if shares:
+    if shares:  # while the port is still this server's: a server that binds it next may write its own file
         remove_token(args.token_file, TOKEN)
+    SERVER.server_close()  # the port is free at once, not after the interpreter's teardown
     log("server stopped")
     return 0
 

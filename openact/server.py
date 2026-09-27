@@ -659,6 +659,8 @@ def _start_polling(process):
                 return
             try:
                 code, health = http("GET", "/health", port=port, timeout=1.0)
+                if STATE.detached:  # Detach lasts until Start Model (§10.5), also past the load of the server it left
+                    return
                 if code == 200:
                     _apply_health(health)
                     if health.get("status") in ("ready", "error"):
@@ -722,14 +724,16 @@ def stop():
     then says). Another Blender's server is never shut down from here (§10.5): this Blender only stops using it, and
     forgets its token until it attaches again; one whose token it can't read keeps its error."""
     own = STATE.process is not None and STATE.process.poll() is None
-    if not own and (attached() or not STATE.token):  # nothing of this Blender's to shut down
+    shared = attached()
+    if shared or not (own or STATE.token):  # another Blender's server, or nothing of this Blender's to shut down
         if STATE.refused is None:  # stays detached until Start Model, or until that server goes
-            STATE.health, STATE.token, STATE.detached = {}, "", attached()
+            STATE.health, STATE.token, STATE.detached = {}, "", shared
             pipeline.cancel_all()  # queued chunks would go out without a token
             STATE.set("stopped", "")
-        return
+        if not own:
+            return
     try:  # a process of this Blender's while another's server answers lost the port: it is only ended
-        code = 0 if attached() else http("POST", "/shutdown", body={}, timeout=2.0)[0]
+        code = 0 if shared else http("POST", "/shutdown", body={}, timeout=2.0)[0]
     except Exception:
         code = 0
     process = STATE.process

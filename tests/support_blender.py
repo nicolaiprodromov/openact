@@ -6,8 +6,8 @@ headless Blender, against the fake model server the add-on starts itself (OPENAC
 - the templates parse with their sockets' schemas without a problem; New CSV from Template never overwrites (it
   creates name 2.csv, or the next free number), fills only an input that is empty and unlinked (its Import CSV
   companion too), refuses a node without templates and an unsaved .blend, and the Rules templates plan and fill;
-- the diagnostics text has versions and counters but no prompt or CSV text: problems keep their shape, with quoted
-  text replaced and paths cut to file names, and are cut to 200 characters;
+- the diagnostics text has versions and counters but no prompt or CSV text: a problem is copied as its node type and
+  severity, never its text;
 - the JSONL request log appears only while log_requests is on, which reaches the worker as it changes; its folder
   and file are created 0700 and 0600;
 - the Unsure Below preference: its defaults, and it moves the status's unsure count, the sidebar's icons and the
@@ -19,7 +19,8 @@ headless Blender, against the fake model server the add-on starts itself (OPENAC
   a second Blender, which this suite starts, attaches through it without starting a server, the one server answers
   it, its Model box says the server is shared, and its Stop only detaches; a wrong token file gives §10.5's message,
   and a token file put right is tried at the next health probe; a lost start race attaches to the winner at once,
-  and neither it nor a port some other program holds counts as a crash;
+  and neither it nor a port some other program holds counts as a crash; Detach lasts until Start Model, also while
+  the other server loads and in a lost start race;
 - crash-loop protection, time-scaled: 3 unexpected exits within 10 minutes pause auto-start until Start Model, and
   exits further apart don't;
 - the stalled-fill alert, time-scaled, while the scripted question stalls; the queued chunk stays queued;
@@ -405,7 +406,7 @@ def phase_diagnostics():
           and re.search(r"^Nodes: .*\b\d+ Match\b", text, re.M) is not None and re.search(
               r"^  Match: complete; rows per table 2; 1 of 1 stored entries materialised; \d+ nodes in the inner "
               r"group$", text, re.M) is not None, text)
-    check("diagnostics: a problem is copied as its node type, severity, file name and line, never its text",
+    check("diagnostics: a problem is copied as its node type and severity, never its text",
           "'okapi-sentinel' appears twice" in quoted and "folder-sentinel" in pathed
           and "zebrafactor=quokkalevel" in named and re.search(r"^  Match error \(x2\)$", text, re.M)
           and re.search(r"^  Rules error( \(x\d+\))?$", text, re.M), (quoted, pathed, named, text))
@@ -853,6 +854,69 @@ def phase_detach_sticks():
           server.start() and drive(engine, server.is_ready, 30), server.status())
 
 
+def phase_detach_while_starting():
+    """§10.5: Detach lasts also while the other Blender's server still loads (the start poller doesn't attach again
+    once it is ready), and in a lost start race while this Blender's losing server process still runs."""
+    port, token = free_port(), secrets.token_hex(32)
+    token_file = os.path.join(STATE_DIR, f"server-{port}.token")
+    other = other_server(port, token, "--fake-load-seconds", "4")
+    server.stop()
+    P._Defaults.port = port
+    try:
+        up = drive(engine, lambda: listening(port) and os.path.exists(token_file), 20)
+        loading = up and server.start() and server.status()[0] == "starting" and server.attached()
+        server.stop()  # Detach, which the Model box offers while the other server loads
+        node = used("Detached while loading", MATCH, Question="Is it loaded yet?", Items="sand, clay")
+        engine.schedule(immediate=True)
+        loaded = drive(engine, lambda: health().get("status") == "ready", 10)
+        drive(engine, lambda: False, 1.5)  # the start poller asks /health every 0.5 s
+        server.refresh()  # and a health probe
+        drive(engine, lambda: False, 1.0)
+        after = (server.status()[0], server.attached(), server.STATE.token, server.STATE.detached, line(node)[0])
+        again = server.start() and settle(lambda: server.is_ready() and complete(node), 20)
+        check("detach: pressed while the other Blender's server loads, Detach lasts: once that server is ready, this "
+              "Blender is still stopped and not attached, with no token, and the node waits as paused; Start Model "
+              "then attaches again and the node is answered", loading and loaded
+              and after == ("stopped", False, "", True, "paused") and again, (loading, loaded, after, again))
+    finally:
+        server.stop()
+        ended(other)
+
+    port, token = free_port(), secrets.token_hex(32)
+    token_file, script, own = os.path.join(STATE_DIR, f"server-{port}.token"), server.SERVER_SCRIPT, None
+    slow = os.path.join(TMP, "slow_server.py")  # this Blender's server, 2 s late to the port it then loses
+    with open(slow, "w", encoding="utf-8") as handle:
+        handle.write(f"import runpy, time\ntime.sleep(2)\nrunpy.run_path({script!r}, run_name='__main__')\n")
+    winner = other_server(port, token)
+    P._Defaults.port = port
+    try:
+        up = drive(engine, lambda: listening(port) and os.path.exists(token_file), 20)
+        server.SERVER_SCRIPT = slow
+        started = racing_start()
+        server.SERVER_SCRIPT = script
+        own = server.STATE.process
+        shared = drive(engine, lambda: server.attached() and server.is_ready(), 1.5)
+        alive = own is not None and own.poll() is None
+        server.stop()  # the Model box's Detach, while the losing process still runs
+        server.refresh()  # a health probe, which finds the winner
+        drive(engine, lambda: False, 1.5)
+        after = (server.status()[0], server.attached(), server.STATE.token, server.STATE.detached,
+                 own.poll() if own is not None else None, winner.poll())
+        check("detach: pressed in a lost start race while this Blender's losing server still runs, Detach lasts: that "
+              "process ends with the port-taken code, the winner runs on, and after a health probe this Blender is "
+              "still stopped and not attached, with no token", up and started and shared and alive
+              and after == ("stopped", False, "", True, server.PORT_TAKEN, None), (up, started, shared, alive, after))
+    finally:
+        server.SERVER_SCRIPT = script
+        server.stop()
+        ended(winner)
+        if own is not None:
+            ended(own)
+        P._Defaults.port = PORT
+    check("detach: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
 # ---------------------------------------------------------------------------------------- crash loop
 
 def restart_after_crash(node, question):
@@ -975,6 +1039,7 @@ def main():
         phase_lost_race()
         phase_own_after_other()
         phase_detach_sticks()
+        phase_detach_while_starting()
         phase_crash_loop()
         phase_stall()
         phase_slow()

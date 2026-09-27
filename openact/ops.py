@@ -29,8 +29,8 @@ TEMPLATES = {  # node type -> (input, file in TEMPLATE_DIR) of each CSV input th
     "GeometryNodeOpenActDials": (("Settings", "weather_dials.csv"),),
 }
 HEALTH = ("status", "requests", "questions", "rows_scored", "cache_hits", "ms_per_row", "load_seconds")  # §17.5
-# Diagnostics redact what an artist wrote (§16.3): a path (drive, UNC, '//' or '/' rooted) up to ': ' or the end, and
-# a quoted segment. A quote starts and ends at a word boundary, so apostrophes ("Can't", "file's") are no quotes.
+# The server's message in the diagnostics (§17.5): a path (drive, UNC, '//' or '/' rooted) up to ': ' or the end, and a
+# quoted segment. A quote starts and ends at a word boundary, so apostrophes ("runtime's", "can't") are no quotes.
 PATH = re.compile(r"(?<![\w/\\])(?:[A-Za-z]:[\\/]|\\\\|//?)(?=\S)[^\n]*?(?=: |$)")
 QUOTED = re.compile(r"""(?<!\w)(['"]).+?\1(?!\w)""")
 NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
@@ -122,7 +122,7 @@ class OPENACT_OT_server_stop(bpy.types.Operator):
     def description(cls, context, properties):
         if server.attached():  # the button reads "Detach" then (§10.5)
             return ("Stop using the model server another Blender started: it keeps running for that Blender. Start "
-                    "Model, or Start Automatically, uses it again")
+                    "Model uses it again")
         return cls.bl_description
 
     def execute(self, context):
@@ -683,8 +683,8 @@ def redact(text) -> str:
 def diagnostics() -> str:
     """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime (the home
     folder as ~), the model server's status and /health counters, the queue, the nodes and the first 10 problems. A
-    problem is given by its node type, severity, file name and line, never its text; the server's message is redacted.
-    So the report holds no words of the artist's (§16.3)."""
+    problem is given by its node type and severity, never its text; the server's message is redacted. So the report
+    holds no words of the artist's (§16.3)."""
     from . import bl_info  # the package's
 
     prefs, health = P.get_prefs(), server.STATE.health
@@ -712,19 +712,16 @@ def diagnostics() -> str:
     problems = Counter()
     for _tree, node in nodes:  # counts only: a label or a word could be the artist's text
         status = engine.STATUS.get(node.uid)
-        for problem in status.problems if status else ():  # its kind and place, never its text (§16.3)
-            where = f"{node.bl_label} {problem.severity}"
-            if problem.file:
-                where += f" in {os.path.basename(problem.file)}" + (f", line {problem.line}" if problem.line else "")
-            problems[where] += 1
+        for problem in status.problems if status else ():  # its node type and severity, never its text (§16.3)
+            problems[f"{node.bl_label} {problem.severity}"] += 1
         jobs = [job for _label, job, _entry in status.uses] if status else []
         entries = store.load(node).entries
         lines.append(f"  {node.bl_label}: {status.state if status else 'no pass yet'}; rows per table "
                      f"{', '.join(str(len(job.rows)) for job in jobs) or 'none'}; "
                      f"{len(inner.materialised(entries, [job.gn for job in jobs]))} of {len(entries)} stored entries "
                      f"materialised; {len(node.node_tree.nodes) if node.node_tree else 0} nodes in the inner group")
-    lines.append(f"Problems: {sum(problems.values())}")
-    lines += [f"  {where}" + (f" (x{count})" if count > 1 else "") for where, count in list(problems.items())[:10]]
+    lines.append(f"Problems: {problems.total()}")
+    lines += [f"  {kind}" + (f" (x{count})" if count > 1 else "") for kind, count in list(problems.items())[:10]]
     return "\n".join(lines)
 
 
