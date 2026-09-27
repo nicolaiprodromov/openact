@@ -44,7 +44,7 @@ CLASH = ("'{}' and '{}' share every word but not their list (a collection, objec
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
 P0_CELLS = 8
-PARTIAL = "openact_partial"  # ID property of the inner group: its table object holds an unstored partial table's rows
+PARTIAL = "openact_partial"  # ID property of the inner group: digest of the unstored partial tables its table holds
 
 STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
@@ -390,14 +390,16 @@ def _process(tree, node, contexts):
     if hidden:  # a hidden entry leaves the graph, or leaves its place to the partial table shown instead
         graph = store.NodeStore([entry for entry in (hidden.get((stored.gn, stored.words_key), stored)
                                                      for stored in node_store.entries) if entry is not None])
-    # An unstored partial table has the gn, so the place in the graph, of the entry it shows instead of: while it shows,
-    # and once after (also in a reopened file), the table object's rows are rewritten.
-    filling = any(entry is not None for entry in hidden.values())
-    marked = node.node_tree is not None and bool(node.node_tree.get(PARTIAL))
-    if not inner.update_values(node, graph, live, default, rows=rows or filling or marked):  # values only (§8.8)
+    # An unstored partial table has the gn, so the place in the graph, of the entry it shows instead of. The table
+    # object's rows are rewritten when the partial tables shown change, and once after (also in a reopened file): only
+    # then, as a rewrite re-evaluates every modifier that reads the table, whose depsgraph update schedules a pass.
+    partials = [(entry.words_key, entry.rows.v, entry.rows.payload) for entry in hidden.values() if entry is not None]
+    partial = pipeline.digest(*partials) if partials else ""
+    written = node.node_tree.get(PARTIAL, "") if node.node_tree is not None else ""
+    if not inner.update_values(node, graph, live, default, rows=rows or partial != written):  # values only (§8.8)
         inner.build(node, graph, live, default)
-    if filling != marked:  # the table object holds the rows of the graph just laid out
-        node.node_tree[PARTIAL] = filling
+    if partial != written:  # the table object holds the rows of the graph just laid out
+        node.node_tree[PARTIAL] = partial
     STATUS[node.uid] = NodeStatus(*_status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings),
                                   shown, pipeline.progress(node.uid))
     return changed

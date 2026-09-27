@@ -209,11 +209,11 @@ class Spec:
     def resolve(self, job: pipeline.Job, entries, last_shown: str = "", partial: bool = False):
         """Answer the job by the validity rule (§5.4), from the node's stored entries and this session's caches.
 
-        The stored entry with the job's words holds while its words key matches, whatever its ask keys. Otherwise
-        each row takes the answer of a row with its wkey in that entry or in the one this context showed last
-        (words key last_shown), else its cell's answer in MEMORY. Returns (entry, missing cells, failure messages):
-        the stored entry, or a new one once every row is answered, else None; with `partial`, once any row is known,
-        the table so far (stale()), which the pass stores while it refills."""
+        The stored entry with the job's words holds while its words key matches and it is whole (complete()),
+        whatever its ask keys. Otherwise each row takes the answer of a row with its wkey in that entry or in the one
+        this context showed last (words key last_shown), else its cell's answer in MEMORY. Returns (entry, missing
+        cells, failure messages): the stored entry, or a new one once every row is answered, else None; with
+        `partial`, once any row is known, the table so far (stale())."""
         found = next((entry for entry in entries if entry.gn == job.gn), None)
         if found is not None and found.words_key == job.words_key and complete(found):
             return found, [], []

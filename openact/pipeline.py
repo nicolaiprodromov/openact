@@ -335,8 +335,8 @@ def _fill(uid, cell, answered=0, asked=0):
 
 
 def progress(uid: str) -> tuple[int, int, float] | None:
-    """The node's fill (PR-22's "Filling n/N · ~ETA", §17.1): (done, total, ms_per_row) while cells are queued or in
-    flight for it, else None. done and total count its cells answered (or failed) and asked since the fill began; a
+    """The node's fill (the status's "Filling n/N · ~ETA", §17.1): (done, total, ms_per_row) while cells are queued or
+    in flight for it, else None. done and total count its cells answered (or failed) and asked since the fill began; a
     cell is one question, so one table row for Match, Classify, Rules and Dials and the whole table for Ask and Pick.
     ms_per_row is what each remaining one should take: /health's ms_per_row (MS_PER_ROW until it reports one) times
     the scored rows it costs, so (total - done) * ms_per_row / 1000 is the ETA in seconds. Main thread only."""

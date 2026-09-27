@@ -16,7 +16,9 @@ starts itself (OPENACT_BACKEND=fake), whose --record log holds every request it 
   render_running and playing events tick() publishes; the worker never touches bpy;
 - stale-while-refilling: carried rows keep their answers, an edited row shows its old one (stale) and a new row its
   neutral value (pending), and the status record counts them with the ETA of pipeline.progress(); a new table with
-  no row known yet stores nothing; a row whose question failed shows its neutral value, not its old answer;
+  no row known yet stores nothing; a row whose question failed shows its neutral value, not its old answer; the
+  table so far shown in the old entry's place (an Items CSV edit: the same words) while nothing refills it is
+  written once, and then only the safety passes run, writing nothing;
 - a simulated 5 s cold load: a P0 job queued after a P2 chunk (503 loading) is answered first once the model is ready;
   a failed load (503 error) fails the cells without requeueing them;
 - unregistering and registering again mid-fill (disable and enable, Reload Scripts): the fill completes;
@@ -53,7 +55,7 @@ import bpy  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import FAILURES, check, drive, finish, store  # noqa: E402
-from openact import csvfmt, engine, lists, nodes, pipeline, server, sources  # noqa: E402
+from openact import csvfmt, engine, lists, nodes, pipeline, server, sources, tables  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402
 from openact.specs import SPECS  # noqa: E402
@@ -556,6 +558,70 @@ def phase_failed():
           (entry and entry.rows.src, first, got, counts))
 
 
+def phase_idle():
+    """The table so far shown in the old entry's place (§5.4) while nothing refills it: an Items CSV edit (the same
+    words) with the model stopped. Its table object is written once, then only the 2 s safety passes run, writing
+    nothing. Blender's event loop evaluates the depsgraph after each timer, so each tick here is followed by an
+    evaluation: the update of a table write would schedule another pass."""
+    path = os.path.join(TMP, "idle.csv")
+
+    def items(lamp, stamp):  # each edit gets a new stamp, which the fingerprint holds
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(f"answer,when\nspoon,a kitchen tool\nchair,a seat\nlamp,{lamp}\n")
+        os.utime(path, ns=(stamp, stamp))
+
+    def ui(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            engine.tick()
+            bpy.context.evaluated_depsgraph_get()
+            time.sleep(0.05)
+
+    def counted_pass(everything=True):
+        passes.append(everything)  # the safety pass visits every node; a scheduled one passes False
+        return run_pass(everything)
+
+    def counted_write(node_, *args, **kwargs):
+        writes.append(node_.uid)
+        return write_rows(node_, *args, **kwargs)
+
+    items("gives light", 10 ** 18)
+    _tree, (node,), obj = match_tree("Idle", ("Is it made of metal?", path))
+    settle()
+    first, stored = read(obj), [entry.words_key for entry in S.load(node).entries]
+    passes, writes, run_pass, write_rows = [], [], engine.run_pass, tables.write_rows
+    engine.run_pass, tables.write_rows = counted_pass, counted_write
+    P._Defaults.auto_start = False
+    try:
+        server.stop()
+        ui(1.0)  # the pass the stop schedules
+        writes.clear()
+        items("gives light at night", 2 * 10 ** 18)  # only lamp's wkey changes
+        ui(1.5)  # the watcher sees the edit, and a pass shows the table so far
+        edited, status = len(writes), engine.STATUS[node.uid]
+        passes.clear()
+        ui(6.0)
+        idle = (list(passes), len(writes) - edited)
+    finally:
+        engine.run_pass, tables.write_rows = run_pass, write_rows
+        P._Defaults.auto_start = True
+    counts = (status.rows, status.answered, status.stale, status.pending)
+    check("partial in place: an Items CSV edit with the model stopped shows the table so far in the old entry's place "
+          "(2 rows answered, 1 stale), and the old entry stays stored", status[0] == 'PAUSE' and counts == (3, 2, 1, 0)
+          and [entry.words_key for entry in S.load(node).entries] == stored and read(obj) == first,
+          (tuple(status), counts))
+    check("partial in place: with nothing to refill it, its table object is written once, and then only the 2 s "
+          "safety passes run, writing nothing", edited <= 1 and idle[1] == 0 and 2 <= len(idle[0]) <= 4
+          and all(idle[0]), (edited, idle))
+    server.start()
+    words_key = engine._jobs(node)[0][1].words_key
+    done = drive(engine, lambda: any(entry.words_key == words_key and entry.rows.src == "mmm"
+                                     for entry in S.load(node).entries), 30)
+    got = read(obj)
+    check("partial in place: once the model is back, the edited row is answered and stored, and the table object "
+          "shows its answer", done and got[:2] == first[:2] and got[2] != first[2], (done, first, got))
+
+
 # ------------------------------------------------------------------------------ entry validity (§5.4)
 
 def phase_validity():
@@ -829,6 +895,7 @@ def main():
         phase_pauses()
         phase_stale()
         phase_failed()
+        phase_idle()
         phase_validity()
         phase_cold_load()
         phase_reregister()

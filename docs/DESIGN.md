@@ -3199,7 +3199,7 @@ still work):
 | Code | When | Client reaction (`server.Worker`) |
 |---|---|---|
 | 200 | answered | fill `MEMORY`, post to the main thread |
-| 403 | missing or wrong token, `Origin` present, bad `Host` | status *error* "The model server refused this Blender (token)"; no retry |
+| 403 | missing or wrong token, `Origin` present, bad `Host` | status *error* "A model server started by another Blender holds port N: close that Blender or choose another port" while `/health` reports that server's pid; the cells stay unanswered (not `FAILED`) and are asked again once it has gone. A refused *Stop Model* (`/shutdown`) is reported the same way |
 | 413 | body over 4 MB | should never happen, because chunks stay far below it; log, then split the chunk |
 | 422 | invalid question; `question` names it | mark that cell `FAILED`; resend the rest of the chunk (§10.3) |
 | 503 `loading` | model still loading (returned immediately, no blocking) | requeue at the head, poll `/health` until `ready` |
