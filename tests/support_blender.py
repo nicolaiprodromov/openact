@@ -398,12 +398,21 @@ def phase_diagnostics():
     done = settle(lambda: complete(node) and line(missing)[0] == line(doubled)[0] == "error"
                   and "No outcome applies" in line(uncovered)[1], 60)
     quoted, pathed, named = line(doubled)[1], line(missing)[1], line(uncovered)[1]
-    text = ops.diagnostics()
+    config = os.path.join(P._Defaults.runtime_dir, "venv", "pyvenv.cfg")  # names the venv's base Python (§12.2)
+    os.makedirs(os.path.dirname(config), exist_ok=True)
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(f"home = {os.path.join(HOME, 'uv', 'python')}\n")
+    try:
+        text = ops.diagnostics()
+    finally:
+        os.remove(config)
     version = ".".join(map(str, openact.bl_info["version"]))
     parts = [f"OpenAct {version}, Blender {bpy.app.version_string}, {platform.platform()}", "Backend: fake, model fake",
-             "\nRuntime: ", f"Server: ready on port {PORT}", "Health: status ready, requests "]
-    check("diagnostics: OpenAct, Blender and OS versions, the backend and model, the runtime, the server's status and "
-          "its /health counters", done and all(part in text for part in parts)
+             "\nRuntime: ", f"; Python from {os.path.join('~', 'uv', 'python')}\nServer: ready on port {PORT}",
+             "Health: status ready, requests "]
+    check("diagnostics: OpenAct, Blender and OS versions, the backend and model, the runtime and its venv's base Python "
+          "(the home folder as ~), the server's status and its /health counters", done
+          and all(part in text for part in parts)
           and all(re.search(rf"\b{key} \d", text) for key in ("requests", "questions", "rows_scored", "cache_hits")),
           text)
     check("diagnostics: the queue, a count per node type, and per node its rows per table, materialised entries and "

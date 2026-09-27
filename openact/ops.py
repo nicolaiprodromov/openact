@@ -792,16 +792,20 @@ def redact(text) -> str:
 
 
 def diagnostics() -> str:
-    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime (the home
-    folder as ~), the model server's status and /health counters, the queue, the nodes and the first 10 problems. A
-    problem is given by its node type and severity, never its text; the server's message is redacted. So the report
-    holds no words of the artist's (§16.3)."""
+    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime and the base
+    Python of its venv (the home folder as ~), the model server's status and /health counters, the queue, the nodes and
+    the first 10 problems. A problem is given by its node type and severity, never its text; the server's message is
+    redacted. So the report holds no words of the artist's (§16.3)."""
     from . import bl_info  # the package's
 
-    prefs, health = P.get_prefs(), server.STATE.health
-    root, home = P.runtime_root(prefs), os.path.expanduser("~")
-    if os.path.normcase(root).startswith(os.path.normcase(home) + os.sep):
-        root = "~" + root[len(home):]
+    prefs, health, home = P.get_prefs(), server.STATE.health, os.path.expanduser("~")
+
+    def tilde(path):
+        return "~" + path[len(home):] if os.path.normcase(path).startswith(os.path.normcase(home) + os.sep) else path
+
+    root = P.runtime_root(prefs)
+    legacy = " (the legacy Jev Nodes runtime)" if os.path.basename(root).casefold() == "jevnodes" else ""
+    python = P.venv_home(root)  # outside the Jev Nodes runtime: its venv uses the user's uv Python (§12.2)
     state, message = server.status()
     per_class, flight = pipeline.queue_counts()
     nodes = list(engine.iter_nodes())
@@ -811,8 +815,7 @@ def diagnostics() -> str:
         f"GPU: {health.get('device') or 'unknown'} (device {prefs.device}, GPU {prefs.gpu})",
         f"Backend: {health.get('backend') or 'unknown'}, model {health.get('model_id') or 'unknown'}, revision "
         f"{health.get('revision') or 'unknown'}",
-        f"Runtime: {root}" + (" (the legacy Jev Nodes runtime)" if os.path.basename(root).casefold() == "jevnodes"
-                              else ""),
+        f"Runtime: {tilde(root)}{legacy}" + (f"; Python from {tilde(python)}" if python else ""),
         f"Server: {state} on port {server.STATE.port}" + (f": {redact(message)[:200]}" if message else ""),
         "Health: " + (", ".join(f"{key} {health[key]}" for key in HEALTH if health.get(key) is not None) or "none"),
         f"Queue: {per_class[0]}/{per_class[1]}/{per_class[2]} chunks (P0/P1/P2), {flight} cells in flight, "

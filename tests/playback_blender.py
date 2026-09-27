@@ -31,7 +31,10 @@ the add-on starts itself (OPENACT_BACKEND=fake), whose --record log counts every
   be saved are named in the note;
 - pin order: with 12 pins, objects added until live plus pinned exceeds 16 leave out the pins whose words start latest
   in the frame range (ties by their words), the same ones after a rebuild; a new run is then refused, asking nothing;
-- pins above 2 MB are kept, with the size note, and Prepare for Playback reported the size of the pins first.
+- pins above 2 MB are kept, with the size note, and Prepare for Playback reported the size of the pins first;
+- stress: the pins' undo step is checked and pushed for 3 s while another thread runs Python, as the worker and the
+  /health probes do (Blender 4.5 crashed when bpy.ops ran under temp_override then), and OpenAct's code calls no
+  temp_override.
 
 Run:  blender -b --factory-startup --python tests/playback_blender.py
 """
@@ -43,6 +46,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -1276,6 +1280,46 @@ def phase_size():
           (done, len(pins), size, notes))
 
 
+# ------------------------------------------------------------------------------ threads
+
+def calls_override(path):
+    with open(path, encoding="utf-8") as handle:
+        return re.search(r"\btemp_override\(", handle.read()) is not None
+
+
+def phase_stress():
+    """Blender 4.5 (Python 3.11) crashed when bpy.ops ran under temp_override while another Python thread ran: the
+    override's lookup took that thread's hold on the GIL for its own. The pins' undo step is checked and pushed again
+    and again while a thread parses JSON, as the worker and the /health probes do."""
+    reset(1, 10)  # a small file: many pushes
+    stop, parsed = threading.Event(), [0]
+
+    def busy():
+        text = json.dumps({"status": "ready", "server": "openact-semif", "rows": list(range(200))})
+        while not stop.is_set():
+            json.loads(text)
+            parsed[0] += 1
+
+    thread, live, pushes = threading.Thread(target=busy, daemon=True), bpy.ops.ed.undo_push.poll(), 0
+    thread.start()
+    start = time.monotonic()
+    try:
+        while time.monotonic() - start < 3.0:
+            engine._hold()
+            engine._undo_push("Pin for Playback")
+            pushes += 1
+    finally:
+        stop.set()
+        thread.join()
+    check("stress: for 3 s the pins' undo step is checked and pushed, at least 20 times, while another thread runs "
+          "Python, and Blender doesn't crash", live and pushes >= 20 and parsed[0] > 0, (live, pushes, parsed[0]))
+    code = os.path.join(ROOT, "openact")
+    found = [os.path.relpath(os.path.join(folder, name), code) for folder, _dirs, names in os.walk(code)
+             for name in names if name.endswith(".py") and calls_override(os.path.join(folder, name))]
+    check("stress: OpenAct's code calls no temp_override, under which bpy.ops crashes Blender 4.5 while OpenAct's "
+          "threads run Python (the old-nodes report's timer, which no headless run reaches, included)", not found, found)
+
+
 def main():
     print("BLENDER", bpy.app.version_string, "fake model server on port", PORT, flush=True)
     try:
@@ -1298,6 +1342,7 @@ def main():
         phase_newer()
         phase_pin_order()
         phase_size()
+        phase_stress()
     except Exception:
         check("no unexpected error", False, traceback.format_exc())
     finally:

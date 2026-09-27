@@ -1034,20 +1034,12 @@ def frames_text(spans):
     return ", ".join(str(start) if start == end else f"{start}–{end}" for start, end in spans)
 
 
-def _window():
-    """The window an undo step is pushed from: the context's, else the first one (a timer has no window)."""
-    wm = getattr(bpy.context, "window_manager", None)
-    return bpy.context.window or (wm.windows[0] if wm and wm.windows else None)
-
-
 def _undo_push(message):
-    """An undo step for what the pass wrote on its own, when there is a window to push it from."""
-    window = _window()
-    if window is None:
-        return
-    with bpy.context.temp_override(window=window):
-        if bpy.ops.ed.undo_push.poll():
-            bpy.ops.ed.undo_push(message=message)
+    """An undo step for what the pass wrote on its own, in the context as it is (a timer's has the first window): under
+    temp_override, Blender 4.5 reads the override without the GIL during bpy.ops, which crashes while a thread of
+    OpenAct's runs Python."""
+    if bpy.ops.ed.undo_push.poll():
+        bpy.ops.ed.undo_push(message=message)
 
 
 def _modal_undo():
@@ -1060,18 +1052,16 @@ def _hold():
     """Why pins a pass writes must wait, or "" when an undo step can hold them without cutting the user's history: a
     modal operator is mid-way (its own step would take them), the mode's undo steps hold only its own data (Edit Mode,
     Sculpt Mode, Texture Paint...), or there are steps to redo (a push would delete them)."""
-    window = _window()
-    if window is None:  # no undo step to push, and none to cut
+    if bpy.context.window is None:  # no undo step to push, and none to cut
         return ""
     if _modal_undo():
         return "they are pinned once the running tool finishes"
-    with bpy.context.temp_override(window=window):
-        if bpy.context.mode not in LAND_MODES:
-            obj = bpy.context.active_object
-            mode = obj.bl_rna.properties["mode"].enum_items[obj.mode].name if obj is not None else bpy.context.mode
-            return f"they are pinned once you leave {mode}"
-        if bpy.ops.ed.redo.poll():
-            return "they are pinned once nothing is left to redo (redo it, or make any change)"
+    if bpy.context.mode not in LAND_MODES:
+        obj = bpy.context.active_object
+        mode = obj.bl_rna.properties["mode"].enum_items[obj.mode].name if obj is not None else bpy.context.mode
+        return f"they are pinned once you leave {mode}"
+    if bpy.ops.ed.redo.poll():
+        return "they are pinned once nothing is left to redo (redo it, or make any change)"
     return ""
 
 
