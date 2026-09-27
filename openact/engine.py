@@ -34,7 +34,7 @@ from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
-from .specs.base import UNSURE_BELOW, orphaned
+from .specs.base import orphaned, unsure_below
 from .specs.pick import PickSpec
 from .watch import WATCH
 
@@ -45,6 +45,10 @@ SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; i
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
 OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
+STALL = 60.0  # seconds with cells asked of a ready model and no chunk answered: the stalled-fill alert (§17.6)
+STALLED = "No answers for {:g} s: see the log"
+SLOW_MS, SLOW_FOR = 3 * pipeline.MS_PER_ROW, 60.0  # /health's ms_per_row above this for so long: the slow note (§17.3)
+SLOW = "Running slower than expected: is the GPU busy (rendering, another app)?"
 ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
          "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
@@ -69,6 +73,8 @@ _group_count = -1  # number of node groups at the last pass that found no OpenAc
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
 _pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
+_quiet_since = time.monotonic()  # the stall clock: since a chunk was last answered, or cells were first asked
+_slow_since = None  # since when /health's ms_per_row has been above SLOW_MS
 
 
 @dataclass
@@ -504,13 +510,33 @@ def _submit(job, missing):
     """Ask for the missing cells once the model is ready, starting it if the preferences allow. True when they are
     asked: sent now, or sent by the pass that runs once the model is ready, as a start is under way, queued or begun
     here."""
+    global _quiet_since
     state, _message = server.status()
     if state == "ready":
-        pipeline.submit(job, missing, job.priority, on_rows=lambda _job: schedule(immediate=True))
+        if not pipeline.PENDING:  # a fill begins: the stall clock starts
+            _quiet_since = time.monotonic()
+        pipeline.submit(job, missing, job.priority, on_rows=_answered)
         return True
     if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
         return server.start()  # asked by the pass that runs when the server is ready; an install starts it as it ends
     return state == "starting" or server.STATE.start_queued
+
+
+def _answered(_job):
+    """A chunk came back, answered or failed: the stall clock starts again, and a pass shows the answers."""
+    global _quiet_since
+    _quiet_since = time.monotonic()
+    schedule(immediate=True)
+
+
+def stalled():
+    """True when cells are asked of a ready model and no chunk has come back for STALL seconds (§17.6)."""
+    return bool(pipeline.PENDING) and server.is_ready() and time.monotonic() - _quiet_since >= STALL
+
+
+def slow_note():
+    """The Model box's note once /health's ms_per_row has been above SLOW_MS for SLOW_FOR seconds (§17.3), else ""."""
+    return SLOW if _slow_since is not None and time.monotonic() - _slow_since >= SLOW_FOR else ""
 
 
 def _priority(spec, node, missing):
@@ -547,6 +573,8 @@ def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
             return "paused", "Model server is stopped (OpenAct tab)", None
         if upstream and not waiting:
             return "waiting", "Waiting for another OpenAct node...", None
+        if stalled():  # its chunks stay queued
+            return "warning", STALLED.format(STALL), None
         return ("filling", *_filling(uid))
     if not jobs:
         return "hint", hints[0] if hints else spec.empty_hint, None
@@ -577,6 +605,7 @@ def _counts(jobs, resolved, asked):
     plan's rows, whose cells are asked (pending), failed (errors) or answered this session."""
     counts = dict.fromkeys(("rows", "answered", "pending", "stale", "unsure", "locked", "code", "errors"), 0)
     letters = {"m": "answered", "p": "pending", "s": "stale", "l": "locked", "c": "code", "e": "errors"}
+    below = unsure_below()
     for gn, (job, _ctx) in jobs.items():
         counts["rows"] += len(job.rows)
         entry = resolved.get(gn)
@@ -584,7 +613,7 @@ def _counts(jobs, resolved, asked):
             for letter in entry.rows.src:
                 counts[letters.get(letter, "answered")] += 1
             confidences = entry.rows.v.get("c") or ()
-            counts["unsure"] += sum(src == "m" and c < UNSURE_BELOW for src, c in zip(entry.rows.src, confidences))
+            counts["unsure"] += sum(src == "m" and c < below for src, c in zip(entry.rows.src, confidences))
             continue
         for row in job.rows:
             if row.cell is None:
@@ -668,7 +697,7 @@ def _publish(event, value):
 
 
 def tick():
-    global _last_refresh, _dirty
+    global _last_refresh, _dirty, _quiet_since, _slow_since
     try:
         if server.pump():
             redraw()
@@ -676,6 +705,14 @@ def tick():
         _publish(server.Worker.render_running, rendering)  # for the worker, which never calls bpy (§5.5)
         _publish(server.Worker.playing, playing)
         now = time.monotonic()
+        ready = server.is_ready()
+        if rendering or not (ready and pipeline.PENDING):  # the stall clock runs only while the worker may send
+            _quiet_since = now
+        ms_per_row = server.STATE.health.get("ms_per_row") if ready else None
+        if ms_per_row is None or ms_per_row <= SLOW_MS:
+            _slow_since = None
+        elif _slow_since is None:
+            _slow_since = now
         if now - _last_refresh > 5.0 and (_has_nodes or server.STATE.status in ("unknown", "ready", "starting")):
             _last_refresh = now
             server.refresh()

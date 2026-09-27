@@ -22,7 +22,13 @@ SOURCES = {"lock": "l", "code": "c", "model": "m", "pending": "p", "stale": "s",
 KINDS = {src: source for source, src in SOURCES.items()}  # src -> Row.source
 OVERRIDES = ("Optional Overrides CSV (.csv path). Rows with lock = 1 replace the model's answer and are never asked. "
              "Write Overrides CSV (sidebar) starts one from the current answers")
-UNSURE_BELOW = 0.30  # 4.e: the exported unsure column
+
+
+def unsure_below() -> float:
+    """The Unsure Below preference (4.e): a model row with a lower confidence is flagged unsure."""
+    from ..prefs import get_prefs  # imports bpy
+
+    return get_prefs().unsure_below
 
 
 def option_text(option) -> str:
