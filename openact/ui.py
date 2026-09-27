@@ -1,8 +1,9 @@
 """The sidebar (Geometry Node editor > N > OpenAct) and the preferences panel (§17.2): banners, the Model box, the
-active node's status, contexts and table, and the files it reads. Inspection only: every change goes through a file,
-a socket or an operator.
+active node's status, contexts, table and pins, and the files it reads. Inspection only: every change goes through a
+file, a socket or an operator.
 
-status_rows(), table_rows(), table_page() and banners() are plain data, so the tests check them without drawing.
+status_rows(), table_rows(), table_page(), pin_rows() and banners() are plain data, so the tests check them without
+drawing.
 Drawing plans and writes nothing: Blender refuses changes to nodes and data while it draws.
 """
 
@@ -110,6 +111,19 @@ def table_page(rows, page=0):
         icon = ROW_ICONS.get(source, 'QUESTION' if unsure else 'BLANK1')
         lines.append((name, answer, confidence, icon, source not in ("stale", "pending")))
     return lines, page, pages
+
+
+def pin_rows(pins) -> list[tuple[str, str]]:
+    """(words key, text) of each pinned entry (NodeStatus.pins, in pin order): the frames its words occur at, and the
+    words that tell it from the node's other pins, a CSV path by its file name."""
+    varying = [j for j in range(len(pins[0][2]) if pins else 0) if len({gn[j] for _key, _frames, gn in pins}) > 1]
+    rows = []
+    for key, frames, gn in pins:
+        words = [os.path.basename(word) if lists.is_csv_path(word) else word
+                 for j, word in enumerate(gn) if word and (j in varying or not varying)]
+        spans = ", ".join(str(start) if start == end else f"{start}–{end}" for start, end in frames)
+        rows.append((key, f"Frames {spans}: {' · '.join(words)}"))
+    return rows
 
 
 def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(), over=()) -> list[tuple]:
@@ -302,6 +316,24 @@ def draw_table(layout, context, node, uses, index):
         op.uid, op.context_index, op.row = node.uid, index, page * PAGE_ROWS + i
 
 
+def draw_pins(layout, node):
+    """The node's pinned entries (§5.5), each with Unpin, and Unpin All."""
+    status = engine.STATUS.get(node.uid)
+    rows = pin_rows(status.pins) if status is not None else []
+    if not rows:
+        return
+    box = layout.box()
+    box.enabled = node.id_data.library is None  # a linked node's answers come from its library file
+    head = box.row(align=True)
+    head.label(text=f"Pinned for playback: {len(rows)}", icon='PINNED')
+    head.operator("openact.unpin", text="Unpin All", icon='UNPINNED').uid = node.uid
+    for key, text in rows:
+        row = box.row(align=True)
+        row.label(text=text, icon='BLANK1')
+        op = row.operator("openact.unpin", text="", icon='UNPINNED')
+        op.uid, op.words_key = node.uid, key
+
+
 def draw_files(layout, node):
     """The files the node reads (§7.10): path, rows, text and payload columns, when read, the Import CSV note, and up
     to FILE_PROBLEMS problems, with Open File."""
@@ -367,6 +399,15 @@ class NODE_PT_openact(bpy.types.Panel):
             if banner[0] not in SERVER_BANNERS:
                 draw_banner(layout.box(), banner)
         draw_server(layout, next((banner for banner in found if banner[0] in SERVER_BANNERS), None))
+        if engine.STATUS:  # the file has OpenAct nodes
+            col = layout.column(align=True)
+            col.operator("openact.prepare_playback", icon='PLAY')
+            if engine.PLAYBACK is not None:
+                count = sum(len(sets) for sets in engine.PLAYBACK.values())
+                wrap(col, f"Pinning {count} word set{'s' if count != 1 else ''} once the model has answered them",
+                     icon='SORTTIME')
+            elif engine.PLAYBACK_NOTE:
+                wrap(col, engine.PLAYBACK_NOTE, icon='INFO')
         if _active(context) is None:
             col = layout.column(align=True)
             col.label(text="Add nodes with Shift A > OpenAct", icon='INFO')
@@ -389,6 +430,7 @@ class NODE_PT_openact_node(bpy.types.Panel):
         node = _active(context)
         self.layout.label(text=node.name, icon='NODE')
         node.draw_buttons_ext(context, self.layout)
+        draw_pins(self.layout, node)
 
 
 class NODE_PT_openact_files(bpy.types.Panel):

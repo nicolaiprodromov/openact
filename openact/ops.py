@@ -1,13 +1,15 @@
 """Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; show
-what a row asks; open files; trust a .blend's file reads."""
+what a row asks; open files; trust a .blend's file reads; prepare animated words for playback, and unpin them."""
 
 from __future__ import annotations
 
 import contextlib
 import csv
+import math
 import os
 import subprocess
 import sys
+import time
 
 import bpy
 
@@ -124,6 +126,95 @@ class OPENACT_OT_reask(bpy.types.Operator):
         except ValueError as error:  # a newer OpenAct's answers
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class OPENACT_OT_prepare_playback(bpy.types.Operator):
+    bl_idname = "openact.prepare_playback"
+    bl_label = "Prepare for Playback"
+    bl_description = ("Answer every set of words the OpenAct nodes see over the scene's frame range, and pin those "
+                      "answers, so animated words (a keyframed dropdown, say) never wait for the model during playback")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):  # run from a script, the fallback sets every frame here without a modal loop
+        run = engine.Playback(context.scene)
+        if not run.read_curves():
+            for _frame in run.step_frames():
+                pass
+        return self.finish(run)
+
+    def invoke(self, context, event):
+        self.run = engine.Playback(context.scene)
+        if self.run.read_curves():
+            return self.finish(self.run)
+        # The fallback: one scene evaluation per frame, with progress, and Esc cancels
+        self.steps, self.done, self.total = self.run.step_frames(), 0, max(self.run.last - self.run.first + 1, 0)
+        self.started = time.monotonic()
+        wm = context.window_manager
+        wm.progress_begin(0, self.total)
+        context.workspace.status_text_set(f"Prepare for Playback ({self.run.fallback}): {self.total} frames to set, "
+                                          f"one scene evaluation each. Esc cancels")
+        self.timer = wm.event_timer_add(0.001, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC' and event.value == 'PRESS':
+            self.steps.close()  # sets the frame it started at again
+            self.end(context)
+            self.report({'INFO'}, "Prepare for Playback cancelled: nothing was pinned")
+            return {'CANCELLED'}
+        if event.type != 'TIMER':
+            return {'RUNNING_MODAL'}  # no edits while the scene is at another frame
+        try:
+            next(self.steps)
+        except StopIteration:
+            self.end(context)
+            return self.finish(self.run)
+        self.done += 1
+        left = (time.monotonic() - self.started) / self.done * (self.total - self.done)
+        context.window_manager.progress_update(self.done)
+        context.workspace.status_text_set(f"Prepare for Playback ({self.run.fallback}): frame {self.done} of "
+                                          f"{self.total}, about {math.ceil(left)} s left. Esc cancels")
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):  # Blender ends the modal loop itself, e.g. when its window closes
+        self.steps.close()  # else no pass would run again
+        self.end(context)
+
+    def end(self, context):
+        wm = context.window_manager
+        wm.event_timer_remove(self.timer)
+        wm.progress_end()
+        if context.workspace is not None:
+            context.workspace.status_text_set(None)
+
+    def finish(self, run):
+        try:
+            text = run.finish()
+        except ValueError as error:  # a limit: nothing was asked
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        self.report({'WARNING'} if run.problems else {'INFO'}, text)
+        return {'FINISHED'}
+
+
+class OPENACT_OT_unpin(bpy.types.Operator):
+    bl_idname = "openact.unpin"
+    bl_label = "Unpin"
+    bl_description = ("Stop keeping this answer (Unpin All: every answer of the node) for playback. It stays stored, "
+                      "and old stored answers may be dropped to keep the file small")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    uid: bpy.props.StringProperty(options={'HIDDEN'})  # "": every node
+    words_key: bpy.props.StringProperty(options={'HIDDEN'})  # "": every pin of the node
+
+    def execute(self, context):
+        count = engine.unpin(self.uid, self.words_key)
+        if not count:
+            self.report({'WARNING'}, "Nothing to unpin")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Unpinned {count} answer{'s' if count != 1 else ''}")
         return {'FINISHED'}
 
 
@@ -589,7 +680,7 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
            OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
-           OPENACT_OT_write_overrides)
+           OPENACT_OT_write_overrides, OPENACT_OT_prepare_playback, OPENACT_OT_unpin)
 
 
 def register():
