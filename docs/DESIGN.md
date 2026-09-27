@@ -959,12 +959,16 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
        - the action is in **tweak mode** (`animation_data.use_tweak_mode`);
        - the action is **blended** (`action_blend_type != 'REPLACE'` or `action_influence < 1`).
 
+       It also falls back when an animated value is read while **Time Stretching** is on
+       (`render.frame_map_old != frame_map_new`), which plays animation at remapped times.
+
        The fallback runs as a **modal operator** with progress in the status bar and **Esc to
        cancel**. Cost is frames × one scene evaluation, e.g. 250 × 50 ms ≈ 12 s, shown up front as
        an estimate. Cancelling pins nothing.
     4. **Afterwards.** The current frame is restored. Pinning changes the inner group, which
        invalidates unbaked simulation caches. Baked simulations are flagged "re-bake: rules changed
-       for frames …".
+       for frames …". Python can't tell a baked simulation or Bake node from an unbaked one, so every
+       modifier with bakes whose rules the new pins change is named.
   - **Limits and overflow.**
     - At most 12 pinned entries, and live plus pinned at most 16 (§8.1).
     - If the range yields more distinct word tuples, it **refuses without asking anything**: "40
