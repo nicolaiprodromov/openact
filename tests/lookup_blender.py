@@ -486,14 +486,15 @@ def user_of(group, name, points=1):
 
 def phase_carry():
     """Carry-over by wkey (§5.4) in a new session, where only the stored entry can answer: a text edit of a Match's
-    Items CSV (the same words) asks only the row whose wkey changed, the old answers never showing meanwhile, and
-    nothing more once its answer arrives; undoing the edit before then asks nothing and shows the stored answers."""
+    Items CSV (the same words) asks only the row whose wkey changed, and nothing more once its answer arrives.
+    Meanwhile the table so far shows (stale-while-refilling), while the old entry stays stored, hidden: undoing the
+    edit before the answer arrives asks nothing and shows the stored answers, also in a reopened file."""
     folder = tempfile.mkdtemp(prefix="openact-carry-")
     path = os.path.join(folder, "items.csv")
 
-    def items(lamp, stamp):  # each edit gets a new stamp, which the fingerprint holds
+    def items(lamp, stamp, table="a flat surface"):  # each edit gets a new stamp, which the fingerprint holds
         with open(path, "w", encoding="utf-8", newline="") as handle:
-            handle.write(f"answer,when\nchair,a seat\ntable,a flat surface\nlamp,{lamp}\n")
+            handle.write(f"answer,when\nchair,a seat\ntable,{table}\nlamp,{lamp}\n")
         os.utime(path, ns=(stamp, stamp))
 
     group = bpy.data.node_groups.new("Carry", 'GeometryNodeTree')
@@ -511,23 +512,29 @@ def phase_carry():
         return [row.cell.key for row in
                 engine.SPECS[MatchSpec.idname].plan(matcher, evaluator.find_uses()[group.as_pointer()][0]).rows]
 
+    def keys():
+        return [entry.words_key for entry in S.load(matcher).entries]
+
     items("gives light", 10 ** 18)
-    old, questions = cells(), []
+    old, questions, extra = cells(), [], []
     for key, p in zip(old, (0.875, 0.75, 0.25)):
         pipeline.remember(key, {"p": p, "model": "fake"})
     try:
         with asking(matcher, questions):
             engine.run_pass()
-        stored = table_read(user)["prob"]
+        stored, before = table_read(user)["prob"], keys()
         pipeline.forget(old)  # a new session, in which the CSV was edited while Blender was closed
         engine.on_load_post()
         items("gives light at night", 2 * 10 ** 18)  # only lamp's wkey changes
         with asking(matcher, questions):
             engine.run_pass()
         edited, meanwhile, lamp = list(questions), table_read(user)["prob"], cells()[2]
-        check("carry-over, new session: a text edit asks only the row whose wkey changed, and the old answers never "
-              "show meanwhile", stored == [0.875, 0.75, 0.25] and edited == [lamp] and meanwhile == [0.0] * 3,
-              (stored, len(edited), meanwhile))
+        status = engine.STATUS[matcher.uid]
+        check("carry-over, new session: a text edit asks only the row whose wkey changed; meanwhile the carried rows "
+              "show their answers and the edited one its old answer, marked stale (§5.4), and the old entry stays "
+              "stored", stored == [0.875, 0.75, 0.25] and edited == [lamp] and meanwhile == stored and keys() == before
+              and (status.rows, status.answered, status.stale, status.pending) == (3, 2, 1, 0),
+              (stored, len(edited), meanwhile, keys() == before, (status.rows, status.answered, status.stale)))
         questions.clear()
         items("gives light", 3 * 10 ** 18)  # undone before lamp's answer arrives
         with asking(matcher, questions):
@@ -544,8 +551,24 @@ def phase_carry():
         check("carry-over: once the changed row is answered nothing more is asked, and the others keep their stored "
               "answers", not questions and table_read(user)["prob"] == [0.875, 0.75, 0.125],
               (len(questions), table_read(user)["prob"]))
+        answered = keys()
+        items("gives light", 5 * 10 ** 18, "a flat surface to eat at")  # table's answer is known, lamp's isn't
+        extra.append(cells()[1])
+        pipeline.remember(extra[0], {"p": 0.5, "model": "fake"})
+        with asking(matcher, questions):
+            engine.run_pass()
+        partial = table_read(user)["prob"]
+        engine.on_load_post()  # the file saved and reopened meanwhile
+        items("gives light at night", 6 * 10 ** 18)  # undone
+        questions.clear()
+        with asking(matcher, questions):
+            engine.run_pass()
+        check("carry-over: undoing an edit whose table so far showed a new answer, in a reopened file, asks nothing "
+              "and shows the stored answers again", partial == [0.875, 0.5, 0.125] and keys() == answered
+              and not questions and table_read(user)["prob"] == [0.875, 0.75, 0.125],
+              (partial, keys() == answered, len(questions), table_read(user)["prob"]))
     finally:
-        pipeline.forget(old + cells())
+        pipeline.forget(old + cells() + extra)
         shutil.rmtree(folder, ignore_errors=True)
 
 

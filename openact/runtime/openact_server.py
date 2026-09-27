@@ -18,7 +18,8 @@ Additions on top of SemIf:
 * A per-question LRU answer cache and a watchdog that exits when the parent process (Blender) is gone.
 * Backends: SemIf on PyTorch, or a deterministic fake that needs neither torch nor a GPU (tests).
 * Only local clients: a request with an Origin header, or a Host other than 127.0.0.1:<port> or
-  localhost:<port>, gets 403. When OPENACT_TOKEN is set, every POST must send it as X-OpenAct-Token.
+  localhost:<port>, gets 403. Every POST must send OPENACT_TOKEN as X-OpenAct-Token; without OPENACT_TOKEN
+  the server refuses to start, except with the test-only fake backend.
 """
 
 from __future__ import annotations
@@ -528,7 +529,7 @@ class Engine:
 
 ENGINE: Engine | None = None
 SERVER: ThreadingHTTPServer | None = None
-TOKEN = ""  # from OPENACT_TOKEN; empty means POSTs need no token
+TOKEN = ""  # from OPENACT_TOKEN; empty only for the fake backend, whose POSTs then need no token
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -710,6 +711,11 @@ def main(argv=None):
 
     global ENGINE, SERVER, TOKEN
     TOKEN = os.environ.get("OPENACT_TOKEN", "")
+    if not TOKEN and args.backend != "fake":
+        log("OPENACT_TOKEN is not set: the model server runs only with the launch token its Blender passes "
+            "(--backend fake, for tests, may run without). To run it by hand, e.g. to debug it, set OPENACT_TOKEN "
+            "yourself: Blender can't use such a server (its requests get 403) until it can read the server's token")
+        return 3
     ENGINE = Engine(args, FakeBackend(args) if args.backend == "fake" else SemIfTorchBackend(args))
     try:
         SERVER = ThreadingHTTPServer((args.host, args.port), Handler)

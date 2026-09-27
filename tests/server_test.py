@@ -3,8 +3,8 @@
 Each server is openact/runtime/openact_server.py --backend fake, run by this Python on a free port.
 - Auth: launched with OPENACT_TOKEN, a POST without the token or with a wrong one gets 403, and so
   does any request with an Origin header or a foreign Host, token or not. /health needs no token,
-  /shutdown does. Launched without OPENACT_TOKEN, requests need no token, but Origin and Host are
-  still checked.
+  /shutdown does. Without OPENACT_TOKEN the server refuses to start; only the test-only fake backend
+  runs, needing no token, with Origin and Host still checked.
 - The per-question cache: cached_questions on a repeat, only new questions scored, the /health
   counters, options.debias honoured per request; reordered options or state keys miss the cache.
 - /v1/capabilities; 422 for 257 questions and for an invalid question or one over the token limit,
@@ -168,6 +168,16 @@ def phase_cold_load():
           code == 503 and "CUDA is not available to PyTorch (is the NVIDIA driver too old" in reply.get("error", ""),
           (code, reply))
     return loading, process
+
+
+def phase_no_token():
+    env = {key: value for key, value in os.environ.items() if key != "OPENACT_TOKEN"}
+    result = subprocess.run(
+        [sys.executable, "-u", SERVER, "--backend", "semif", "--port", str(free_port()), "--parent-pid",
+         str(os.getpid())], capture_output=True, text=True, timeout=60, env=env)
+    output = result.stdout + result.stderr
+    check("without OPENACT_TOKEN the model server refuses to start (only the fake backend may)",
+          result.returncode != 0 and "OPENACT_TOKEN is not set" in output, (result.returncode, output[-300:]))
 
 
 def phase_bad_record():
@@ -440,20 +450,22 @@ def phase_open_mode(port, process, window):
     check("cold load: ready once --fake-load-seconds are over", wait_status(port, "ready", 20),
           health(port).get("load_seconds"))
     code, reply = call(port, "POST", "/v1/systemone", WINDOW)
-    check("without OPENACT_TOKEN, a POST needs no token", code == 200, (code, reply))
+    check("the fake backend without OPENACT_TOKEN (tests only): a POST needs no token", code == 200, (code, reply))
     check("fake answers are the same in every process", reply.get("answers") == window.get("answers"),
           (reply.get("answers"), window.get("answers")))
     code, reply = call(port, "POST", "/v1/systemone", WINDOW, {"Origin": "http://evil.example"})
-    check("without OPENACT_TOKEN, an Origin header still gets 403", code == 403, (code, reply))
+    check("the fake backend without OPENACT_TOKEN: an Origin header still gets 403", code == 403, (code, reply))
     code, reply = call(port, "POST", "/v1/systemone", WINDOW, {"Host": f"evil.example:{port}"})
-    check("without OPENACT_TOKEN, a foreign Host still gets 403", code == 403, (code, reply))
+    check("the fake backend without OPENACT_TOKEN: a foreign Host still gets 403", code == 403, (code, reply))
     code, reply = call(port, "POST", "/shutdown", {})
-    check("without OPENACT_TOKEN, /shutdown needs no token", code == 200 and exited(process, 10), (code, reply))
+    check("the fake backend without OPENACT_TOKEN: /shutdown needs no token", code == 200 and exited(process, 10),
+          (code, reply))
 
 
 def main():
     try:
         loading, loading_process = phase_cold_load()
+        phase_no_token()
         phase_bad_record()
         record, script = os.path.join(TMP, "record.jsonl"), os.path.join(TMP, "script.json")
         with open(script, "w", encoding="utf-8") as handle:

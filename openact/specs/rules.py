@@ -249,19 +249,19 @@ class RulesSpec(Spec):
 
     # ------------------------------------------------------------------ answers
 
-    def resolve(self, job, entries, last_shown=""):
+    def resolve(self, job, entries, last_shown="", partial=False):
         """Spec.resolve(). A One-of row stores its outcome as a row of the Outcomes, while its wkey holds only the
         names and whens of the outcomes it offers (§5.4). So a row carried from an entry that lists its outcomes in
         another order takes its outcome's row in the job, by name: moving, inserting or deleting an Outcomes row never
         relabels a carried row, and asks only the cells whose offered outcomes changed. The entry that holds gets the
         outcome names if it was stored without them."""
         if job.answer_type != 'ONE_OF':
-            return super().resolve(job, entries, last_shown)
+            return super().resolve(job, entries, last_shown, partial)
         outcomes = list(job.shape.outcomes)
         entries = [_renumbered(entry, outcomes) if entry.words_key != job.words_key
                    and (entry.gn == job.gn or (last_shown and entry.words_key == last_shown)) else entry
-                   for entry in entries]  # only the entries Spec.resolve() carries rows from
-        entry, missing, failed = super().resolve(job, entries, last_shown)
+                   for entry in entries]  # only the entries Spec.resolve() carries rows from (stale rows too)
+        entry, missing, failed = super().resolve(job, entries, last_shown, partial)
         if entry is not None and entry.shape.get("outcomes") != outcomes:
             entry = dataclasses.replace(entry, shape=dict(entry.shape, outcomes=outcomes))
         return entry, missing, failed

@@ -16,6 +16,7 @@ node is answered outside evaluation:
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 import traceback
@@ -46,12 +47,17 @@ CLASH = ("'{}' and '{}' share every word but not their list (a collection, objec
 OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
 ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
          "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
+INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
+P0_CELLS = 8
+PARTIAL = "openact_partial"  # ID property of the inner group: digest of the unstored partial tables its table holds
 
 STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
 LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last
 LIVE = {}  # node uid -> words keys of the entries its contexts showed at its last pass
+CONTEXTS = {}  # node uid -> the ctx keys of its contexts at the last pass: tells the pass when one goes away
 DIRTY = set()  # uids of the nodes the next pass visits, when not all of them are dirty
+GENERATIONS = {}  # node uid -> its generation, bumped when its words change: its older queued chunks are dropped
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -61,6 +67,7 @@ _last_pass = 0.0
 _has_nodes = False
 _group_count = -1  # number of node groups at the last pass that found no OpenAct nodes
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
+_pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
 
 
@@ -129,9 +136,13 @@ def _plan(spec, node, ctx):
     Raises Hint, Pending or Unresolvable."""
     global _plans_made
     key = (node.uid, ctx.key())
+    if _pass_plans is not None:
+        _pass_plans.add(key)
     fingerprint = spec.fingerprint(node, ctx)
     cached = PLANS.get(key)
     if cached is None or cached[0] != fingerprint:
+        if cached is not None:  # new words: the chunks still queued for the node ask about the old ones
+            _bump(node.uid)
         try:
             planned = spec.locked(node, ctx, spec.plan(node, ctx))
         except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
@@ -142,6 +153,12 @@ def _plan(spec, node, ctx):
         kind, message = cached[1]
         raise kind(message)
     return cached[1]
+
+
+def _bump(uid):
+    """A new generation for the node, whose queued chunks of older ones are dropped (§5.5)."""
+    GENERATIONS[uid] = GENERATIONS.get(uid, 0) + 1
+    pipeline.cancel(uid, below=GENERATIONS[uid])
 
 
 def _jobs(node):
@@ -223,13 +240,15 @@ def schedule(immediate=False, node=None):
 def run_pass(everything=True):
     """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. Main thread
     only."""
-    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, passes
+    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, passes
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
-    for uid in WATCH.take_dirty():  # a CSV they read changed on disk: plan them again (§7.8)
+    for uid, kind in WATCH.take_dirty().items():  # a CSV they read changed on disk: plan them again (§7.8)
         for key in [key for key in PLANS if key[0] == uid]:
             del PLANS[key]
+        if kind == "text":  # new words: the chunks queued for the old ones go
+            _bump(uid)
         dirty.add(uid)
     _dirty = _dirty_all = False
     _last_pass = time.monotonic()
@@ -238,10 +257,13 @@ def run_pass(everything=True):
     _has_nodes = bool(nodes)
     _group_count = -1 if nodes else len(bpy.data.node_groups)
     if not nodes:
+        for uid in LIVE:  # the nodes are gone: their queued chunks too
+            pipeline.cancel(uid, below=math.inf)
         STATUS.clear()
         PLANS.clear()
         LAST_SHOWN.clear()
         LIVE.clear()
+        CONTEXTS.clear()
         WATCH.retain(())
         tables.collect_garbage(nodes)
         return
@@ -251,6 +273,7 @@ def run_pass(everything=True):
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
     csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
+    planned = _pass_plans = set()
     try:
         trust.PASS = trust.is_trusted()
         for tree, node in nodes:
@@ -264,13 +287,26 @@ def run_pass(everything=True):
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
         csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
+        _pass_plans = None
     if stored or _plans_made != plans_made:
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
     contexts = {node.uid: {ctx.key() for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]}
                 for tree, node in nodes}
-    for cache in (PLANS, LAST_SHOWN):  # contexts that disappeared, and nodes that did
-        for key in [key for key in cache if key[1] not in contexts.get(key[0], ())]:
+    # Nothing shows the words of a context that has gone (its object deleted, its modifier removed or re-pointed, a
+    # group node on its path muted): its node's queued chunks go, and the next pass queues the other contexts' again
+    lost = [uid for uid, keys in CONTEXTS.items() if uid in contexts and not keys <= contexts[uid]]
+    CONTEXTS.clear()
+    CONTEXTS.update(contexts)
+    # Contexts that disappeared, and nodes that did, but never one this pass planned: an evaluator read also reaches
+    # contexts find_uses() lacks (through a group node in a tree no modifier uses), planned again every pass if dropped
+    for cache in (PLANS, LAST_SHOWN):
+        for key in [key for key in cache if key not in planned and key[1] not in contexts.get(key[0], ())]:
             del cache[key]
+    for uid in lost:
+        _bump(uid)
+        schedule(immediate=True)
+    for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
+        pipeline.cancel(uid, below=math.inf)
     for cache in (LIVE, STATUS):  # nodes that disappeared: undo and deleting a node group call no node's free()
         for uid in [uid for uid in cache if uid not in contexts]:
             del cache[uid]
@@ -292,7 +328,9 @@ def _process(tree, node, contexts):
     entries = node_store.entries
     contexts = contexts or [Ctx(None, None, (), tree)]
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
-    hidden = set()  # (gn, words key) of stored entries whose words mean something else now: kept for their rows
+    # Stored entries whose words mean something else now stay stored for their rows, but leave the graph (§5.4):
+    hidden = {}  # their (gn, words key) -> the partial table shown in their place, or None while nothing is known
+    instead = {}  # (uid, ctx key) -> the words key of the partial table that context shows in a hidden entry's place
     problems, warnings, failed = [], [], []
     uses, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells missing
     sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
@@ -353,8 +391,24 @@ def _process(tree, node, contexts):
             if any(entry is found for entry in shown):
                 LAST_SHOWN[key] = found.words_key
             continue
-        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""))
-        if entry is not None:
+        # A converted v0.1.0 answer has no words key to judge it by: it shows until the new answer replaces it.
+        legacy = found is not None and found.legacy and found.answer_type == job.answer_type
+        # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
+        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=not legacy)
+        if entry is not None and found is not None and entry is not found and dataclasses.replace(
+                entry, t=found.t) == found:
+            entry = found  # the partial table as stored already
+        # Words that mean something else now never show the old answer, but its rows carry over until the new table is
+        # whole, also after a reload: the old entry stays stored, and the partial table shows in its place unstored.
+        # LAST_SHOWN keeps naming the stored entry its stale rows come from.
+        if found is not None and found.words_key != job.words_key and not legacy and (
+                entry is None or missing or errors):
+            hidden[(found.gn, found.words_key)] = entry
+            if entry is not None:
+                shown.append(entry)
+                instead[key] = entry.words_key
+                resolved[job.gn] = entry  # the sidebar and the counts describe the table shown, not the hidden entry
+        elif entry is not None:
             LAST_SHOWN[key] = entry.words_key
             shown.append(entry)
             resolved[job.gn] = entry
@@ -364,17 +418,12 @@ def _process(tree, node, contexts):
                 else:
                     entries.append(entry)
                 changed = True
-            continue
-        # Words that mean something else now never show the old answer, but its rows carry over until the new answer
-        # replaces it, also after a reload. A converted v0.1.0 answer has no words key to judge it by, so it shows.
-        if found is not None and found.words_key != job.words_key and not (
-                found.legacy and found.answer_type == job.answer_type):
-            hidden.add((found.gn, found.words_key))
         failed += errors
         if missing:
             waiting = True
             asked.update(cell.key for cell in missing)
-            if _submit(job, missing):
+            if _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
+                                           generation=GENERATIONS.get(node.uid, 0)), missing):
                 sent.update(cell.key for cell in missing)
     if len(live) > inner.MATERIALISED_MAX:  # the first contexts stay materialised, the others show neutral values
         problems.append(OVER_CAP.format(len(live), inner.MATERIALISED_MAX))
@@ -398,13 +447,23 @@ def _process(tree, node, contexts):
             changed = rows = False
             node_store = store.load(node)
     warnings += orphaned([job for job, _ctx in jobs.values()])  # locks no context's rows use (§7.6)
-    last = [LAST_SHOWN.get((node.uid, ctx.key())) for ctx in contexts]
+    keys = [(node.uid, ctx.key()) for ctx in contexts]
+    last = [instead.get(key, LAST_SHOWN.get(key)) for key in keys]  # a no-match shows what the graph showed last
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     graph = node_store
-    if hidden:
-        graph = store.NodeStore([entry for entry in node_store.entries if (entry.gn, entry.words_key) not in hidden])
-    if not inner.update_values(node, graph, live, default, rows=rows):  # values only when it can (§8.8)
+    if hidden:  # a hidden entry leaves the graph, or leaves its place to the partial table shown instead
+        graph = store.NodeStore([entry for entry in (hidden.get((stored.gn, stored.words_key), stored)
+                                                     for stored in node_store.entries) if entry is not None])
+    # An unstored partial table has the gn, so the place in the graph, of the entry it shows instead of. The table
+    # object's rows are rewritten when the partial tables shown change, and once after (also in a reopened file): only
+    # then, as a rewrite re-evaluates every modifier that reads the table, whose depsgraph update schedules a pass.
+    partials = [(entry.words_key, entry.rows.v, entry.rows.payload) for entry in hidden.values() if entry is not None]
+    partial = pipeline.digest(*partials) if partials else ""
+    written = node.node_tree.get(PARTIAL, "") if node.node_tree is not None else ""
+    if not inner.update_values(node, graph, live, default, rows=rows or partial != written):  # values only (§8.8)
         inner.build(node, graph, live, default)
+    if partial != written:  # the table object holds the rows of the graph just laid out
+        node.node_tree[PARTIAL] = partial
     warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
     state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
@@ -453,6 +512,20 @@ def _submit(job, missing):
     if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
         return server.start()  # asked by the pass that runs when the server is ready; an install starts it as it ends
     return state == "starting" or server.STATE.start_queued
+
+
+def _priority(spec, node, missing):
+    """The job's class (§5.5): P0 for Ask, Pick, Dials and any job of at most P0_CELLS missing cells, P1 for the table
+    of the node active in a node editor, P2 for every other table."""
+    if spec.name in INTERACTIVE or len(missing) <= P0_CELLS:
+        return 0
+    wm = getattr(bpy.context, "window_manager", None)
+    for window in wm.windows if wm else ():
+        for area in window.screen.areas if window.screen else ():
+            tree = getattr(area.spaces.active, "edit_tree", None) if area.type == 'NODE_EDITOR' else None
+            if tree is not None and tree.nodes.active == node:
+                return 1
+    return 2
 
 
 def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
@@ -580,12 +653,20 @@ def redraw():
 # ------------------------------------------------------------------ handlers & timer
 
 
-def _playing():
-    """Don't touch node trees during playback or while a render job runs."""
-    if bpy.app.is_job_running('RENDER'):
-        return True
+def _rendering():
+    return bpy.app.is_job_running('RENDER')
+
+
+def _animation_playing():
     wm = getattr(bpy.context, "window_manager", None)
     return bool(wm) and any(w.screen and w.screen.is_animation_playing for w in wm.windows)
+
+
+def _publish(event, value):
+    if value:
+        event.set()
+    else:
+        event.clear()
 
 
 def tick():
@@ -593,11 +674,14 @@ def tick():
     try:
         if server.pump():
             redraw()
+        rendering, playing = _rendering(), _animation_playing()
+        _publish(server.Worker.render_running, rendering)  # for the worker, which never calls bpy (§5.5)
+        _publish(server.Worker.playing, playing)
         now = time.monotonic()
         if now - _last_refresh > 5.0 and (_has_nodes or server.STATE.status in ("unknown", "ready", "starting")):
             _last_refresh = now
             server.refresh()
-        if not _playing():
+        if not (rendering or playing):  # node trees are left alone during playback and render jobs
             if WATCH.poll(now):  # a watched CSV changed: the pass visits the nodes that read it (take_dirty())
                 _dirty = True
             if _dirty and now - _last_change >= DEBOUNCE:
@@ -620,11 +704,13 @@ def on_depsgraph_update(scene, depsgraph):
 
 @persistent
 def on_load_post(*_args):
+    pipeline.cancel_all()  # asked for the file just closed; the chunk in flight still lands in MEMORY
     STATUS.clear()
     pipeline.FAILED.clear()
     PLANS.clear()
     LAST_SHOWN.clear()
     LIVE.clear()
+    CONTEXTS.clear()
     schedule(immediate=True)
 
 

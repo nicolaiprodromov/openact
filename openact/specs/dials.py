@@ -208,14 +208,18 @@ class DialsSpec(Spec):
             WARNINGS.pop(uid, None)
         return ""
 
-    def resolve(self, job, entries, last_shown=""):
+    def resolve(self, job, entries, last_shown="", partial=False):
         """Spec.resolve(), except for a job whose settings differ from the ones the node's contexts last agreed on
         (agree(), §6.0), which the pass doesn't answer: the sidebar and chained reads get the entry stored for its
         words, the last good table the graph still shows, and nothing is asked."""
         agreed = FACES.get(job.uid)
         if agreed is not None and sorted(_outputs(job.shape.settings)) != agreed:
             return next((entry for entry in entries if entry.gn == job.gn), None), [], []
-        return super().resolve(job, entries, last_shown)
+        return super().resolve(job, entries, last_shown, partial)
+
+    def neutral(self, job, index):
+        _name, kind, _low, _high = job.shape.settings[index]
+        return {"value": -1.0 if kind == "one_of" else 0.0, "c": 0.0}  # a one-of output shows -1 before its answer
 
     # ------------------------------------------------------------------------------------------- answers
 

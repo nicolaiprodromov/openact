@@ -40,8 +40,12 @@ on your GPU. Nothing leaves your computer.
 ## Tests
 
 ```
-tests\run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1] [-Gpu 0] [-Port 18765]
+tests\run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1] [-Gpu 0] [-Port 18765] [-Threads 4]
 ```
+
+Every suite runs at BelowNormal priority with `OMP_NUM_THREADS`/`MKL_NUM_THREADS` set to `-Threads`,
+and every Blender with `-t <Threads>`, so its `--bench` and timing figures can differ from a single
+suite run at full speed.
 
 The `*_blender.py` suites run on each `-Versions` entry. The `*_test.py` suites run under every
 CPython 3.11+ found, and always inside Blender 4.5 and 5.1. `-Model` adds the e2e phases with the
