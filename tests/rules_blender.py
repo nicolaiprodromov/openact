@@ -684,12 +684,14 @@ def shared_scene(name, words, values):
 def phase_agreement():
     """§6.0: the contexts of one node must agree on what the graph bakes. Factors CSVs that differ only in their
     band edges, or Outcomes CSVs whose payload columns differ, give the error naming both contexts; nothing is
-    asked, stored or rebuilt, so the last good table stays. Payload values and texts may differ."""
+    asked, stored or rebuilt, so the last good table stays. Payload values and texts may differ. While a context has
+    no job (a missing or broken CSV, an inline error), the sockets, their links and the graph stay: another context's
+    new words are still asked and shown if they fit them, and wait if they would change them."""
     a, b = write("agree_a.csv", EDGES.format("0.5")), write("agree_b.csv", EDGES.format("0.5"))
     sizes = "answer,when,size\nA,the first,{0}\nB,the second,{1}\n"
     oa, ob = write("agree_oa.csv", sizes.format(1, 2)), write("agree_ob.csv", sizes.format(3, 4))
     heat = [0.1, 0.3, 0.6, 0.9]
-    tree, rules, objs, gi, go = shared_scene("Agree", {"Factors": [a, b], "Outcomes": [oa, ob]},
+    tree, rules, objs, gi, go = shared_scene("Agree", {"Factors": [a, b], "Outcomes": [oa, ob], "Context": ["", ""]},
                                              [{"in_heat": ('FLOAT', heat)}] * 2)
     answer_cells(planned(rules), lambda name: 0 if name == "cold" else 1)
     wire(tree, rules, gi, go, ["Outcome", "size"])
@@ -703,11 +705,11 @@ def phase_agreement():
 
     build, builds = inner.build, []
 
-    def edited(name, text, what):
-        """Write one CSV, run a pass: (the status is the conflict, cells asked, builds, whether the entries and the
-        outputs stayed)."""
+    def step(change):
+        """Make a change, run a pass: (status, the Jobs it asks, whether it rebuilt the graph, whether the entries
+        stayed, what both objects read)."""
         stored = [(entry.gn, entry.words_key) for entry in S.load(rules).entries]
-        write(name, text)
+        change()
         csvfmt.clear_cache()
         builds.clear()
         inner.build = lambda node_, *args: (builds.append(node_ == rules), build(node_, *args))[1]
@@ -715,11 +717,17 @@ def phase_agreement():
             asked = planned(rules)
         finally:
             inner.build = build
-        message = f"Rules: '{labels[0]}' and '{labels[1]}' use {what}"
         kept = [(entry.gn, entry.words_key) for entry in S.load(rules).entries] == stored
         status = engine.STATUS.get(rules.uid)
-        return (status is not None and (status.icon, status.text) == ('CANCEL', message), len(asked), any(builds), kept,
-                [read(obj, ["Outcome", "size"]) for obj in objs] == before)
+        return ((status.icon, status.text) if status else None, asked, any(builds), kept,
+                [read(obj, ["Outcome", "size"]) for obj in objs])
+
+    def edited(name, text, what):
+        """Write one CSV, run a pass: (the status is the conflict, cells asked, builds, whether the entries and the
+        outputs stayed)."""
+        status, asked, built, kept, got = step(lambda: write(name, text))
+        message = f"Rules: '{labels[0]}' and '{labels[1]}' use {what}"
+        return status == ('CANCEL', message), len(asked), built, kept, got == before
 
     got = edited("agree_b.csv", EDGES.format("0.2"), "Factors CSVs with different factors")
     check("agreement: Factors CSVs that differ only in their band edges give the error; nothing is asked, stored or "
@@ -736,6 +744,57 @@ def phase_agreement():
     got = edited("agree_ob.csv", sizes.format(3.5, 4), "Outcomes CSVs with different payload columns")
     check("agreement: an Outcomes CSV whose payload column changes its type gives the error, and the last good table "
           "stays", got == (True, 0, False, True, True), (got, engine.STATUS.get(rules.uid)))
+
+    # the hold is on the sockets and the graph, not on the answers: while a context has no job, another context's
+    # new words that fit them are answered, and the ones that would change them wait
+    def use(obj, word, text):
+        obj.modifiers["Rules"][tree.interface.items_tree[word].identifier] = text
+        obj.update_tag()
+
+    def sockets():
+        return [(s.name, s.is_linked) for s in rules.outputs] + [(n, rules.inputs[n].is_linked)
+                                                                for n in factor_names(rules)]
+
+    got = step(lambda: write("agree_ob.csv", sizes.format(3, 4)))
+    good, face = got[4], sockets()
+    check("agreement: the payload column's type back, both agree again", got[0][0] == 'CHECKMARK' and not got[1]
+          and good == [{"Outcome": [0, 1, 1, 1], "size": [1, 2, 2, 2]}, {"Outcome": [0, 1, 1, 1], "size": [3, 4, 4, 4]}],
+          got)
+    missing = ('CANCEL', f"Can't find {os.path.normpath(oa)}")
+    os.remove(oa)
+    waited = step(lambda: use(objs[1], "Context", "On a windy hill."))
+    answer_cells(waited[1], lambda name: 1 if name == "cold" else 0)
+    got = step(lambda: None)
+    check("agreement: while an Outcomes CSV is missing, another context's new Context is asked, and shown once "
+          "answered; the sockets keep their links, and the object whose CSV is missing its last table",
+          waited[0] == got[0] == missing and [job.gn[1] for job in waited[1]] == ["On a windy hill."] and not got[1]
+          and sockets() == face and got[4] == [good[0], {"Outcome": [1, 0, 0, 0], "size": [4, 3, 3, 3]}],
+          (waited, got, sockets()))
+    got = step(lambda: (write("agree_oa.csv", sizes.format(1, 2)), use(objs[1], "Context", "")))
+    check("agreement: once the CSV is back, both show their tables with a checkmark, 0 requests",
+          got[0][0] == 'CHECKMARK' and not got[1] and got[4] == good, got)
+    payload = ('CANCEL', f"Rules: '{labels[0]}' and '{labels[1]}' use Outcomes CSVs with different payload columns")
+    got = (step(lambda: write("agree_oa.csv", "answer,when,weight\nA,the first,5\nB,the second,6\n")),
+           step(lambda: use(objs[1], "Outcomes", "A: the first; A: again")), step(lambda: use(objs[1], "Outcomes", ob)))
+    check("agreement: while the context whose payload the outputs show has an error of its own, the sockets, their "
+          "links, the entries and the other object's table stay; fixed, the error is back",
+          got[0][0] == got[2][0] == payload and got[1][0] == ('CANCEL', "Outcomes: Entry 2: 'A' appears twice")
+          and all(not g[1] and g[3] and g[4][0] == good[0] for g in got) and sockets() == face,
+          (got, sockets()))
+    got = step(lambda: write("agree_oa.csv", sizes.format(1, 2)))
+    check("agreement: the first context's payload column back, a checkmark", got[0][0] == 'CHECKMARK'
+          and got[4] == good, got)
+    got = step(lambda: (write("agree_ob.csv", "answer,when,size\nA,the first,3\nA,again,4\n"),
+                        write("agree_a.csv", EDGES.format("0.5"))))
+    check("agreement: while an Outcomes CSV has errors, another context's new band edges wait: nothing is asked, "
+          "stored or rebuilt, so the object whose CSV has errors is never read through them",
+          got[0] == ('CANCEL', "agree_ob.csv: Line 3: 'A' appears twice") and not got[1] and not got[2] and got[3]
+          and got[4] == good, got)
+    got = edited("agree_ob.csv", sizes.format(3, 4), "Factors CSVs with different factors")
+    check("agreement: that CSV fixed, the band edges give the error, and both objects keep the last good table",
+          got == (True, 0, False, True, True), got)
+    got = step(lambda: write("agree_a.csv", EDGES.format("0.2")))
+    check("agreement: the band edges back, a checkmark", got[0][0] == 'CHECKMARK' and got[4] == good, got)
 
 
 class _PollProbe(bpy.types.Operator):

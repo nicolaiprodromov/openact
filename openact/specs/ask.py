@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, state_text, warnings, yes_no_text
+from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, state_text, warnings
 
 ANSWERS = ("Optional answer set. Yes / No: 'yes: <when>; no: <when>'. Amount: 2-16 levels, lowest first, e.g. "
            "'none; dusting; patchy; thick; buried'. Or a .csv path. Empty: Yes / No, or Not at all ... Extremely")
@@ -55,7 +55,7 @@ class AskSpec(Spec):
         answers = self.answers(node, ctx)
         job = self.job(gn, node.answer_type, node.balance_order, node.uid, answers)
         job.problems = warnings(answers.problems)
-        return self.locked(node, ctx, job)
+        return job
 
     def job(self, gn, answer_type, debias, uid="", answers=None):
         """The Job for these words and answer set (csvfmt.AnswerSet; None: the default Yes / No or five levels).
@@ -92,7 +92,7 @@ class AskSpec(Spec):
         return value if isinstance(value, str) else [{column: value, "c": 1.0}]
 
     def answer_text(self, job, index, values):
-        return number_text(values["amount"]) if "amount" in values else yes_no_text(values["p"])
+        return number_text(values["amount"] if "amount" in values else values["p"], job.options)
 
     def single(self, rows):
         values = rows[0].values

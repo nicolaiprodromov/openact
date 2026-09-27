@@ -39,10 +39,11 @@ SETTING_REQUIRED = ("setting", "type", "question")
 # What the socket that reads a file expects it to be. "answer_set" also covers Items lists and Overrides files;
 # Factors and Settings files carry no payload, so read_csv() classifies none of their columns as numbers.
 SCHEMAS = ("answer_set", "factors", "settings")
+# An Overrides CSV's columns after its key columns, in the order the export writes them (design 7.6). Rules' key
+# columns are its factor names, so no factor may take one of these.
+OVERRIDE_COLUMNS = ("answer", "lock", "model_answer", "confidence", "unsure", "source")
 # Never payload in an answer set (design 7.3); every other numeric column is.
-ANSWER_COLUMNS = frozenset(
-    NAME_COLUMNS + WHEN_COLUMNS + ("if", "lock", "unsure", "confidence", "model_answer", "source")
-)
+ANSWER_COLUMNS = frozenset(NAME_COLUMNS + WHEN_COLUMNS + ("if",) + OVERRIDE_COLUMNS)
 # Where an answer set's numeric columns become output sockets: (node, kind) -> the node's fixed output names, which
 # those sockets must not take.
 PAYLOAD_OUTPUTS = {
@@ -94,6 +95,8 @@ class CsvDoc:
     num_hash: str  # sha1: num_cols + numbers
     problems: tuple[Problem, ...]
     schema: str  # the SCHEMAS entry the columns were classified for; each parser insists on its own
+    delimiter: str = ","  # the one the rows were split with: given, or sniffed
+    bom: bool = False  # the file starts with a UTF-8 BOM, as Excel's "CSV UTF-8" writes it
 
 
 @dataclass(frozen=True)
@@ -318,16 +321,24 @@ def read_csv(path: str, delimiter: str | None = None, schema: str = "answer_set"
         num_hash=_sha1([num_cols, numbers]),
         problems=tuple(problems),
         schema=schema,
+        delimiter=delimiter,
+        bom=bool(bom),
     )
 
 
 _DOCS = {}  # (identity, schema, delimiter) -> the CsvDoc last read; the schema decides the column classes
 MAX_DOCS = 256
+IDENTITIES = None  # path -> identity(path) while engine.run_pass() runs; None between passes
 
 
 def identity(path: str) -> str:
-    """How the parse cache and the file watcher tell files apart: a symlink or '..' spelling is the same file."""
-    return os.path.normcase(os.path.realpath(path))
+    """How the parse cache, the file watcher and the trust rule tell files apart: a symlink or '..' spelling is the
+    same file. realpath opens the file on Windows and every fingerprint asks, so a pass resolves each path once."""
+    if IDENTITIES is None:
+        return os.path.normcase(os.path.realpath(path))
+    if path not in IDENTITIES:
+        IDENTITIES[path] = os.path.normcase(os.path.realpath(path))
+    return IDENTITIES[path]
 
 
 def load(path: str, delimiter: str | None = None, schema: str = "answer_set") -> CsvDoc:
@@ -498,6 +509,9 @@ def parse_factors(doc: CsvDoc) -> list[Factor]:
             problems.add(ERROR, line, "", f"Line {line}: the factor name has {size} bytes in UTF-8 (limit {MAX_NAME})")
         if name.casefold() in RULES_INPUTS:
             problems.add(ERROR, line, "", f"Line {line}: rename factor '{name}': it clashes with a node input")
+        elif name.casefold() in OVERRIDE_COLUMNS:
+            message = f"Line {line}: rename factor '{name}': it clashes with an Overrides CSV column"
+            problems.add(ERROR, line, "", message)
         if kind not in FACTOR_LEVELS:
             problems.add(ERROR, line, "", f"Line {line}: factor '{name}' needs a kind: amount, category or flag")
             continue
@@ -554,7 +568,7 @@ def _bands(name, rows, problems):
         return [None] * len(rows)
     bands = []
     for (cells, line), raw in zip(rows, edges):
-        band = (_number(raw[0]), _number(raw[1]))
+        band = (number(raw[0]), number(raw[1]))
         for column, text, value in zip(("from", "to"), raw, band):
             if value is None:
                 message = f"Line {line}: '{column}' of {cells['level']} must be a number, not '{text}'"
@@ -611,7 +625,7 @@ def parse_settings(doc: CsvDoc) -> list[Setting]:
         bounds = [0.0, 1.0]
         for i, column in enumerate(("min", "max")):
             if kind == "amount" and cells[column]:
-                value = _number(cells[column])
+                value = number(cells[column])
                 if value is None:
                     message = f"Line {line}: '{column}' must be a number, not '{cells[column]}'"
                     problems.add(ERROR, line, column, message)
@@ -679,9 +693,14 @@ def _setting_name_problem(name, seen):
     return problem
 
 
+def lock_key(cells) -> str:
+    """The key of an Overrides row or of a table unit (design 7.6): its key cells trimmed, casefolded and joined with
+    KEY_SEP, so a lock matches its unit ignoring case."""
+    return KEY_SEP.join(cell.strip().casefold() for cell in cells)
+
+
 def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]:
-    """The locked rows of an Overrides CSV, by key: the row's cells in the key columns, casefolded and joined with
-    KEY_SEP.
+    """The locked rows of an Overrides CSV, by key: lock_key() of the row's cells in the key columns.
 
     keys: the node's key columns, e.g. ["question"] for Ask, or one per factor for Rules. Unlocked rows and the
     informational columns are ignored. Matching locks to table rows and checking their answers is the caller's.
@@ -701,7 +720,7 @@ def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]:
     for row, line in zip(doc.rows, doc.lines):
         if lock_at is None or row[lock_at].casefold() not in LOCKED:
             continue
-        key = KEY_SEP.join(row[i].casefold() for i in at)
+        key = lock_key(row[i] for i in at)
         if key in locks:
             shown = ", ".join(row[i] for i in at)
             problems.add(ERROR, line, "", f"Line {line}: '{shown}' is locked twice (also line {locks[key].line})")
@@ -741,7 +760,9 @@ def _int32(cell):
     return None
 
 
-def _number(cell):
+def number(cell):
+    """The cell's value if it is a number as these files write one (never inf or nan, though a huge exponent reads as
+    inf), else None."""
     return float(cell) if _FLOAT.fullmatch(cell) else None
 
 
@@ -750,7 +771,7 @@ def _classify(cells):
     ints = [_int32(cell) for cell in cells]
     if cells and None not in ints:
         return "INT", tuple(ints)
-    floats = [_number(cell) for cell in cells]
+    floats = [number(cell) for cell in cells]
     if cells and None not in floats:
         return "FLOAT", tuple(floats)
     return None, ()

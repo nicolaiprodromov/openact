@@ -42,6 +42,7 @@ os.environ.setdefault("OPENACT_STATE_DIR", os.path.join(TMP, "state"))  # where 
 from openact import csvfmt, engine, lists, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402
+from openact.specs.base import number_text  # noqa: E402
 from openact.specs.classify import ClassifySpec  # noqa: E402
 from openact.specs.match import MatchSpec  # noqa: E402
 from openact.specs.rules import RulesSpec  # noqa: E402
@@ -315,9 +316,9 @@ def phase_table(pick, ask):
           and [line[4] for line in ui.table_page(pending)[0]] == [False] * 3, pending)
     _label, job, entry = status(ask).uses[0]
     got = ui.table_rows(engine.SPECS[ask.bl_idname], job, entry)
-    check("table_rows: an answered Ask lists its question, yes or no, and its confidence",
-          got == [("Is it soft?", "yes" if entry.single["Answer"] >= 0.5 else "no", entry.rows.v["c"][0], "model")],
-          got)
+    check("table_rows: an answered Ask lists its question, its answer as the Overrides CSV writes it (the probability "
+          "of yes), and its confidence",
+          got == [("Is it soft?", number_text(entry.rows.v["p"][0], job.options), entry.rows.v["c"][0], "model")], got)
     spec = engine.SPECS[engine.PICK_ID]
     slots = spec.job(("Something shiny", ""), [lists.Item("Steel"), lists.Item("", offered=False),
                                                 lists.Item("Gold")], True)

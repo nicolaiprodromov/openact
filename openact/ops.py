@@ -3,6 +3,7 @@ what a row asks; open files; trust a .blend's file reads."""
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import os
 import subprocess
@@ -12,11 +13,10 @@ import bpy
 
 from . import csvfmt, engine, lists, server, store, trust, ui
 from . import prefs as P
-from .evaluator import Hint, Pending, Unresolvable
+from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
 from .specs.base import UNSURE_BELOW, table_of
 
 PERMISSION = "Close the file in the other program (e.g. Excel) and try again."
-EXPORTED = ("answer", "lock", "model_answer", "confidence", "unsure", "source")  # after the key columns (§7.6)
 NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
               "code": "Decided by code (one option applies): never sent to the model",
               "error": "No outcome applies to this cell: never sent to the model"}
@@ -319,17 +319,34 @@ class OPENACT_OT_table_view(bpy.types.Operator):
 
 # ----------------------------------------------------------------------------- the Overrides CSV (§7.6)
 
+def export_uses(node):
+    """(ctx, Job) of each context of the node that plans, as the pass plans it, then of each context whose Overrides
+    CSV alone can't be applied (missing, with errors or blocked), with its Job without that file, so the export can
+    create it, or refuse it with its own error. The first ones are the contexts the sidebar lists, in its order."""
+    spec, tree = engine.SPECS[node.bl_idname], node.id_data
+    uses, unlocked = [], []
+    for ctx in find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
+        try:
+            uses.append((ctx, engine._plan(spec, node, ctx)))
+        except (Hint, Unresolvable):  # perhaps its Overrides CSV alone
+            try:
+                unlocked.append((ctx, spec.plan(node, ctx)))
+            except (Hint, Pending, Unresolvable):
+                continue
+        except Pending:
+            continue
+    return uses + unlocked
+
+
 def export_context(node, index=0):
-    """(ctx, Job, entry or None) of the node's live context `index` (0: the first), as the pass plans it."""
-    uses = engine._jobs(node)
+    """(uses, ctx, Job): the node's contexts the export can write (export_uses()), and its context `index` (0: the
+    first), whose Overrides CSV it writes. Raises OverridesError."""
+    uses = export_uses(node)
     if not uses:
         raise OverridesError("Nothing to export: the node has no answered context")
     if not 0 <= index < len(uses):
         raise OverridesError(f"The node has {len(uses)} context{'s' if len(uses) != 1 else ''}, not {index + 1}")
-    ctx, job = uses[index]
-    entries = store.load(node).entries
-    entry = engine.SPECS[node.bl_idname].resolve(job, entries, engine.LAST_SHOWN.get((node.uid, ctx.key()), ""))[0]
-    return ctx, job, entry
+    return (uses, *uses[index])
 
 
 def overrides_target(node, ctx):
@@ -351,22 +368,75 @@ def proposed_path(node):
     return f"//{bpy.path.clean_name(node.id_data.name)}_{bpy.path.clean_name(node.name)}_overrides.csv"
 
 
-def merged_rows(spec, job, entry, path, delimiter):
-    """(header, rows) of the Overrides CSV: one row per lockable unit of the table, in table order. Locked rows of
-    the existing file are kept verbatim, user columns included; other rows keep their user columns."""
-    keys = spec.override_keys(job)
-    header, old = [*keys, *EXPORTED], {}
-    if os.path.exists(path):
-        doc = csvfmt.read_csv(path, delimiter)
-        errors = [p.message for p in doc.problems if p.severity == csvfmt.ERROR]
-        if errors:
-            raise OverridesError(f"{os.path.basename(path)}: {errors[0]}. Fix it, or write another file")
+def _identity(path):
+    """csvfmt.identity() of a path the trust rule lets this file read, else None: a blocked path is never touched."""
+    return None if trust.blocked(path) else csvfmt.identity(path)
+
+
+def input_files():
+    """csvfmt.identity() -> (node name, input) of each file an OpenAct node reads as other than its Overrides CSV:
+    the export never writes into one."""
+    files, uses = {}, find_uses()
+    for tree, node in engine.iter_nodes():
+        inputs = [name for name in engine.SPECS[node.bl_idname].words(node)
+                  if name != "Overrides" and lists.find_input(node, f"{name} CSV") is not None]
+        for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
+            for name in inputs:
+                try:
+                    source = lists.csv_source(node, name, ctx)
+                    found = source and _identity(lists.resolve_path(source.path, node))
+                except (Hint, Pending, Unresolvable):
+                    continue
+                if found:
+                    files.setdefault(found, (node.name, name))
+    return files
+
+
+def _writes_to(node, ctx, ident):
+    """True when ctx's Overrides CSV is the file with this csvfmt.identity(); ident None: an empty, unlinked socket."""
+    try:
+        path = overrides_target(node, ctx)[0]
+    except (OverridesError, Hint, Pending, Unresolvable):
+        return False
+    return path is None if ident is None else path is not None and _identity(path) == ident
+
+
+def _mergeable(doc, keys):
+    """Raise OverridesError unless the existing file can be merged into: an Overrides CSV with these key columns, a
+    'lock' column and no errors, or an empty file."""
+    name = os.path.basename(doc.path)
+    errors = [p.message for p in doc.problems if p.severity == csvfmt.ERROR]
+    if errors:
+        raise OverridesError(f"{name}: {errors[0]}. Fix it, or write another file")
+    if not doc.header:  # nothing to keep
+        return
+    folded = {column.casefold() for column in doc.header}
+    if not any(key.casefold() in folded for key in keys):
+        raise OverridesError(f"{name} is not an Overrides CSV for this node (no '{keys[0]}' column): choose another "
+                             "file")
+    # An input file can have the key column (an Items CSV's 'item', a Settings CSV's 'question') although no open node
+    # reads it (input_files()); none has 'lock', which an Overrides file needs to lock anything.
+    if "lock" not in folded:
+        raise OverridesError(f"{name} is not an Overrides CSV (no 'lock' column): choose another file")
+    try:
+        csvfmt.parse_overrides(doc, keys)
+    except csvfmt.CsvError as error:  # a factor's column is missing, or a key is locked twice
+        raise OverridesError(f"{name}: {error}. Fix it, or write another file") from None
+
+
+def merged_rows(spec, answered, doc=None):
+    """(header, rows) of the Overrides CSV. answered: (Job, entry or None) of each context that uses the file, in
+    context order; doc: the file as it is, or None. One row per distinct key of their lockable units, in table order
+    and with its own context's answer, then every other row of the file as it was. A unit takes the file's row with
+    its key, a locked one first: kept verbatim when locked, else with its user columns. Raises OverridesError for a
+    file it can't merge into (_mergeable())."""
+    keys = spec.override_keys(answered[0][0])
+    header, old = [*keys, *csvfmt.OVERRIDE_COLUMNS], []
+    if doc is not None:
+        _mergeable(doc, keys)
         known = {column.casefold() for column in header}
         header += [column for column in doc.header if column.casefold() not in known]
-        for row in doc.rows:
-            cells = {column.casefold(): cell for column, cell in zip(doc.header, row)}
-            old.setdefault(csvfmt.KEY_SEP.join(cells.get(k.casefold(), "").casefold() for k in keys), cells)
-    table = table_of(job, entry)
+        old = [{column.casefold(): cell for column, cell in zip(doc.header, row)} for row in doc.rows]
 
     def locked(cells):
         return cells.get("lock", "").casefold() in csvfmt.LOCKED
@@ -374,70 +444,90 @@ def merged_rows(spec, job, entry, path, delimiter):
     def line(cells):
         return [cells.get(column.casefold(), "") for column in header]
 
-    rows, seen = [], set()
-    for unit, indices in spec.override_units(job):
-        key = csvfmt.KEY_SEP.join(cell.strip().casefold() for cell in unit)
-        seen.add(key)
-        cells = dict(old.get(key, {}))
-        if not locked(cells):
-            answer, c, source = spec.export_unit(job, indices, table)
-            cells.update({k.casefold(): cell for k, cell in zip(keys, unit)})
-            cells.update(answer=answer, lock="0", model_answer=answer, confidence="" if c is None else f"{c:.2f}",
-                         unsure="" if c is None else str(int(c < UNSURE_BELOW)), source=source)
-        rows.append(line(cells))
-    rows += [line(cells) for key, cells in old.items() if key not in seen and locked(cells)]
-    return header, rows
+    taken = {}  # key -> the file's row its unit takes: the locked one, as parse_overrides() reads it, else the first
+    for i, cells in enumerate(old):
+        key = csvfmt.lock_key(cells.get(k.casefold(), "") for k in keys)
+        if key not in taken or (locked(cells) and not locked(old[taken[key]])):
+            taken[key] = i
+    rows, seen, left = [], set(), set(range(len(old)))
+    for job, entry in answered:
+        table = table_of(job, entry)
+        for unit, indices in spec.override_units(job):
+            key = csvfmt.lock_key(unit)
+            if key in seen:  # a material in two slots, a question in two contexts: one row locks every use
+                continue
+            seen.add(key)
+            at = taken.get(key)
+            left.discard(at)
+            cells = dict(old[at]) if at is not None else {}
+            if not locked(cells):
+                answer, c, source = spec.export_unit(job, indices, table)
+                cells.update({k.casefold(): cell for k, cell in zip(keys, unit)})
+                cells.update(answer=answer, lock="0", model_answer=answer, confidence="" if c is None else f"{c:.2f}",
+                             unsure="" if c is None else str(int(c < UNSURE_BELOW)), source=source)
+            rows.append(line(cells))
+    return header, rows + [line(old[i]) for i in sorted(left)]
 
 
-def write_csv(path, header, rows, delimiter=","):
-    """Write <path>.tmp, then replace path with it, so a reader never sees half a file."""
-    temporary = path + ".tmp"
+def write_csv(path, header, rows, delimiter=",", bom=False):
+    """Write <path>.tmp, then replace path with it, so a reader never sees half a file and a failed write leaves path
+    as it was. bom: start with a UTF-8 BOM, as the file did."""
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        raise OverridesError(f"Can't write {path}: the file is read-only")
+    temporary, created = path + ".tmp", False
     try:
-        with open(temporary, "w", encoding="utf-8", newline="") as handle:
+        if os.path.lexists(temporary):  # left by an export that stopped half-way; a link is removed, never followed
+            os.remove(temporary)
+        with open(temporary, "x", encoding="utf-8-sig" if bom else "utf-8", newline="") as handle:
+            created = True
             writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
             writer.writerow(header)
             writer.writerows(rows)
+    except (OSError, csv.Error, TypeError) as error:  # TypeError: an Import CSV Delimiter that isn't one character
+        if created:
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
+        raise OverridesError(f"Can't write {path}: {getattr(error, 'strerror', None) or error}") from None
+    try:
         os.replace(temporary, path)
     except OSError as error:
-        if os.path.exists(temporary):
+        with contextlib.suppress(OSError):
             os.remove(temporary)
-        if isinstance(error, PermissionError):
+        if isinstance(error, PermissionError):  # not read-only (checked above): open in another program
             raise OverridesError(PERMISSION) from None
         raise OverridesError(f"Can't write {path}: {error.strerror or error}") from None
 
 
-def _delimiter(path):
-    """The existing file's delimiter, sniffed as csvfmt.read_csv() does; ',' for a new file."""
-    try:
-        with open(path, encoding="utf-8-sig", errors="replace") as handle:
-            first = next((line for line in handle if line.strip()), "")
-    except OSError:
-        return ","
-    return next((sign for sign in (",", ";", "\t") if sign in first), ",")
-
-
 def write_overrides(node, index=0, path=None):
-    """Export the table of the node's live context `index` to its Overrides CSV (§7.6); returns the path written.
-    path: the file chosen for an empty, unlinked Overrides socket, which then takes it. Raises OverridesError."""
+    """Write the node's answers to the Overrides CSV of its live context `index` (§7.6), with the rows of every context
+    that uses that file; returns the path written. path: the file chosen for an empty, unlinked Overrides socket,
+    which then takes it. Raises OverridesError, having written nothing."""
     spec = engine.SPECS[node.bl_idname]
     try:
-        ctx, job, entry = export_context(node, index)
+        uses, ctx, job = export_context(node, index)
         target, delimiter = overrides_target(node, ctx)
+        fill = target is None
+        if fill:
+            if not path:
+                raise OverridesError("Choose a file for the Overrides CSV")
+            target = lists.resolve_path(path, node)
+            if not target.lower().endswith(".csv"):
+                target += ".csv"
     except (Hint, Pending, Unresolvable) as error:
         raise OverridesError(str(error)) from None
-    fill = target is None
-    if fill:
-        if not path:
-            raise OverridesError("Choose a file for the Overrides CSV")
-        target = os.path.normpath(bpy.path.abspath(path))
-        if not target.lower().endswith(".csv"):
-            target += ".csv"
-    blocked = trust.blocked(target)
+    blocked = trust.blocked(target, writing=True)
     if blocked:
-        raise OverridesError(blocked.replace("reading", "writing", 1))
-    delimiter = delimiter or _delimiter(target)
-    header, rows = merged_rows(spec, job, entry, target, delimiter)
-    write_csv(target, header, rows, delimiter)
+        raise OverridesError(blocked)
+    ident = csvfmt.identity(target)
+    used = input_files().get(ident)
+    if used:
+        raise OverridesError(f"{os.path.basename(target)} is the {used[1]} CSV of '{used[0]}': choose another file")
+    keys, entries = spec.override_keys(job), store.load(node).entries
+    answered = [(j, spec.resolve(j, entries, engine.LAST_SHOWN.get((node.uid, c.key()), ""))[0])
+                for c, j in uses if spec.override_keys(j) == keys and _writes_to(node, c, None if fill else ident)]
+    doc = csvfmt.read_csv(target, delimiter) if os.path.exists(target) else None
+    header, rows = merged_rows(spec, answered, doc)
+    write_csv(target, header, rows, doc.delimiter if doc else delimiter or ",", doc is not None and doc.bom)
     if fill:
         try:
             shown = bpy.path.relpath(target) if bpy.data.filepath else target
@@ -451,8 +541,8 @@ def write_overrides(node, index=0, path=None):
 class OPENACT_OT_write_overrides(bpy.types.Operator):
     bl_idname = "openact.write_overrides"
     bl_label = "Write Overrides CSV"
-    bl_description = ("Write this node's answers to its Overrides CSV, to lock rows in (lock = 1). Rows you locked, "
-                      "and your own columns, are kept")
+    bl_description = ("Write this node's answers to its Overrides CSV, to lock rows in (lock = 1). The file's other "
+                      "rows, the rows you locked and your own columns are kept")
     bl_options = {'REGISTER', 'UNDO'}
 
     uid: bpy.props.StringProperty(options={'HIDDEN'})
@@ -460,13 +550,14 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
                                          description="Which of the node's live contexts to export (0 = the first)")
     filepath: bpy.props.StringProperty(subtype='FILE_PATH', options={'SKIP_SAVE'})
     filter_glob: bpy.props.StringProperty(default="*.csv", options={'HIDDEN'})
+    check_existing: bpy.props.BoolProperty(default=True, options={'HIDDEN'})  # the file dialog flags an existing file
 
     def invoke(self, context, event):
         _tree, node = engine.find_node(self.uid)
         if node is None:
             return {'CANCELLED'}
         try:
-            ctx, _job, _entry = export_context(node, self.context_index)
+            _uses, ctx, _job = export_context(node, self.context_index)
             target, _delimiter = overrides_target(node, ctx)
         except (OverridesError, Hint, Pending, Unresolvable) as error:
             self.report({'ERROR'}, str(error))

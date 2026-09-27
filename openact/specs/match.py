@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .. import pipeline
 from ..csvfmt import _n
-from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings, yes_no_text
+from .base import KEY, UNSURE_BELOW, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
 
@@ -126,7 +126,7 @@ class MatchSpec(PerItemSpec):
         items, answers = self.resolved(node, ctx)
         job = self.job(gn, node.answer_type, items, answers, node.balance_order, node.uid)
         job.problems = warnings(items.problems + answers.problems)  # the pass shows them (§17.1)
-        return self.locked(node, ctx, job)  # after the warnings: locked() appends its own
+        return job
 
     def job(self, gn, answer_type, items, answers, debias, uid=""):
         """The Job for these words, items (an ItemList or its items) and answer set. Pure, like Ask's and Pick's."""
@@ -141,7 +141,7 @@ class MatchSpec(PerItemSpec):
         return value if isinstance(value, str) else [{"p": value, "c": 1.0}]
 
     def answer_text(self, job, index, values):
-        return number_text(values["p"]) if job.answer_type == 'AMOUNT' else yes_no_text(values["p"])
+        return number_text(values["p"], job.options)
 
     def values(self, index, answer):
         if "amount" in answer:

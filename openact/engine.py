@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 import bpy
 from bpy.app.handlers import persistent
 
-from . import evaluator, inner, pipeline, server, store
+from . import csvfmt, evaluator, inner, pipeline, server, store, trust
 from . import prefs as P
 from . import tables
 from .csvfmt import ERROR, WARNING, Problem
@@ -129,15 +129,15 @@ evaluator.HANDLERS.update(dict.fromkeys(OPENACT_TYPES, _openact_output))
 
 
 def _plan(spec, node, ctx):
-    """The node's Job in ctx, planned again only when its fingerprint changed (§5.3). Raises Hint, Pending or
-    Unresolvable."""
+    """The node's Job in ctx with its Overrides CSV applied, planned again only when its fingerprint changed (§5.3).
+    Raises Hint, Pending or Unresolvable."""
     global _plans_made
     key = (node.uid, ctx.key())
     fingerprint = spec.fingerprint(node, ctx)
     cached = PLANS.get(key)
     if cached is None or cached[0] != fingerprint:
         try:
-            planned = spec.plan(node, ctx)
+            planned = spec.locked(node, ctx, spec.plan(node, ctx))
         except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
             planned = (type(error), str(error))
         cached = PLANS[key] = (fingerprint, planned)
@@ -260,7 +260,9 @@ def run_pass(everything=True):
     uses = find_uses()
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
+    csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
     try:
+        trust.PASS = trust.is_trusted()
         for tree, node in nodes:
             if not (visit_all or node.uid in dirty):
                 continue
@@ -271,6 +273,7 @@ def run_pass(everything=True):
                 STATUS[node.uid] = _error(f"Internal error: {error}")
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
+        csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
     if stored or _plans_made != plans_made:
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
     contexts = {node.uid: {ctx.key() for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]}
@@ -301,37 +304,43 @@ def _process(tree, node, contexts):
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns
     hidden = set()  # (gn, words key) of stored entries whose words mean something else now: kept for their rows
     problems, warnings, hints, failed = [], [], [], []
-    planned, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells asked
+    uses, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells asked
     upstream = waiting = changed = False
-    # §6.0: the sockets follow the live jobs (Rules, Classify). Jobs that disagree answer nothing, so the last good
-    # table stays, as it does while a context's CSV has errors (§7.8): that context still shows its last table
-    held = hasattr(spec, "agree") and _csv_error(spec, node, contexts)
-    conflict = spec.agree(node, _jobs(node, contexts)) if hasattr(spec, "agree") and not held else ""
+    planned = _scan(spec, node, contexts)
+    # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
+    # good table stays. A context without a job (Pending, or Unresolvable: a CSV with errors, too many items...) still
+    # shows its last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't
+    # fit them wait (None) until that context plans again or goes away; jobs that fit them are answered
+    unknown = any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
+    conflict = spec.agree(node, [(ctx, job) for ctx, job in planned if not isinstance(job, Exception)], unknown,
+                          entries) if hasattr(spec, "agree") else ""
+    held = conflict is None
     if conflict:
         problems.append(conflict)
-    for ctx in contexts:
+    for ctx, job in planned:
         key = (node.uid, ctx.key())
-        try:
-            job = _plan(spec, node, ctx)
-        except Pending:  # its words wait for another node's answer: the entry it showed last stays in the graph
+        if isinstance(job, Pending):  # its words wait for another node's answer: the entry it showed last stays live
             upstream = True
             last = next((entry for entry in entries if entry.words_key == LAST_SHOWN.get(key)), None)
             if last is not None and last.gn not in live:
                 live.append(last.gn)
             continue
-        except Hint as hint:
-            hints.append(str(hint))
+        if isinstance(job, Hint):
+            hints.append(str(job))
             continue
-        except Unresolvable as error:  # e.g. a CSV with errors: its words stay live, so the last good table shows
-            problems.append(str(error))
+        if isinstance(job, Unresolvable):  # e.g. a CSV with errors: its words stay live, so the last good table shows
+            problems.append(str(job))
             _live(live, spec, node, ctx)
             continue
-        planned.append((ctx.label(), job))
+        uses.append((ctx.label(), job))
         warnings += job.problems
         problems += job.errors  # rows in error in a table that still shows, e.g. cells no outcome applies to
         if job.gn not in live:
             live.append(job.gn)
-        if conflict or held:
+        if conflict or held:  # nothing is answered: the sidebar shows the stored entry resolve() gives it, if any
+            entry = spec.resolve(job, entries, LAST_SHOWN.get(key, ""))[0]
+            if any(entry is stored for stored in entries):
+                resolved[job.gn] = entry
             continue
         other = jobs.setdefault(job.gn, (job, ctx))
         if other[0] is not job and other[0].words_key != job.words_key:
@@ -388,8 +397,6 @@ def _process(tree, node, contexts):
             changed = rows = False
             node_store = store.load(node)
     warnings += orphaned([job for job, _ctx in jobs.values()])  # locks no context's rows use (§7.6)
-    if hasattr(spec, "sync"):  # outputs that follow the entries shown, kept while none is (Dials, §6.0)
-        spec.sync(node, shown)
     last = [LAST_SHOWN.get((node.uid, ctx.key())) for ctx in contexts]
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     graph = node_store
@@ -401,7 +408,7 @@ def _process(tree, node, contexts):
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
     state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
     STATUS[node.uid] = NodeStatus(
-        state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in planned],
+        state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings],
         **_counts(jobs, resolved, asked))
     return changed
@@ -417,16 +424,16 @@ def _live(live, spec, node, ctx):
         live.append(gn)
 
 
-def _csv_error(spec, node, contexts):
-    """True when a context reads a CSV with errors (evaluator.FileError)."""
+def _scan(spec, node, contexts):
+    """(ctx, its Job, or the Hint, Pending or Unresolvable that planning raised) of each context: a visit plans each
+    context once, for agree() and for answering."""
+    planned = []
     for ctx in contexts:
         try:
-            _plan(spec, node, ctx)
-        except evaluator.FileError:
-            return True
-        except (Hint, Pending, Unresolvable):
-            continue
-    return False
+            planned.append((ctx, _plan(spec, node, ctx)))
+        except (Hint, Pending, Unresolvable) as error:
+            planned.append((ctx, error))
+    return planned
 
 
 def _submit(job, missing):
