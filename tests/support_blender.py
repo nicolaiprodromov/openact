@@ -400,21 +400,29 @@ def phase_diagnostics():
     quoted, pathed, named = line(doubled)[1], line(missing)[1], line(uncovered)[1]
     config = os.path.join(P._Defaults.runtime_dir, "venv", "pyvenv.cfg")  # names the venv's base Python (§12.2)
     os.makedirs(os.path.dirname(config), exist_ok=True)
+    roaming = os.path.join(os.sep * 2 + "fileserver", "users$", "artist", "AppData", "Roaming", "uv", "python",
+                           "cpython-3.12.11-windows-x86_64-none")  # uv's Pythons in a %APPDATA% redirected to a share
     with open(config, "w", encoding="utf-8") as handle:
-        handle.write(f"home = {os.path.join(HOME, 'uv', 'python')}\n")
+        handle.write(f"home = {roaming}\n")
+    runtime, venv_home = P._Defaults.runtime_dir, P.venv_home
     try:
         text = ops.diagnostics()
+        P._Defaults.runtime_dir, P.venv_home = HOME, lambda _root: ""  # a runtime in the home folder itself
+        in_home = ops.diagnostics()
     finally:
+        P._Defaults.runtime_dir, P.venv_home = runtime, venv_home
         os.remove(config)
     version = ".".join(map(str, openact.bl_info["version"]))
     parts = [f"OpenAct {version}, Blender {bpy.app.version_string}, {platform.platform()}", "Backend: fake, model fake",
-             "\nRuntime: ", f"; Python from {os.path.join('~', 'uv', 'python')}\nServer: ready on port {PORT}",
+             "\nRuntime: ", f"; Python from cpython-3.12.11-windows-x86_64-none\nServer: ready on port {PORT}",
              "Health: status ready, requests "]
-    check("diagnostics: OpenAct, Blender and OS versions, the backend and model, the runtime and its venv's base Python "
-          "(the home folder as ~), the server's status and its /health counters", done
-          and all(part in text for part in parts)
+    check("diagnostics: OpenAct, Blender and OS versions, the backend and model, the runtime and the name of its venv's "
+          "Python folder, the server's status and its /health counters", done and all(part in text for part in parts)
           and all(re.search(rf"\b{key} \d", text) for key in ("requests", "questions", "rows_scored", "cache_hits")),
           text)
+    check("diagnostics: no server or account name: the Python only by its folder's name, and a runtime in the home "
+          "folder itself as ~", "fileserver" not in text and "users$" not in text and "\nRuntime: ~\n" in in_home,
+          (text, in_home))
     check("diagnostics: the queue, a count per node type, and per node its rows per table, materialised entries and "
           "inner-group nodes", "Queue: 0/0/0 chunks (P0/P1/P2), 0 cells in flight, 0 pending" in text
           and re.search(r"^Nodes: .*\b\d+ Match\b", text, re.M) is not None and re.search(

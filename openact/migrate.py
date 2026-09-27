@@ -54,8 +54,7 @@ def on_load_post(*_args):
 
 
 def _report():
-    if bpy.context.window is not None:  # a timer's context has the first window: no temp_override (engine._undo_push)
-        bpy.ops.openact.legacy_report('INVOKE_DEFAULT')
+    bpy.ops.openact.legacy_report('INVOKE_DEFAULT')  # the timer's context has the first window: no temp_override (§5.5)
 
 
 def upgrade_all():

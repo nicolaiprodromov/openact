@@ -1052,8 +1052,6 @@ def _hold():
     """Why pins a pass writes must wait, or "" when an undo step can hold them without cutting the user's history: a
     modal operator is mid-way (its own step would take them), the mode's undo steps hold only its own data (Edit Mode,
     Sculpt Mode, Texture Paint...), or there are steps to redo (a push would delete them)."""
-    if bpy.context.window is None:  # no undo step to push, and none to cut
-        return ""
     if _modal_undo():
         return "they are pinned once the running tool finishes"
     if bpy.context.mode not in LAND_MODES:

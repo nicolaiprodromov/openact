@@ -792,20 +792,20 @@ def redact(text) -> str:
 
 
 def diagnostics() -> str:
-    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime and the base
-    Python of its venv (the home folder as ~), the model server's status and /health counters, the queue, the nodes and
-    the first 10 problems. A problem is given by its node type and severity, never its text; the server's message is
-    redacted. So the report holds no words of the artist's (§16.3)."""
+    """The plain-text report Copy Diagnostics puts on the clipboard: versions, GPU and backend, the runtime's folder (the
+    home folder as ~) and the name of its venv's Python folder, the model server's status and /health counters, the
+    queue, the nodes and the first 10 problems. A problem is given by its node type and severity, never its text; the
+    server's message is redacted. So the report holds no words of the artist's (§16.3)."""
     from . import bl_info  # the package's
 
-    prefs, health, home = P.get_prefs(), server.STATE.health, os.path.expanduser("~")
-
-    def tilde(path):
-        return "~" + path[len(home):] if os.path.normcase(path).startswith(os.path.normcase(home) + os.sep) else path
-
-    root = P.runtime_root(prefs)
+    prefs, health = P.get_prefs(), server.STATE.health
+    root, home = P.runtime_root(prefs), os.path.expanduser("~")
     legacy = " (the legacy Jev Nodes runtime)" if os.path.basename(root).casefold() == "jevnodes" else ""
-    python = P.venv_home(root)  # outside the Jev Nodes runtime: its venv uses the user's uv Python (§12.2)
+    # The folder's name only: the Jev Nodes runtime's venv uses the user's uv Python (§12.2), which a roaming profile
+    # can put on a server
+    python = re.split(r"[\\/]", P.venv_home(root).rstrip("\\/"))[-1]
+    if os.path.normcase(root + os.sep).startswith(os.path.normcase(home) + os.sep):  # the home folder itself too
+        root = "~" + root[len(home):]
     state, message = server.status()
     per_class, flight = pipeline.queue_counts()
     nodes = list(engine.iter_nodes())
@@ -815,7 +815,7 @@ def diagnostics() -> str:
         f"GPU: {health.get('device') or 'unknown'} (device {prefs.device}, GPU {prefs.gpu})",
         f"Backend: {health.get('backend') or 'unknown'}, model {health.get('model_id') or 'unknown'}, revision "
         f"{health.get('revision') or 'unknown'}",
-        f"Runtime: {tilde(root)}{legacy}" + (f"; Python from {tilde(python)}" if python else ""),
+        f"Runtime: {root}{legacy}" + (f"; Python from {python}" if python else ""),
         f"Server: {state} on port {server.STATE.port}" + (f": {redact(message)[:200]}" if message else ""),
         "Health: " + (", ".join(f"{key} {health[key]}" for key in HEALTH if health.get(key) is not None) or "none"),
         f"Queue: {per_class[0]}/{per_class[1]}/{per_class[2]} chunks (P0/P1/P2), {flight} cells in flight, "
@@ -843,8 +843,9 @@ class OPENACT_OT_copy_diagnostics(bpy.types.Operator):
     bl_idname = "openact.copy_diagnostics"
     bl_label = "Copy Diagnostics"
     bl_description = ("Copy a report for a bug report to the clipboard: versions, GPU, the model server's status and "
-                      "counters, node counts and the first problems, with names and paths left out. It holds no "
-                      "prompts and no CSV contents")
+                      "counters, node counts, each problem's node type and severity, the runtime's folder (the home "
+                      "folder as ~) and the name of its Python's folder. It holds no content of yours: no prompts, CSV "
+                      "text or paths, and no node, item or factor names")
 
     def execute(self, context):
         context.window_manager.clipboard = diagnostics()

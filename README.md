@@ -19,6 +19,13 @@ on your GPU. Nothing leaves your computer.
 - Blender 4.5 or newer.
 - An NVIDIA GPU with about 9 GB of free VRAM.
 
+## Known issues
+
+- **Blender 4.5 and 5.0 (Python 3.11):** Blender can crash when an operator runs under a context
+  override while one of OpenAct's background threads briefly runs Python (a Blender bug). OpenAct
+  makes no such call, but Blender does (the node editor's viewer shortcuts Ctrl+1…9 and 1…9, Quick
+  Effects), and so may other add-ons. It is rare. Blender 5.1 is not affected.
+
 ## Install
 
 1. Build the extension: `blender --command extension build --source-dir openact --output-dir dist`.
