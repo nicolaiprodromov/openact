@@ -165,10 +165,12 @@ function Get-Blender([string]$Version) {
 }
 
 $saved = [Console]::OutputEncoding
+$shell = Get-Process -Id $PID  # the caller's own shell when the script is run from a prompt
+$priority = $shell.PriorityClass
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("openact-e2e-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 $userRoot = Join-Path $tmp "blender-user"  # Blender user folders for this run only, removed with $tmp
 try {
-    (Get-Process -Id $PID).PriorityClass = "BelowNormal"  # every suite and its children inherit it
+    $shell.PriorityClass = "BelowNormal"  # every suite and its children inherit it
     New-Item -ItemType Directory -Force -Path $userRoot | Out-Null
     try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }  # redirected output keeps the suites' UTF-8; no console, no change
     $e2e = if ($Model) { "e2e with the real model on GPU $Gpu, port $Port" } else { "no e2e (needs -Model)" }
@@ -228,6 +230,7 @@ try {
 }
 finally {
     try { [Console]::OutputEncoding = $saved } catch { }
+    try { $shell.PriorityClass = $priority } catch { }
     Remove-Item -Recurse -Force -Path $tmp -ErrorAction SilentlyContinue
 }
 exit [int]($failed -gt 0)

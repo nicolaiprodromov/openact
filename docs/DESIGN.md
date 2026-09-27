@@ -3902,11 +3902,13 @@ A later run can diff these lines to spot performance regressions.
   they also run under plain CPython in seconds. They must pass under both **3.11** and **3.13**:
   Blender 4.5 and 5.0 bundle Python 3.11, Blender 5.1 bundles 3.13, and this machine has 3.12 on
   PATH.
-- **Runner.** `tests/run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1]` runs the pure suites once and
+- **Runner.** `tests/run_all.ps1 [-Model] [-Versions 4.5,5.0,5.1] [-Threads 4]` runs the pure suites once and
   every Blender suite on every installed version, `tests/lookup_blender.py` with `--bench`, so the
   §8.4 budgets gate every merge under the timing rule of §18.2. The real-model e2e runs only with
-  `-Model`, because it needs the runtime and the GPU. The runner ends with a summary table, which
-  counts each run's warnings, and a non-zero exit code if anything failed.
+  `-Model`, because it needs the runtime and the GPU. Every suite runs at BelowNormal priority with
+  `OMP_NUM_THREADS`/`MKL_NUM_THREADS` at `-Threads`, and every Blender with `-t <Threads>`, so a run
+  leaves most of a shared machine free. The runner ends with a summary table, which counts each
+  run's warnings, and a non-zero exit code if anything failed.
 - **Fake backend.** Suites that need a server set `OPENACT_BACKEND=fake`. The add-on then starts
   `openact_server.py --backend fake [--fake-script tests/fixtures/<name>.json]`. That path imports
   no torch, so `OPENACT_SERVER_PYTHON` may point at any Python 3.10 or newer, Blender's bundled one
