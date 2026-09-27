@@ -40,7 +40,6 @@ from .watch import WATCH
 
 ASK_ID, PICK_ID = AskSpec.idname, PickSpec.idname
 OPENACT_TYPES = tuple(SPECS)
-LEGACY_TYPES = {"GeometryNodeJevAsk": ASK_ID, "GeometryNodeJevPick": PICK_ID}  # old Jev node -> what it upgrades to
 DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
@@ -210,7 +209,7 @@ def ensure_owned(nodes):
 
 def iter_nodes(types=OPENACT_TYPES):
     """(tree, node) of each node of these types outside inner groups: the OpenAct nodes, which the pass visits, or the
-    old Jev nodes (LEGACY_TYPES), which stay frozen until the upgrade (§12.3)."""
+    old Jev nodes (migrate.LEGACY_TYPES), which stay frozen until the upgrade (§12.3)."""
     for tree in bpy.data.node_groups:
         if tree.bl_idname != 'GeometryNodeTree' or tree.name.startswith(INNER_PREFIX):
             continue
@@ -710,8 +709,6 @@ def on_load_post(*_args):
     LIVE.clear()
     CONTEXTS.clear()
     schedule(immediate=True)
-    if next(iter_nodes(LEGACY_TYPES), None) is not None:  # a line pointing at the upgrade, which stays the user's call
-        bpy.ops.openact.legacy_report()
 
 
 @persistent

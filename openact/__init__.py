@@ -17,9 +17,9 @@ bl_info = {  # legacy add-on installs (the extension manifest is used on Blender
 
 import bpy
 
-from . import engine, nodes, ops, prefs, server, trust, ui, watch
+from . import engine, migrate, nodes, ops, prefs, server, trust, ui, watch
 
-_modules = (ops, nodes, ui, trust, watch)
+_modules = (ops, nodes, ui, trust, watch, migrate)
 
 
 def register():

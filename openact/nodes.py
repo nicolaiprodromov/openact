@@ -161,8 +161,10 @@ class GeometryNodeOpenActPick(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
     bl_idname = engine.PICK_ID
     bl_label = "Pick"
 
-    # Set by the upgrade from v0.1.0: the Items texts of the old answers keep v0.1.0's parsing (lists.py, §12.3)
+    # Set by the upgrade from v0.1.0: its old Items texts (a JSON list) keep v0.1.0's parsing until another text comes
+    # (lists.py, §12.3)
     items_parse_v0: bpy.props.BoolProperty(options={'HIDDEN'})
+    items_v0_texts: bpy.props.StringProperty(options={'HIDDEN'}, default="[]")
 
     def draw_settings(self, layout):
         layout.prop(self, "list_source", text="")
@@ -319,17 +321,29 @@ classes = (GeometryNodeOpenActAsk, GeometryNodeOpenActPick, GeometryNodeOpenActD
 legacy_classes = (GeometryNodeJevAsk, GeometryNodeJevPick)
 
 
+def hold_legacy_types():
+    """Register the aliases of the old Jev node types that no class holds (§12.2): jev_nodes' own classes win while it
+    is enabled, and when it unregisters, or is listed but failed to load, the aliases take over, so the upgrade is
+    offered. A timer, once a second: classes can't be registered while Blender draws."""
+    for cls in legacy_classes:
+        if bpy.types.Node.bl_rna_get_subclass_py(cls.bl_idname) is None:
+            bpy.utils.register_class(cls)
+    return 1.0
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    if P.jev_addon() is None:  # the enabled jev_nodes registers these bl_idnames itself (§12.2)
-        for cls in legacy_classes:
-            bpy.utils.register_class(cls)
+    hold_legacy_types()
+    if not bpy.app.timers.is_registered(hold_legacy_types):
+        bpy.app.timers.register(hold_legacy_types, first_interval=1.0, persistent=True)
     bpy.types.NODE_MT_add.append(draw_add_menu)
 
 
 def unregister():
     bpy.types.NODE_MT_add.remove(draw_add_menu)
+    if bpy.app.timers.is_registered(hold_legacy_types):
+        bpy.app.timers.unregister(hold_legacy_types)
     for cls in reversed(legacy_classes):
         if cls.is_registered:  # jev_nodes, enabled later, replaced it
             bpy.utils.unregister_class(cls)

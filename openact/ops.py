@@ -596,12 +596,12 @@ class OPENACT_OT_upgrade_legacy(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        upgraded, trees, problems = migrate.upgrade_all()
+        upgraded, trees, problems, changed = migrate.upgrade_all()
         if not (upgraded or problems):
             self.report({'INFO'}, "This file has no old Jev nodes")
             return {'CANCELLED'}
         self.report({'WARNING'} if problems else {'INFO'}, migrate.report(upgraded, trees, problems))
-        return {'FINISHED'} if upgraded else {'CANCELLED'}
+        return {'FINISHED'} if changed else {'CANCELLED'}  # the undo step also reverts what an internal error left
 
 
 class OPENACT_OT_legacy_report(bpy.types.Operator):
@@ -610,6 +610,19 @@ class OPENACT_OT_legacy_report(bpy.types.Operator):
     bl_idname = "openact.legacy_report"
     bl_label = "Old Jev Nodes"
     bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        # The window manager keeps a modal step's report, for the status bar and the Info editor: a report made while
+        # bpy.ops runs the operator stays with its Python caller
+        self.timer = context.window_manager.event_timer_add(0.0, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        context.window_manager.event_timer_remove(self.timer)
+        return self.execute(context)
 
     def execute(self, context):
         text = migrate.notice()

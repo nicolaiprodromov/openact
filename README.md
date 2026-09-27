@@ -64,7 +64,9 @@ blender -b --factory-startup --python tests/e2e_blender.py -- reopen  <file.blen
 blender -b --factory-startup --python tests/e2e_blender.py -- reopen-bumped <file.blend>
 ```
 
-The e2e phases drive the add-on with the real model.
+The e2e phases drive the add-on with the real model. `tests/migrate_blender.py` builds its v0.1.0
+file with `tests/fixtures/jev_nodes-0.1.0.zip`, the release of the Jev Nodes prototype that OpenAct
+grew from (same author, GPL-3.0-or-later), so it needs nothing outside the repository.
 
 ## Credits
 

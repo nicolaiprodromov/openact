@@ -44,10 +44,15 @@ def get_prefs():
     return addon.preferences if addon else _Defaults()
 
 
+def is_jev(module: str) -> bool:
+    """True for jev_nodes' module name: a legacy install, or an extension (bl_ext.<repo>.jev_nodes)."""
+    return module == "jev_nodes" or module.endswith(".jev_nodes")
+
+
 def jev_addon():
-    """The enabled jev_nodes add-on, a legacy install or an extension (bl_ext.<repo>.jev_nodes), or None."""
+    """The enabled jev_nodes add-on, or None."""
     addons = bpy.context.preferences.addons
-    return next((addons[name] for name in addons.keys() if name == "jev_nodes" or name.endswith(".jev_nodes")), None)
+    return next((addons[name] for name in addons.keys() if is_jev(name)), None)
 
 
 def import_jev():
