@@ -50,6 +50,7 @@ STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
 LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last
 LIVE = {}  # node uid -> words keys of the entries its contexts showed at its last pass
+CONTEXTS = {}  # node uid -> the ctx keys of its contexts at the last pass: tells the pass when one goes away
 DIRTY = set()  # uids of the nodes the next pass visits, when not all of them are dirty
 GENERATIONS = {}  # node uid -> its generation, bumped when its words change: its older queued chunks are dropped
 
@@ -61,6 +62,7 @@ _last_pass = 0.0
 _has_nodes = False
 _group_count = -1  # number of node groups at the last pass that found no OpenAct nodes
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
+_pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
 
 
 class NodeStatus(tuple):
@@ -108,6 +110,8 @@ def _plan(spec, node, ctx):
     Raises Hint, Pending or Unresolvable."""
     global _plans_made
     key = (node.uid, ctx.key())
+    if _pass_plans is not None:
+        _pass_plans.add(key)
     fingerprint = spec.fingerprint(node, ctx)
     cached = PLANS.get(key)
     if cached is None or cached[0] != fingerprint:
@@ -216,7 +220,7 @@ def schedule(immediate=False, node=None):
 def run_pass(everything=True):
     """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. Main thread
     only."""
-    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count
+    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
@@ -237,6 +241,7 @@ def run_pass(everything=True):
         PLANS.clear()
         LAST_SHOWN.clear()
         LIVE.clear()
+        CONTEXTS.clear()
         WATCH.retain(())
         tables.collect_garbage(nodes)
         return
@@ -246,6 +251,7 @@ def run_pass(everything=True):
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
     csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
+    planned = _pass_plans = set()
     try:
         trust.PASS = trust.is_trusted()
         for tree, node in nodes:
@@ -259,15 +265,20 @@ def run_pass(everything=True):
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
         csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
+        _pass_plans = None
     if stored or _plans_made != plans_made:
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
     contexts = {node.uid: {ctx.key() for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]}
                 for tree, node in nodes}
     # Nothing shows the words of a context that has gone (its object deleted, its modifier removed or re-pointed, a
     # group node on its path muted): its node's queued chunks go, and the next pass queues the other contexts' again
-    lost = {uid for uid, key in PLANS if uid in contexts and key not in contexts[uid]}
-    for cache in (PLANS, LAST_SHOWN):  # contexts that disappeared, and nodes that did
-        for key in [key for key in cache if key[1] not in contexts.get(key[0], ())]:
+    lost = [uid for uid, keys in CONTEXTS.items() if uid in contexts and not keys <= contexts[uid]]
+    CONTEXTS.clear()
+    CONTEXTS.update(contexts)
+    # Contexts that disappeared, and nodes that did, but never one this pass planned: an evaluator read also reaches
+    # contexts find_uses() lacks (through a group node in a tree no modifier uses), planned again every pass if dropped
+    for cache in (PLANS, LAST_SHOWN):
+        for key in [key for key in cache if key not in planned and key[1] not in contexts.get(key[0], ())]:
             del cache[key]
     for uid in lost:
         _bump(uid)
@@ -594,6 +605,7 @@ def on_load_post(*_args):
     PLANS.clear()
     LAST_SHOWN.clear()
     LIVE.clear()
+    CONTEXTS.clear()
     schedule(immediate=True)
 
 

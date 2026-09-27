@@ -26,7 +26,9 @@ starts itself (OPENACT_BACKEND=fake), whose --record log holds every request it 
 - entry validity (§5.4), from the --record log: a template bump and a Balance Option Order toggle send 0 requests;
   after a text edit only the row whose wkey changed is asked, with the node's current options.debias; Ask Again
   re-asks with it; two nodes with different toggles send their own debias;
-- the plan cache: TIMING per unchanged node and per idle pass, with a 4096-cell Rules node used by 16 contexts.
+- the plan cache: a node read as words from a nested group of a tree no modifier uses keeps the context only the
+  evaluator reaches, so the scene settles (only safety passes, nothing planned again, no generation bumped); TIMING
+  per unchanged node and per idle pass, with a 4096-cell Rules node used by 16 contexts.
 
 Run:  blender -b --factory-startup --python tests/pipeline_blender.py
 """
@@ -63,7 +65,7 @@ from openact.specs import SPECS  # noqa: E402
 from openact.specs.base import Spec  # noqa: E402
 
 ASK, MATCH = SPECS["GeometryNodeOpenActAsk"], SPECS["GeometryNodeOpenActMatch"]
-CLASSIFY, DIALS, RULES = (SPECS[f"GeometryNodeOpenAct{name}"] for name in ("Classify", "Dials", "Rules"))
+CLASSIFY, DIALS, PICK, RULES = (SPECS[f"GeometryNodeOpenAct{name}"] for name in ("Classify", "Dials", "Pick", "Rules"))
 POINTS = 5
 REFUSED = 2  # the 403s this suite causes on purpose in the log: 2 requests sent straight to the server
 LONG = "x " * 20000  # far above the fake model's 4096-token limit, like a prompt too long for SemIf
@@ -829,6 +831,43 @@ def phase_lost():
           (len(left), about, max(sent.values(), default=0)))
 
 
+def phase_nested():
+    """A node read as words from inside a nested group, in a tree no modifier uses: the evaluator plans it in a context
+    find_uses() doesn't list, which the pass keeps (§5.3). The scene settles: only the 2 s safety passes run, nothing
+    is planned again and no generation is bumped, and the reader has its answer."""
+    inner = bpy.data.node_groups.new("Nested inner", 'GeometryNodeTree')
+    inner.interface.new_socket("Item", in_out='OUTPUT', socket_type='NodeSocketString')
+    pick = inner.nodes.new(PICK.idname)
+    pick.inputs["Prompt"].default_value = "something to sit on"
+    pick.inputs["Items"].default_value = "chair, lamp, rug"
+    inner.links.new(pick.outputs["Item"], inner.nodes.new("NodeGroupOutput").inputs["Item"])
+    outer = bpy.data.node_groups.new("Nested outer", 'GeometryNodeTree')  # used by no modifier
+    group = outer.nodes.new("GeometryNodeGroup")
+    group.node_tree = inner
+    reader = outer.nodes.new(ASK.idname)
+    reader.inputs["Question"].default_value = "Can a person sit on this?"
+    outer.links.new(group.outputs["Item"], reader.inputs["Context"])
+    answered = drive(engine, lambda: bool(S.load(reader).entries), 30)
+    drive(engine, lambda: False, 1.0)  # the passes the answers schedule
+    passes, run_pass = [], engine.run_pass
+    plans, generation = engine._plans_made, engine.GENERATIONS.get(pick.uid, 0)
+
+    def counted_pass(everything=True):
+        passes.append(everything)  # the safety pass visits every node; a scheduled one passes False
+        return run_pass(everything)
+
+    engine.run_pass = counted_pass
+    try:
+        drive(engine, lambda: False, 4.0)
+    finally:
+        engine.run_pass = run_pass
+    got = (passes, engine._plans_made - plans, engine.GENERATIONS.get(pick.uid, 0) - generation)
+    check("nested reader: a Pick read as words from a nested group of a tree no modifier uses is answered, and so is "
+          "its reader; then the scene settles: in 4 s only the 2 s safety passes, nothing planned again and no "
+          "generation bumped", answered and 1 <= len(passes) <= 3 and all(passes) and got[1:] == (0, 0),
+          (answered, got))
+
+
 # ------------------------------------------------------------------------------ the plan cache
 
 def plain_tree(name, idname, **words):
@@ -938,6 +977,7 @@ def main():
         phase_reregister()
         phase_gone()
         phase_lost()
+        phase_nested()
         phase_token_audit()
         phase_timing()
     except Exception:

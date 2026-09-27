@@ -3488,7 +3488,7 @@ computes for the same words.
 |---|---|---|
 | `MEMORY` (cell answers, LRU 100 000), `PENDING`, `FAILED` | `pipeline.py` | Blender restart. `load_post` clears `FAILED`, as today; *Ask Again* clears a node's keys |
 | `STATUS` (per-node icon, text, counts, ETA) | `engine.py` | `load_post` |
-| `PLANS[(uid, ctx key)] → (fingerprint, job)`, the plan cache (§5.3) | `engine.py` | a changed fingerprint; `load_post` |
+| `PLANS[(uid, ctx key)] → (fingerprint, job)`, the plan cache (§5.3) | `engine.py` | a changed fingerprint; a context that disappears, unless the pass planned it (an evaluator read also reaches contexts `find_uses()` doesn't list, through a group node in a tree no modifier uses); `load_post` |
 | `LAST_SHOWN[(uid, ctx key)] → words_key` of the entry that context showed last (stale-while-refilling, carry-over, and `k_default` for single-context nodes, §5.3–§5.4, §8.2). **Seeded on the first pass after load** from the stored entry whose `gn` equals that context's words, so rows re-asked after a CSV edit made while Blender was closed show stale values, not fallbacks | `engine.py` | `load_post` (then re-seeded); a context that disappears |
 | `TRUST`: which file was opened; `PASS`: whether the open file is trusted, worked out once per pass (§16.1) | `trust.py` | `load_post` and enabling OpenAct (`TRUST`); every pass (`PASS`) |
 | `WATCH` (file stamps and `CsvDoc` cache), the evaluator memo and the file identities (`csvfmt.IDENTITIES`) | `engine.py`, `evaluator.py`, `csvfmt.py` | `load_post` (watch); every pass (memos) |
