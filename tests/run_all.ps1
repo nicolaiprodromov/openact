@@ -14,6 +14,8 @@ Runs the OpenAct test suites and prints a summary table.
   needs the port free and 9 GB free on the GPU; the runner waits up to 30 minutes for the memory.
 A run that takes longer than 10 minutes (30 for an e2e build) is stopped. Every suite ends with a
 RESULT line. The script exits with 1 if any run failed.
+- Every suite runs at BelowNormal priority, with OMP_NUM_THREADS and MKL_NUM_THREADS set to -Threads (4), and
+  every Blender with -t (-Threads), so a run leaves most of the machine to its user.
 
 .EXAMPLE
 tests\run_all.ps1 -Model -Versions 4.5,5.1 -Gpu 1
@@ -23,7 +25,8 @@ param(
     [switch]$Model,
     [string[]]$Versions = @("4.5", "5.0", "5.1"),
     [int]$Gpu = 0,
-    [int]$Port = 18765 + 2 * $Gpu
+    [int]$Port = 18765 + 2 * $Gpu,
+    [int]$Threads = 4
 )
 
 # "-Versions 4.5,5.0,5.1" arrives as numbers (5.0 becomes "5"), or as one string under -File.
@@ -81,6 +84,7 @@ function Add-Row($Suite, $Where, $Ok, $Pass, $Fail, $Seconds, $Detail) {
 function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$Arguments, [int]$Minutes = 10) {
     Write-Host ""
     Write-Host "=== $Suite ($Where)" -ForegroundColor Cyan
+    if ((Split-Path -Leaf $Exe) -ieq "blender.exe") { $Arguments = @("-t", "$Threads") + $Arguments }
     $start = [Diagnostics.ProcessStartInfo]::new($Exe, ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join " ")
     $start.UseShellExecute = $false
     $start.WorkingDirectory = Split-Path $PSScriptRoot  # the repository root, like the README's per-suite commands
@@ -88,6 +92,7 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"  # else CPython writes the ANSI code page into the pipe
     $start.EnvironmentVariables["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # so the server's --gpu is the card nvidia-smi -i reads
+    $start.EnvironmentVariables["OMP_NUM_THREADS"] = $start.EnvironmentVariables["MKL_NUM_THREADS"] = "$Threads"
     # Enabling or disabling an add-on re-syncs the extension wheels of Blender's user folder to the session's
     # enabled extensions (none under --factory-startup), which would delete the user's own extension packages.
     $start.EnvironmentVariables["BLENDER_USER_RESOURCES"] = Join-Path $userRoot $Where.Replace(" ", "-")
@@ -163,6 +168,7 @@ $saved = [Console]::OutputEncoding
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("openact-e2e-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 $userRoot = Join-Path $tmp "blender-user"  # Blender user folders for this run only, removed with $tmp
 try {
+    (Get-Process -Id $PID).PriorityClass = "BelowNormal"  # every suite and its children inherit it
     New-Item -ItemType Directory -Force -Path $userRoot | Out-Null
     try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }  # redirected output keeps the suites' UTF-8; no console, no change
     $e2e = if ($Model) { "e2e with the real model on GPU $Gpu, port $Port" } else { "no e2e (needs -Model)" }
