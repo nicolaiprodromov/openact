@@ -86,24 +86,16 @@ def named(answer: str, names) -> int | None:
     return folded.index(answer.casefold()) if answer.casefold() in folded else None
 
 
-def parse_number(text):
-    try:
-        value = float(text)
-    except ValueError:
-        return None
-    return value if math.isfinite(value) else None
-
-
 def lock_answer(answer_type: str, answer: str, levels=()):
-    """A Yes/No lock's p (yes, no or a probability 0-1) or an Amount lock's 0-1 (a number 0-1 or a level name,
-    at its position / (L - 1)); else why the answer names nothing valid (str)."""
-    number = parse_number(answer)
+    """A Yes/No lock's p (yes, no or a probability 0-1) or an Amount lock's 0-1 (a level name, at its position /
+    (L - 1), else a number 0-1: levels may be named '1' to '5'); else why the answer names nothing valid (str)."""
+    number = csvfmt.number(answer)
     if answer_type == 'AMOUNT':
-        at = named(answer, levels) if number is None else None
-        if number is not None and 0.0 <= number <= 1.0:
-            return number
+        at = named(answer, levels)
         if at is not None and len(levels) > 1:
             return at / (len(levels) - 1)
+        if number is not None and 0.0 <= number <= 1.0:
+            return number
         return f"'{answer}' is not a number from 0 to 1 or a level name"
     if answer.casefold() in ("yes", "no"):
         return float(answer.casefold() == "yes")
@@ -112,9 +104,12 @@ def lock_answer(answer_type: str, answer: str, levels=()):
     return f"'{answer}' is not yes, no or a number from 0 to 1"
 
 
-def number_text(value: float) -> str:
-    """0.625 -> "0.625", 1.0 -> "1": how exported numbers read."""
-    return f"{value:.3f}".rstrip("0").rstrip(".") or "0"
+def number_text(value: float, levels=()) -> str:
+    """0.625 -> "0.625", 1.0 -> "1": how exported numbers read, to 6 significant digits, so a small range keeps its
+    digits. levels: the names lock_answer() reads before numbers; a short form that is one of them is written in full
+    (1.0 -> "1.0" beside a level '1')."""
+    text = f"{value:.6g}"
+    return repr(float(value)) if named(text, levels) is not None else text
 
 
 def yes_no_text(p: float) -> str:
@@ -184,7 +179,8 @@ class Spec:
                                trust.is_trusted())
 
     def plan(self, node, ctx) -> pipeline.Job:
-        """The node's Job in ctx. Raises Hint, Pending or Unresolvable."""
+        """The node's Job in ctx, without its Overrides CSV: engine._plan() applies that (locked()). Raises Hint,
+        Pending or Unresolvable."""
         raise NotImplementedError
 
     def values(self, index: int, answer: dict) -> dict:
@@ -364,7 +360,7 @@ class Spec:
         name = os.path.basename(path) or "Overrides"
         rows, errors, used = list(job.rows), [], set()
         for cells, indices in self.override_units(job):
-            key = csvfmt.KEY_SEP.join(cell.strip().casefold() for cell in cells)
+            key = csvfmt.lock_key(cells)
             lock = locks.get(key)
             if lock is None:
                 continue

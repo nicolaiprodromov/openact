@@ -78,7 +78,7 @@ class PickSpec(Spec):
         job = self.job(gn, items.items, node.balance_order, node.uid, items.source,
                        [items.doc.text_hash] if items.doc is not None else [])
         job.problems = warnings(items.problems)
-        return self.locked(node, ctx, job)
+        return job
 
     def job(self, gn, items, debias, uid="", source='TEXT', csv_hashes=()):
         """The Job for these words and items (lists.Item, or names). Pure, so the pure suites plan exactly like the

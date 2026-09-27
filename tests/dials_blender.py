@@ -3,12 +3,15 @@
 Without arguments no model is needed: fake answers stand in for it. The weather settings plan into one request, and
 their outputs exist before the first answer, showing their fallbacks; the one-row-per-entry table object gives each
 output its setting's answer, Amount mapped into min-max; a min/max edit is a values-only update with 0 requests; two
-contexts with different ranges each get their own values; a context with other setting names keeps its last good
-table while the node warns, naming both; an output drives Grid's Vertices X through a valid link; renaming a setting
-warns (in the CSV or inline) until its new socket is linked, it comes back, or File > Revert restores it; after Ask
-Again, or while an edited question is asked again, the outputs and their links stay; a CSV whose rows only move keeps
-each output on its own setting; a new setting gets its output before its answer; a node reading a setting as a word
-waits while Dials shows a hint.
+contexts with different ranges each get their own values; contexts with other setting names give the status error
+naming both, and every context keeps its last good table and every output its link, whichever context changed, also
+after an object rename, while the same settings in another order agree; an output drives Grid's Vertices X through a
+valid link; renaming a setting warns (in the CSV or inline) until its new socket is linked, or it comes back linked
+(File > Revert), and typed back it warns until linked again; after Ask Again, or while an edited question is asked
+again, the outputs and their links stay; a CSV whose rows only move keeps each output on its own setting; a new
+setting gets its output before its answer; a node reading a setting as a word waits while Dials shows a hint; while a
+context has no job (a missing Settings CSV, an inline error), every output keeps its link, another context's new
+prompt is still asked and shown, and a rename in it waits.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -176,6 +179,10 @@ def pointers(node):
     return [n.as_pointer() for n in node.node_tree.nodes]
 
 
+def linked(node):
+    return [(s.name, s.is_linked) for s in node.outputs]
+
+
 # --------------------------------------------------------------------------------------- no model
 
 def phase_nomodel():
@@ -246,26 +253,45 @@ def phase_nomodel():
           a == dict(EXPECTED, **{"Wind speed": 40.0}) and b == dict(EXPECTED, **{"Wind speed": 75.0})
           and len(tables.find(node).data.vertices) == 2, (a, b))
 
-    # contexts must agree on the setting names and types (§6.0): one that differs keeps its last good table
-    good_b, before, rebuilt = read(users["B"]), pointers(node), []
+    # contexts must agree on the setting names and types (§6.0). Otherwise the node shows the error and answers no
+    # context, so each keeps its last good table and the outputs their links, whichever context is first
+    good, before, links = (read(users["A"]), read(users["B"])), pointers(node), linked(node)
+    tail = "; setting names and types must agree"
+
+    def settled(step, error=None):
+        rebuilt = []
+        calls.clear()
+        with asking(calls), rebuilds(rebuilt):
+            settle()
+        got = (read(users["A"]), read(users["B"]))
+        status, warning = engine.STATUS[node.uid], dials.WARNINGS.get(node.uid)
+        shown = ('ERROR', error) if error else ('CHECKMARK', "5 settings · lowest confidence 0.50   +1 more")
+        check(f"shape agreement ({step}): {'the status error names both contexts' if error else 'a checkmark'}, and "
+              "each context keeps its last good table, every output its link and the graph, with 0 requests",
+              status == shown and not warning and got == good and linked(node) == links and not rebuilt
+              and pointers(node) == before and not calls, (status, warning, got, linked(node), rebuilt, len(calls)))
+
     weather("b.csv", ("Wind speed,amount", "Gust,amount"))
-    calls.clear()
-    with asking(calls), rebuilds(rebuilt):
-        settle()
-    check("shape agreement: different setting names warn, naming both contexts", dials.WARNINGS.get(node.uid) == (
-        "Dials: 'A > Dials' and 'B > Dials' use different settings ('Wind speed' (amount) vs 'Gust' (amount)); "
-        "setting names and types must agree"), dials.WARNINGS.get(node.uid))
-    got = (read(users["A"])["Wind speed"], read(users["B"]))
-    check("shape agreement: A keeps its values and B its last good table, with no rebuild and 0 requests",
-          got == (40.0, good_b) and not rebuilt and pointers(node) == before and not calls, (got, rebuilt, len(calls)))
+    settled("the second context renames a setting",
+            "Dials: 'A > Dials' and 'B > Dials' use different settings ('Wind speed' (amount) vs 'Gust' (amount))" + tail)
     shown = [entry and entry.shape["settings"][1]["name"] for _label, entry in engine.answers_for(node)]
     check("shape agreement: the sidebar shows B's last good table too", shown == ["Wind speed", "Wind speed"], shown)
+    users["A"].name = "Harbour"  # contexts go by object name: B, which differs, is now the first
+    settled("an object rename makes the other context first",
+            "Dials: 'B > Dials' and 'Harbour > Dials' use different settings ('Gust' (amount) vs 'Wind speed' (amount))"
+            + tail)
+    users["A"].name = "A"
     weather("b.csv", (",0,30", ",0,100"))
-    with asking(calls):
-        settle()
-    check("shape agreement: agreeing again ends the warning, with 0 requests",
-          engine.STATUS[node.uid][0] == 'CHECKMARK' and not dials.WARNINGS.get(node.uid) and not calls
-          and read(users["B"])["Wind speed"] == 75.0, (engine.STATUS[node.uid], dials.WARNINGS.get(node.uid), len(calls)))
+    settled("B agrees again")
+    weather("a.csv", ("Wind speed,amount", "Gust,amount"))
+    settled("the first context renames a setting",
+            "Dials: 'A > Dials' and 'B > Dials' use different settings ('Gust' (amount) vs 'Wind speed' (amount))" + tail)
+    weather("a.csv", (",0,30", ",10,50"))
+    settled("A agrees again")
+    with open(csv_b, encoding="utf-8") as handle:
+        header, rain, wind, time_, street, fog = handle.read().split("\n")[:6]
+    rewrite(csv_b, [header, rain, fog, wind, time_, street])  # each entry fills the outputs by name
+    settled("the same settings in another order agree")
 
     # with two entries too: the pass replaces the entry in place, so the graph's entry order holds
     before, rebuilt = pointers(node), []
@@ -324,6 +350,18 @@ def phase_inline():
           names == ["Rain", "Fog", "Confidence"] and not calls
           and dials.WARNINGS.get(node.uid) == "Setting 'Mist' renamed or retyped: reconnect its output",
           (names, len(calls), dials.WARNINGS.get(node.uid)))
+    words(users["I"], Settings=inline.format("Mist"))  # typed back: a new socket, without the link undo brings back
+    with asking(calls):
+        settle()
+    check("inline rename typed back: Mist returns without its link, so the node still warns",
+          not node.outputs["Mist"].is_linked and not calls
+          and dials.WARNINGS.get(node.uid) == "Setting 'Mist' renamed or retyped: reconnect its output",
+          (linked(node), len(calls), dials.WARNINGS.get(node.uid)))
+    tree.links.new(node.outputs["Mist"], next(s for s in orphan.inputs if s.name == "Value" and s.enabled))
+    with asking(calls):
+        settle()
+    check("inline rename typed back: once Mist is linked again, the warning ends", dials.WARNINGS.get(node.uid) is None,
+          dials.WARNINGS.get(node.uid))
     phase_live_outputs()
 
 
@@ -474,6 +512,55 @@ def phase_chained_hint():
     asked = [job.rows[0].name for job, _missing in calls if job.uid == one_of.uid]
     check("chained hint: a One-of read through an Index Switch waits too, instead of asking about item 0",
           not asked and engine.STATUS[one_of.uid][0] in ('PAUSE', 'SORTTIME'), (asked, engine.STATUS[one_of.uid]))
+    phase_hold()
+
+
+def phase_hold():
+    """§6.0: a context without a job (its Settings CSV missing, an inline error) may still show the outputs as they
+    are, so they stay, with their links. Another context's new prompt, which fits them, is still asked and shown;
+    a rename, which would change them, waits, and gives the error once that context plans again."""
+    csv_a, csv_b = weather("hold_a.csv"), weather("hold_b.csv")
+    tree, node, users = scene("DialsHold", [("HA", STORM, csv_a), ("HB", STORM, csv_b)])
+    calls = []
+
+    def passes(change, times=3):
+        """Make a change and run the passes: (status, what both objects read, the links, the cells this node asks)."""
+        change()
+        calls.clear()
+        with asking(calls):
+            settle(times)
+        return (engine.STATUS[node.uid], (read(users["HA"]), read(users["HB"])), linked(node),
+                [cell for job, missing in calls if job.uid == node.uid for cell in missing])
+
+    passes(lambda: None)  # the weather cells are cached
+    wire(tree, node)
+    good, links = (read(users["HA"]), read(users["HB"])), linked(node)
+    os.remove(csv_a)
+    waited = passes(lambda: words(users["HB"], Prompt=CALM), 1)
+    for cell in waited[3]:  # the calm morning is dry
+        pipeline.remember(cell.key, dict(FAKE[cell.question["instructions"]], model="fake",
+                                         **({"p": 0.1} if cell.question["instructions"] == "Is it raining?" else {})))
+    got = passes(lambda: None)
+    check("hold: while a Settings CSV is missing, another context's new prompt is asked, and shown once answered; "
+          "every output keeps its link, and the object whose CSV is missing its last table",
+          waited[0] == got[0] == ('ERROR', f"Can't find {os.path.normpath(csv_a)}") and len(waited[3]) == 5
+          and not got[3] and got[1] == (good[0], dict(good[1], Rain=False)) and got[2] == links, (waited, got))
+    got = passes(lambda: (weather("hold_a.csv"), words(users["HB"], Prompt=STORM)))
+    check("hold: the CSV back, a checkmark, and both objects show their tables again, 0 requests",
+          got == (('CHECKMARK', "5 settings · lowest confidence 0.50   +1 more"), good, links, []), got)
+    renamed = ("Dials: 'HA > Dials' and 'HB > Dials' use different settings ('Wind speed' (amount) vs 'Gust' (amount));"
+               " setting names and types must agree")
+    got = (passes(lambda: weather("hold_b.csv", ("Wind speed,amount", "Gust,amount"))),
+           passes(lambda: words(users["HA"], Settings="Rain (yes/no): Is it raining?; Rain (yes/no): Is it wet?")),
+           passes(lambda: words(users["HA"], Settings=csv_a)))
+    check("hold: while the context whose settings the outputs show has an inline error, another context's rename "
+          "waits: every output keeps its link and the renamed context its last table, with 0 requests; fixed, the "
+          "error is back",
+          got[0] == got[2] == (('ERROR', renamed), good, links, []) and got[1][0] == (
+              'ERROR', "Settings: Entry 2: 'Rain' appears twice") and got[1][1][1] == good[1] and got[1][2:] == (
+              links, []) and not dials.WARNINGS.get(node.uid), got)
+    got = passes(lambda: weather("hold_b.csv"))
+    check("hold: the rename undone, a checkmark", got[0][0] == 'CHECKMARK' and got[1:] == (good, links, []), got)
     phase_revert()
 
 
