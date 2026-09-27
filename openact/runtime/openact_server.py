@@ -26,6 +26,7 @@ Additions on top of SemIf:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import json
@@ -703,17 +704,6 @@ def write_token(path, token):
         log(f"cannot write --token-file {path}: {error}")
 
 
-def remove_token(path, token):
-    """On a clean exit: remove the token file, unless it holds another server's token by now."""
-    try:
-        with open(path, encoding="ascii") as handle:
-            if handle.read(256).strip() != token:
-                return
-        os.remove(path)
-    except (OSError, ValueError):
-        pass
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
@@ -773,8 +763,9 @@ def main(argv=None):
         SERVER.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
-    if shares:  # while the port is still this server's: a server that binds it next may write its own file
-        remove_token(args.token_file, TOKEN)
+    if shares:  # while the port is still this server's: only the server that holds it writes the file
+        with contextlib.suppress(OSError):
+            os.remove(args.token_file)
     SERVER.server_close()  # the port is free at once, not after the interpreter's teardown
     log("server stopped")
     return 0

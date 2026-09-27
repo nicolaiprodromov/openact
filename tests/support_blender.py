@@ -21,6 +21,10 @@ headless Blender, against the fake model server the add-on starts itself (OPENAC
   and a token file put right is tried at the next health probe; a lost start race attaches to the winner at once,
   and neither it nor a port some other program holds counts as a crash; Detach lasts until Start Model, also while
   the other server loads and in a lost start race;
+- the client's state follows from what can be observed: a health probe that times out changes nothing (a ready
+  server stays ready, a Detach lasts); a chunk the worker took before a Detach never goes out without a token; the
+  other Blender's server dying during its load leaves this Blender stopped within seconds, and auto-start starts its
+  own; Stop Model during this Blender's own load ends stopped, not in an "exited" error;
 - crash-loop protection, time-scaled: 3 unexpected exits within 10 minutes pause auto-start until Start Model, and
   exits further apart don't;
 - the stalled-fill alert, time-scaled, while the scripted question stalls; the queued chunk stays queued;
@@ -42,6 +46,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import traceback
@@ -783,9 +788,9 @@ def phase_lost_race():
           server.start() and drive(engine, server.is_ready, 30), server.status())
 
 
-def attach_other(port, token):
+def attach_other(port, token, *flags):
     """This Blender attached to a server another Blender started on its own port: (that server, attached)."""
-    other = other_server(port, token)
+    other = other_server(port, token, *flags)
     server.stop()
     P._Defaults.port = port
     up = drive(engine, lambda: listening(port) and os.path.exists(os.path.join(STATE_DIR, f"server-{port}.token")), 20)
@@ -917,6 +922,140 @@ def phase_detach_while_starting():
           server.start() and drive(engine, server.is_ready, 30), server.status())
 
 
+def phase_timeouts():
+    """§10.5: a health probe that times out says nothing: an attached, ready server stays ready, and a Detach lasts."""
+    port = free_port()
+    other, attached = attach_other(port, secrets.token_hex(32))
+    real = server.http
+
+    def slow(method, path, body=None, port=None, timeout=10.0):
+        if method == "GET" and path == "/health":
+            raise TimeoutError("timed out")  # as from a busy server, or a Blender busy on its main thread
+        return real(method, path, body, port, timeout)
+
+    try:
+        server.http = slow
+        server.refresh()
+        drive(engine, lambda: False, 1.0)
+        ready = (server.status()[0], server.attached())
+        server.stop()  # Detach
+        server.refresh()
+        drive(engine, lambda: False, 1.0)
+        timed = server.STATE.detached
+        server.http = real
+        server.refresh()  # the other server answers
+        drive(engine, lambda: False, 1.5)
+        after = (server.status()[0], server.attached(), server.STATE.detached, server.STATE.token)
+        check("timeout: a health probe that times out leaves an attached, ready server ready: a timeout is no verdict",
+              attached and ready == ("ready", True), ready)
+        check("timeout: ...and doesn't end a Detach: after it, a probe that finds the other server leaves this Blender "
+              "stopped and detached, with no token", timed and after == ("stopped", False, True, ""), (timed, after))
+    finally:
+        server.http = real
+        ended(other)
+        server.stop()
+        P._Defaults.port = PORT
+    check("timeout: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
+def phase_detach_taken_chunk():
+    """§10.5: Detach while the worker holds a chunk it has taken from the queue: the chunk never goes out without a
+    token (nothing reaches the other server), and no "…without a readable token" error follows."""
+    port, record = free_port(), os.path.join(TMP, "other_record.jsonl")
+    other, attached = attach_other(port, secrets.token_hex(32), "--record", record)
+    armed, held, go, take = threading.Event(), threading.Event(), threading.Event(), pipeline.take
+
+    def holding(timeout):
+        armed.set()  # the worker's takes come here from now on
+        chunk = take(timeout)
+        if chunk is not None and not held.is_set():
+            held.set()  # taken: the test detaches now
+            go.wait(10)
+        return chunk
+
+    pipeline.take = holding
+    try:
+        server.worker()
+        armed.wait(5)  # a take the worker began before the patch would send the chunk unheld
+        node = used("Taken", MATCH, Question="Is it taken?", Items="cup, saucer")
+        engine.schedule(immediate=True)
+        took = drive(engine, held.is_set, 10)
+        server.stop()  # Detach while the worker holds the chunk
+        sent = len(read(record).splitlines())
+        go.set()
+        drive(engine, lambda: False, 1.5)
+        after = (server.status(), server.STATE.detached, line(node)[0], len(read(record).splitlines()) - sent)
+        check("detach: a chunk the worker took before Detach isn't sent without a token: nothing reaches the other "
+              "server, no '…without a readable token' error follows, and the node waits as paused",
+              attached and took and after == (("stopped", ""), True, "paused", 0), after)
+    finally:
+        pipeline.take = take
+        go.set()
+        ended(other)
+        server.stop()
+        P._Defaults.port = PORT
+    check("detach: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
+def phase_other_gone_while_loading():
+    """§10.5: the other Blender's server goes away during its load while this Blender is attached to it: this Blender
+    is stopped within seconds, not "Loading the model..." for up to 10 minutes, its start poller ends, and auto-start
+    then starts this Blender's own server."""
+    port, token = free_port(), secrets.token_hex(32)
+    token_file = os.path.join(STATE_DIR, f"server-{port}.token")
+    other = other_server(port, token, "--fake-load-seconds", "60")
+    server.stop()
+    P._Defaults.port, P._Defaults.auto_start = port, False
+    try:
+        up = drive(engine, lambda: listening(port) and os.path.exists(token_file), 20)
+        loading = up and server.start() and server.status() == ("starting", "Loading the model...") \
+            and server.attached()
+        node = used("Orphaned", MATCH, Question="Is anyone there?", Items="echo, silence")
+        engine.schedule(immediate=True)
+        ended(other)  # the other Blender closes during its load
+        gone = drive(engine, lambda: server.status() == ("stopped", "The model server stopped"), 8)
+        polled = drive(engine, lambda: not server.STATE.poll_thread.is_alive(), 2)
+        paused = drive(engine, lambda: line(node)[0] == "paused", 3)
+        P._Defaults.auto_start = True
+        own = drive(engine, lambda: server.is_ready() and not server.attached() and complete(node), 30)
+        check("other gone while loading: the other Blender's server dies during its load: within seconds this Blender "
+              "is stopped, not 'Loading the model...', its start poller has ended, and the node waits as paused",
+              loading and gone and polled and paused, (loading, gone, polled, paused, server.status()))
+        check("other gone while loading: ...then auto-start starts this Blender's own server, which answers the node",
+              own, (server.status(), line(node)))
+    finally:
+        P._Defaults.auto_start = True
+        ended(other)
+        server.stop()
+        P._Defaults.port = PORT
+    check("other gone while loading: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
+def phase_stop_while_loading():
+    """§17.6: Stop Model while this Blender's own server still loads ends stopped: the exit it asks for is no crash,
+    and is not reported as one."""
+    fake, exits = list(server.FAKE_ARGS), list(server.STATE.exits)
+    server.stop()
+    server.FAKE_ARGS[:] = [*fake, "--fake-load-seconds", "5"]
+    P._Defaults.auto_start = False  # auto-start would start it again at once, which would hide an error
+    try:
+        loading = server.start() and drive(engine, lambda: server.status() == ("starting", "Loading the model..."), 15)
+        own = server.STATE.process
+        server.stop()  # Stop Model during the load
+        drive(engine, lambda: False, 2.0)  # the start poller's rounds
+        after = (server.status(), own.poll() if own is not None else None, server.STATE.exits == exits)
+        check("stop while loading: Stop Model during this Blender's own load ends stopped, not in 'The model server "
+              "exited', and is no crash", loading and after == (("stopped", ""), 0, True), after)
+    finally:
+        server.FAKE_ARGS[:] = fake
+        P._Defaults.auto_start = True
+    check("stop while loading: this Blender's own server starts again on its port",
+          server.start() and drive(engine, server.is_ready, 30), server.status())
+
+
 # ---------------------------------------------------------------------------------------- crash loop
 
 def restart_after_crash(node, question):
@@ -1040,6 +1179,10 @@ def main():
         phase_own_after_other()
         phase_detach_sticks()
         phase_detach_while_starting()
+        phase_timeouts()
+        phase_detach_taken_chunk()
+        phase_other_gone_while_loading()
+        phase_stop_while_loading()
         phase_crash_loop()
         phase_stall()
         phase_slow()

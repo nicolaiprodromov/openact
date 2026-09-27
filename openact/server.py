@@ -46,6 +46,10 @@ CRASH_EXITS, CRASH_WINDOW = 3, 600.0  # unexpected exits of this Blender's serve
 KEEPS_STOPPING = "The model server keeps stopping: see the log"
 PORT_TAKEN = 4  # openact_server.py's exit code when it can't bind its port: attach to the server that holds it
 SHARED = "Shared: started by another Blender"
+# What a /health probe of the port finds (§10.5): its answer; a refused connection, so nothing listens; or a timeout,
+# which says nothing (a busy server, or a Blender busy on its main thread)
+ANSWERED, REFUSED, TIMED_OUT = "answered", "refused", "timed out"
+PROBE_TIMEOUT = 3.0  # longer than a refused localhost connection takes on Windows (about 2 s): nothing there is REFUSED
 FAKE_ARGS: list[str] = []  # tests: more openact_server.py flags for the fake backend, e.g. --record <path.jsonl>
 
 SEMIF_COMMIT = "23cf1f39fc9534fe81437200959b6dfc7106e45a"
@@ -70,7 +74,9 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows only: no cons
 
 class _State:
     def __init__(self):
-        self.lock = threading.Lock()
+        # The facts below change under it: a probe's result is applied whole, or not at all once stale (_observe())
+        self.lock = threading.RLock()
+        self.epoch = 0  # bumped by each start, Stop Model and start poller: older probes and requests say nothing
         self.status = "unknown"  # unknown, not_installed, stopped, starting, ready, error, installing
         self.message = ""
         self.health = {}
@@ -167,14 +173,22 @@ def _opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never proxy localhost
 
 
+class NoToken(Exception):
+    """A POST while no token is in use (after a Detach, or a token file that can't be read): it never leaves."""
+
+
 def http(method, path, body=None, port=None, timeout=10.0):
     """Blocking JSON request to the local server. Returns (status_code, json)."""
     url = f"http://127.0.0.1:{port or STATE.port}{path}"
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    # Every POST needs the token. GETs never carry it: the probes may reach a program on the port that isn't ours
-    if method == "POST" and STATE.token:
-        headers["X-OpenAct-Token"] = STATE.token
+    # Every POST carries the token, read as it leaves: that of the server in use then (§10.5). GETs never carry it: the
+    # probes may reach a program on the port that isn't ours
+    if method == "POST":
+        token = STATE.token
+        if not token:
+            raise NoToken(path)
+        headers["X-OpenAct-Token"] = token
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with _opener().open(request, timeout=timeout) as response:
@@ -188,10 +202,12 @@ def http(method, path, body=None, port=None, timeout=10.0):
 
 
 def _offline(error):
-    reason = getattr(error, "reason", error)
-    return isinstance(reason, (ConnectionRefusedError, ConnectionResetError)) or isinstance(
-        error, (ConnectionRefusedError, ConnectionResetError, TimeoutError)
-    )
+    """True when nothing listens: the connection was refused or reset. A timeout is no verdict (§10.5)."""
+    return isinstance(getattr(error, "reason", error), (ConnectionRefusedError, ConnectionResetError))
+
+
+def _timed_out(error):
+    return isinstance(getattr(error, "reason", error), TimeoutError)
 
 
 class Worker(threading.Thread):
@@ -227,15 +243,19 @@ class Worker(threading.Thread):
     def send(self, chunk):
         self.size()
         request, ids = pipeline.build_request(chunk)
-        token, started = STATE.token, time.perf_counter()
+        token, epoch, started = STATE.token, STATE.epoch, time.perf_counter()
         try:
             code, body = http("POST", "/v1/systemone", request, timeout=180.0)
+        except NoToken:  # none in use (a Detach, a token file that can't be read): nothing went out
+            post(pipeline.answered, chunk, "refused", None)  # asked again once a server is in use (§10.5)
+            return
         except Exception as error:
-            if not _offline(error):
+            if not (_offline(error) or _timed_out(error)):
                 post(pipeline.answered, chunk, "error", f"{type(error).__name__}: {error}")
                 return
             pipeline.requeue(chunk)  # its cells stay queued, and auto-start applies (§13.2)
-            post(_lost_connection)
+            if _offline(error):  # a timeout says nothing about the server
+                post(_lost_connection, epoch)
             self.wait()
             return
         if STATE.log_requests:
@@ -327,9 +347,10 @@ def worker():
     return _worker
 
 
-def _lost_connection():
-    if STATE.status == "ready":
-        STATE.set("stopped", "The model server stopped")
+def _lost_connection(epoch):
+    """The worker's request found nothing listening: what a refused probe finds. Main thread only."""
+    _reap()  # a server of this Blender's that crashed: counted, and forgotten
+    _observe(REFUSED, {}, epoch)
 
 
 # ------------------------------------------------------------------------------ lifecycle
@@ -354,11 +375,11 @@ def _refuse_backend(other):
 
 
 def _refused_by(pid):
-    """The server on the port refused this Blender's token (403): it was started elsewhere, and its token file is
-    missing or wrong. It stays unusable, and the status an error, while /health reports its pid (§10.5). Any
-    thread."""
-    STATE.refused, STATE.conflict = pid, TOKEN_REFUSED.format(STATE.port)
-    STATE.set("error", STATE.conflict)
+    """The server on the port refused this Blender's token (403), or its token file can't be read: it was started
+    elsewhere. It stays unusable, and the status an error, while /health reports its pid (§10.5). Any thread."""
+    with STATE.lock:
+        STATE.refused, STATE.conflict = pid, TOKEN_REFUSED.format(STATE.port)
+        STATE.set("error", STATE.conflict)
 
 
 def state_dir(root):
@@ -393,11 +414,12 @@ def attached():
 def _adopt_token():
     """For another Blender's server: use the token its file holds, when that differs from the one in use, and forget a
     refusal. True when the token changed. Any thread."""
-    token = _read_token(STATE.port) if attached() else STATE.token
-    if token == STATE.token:
-        return False
-    STATE.token, STATE.refused = token, None
-    return True
+    with STATE.lock:
+        token = _read_token(STATE.port) if attached() else STATE.token
+        if token == STATE.token:
+            return False
+        STATE.token, STATE.refused = token, None
+        return True
 
 
 def _child_env():
@@ -503,47 +525,77 @@ def refresh(prefs=None):
             return
     if STATE.status in ("unknown", "not_installed"):
         STATE.set("stopped", "")
-    port = STATE.port
+    port, epoch = STATE.port, STATE.epoch
+    executor().submit(lambda: _observe(*_probe_port(port), epoch))
 
-    def probe():
-        try:
-            code, health = http("GET", "/health", port=port, timeout=1.0)
-        except Exception:
-            code, health = 0, {}
-            if STATE.status == "ready":
-                STATE.set("stopped", "The model server stopped")
-        other = _other_backend(health) if code == 200 and health.get("server") == SERVER_ID else None
-        if code == 0:
+
+def _probe_port(port, timeout=PROBE_TIMEOUT):
+    """GET /health on the port: (ANSWERED, its /health, or {} for an answer that isn't one), (REFUSED, {}) or
+    (TIMED_OUT, {}). Any thread."""
+    try:
+        code, health = http("GET", "/health", port=port, timeout=timeout)
+    except Exception as error:
+        return (REFUSED if _offline(error) else TIMED_OUT), {}
+    return ANSWERED, health if code == 200 else {}
+
+
+def _observe(outcome, health, epoch, poller=False):
+    """Apply what a probe of the port found. Every probe comes here: refresh()'s, the start poller's, a start's, and a
+    request of the worker's that was refused. The facts decide the state (§10.5):
+    - the probe's outcome;
+    - whose server answered (/health's parent_pid);
+    - its token file;
+    - a Detach, a refusal (403);
+    - this Blender's own process.
+    A timeout says nothing, and neither does a probe made before the last start, Stop Model or start poller (epoch).
+    Starts the poller for a server that loads, unless a poller asks. True when a start poller can end. Any thread."""
+    with STATE.lock:
+        if epoch != STATE.epoch:
+            return True
+        if outcome == TIMED_OUT:  # a busy server, or a busy Blender: no verdict
+            return False
+        if outcome == REFUSED:  # nothing listens on the port
             STATE.detached = False  # the server this Blender detached from has gone
-        if STATE.detached:
-            pass  # Detach lasts until Start Model (§10.5)
-        elif other:
+            if STATE.process is not None:
+                return False  # its own server doesn't listen yet, or has exited: the poller or _reap() says which
+            conflict = (STATE.status, STATE.message) in (("error", LEGACY_SERVER_MESSAGE), ("error", STATE.conflict))
+            if STATE.status in ("ready", "starting") or conflict:  # the server it used or couldn't use has gone
+                if attached():
+                    STATE.token = ""  # another Blender's token is of no use any more
+                STATE.health, STATE.refused = {}, None
+                STATE.set("stopped", "" if conflict else "The model server stopped")  # auto-start may start one
+            return True
+        if health.get("server") != SERVER_ID:
+            STATE.set("error", LEGACY_SERVER_MESSAGE if health.get("server") == LEGACY_SERVER_ID else
+                      f"Port {STATE.port} is used by another program. Pick another port in the preferences")
+            return True
+        other = _other_backend(health)
+        if other:
             _refuse_backend(other)  # also ends a "ready" left over from the server it replaced
-        elif code == 200 and health.get("server") == SERVER_ID:
-            _apply_health(health)
-            if health.get("status") == "loading":
+            return True
+        mine = health.get("parent_pid") == os.getpid()
+        if STATE.detached and not mine:
+            return True  # Detach lasts until Start Model, or until that server goes
+        STATE.health = health
+        if not mine:
+            _adopt_token()  # shared through its token file (§10.5)
+        if not STATE.token:  # its token file can't be read: nothing may be sent to it
+            _refused_by(health.get("pid"))
+            return True
+        if STATE.refused is not None and health.get("pid") == STATE.refused:  # still the server that refused
+            STATE.set("error", STATE.conflict)
+            return True
+        STATE.refused = None
+        state = health.get("status")
+        if state == "ready":
+            STATE.set("ready", f"{health.get('source', '')} on {health.get('device') or 'unknown device'}")
+        elif state == "error":
+            STATE.set("error", health.get("error") or "The model failed to load")
+        elif state == "loading":
+            STATE.set("starting", "Loading the model...")
+            if not poller:
                 _start_polling(None)
-        elif health.get("server") != LEGACY_SERVER_ID and status() in (
-                ("error", LEGACY_SERVER_MESSAGE), ("error", STATE.conflict)):
-            STATE.set("stopped", "")  # the refused server has gone, or the port changed: auto-start may retry
-
-    executor().submit(probe)
-
-
-def _apply_health(health):
-    STATE.health = health
-    _adopt_token()  # another Blender's server is shared through its token file (§10.5)
-    if STATE.refused is not None and health.get("pid") == STATE.refused:  # still the server that refused the token
-        STATE.set("error", STATE.conflict)
-        return
-    STATE.refused = None
-    state = health.get("status")
-    if state == "ready":
-        STATE.set("ready", f"{health.get('source', '')} on {health.get('device') or 'unknown device'}")
-    elif state == "loading":
-        STATE.set("starting", "Loading the model...")
-    elif state == "error":
-        STATE.set("error", health.get("error") or "The model failed to load")
+        return state in ("ready", "error")
 
 
 def start(prefs=None):
@@ -554,7 +606,9 @@ def start(prefs=None):
         return True
     if _reap():
         return False
-    STATE.detached = False
+    with STATE.lock:
+        STATE.detached = False
+        STATE.epoch += 1  # what probes found before this start says nothing about it
     STATE.port = prefs.port
     root = P.runtime_root(prefs)
     STATE.folder = state_dir(root)
@@ -610,67 +664,52 @@ def start(prefs=None):
 
 def _attach():
     """Use what answers /health on the port: an OpenAct server with this session's backend (another Blender's is shared
-    through its token file, §10.5), else an error that names what holds the port. None when nothing listens, else what
-    start() returns. Main thread only."""
-    try:
-        code, health = http("GET", "/health", timeout=0.5)
-    except Exception:
+    through its token file, §10.5), else an error that names what holds the port. None when nothing answers in time,
+    else what start() returns. Main thread only."""
+    outcome, health = _probe_port(STATE.port, timeout=0.5)  # a refusal takes 2 s on Windows: the bind decides then
+    if outcome != ANSWERED:
         return None
-    if code == 200 and health.get("server") == SERVER_ID:
-        other = _other_backend(health)
-        if other:
-            _refuse_backend(other)
-            return False
-        _apply_health(health)
-        if health.get("status") == "loading":
-            _start_polling(None)
-        return True
-    if code == 200 and health.get("server") == LEGACY_SERVER_ID:
-        STATE.set("error", LEGACY_SERVER_MESSAGE)
-    else:
-        STATE.set("error", f"Port {STATE.port} is used by another program. Pick another port in the preferences")
-    return False
+    _observe(outcome, health, STATE.epoch)
+    return health.get("server") == SERVER_ID and not _other_backend(health)
 
 
 def _lost_port():
     """The server this Blender started couldn't bind its port: one started meanwhile, e.g. by another Blender at the
-    same moment, holds it. Attach to that one at once; if nothing listens, the port can't be used. Main thread only."""
+    same moment, holds it. Attach to that one at once; if nothing answers, the port can't be used. Main thread only."""
     _reap()
-    if STATE.poll_thread is not None:
-        STATE.poll_thread.join(1.0)  # it posted this and ends: an attach to a loading server polls anew
     if STATE.status == "starting" and _attach() is None:  # else a health probe attached meanwhile
         STATE.set("error", "The model server exited: " + _log_tail())
 
 
 def _start_polling(process):
-    if STATE.poll_thread and STATE.poll_thread.is_alive():
-        return
-    port = STATE.port
+    """Follow a start until the server is ready or has failed, gone or been left: process, the server this Blender
+    started, else None for another Blender's that loads (§10.5). It ends once a newer poller, start or Stop Model
+    changes the epoch. Any thread."""
+    with STATE.lock:
+        STATE.epoch += 1
+        epoch, port = STATE.epoch, STATE.port
 
     def poll():
         deadline = time.time() + 600
-        while time.time() < deadline:
+        while time.time() < deadline and epoch == STATE.epoch:
             if process is not None and process.poll() is not None:
-                if process.poll() == PORT_TAKEN:
-                    post(_lost_port)
-                else:
-                    STATE.set("error", "The model server exited: " + _log_tail())
-                    post(_reap)
+                with STATE.lock:
+                    if epoch != STATE.epoch or process is not STATE.process:
+                        return  # Stop Model released it: its exit is no crash (§17.6)
+                    if process.poll() == PORT_TAKEN:
+                        post(_lost_port)
+                    else:
+                        STATE.set("error", "The model server exited: " + _log_tail())
+                        post(_reap)
                 return
-            try:
-                code, health = http("GET", "/health", port=port, timeout=1.0)
-                if STATE.detached:  # Detach lasts until Start Model (§10.5), also past the load of the server it left
-                    return
-                if code == 200:
-                    _apply_health(health)
-                    if health.get("status") in ("ready", "error"):
-                        if health.get("status") == "ready":
-                            post(_became_ready)
-                        return
-            except Exception:
-                pass
+            if _observe(*_probe_port(port), epoch, poller=True):
+                if STATE.status == "ready":
+                    post(_became_ready)
+                return
             time.sleep(0.5)
-        STATE.set("error", "The model server did not become ready in 10 minutes")
+        with STATE.lock:
+            if epoch == STATE.epoch:
+                STATE.set("error", "The model server did not become ready in 10 minutes")
 
     STATE.poll_thread = threading.Thread(target=poll, name="openact-poll", daemon=True)
     STATE.poll_thread.start()
@@ -699,10 +738,10 @@ def _log_tail(lines=6):
 
 
 def _reap():
-    """Forget the server this Blender started once it has exited. An exit that is neither a /shutdown's (0) nor a port
-    another server holds (PORT_TAKEN) counts: the CRASH_EXITS-th within CRASH_WINDOW seconds pauses auto-start
-    (§17.6), as the status becomes an error, which auto-start leaves alone, until Start Model. True when it paused.
-    Main thread only."""
+    """Forget the server this Blender started once it has exited (one Stop Model ended never comes here: stop() releases
+    it first). An exit that is neither clean (0) nor a port another server holds (PORT_TAKEN) counts: the CRASH_EXITS-th
+    within CRASH_WINDOW seconds pauses auto-start (§17.6), as the status becomes an error, which auto-start leaves
+    alone, until Start Model. True when it paused. Main thread only."""
     process = STATE.process
     code = process.poll() if process is not None else None
     if code is None:
@@ -722,22 +761,25 @@ def _reap():
 def stop():
     """Stop the server this Blender started (/shutdown needs its token: one that refuses keeps running, which the status
     then says). Another Blender's server is never shut down from here (§10.5): this Blender only stops using it, and
-    forgets its token until it attaches again; one whose token it can't read keeps its error."""
-    own = STATE.process is not None and STATE.process.poll() is None
-    shared = attached()
-    if shared or not (own or STATE.token):  # another Blender's server, or nothing of this Blender's to shut down
-        if STATE.refused is None:  # stays detached until Start Model, or until that server goes
-            STATE.health, STATE.token, STATE.detached = {}, "", shared
-            pipeline.cancel_all()  # queued chunks would go out without a token
-            STATE.set("stopped", "")
-        if not own:
-            return
+    forgets its token until it attaches again; one whose token it can't read keeps its error. The process is released
+    first, and the start poller ends: the exit this asks for is never reported as a crash (§17.6). Main thread only."""
+    with STATE.lock:
+        process, shared = STATE.process, attached()
+        own = process is not None and process.poll() is None
+        STATE.process = None
+        STATE.epoch += 1
+        if shared or not (own or STATE.token):  # another Blender's server, or nothing of this Blender's to shut down
+            if STATE.refused is None:  # stays detached until Start Model, or until that server goes
+                STATE.health, STATE.token, STATE.detached = {}, "", shared
+                pipeline.cancel_all()  # queued chunks would go out without a token
+                STATE.set("stopped", "")
+            if not own:
+                return
     try:  # a process of this Blender's while another's server answers lost the port: it is only ended
         code = 0 if shared else http("POST", "/shutdown", body={}, timeout=2.0)[0]
     except Exception:
         code = 0
-    process = STATE.process
-    if process is not None:
+    if own:
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -746,12 +788,12 @@ def stop():
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-        STATE.process = None
     elif code == 403:
         _refused_by(STATE.health.get("pid"))
         return
-    STATE.health = {}
-    STATE.set("stopped", "")
+    with STATE.lock:
+        STATE.health = {}
+        STATE.set("stopped", "")
 
 
 def shutdown_owned():
