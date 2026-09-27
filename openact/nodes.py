@@ -5,14 +5,12 @@ from __future__ import annotations
 
 import bpy
 
-from . import engine, inner, sources
+from . import engine, inner, sources, ui
 from . import prefs as P
 from .specs import dials
 from .specs.classify import ClassifySpec
 from .specs.match import MatchSpec
 from .specs.rules import RulesSpec
-
-PREVIEW_ROWS = 8  # per-item rows the sidebar lists
 
 
 def _changed(self, context):
@@ -73,31 +71,34 @@ class _OpenActNode:
         engine.schedule(node=self)
 
     def draw_status(self, layout, full=False):
-        icon, text = engine.STATUS.get(self.uid, ('SORTTIME', "Waiting..."))
-        if full and len(text) > 48:
-            col = layout.column(align=True)
-            words, line = text.split(), ""
-            first = True
-            for word in words:
-                if len(line) + len(word) > 44:
-                    col.label(text=line, icon=icon if first else 'BLANK1')
-                    first, line = False, ""
-                line = f"{line} {word}".strip()
-            col.label(text=line, icon=icon if first else 'BLANK1')
-        else:
-            layout.label(text=text, icon=icon)
-
-    def draw_answers(self, layout):
-        rows = engine.answers_for(self)
-        spec = engine.SPECS[self.bl_idname]
-        if not rows:
+        """One line on the node; with full, the whole status record (§17.1)."""
+        status = engine.STATUS.get(self.uid)
+        if not full:
+            layout.label(text=status.text if status else "Waiting...", icon=status.icon if status else 'SORTTIME')
             return
+        col = layout.column(align=True)
+        for icon, text in ui.status_rows(status):
+            ui.wrap(col, text, icon=icon)
+
+    def draw_answers(self, layout, uses, selected):
+        """One summary per context; with several, each one a button that shows its table."""
+        spec = engine.SPECS[self.bl_idname]
+        sent = getattr(engine.STATUS.get(self.uid), "asking", frozenset())  # the cells the last pass asks the model
         box = layout.box()
-        for label, answer in rows:
+        for i, (label, job, answer) in enumerate(uses):
             col = box.column(align=True)
-            col.label(text=label, icon='MODIFIER' if not label.startswith("(") else 'NODETREE')
-            if answer is None:
-                col.label(text="Asking...", icon='SORTTIME')
+            icon = 'MODIFIER' if not label.startswith("(") else 'NODETREE'
+            if len(uses) > 1:
+                op = col.operator("openact.table_view", text=label, icon=icon, depress=i == selected)
+                op.context_index, op.page = i, 0
+            else:
+                col.label(text=label, icon=icon)
+            # no table, or a table so far with no answer yet (a Pick's Index is -1): "Asking..." while the pass asks one
+            # of its cells, else it waits, disagrees or failed
+            if answer is None or ("p" in answer.rows.src and not {"m", "s"} & set(answer.rows.src)):
+                asking = bool(sent) and any(row.cell is not None and row.cell.key in sent for row in job.rows)
+                col.label(text="Asking..." if asking else "Not asked: see the status above",
+                          icon='SORTTIME' if asking else 'INFO')
                 continue
             col.label(text=spec.summary(answer), icon='CHECKMARK')
             if engine.older_settings(self, answer):
@@ -108,14 +109,6 @@ class _OpenActNode:
                     row = col.row()
                     row.label(text=name, icon='BLANK1')
                     row.label(text=f"{probability * 100:.1f}%")
-            elif hasattr(spec, "preview"):  # Match and Classify: every output is per element
-                preview = spec.preview(answer)
-                for name, text in preview[:PREVIEW_ROWS]:
-                    row = col.row()
-                    row.label(text=name, icon='BLANK1')
-                    row.label(text=text)
-                if len(preview) > PREVIEW_ROWS:
-                    col.label(text=f"... {len(preview) - PREVIEW_ROWS} more", icon='BLANK1')
             elif "Confidence" in answer.single:
                 col.label(text=f"Confidence {answer.single['Confidence']:.2f}", icon='BLANK1')
 
@@ -129,11 +122,16 @@ class _OpenActNode:
     def draw_buttons_ext(self, context, layout):
         self.draw_settings(layout)
         self.draw_status(layout, full=True)
-        self.draw_answers(layout)
+        uses = engine.answers_for(self)
+        selected = min(context.window_manager.openact_context, len(uses) - 1) if uses else 0
+        if uses:
+            self.draw_answers(layout, uses, selected)
+            ui.draw_table(layout, context, self, uses, selected)
         row = layout.row()
         row.enabled = self.id_data.library is None  # a linked node's answers come from its library file
         row.operator("openact.reask", icon='FILE_REFRESH').uid = self.uid
-        row.operator("openact.write_overrides", icon='EXPORT').uid = self.uid
+        op = row.operator("openact.write_overrides", icon='EXPORT')
+        op.uid, op.context_index = self.uid, selected
 
 
 class GeometryNodeOpenActAsk(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
@@ -221,12 +219,6 @@ class GeometryNodeOpenActDials(_OpenActNode, bpy.types.GeometryNodeCustomGroup):
 
     bl_idname = dials.DialsSpec.idname
     bl_label = "Dials"
-
-    def draw_status(self, layout, full=False):
-        super().draw_status(layout, full)
-        warning = dials.WARNINGS.get(self.uid)
-        if warning:
-            layout.label(text=warning, icon='ERROR')
 
 
 class GeometryNodeOpenActRules(_OpenActNode, bpy.types.GeometryNodeCustomGroup):

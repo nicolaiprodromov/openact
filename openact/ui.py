@@ -1,11 +1,23 @@
-"""Sidebar panel (Geometry Node editor > N > OpenAct) and the preferences panel."""
+"""The sidebar (Geometry Node editor > N > OpenAct) and the preferences panel (§17.2): banners, the Model box, the
+active node's status, contexts and table, and the files it reads. Inspection only: every change goes through a file,
+a socket or an operator.
+
+status_rows(), table_rows(), table_page() and banners() are plain data, so the tests check them without drawing.
+Drawing plans and writes nothing: Blender refuses changes to nodes and data while it draws.
+"""
 
 from __future__ import annotations
 
+import functools
+import os
+import time
+
 import bpy
 
-from . import engine, server
+from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
 from . import prefs as P
+from .specs.base import UNSURE_BELOW, table_of
+from .watch import WATCH
 
 _ICONS = {
     "ready": 'CHECKMARK',
@@ -25,9 +37,18 @@ _TITLES = {
     "error": "Error",
     "unknown": "Checking...",
 }
+PAGE_ROWS = 50  # table rows per page
+FILE_PROBLEMS = 50  # problems listed per file
+ROW_ICONS = {"lock": 'LOCKED', "code": 'CHECKBOX_HLT', "error": 'CANCEL'}
+PROBLEM_ICONS = {csvfmt.ERROR: 'CANCEL', csvfmt.WARNING: 'ERROR', csvfmt.INFO: 'INFO'}
+SERVER_BANNERS = ("install", "runtime", "port")  # shown in the Model box, above its buttons
+IMPORT_CSV_NOTE = ("Import CSV '{}' reads the same file; Blender won't re-read it after edits in this session. Use "
+                   "this node's payload outputs, or restart Blender")
+LEGACY = []  # callables giving the old Jev nodes banner as (text, operator idname), or None (§12.3)
+EMPTY_SLOT = "(empty slot)"  # a row without a name: an empty material slot, never offered
 
 
-def _wrap(layout, text, width=46, icon='NONE'):
+def wrap(layout, text, width=46, icon='NONE'):
     col = layout.column(align=True)
     line, first = "", True
     for word in text.split():
@@ -39,28 +60,199 @@ def _wrap(layout, text, width=46, icon='NONE'):
         col.label(text=line, icon=icon if first else 'BLANK1')
 
 
-def draw_server(layout):
+# ---------------------------------------------------------------------------------------------- data
+
+def status_rows(status) -> list[tuple[str, str]]:
+    """(icon, text) lines of a node's status record (§17.1): the status line (its ETA included), the row counts, then
+    every other problem, errors first."""
+    if status is None:
+        return [('SORTTIME', "Waiting...")]
+    rows = [(status.icon, status.text)]
+    if status.rows:
+        counts = ", ".join(f"{n} {name}" for name, n in (
+            ("answered", status.answered), ("pending", status.pending), ("stale", status.stale),
+            ("unsure", status.unsure), ("locked", status.locked), ("by code", status.code),
+            ("in error", status.errors)) if n)
+        total = f"{status.rows} row{'s' if status.rows != 1 else ''}"
+        rows.append(('BLANK1', f"{total}: {counts}" if counts else total))
+    return rows + [(PROBLEM_ICONS.get(problem.severity, 'INFO'), problem.message) for problem in status.problems
+                   if problem.message != status.text]  # an error's line is its first problem
+
+
+def table_rows(spec, job, entry=None) -> list[tuple]:
+    """(name, answer, confidence or None, source) of each row of a context's table: from the entry it shows once it is
+    answered, else from its plan, whose pending rows have no answer yet. An empty material slot has neither."""
+    rows = []
+    for i, (source, values) in enumerate(table_of(job, entry)):
+        name = job.rows[i].name
+        if not name:  # never offered, so nothing was decided
+            rows.append((EMPTY_SLOT, "", None, source))
+            continue
+        if not values or source == "error":
+            answer = ""
+        elif "prob" in values:  # Pick: how well each item fits
+            answer = f"{values['prob'] * 100:.0f}%"
+        else:
+            answer = spec.answer_text(job, i, values)  # as the Overrides CSV writes it
+        rows.append((name, answer, values.get("c"), source))
+    return rows
+
+
+def table_page(rows, page=0):
+    """One page of a table view (§17.2): (lines, page, pages), page clamped to the table. rows: table_rows(); lines:
+    (name, answer, confidence, icon, active) of up to PAGE_ROWS rows. The icon tells a lock, a code row, a row in error
+    and an unsure model row (confidence below UNSURE_BELOW); stale and pending rows are not active (greyed out)."""
+    pages = max(1, -(-len(rows) // PAGE_ROWS))
+    page = min(max(page, 0), pages - 1)
+    lines = []
+    for name, answer, confidence, source in rows[page * PAGE_ROWS:(page + 1) * PAGE_ROWS]:
+        unsure = source == "model" and confidence is not None and confidence < UNSURE_BELOW
+        icon = ROW_ICONS.get(source, 'QUESTION' if unsure else 'BLANK1')
+        lines.append((name, answer, confidence, icon, source not in ("stale", "pending")))
+    return lines, page, pages
+
+
+def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(), over=()) -> list[tuple]:
+    """The sidebar's banners (§17.2), most urgent first: (kind, icon, text, operator idnames of its buttons). Plain
+    data: live_banners() passes the live state. state, message: server.status(); probe: the runtime probe's failure;
+    blocked: how many reads of this untrusted file were blocked; addons: the enabled add-on modules; notes: Import CSV
+    notes; legacy: the old Jev nodes banners as (text, operator idname); over: the over-cap errors."""
+    found = []
+    if state == "not_installed":
+        found.append(("install", 'ERROR', "Model not installed: Install Model downloads it once (about 12 GB); Locate "
+                      "Existing Runtime uses one already on this computer",
+                      ("openact.install_runtime", "openact.locate_runtime")))
+    elif probe:
+        found.append(("runtime", 'ERROR', probe, ("openact.locate_runtime",)))
+    elif message == server.CHECKING:
+        found.append(("runtime", 'SORTTIME', message, ("openact.locate_runtime",)))
+    elif state == "error" and (message == server.LEGACY_SERVER_MESSAGE or message.startswith("Port ")):
+        found.append(("port", 'ERROR', message, ()))
+    if blocked:
+        found.append(("trust", 'ERROR', f"This file is not trusted, so {blocked} read{'s' if blocked > 1 else ''} "
+                      f"outside its folder {'were' if blocked > 1 else 'was'} blocked",
+                      ("openact.allow_file", "openact.trust_folder")))
+    if any(name == "jev_nodes" or name.endswith(".jev_nodes") for name in addons):
+        found.append(("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ()))
+    found += [("legacy", 'INFO', text, (idname,)) for text, idname in legacy]
+    found += [("over_cap", 'CANCEL', text, ()) for text in over]
+    found += [("import_csv", 'INFO', text, ()) for text in notes]
+    return found
+
+
+def import_csv_notes() -> dict:
+    """§7.1: csvfmt.identity() -> note, for each file an OpenAct node reads that one of the artist's own Import CSV
+    nodes reads too. Blender keeps its first read of a path for the session, so after an edit that node shows old
+    rows. Worked out once per pass, when drawn."""
+    return _import_csv_notes(engine.passes)
+
+
+@functools.lru_cache(maxsize=1)  # keyed by the pass
+def _import_csv_notes(_pass):
+    notes, uses = {}, None
+    if not WATCH.files:
+        return notes
+    for tree in bpy.data.node_groups:
+        if tree.bl_idname != 'GeometryNodeTree' or tree.name.startswith(inner.INNER_PREFIX):
+            continue
+        for node in tree.nodes:
+            if node.bl_idname != evaluator.IMPORT_CSV or node.mute or all(
+                    link.is_muted or link.to_node.bl_idname in engine.OPENACT_TYPES
+                    for out in node.outputs for link in out.links):
+                continue  # unused, or only plugged into OpenAct nodes, which read its Path and never evaluate it
+            uses = evaluator.find_uses() if uses is None else uses
+            path = next(s for s in node.inputs if s.identifier == "Path")
+            for ctx in uses.get(tree.as_pointer()) or [evaluator.Ctx(None, None, (), tree)]:
+                try:
+                    text = evaluator.as_text(evaluator.eval_input(path, ctx))
+                    ident = csvfmt.identity(lists.resolve_path(text, node))
+                except Exception:  # noqa: BLE001 - a Path that can't be read here gets no note
+                    continue
+                if ident in WATCH.files:
+                    notes.setdefault(ident, IMPORT_CSV_NOTE.format(node.name))
+    return notes
+
+
+def live_banners(context) -> list[tuple]:
+    """banners() for this session: the server and the runtime probe, this file's trust, the add-ons, the nodes."""
+    state, message = server.status()
+    records = list(engine.STATUS.values())
+    # from BLOCKED on: a node that reads a blocked node's answer repeats its read behind a breadcrumb
+    blocked = {problem.message[problem.message.index(trust.BLOCKED):] for status in records
+               for problem in status.problems if trust.BLOCKED in problem.message}
+    if blocked and trust.is_trusted():  # allowed since the pass; asked only then, as it resolves paths
+        blocked = set()
+    over = []
+    if any(status.contexts > inner.MATERIALISED_MAX for status in records):
+        over = [f"{node.name}: {engine.OVER_CAP.format(status.contexts, inner.MATERIALISED_MAX)}"
+                for _tree, node in engine.iter_nodes()
+                if (status := engine.STATUS.get(node.uid)) and status.contexts > inner.MATERIALISED_MAX]
+    notes = [f"{os.path.basename(WATCH.files[ident].path)}: {note}" for ident, note in import_csv_notes().items()
+             if ident in WATCH.files]
+    legacy = [found for hook in LEGACY if (found := hook()) is not None]
+    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", len(blocked),
+                   context.preferences.addons.keys(), notes, legacy, over)
+
+
+# ------------------------------------------------------------------------------------------ drawing
+
+def draw_banner(layout, banner):
+    _kind, icon, text, actions = banner
+    col = layout.column(align=True)
+    col.alert = icon in ('ERROR', 'CANCEL')
+    wrap(col, text, icon=icon)
+    if actions:
+        row = layout.row(align=True)
+        for idname in actions:
+            row.operator(idname)
+
+
+def draw_server(layout, banner=None):
+    """The Model box: the server's status, or the banner about it, its details, and Install / Start / Stop."""
     state, message = server.status()
     box = layout.box()
-    box.label(text=_TITLES.get(state, state), icon=_ICONS.get(state, 'QUESTION'))
-    if message:
-        _wrap(box, message, icon='BLANK1')
+    if banner is not None:
+        draw_banner(box, banner)
+    else:
+        box.label(text=_TITLES.get(state, state), icon=_ICONS.get(state, 'QUESTION'))
+        if message:
+            wrap(box, message, icon='BLANK1')
+    if server.STATE.install_warning and server.STATE.install_warning not in message:  # "Runtime installed. <it>"
+        wrap(box, server.STATE.install_warning, icon='ERROR')
+    health = server.STATE.health
+    if state == "ready" and health:
+        col = box.column(align=True)
+        wrap(col, " · ".join(str(health[key]) for key in ("backend", "device", "model_id") if health.get(key)),
+             icon='BLANK1')
+        if health.get("load_seconds") is not None:
+            col.label(text=f"Loaded in {health['load_seconds']:.1f} s", icon='BLANK1')
+        per_class, flight = pipeline.queue_counts()
+        col.label(text="Queue: {}/{}/{} chunks (P0/P1/P2)".format(*per_class), icon='BLANK1')
+        col.label(text=f"In flight: {flight} cells", icon='BLANK1')
+        throughput = [f"{health['ms_per_row']:.1f} ms per row"] if health.get("ms_per_row") is not None else []
+        if health.get("questions"):
+            throughput.append(f"cache hits {health.get('cache_hits', 0) / health['questions']:.0%}")
+        if throughput:
+            col.label(text=" · ".join(throughput), icon='BLANK1')
     row = box.row(align=True)
-    installed = state not in ("not_installed", "error") or P.runtime_installed(P.runtime_root())
     if state == "installing":
         row.operator("openact.open_log", icon='TEXT')
         return
-    if not installed:
-        row.operator("openact.install_runtime", icon='IMPORT')
-    elif state in ("ready", "starting"):
-        row.operator("openact.server_stop", icon='PAUSE')
-    else:
-        row.operator("openact.server_start", icon='PLAY')
+    if banner is None or banner[0] != "install":  # that banner has the Install button
+        installed = state not in ("not_installed", "error") or P.runtime_installed(P.runtime_root())
+        if not installed:
+            row.operator("openact.install_runtime", icon='IMPORT')
+        elif state in ("ready", "starting"):
+            row.operator("openact.server_stop", icon='PAUSE')
+        else:
+            row.operator("openact.server_start", icon='PLAY')
     row.operator("openact.open_log", text="", icon='TEXT')
 
 
 def draw_preferences(prefs, context, layout):
-    draw_server(layout)
+    state, message = server.status()
+    found = banners(state, message, server.STATE.probes.get(P.runtime_root(prefs)) or "")
+    draw_server(layout, found[0] if found else None)
     col = layout.column()
     col.use_property_split = True
     col.prop(prefs, "auto_start")
@@ -80,6 +272,84 @@ def draw_preferences(prefs, context, layout):
     note.label(text="Qwen3.5-4B by Alibaba Qwen, Apache-2.0. Not affiliated with TypeSafe or Jev", icon='BLANK1')
 
 
+def draw_table(layout, context, node, uses, index):
+    """The table of context `index` (§17.2), PAGE_ROWS rows a page: name, answer, confidence bar, source icon, and
+    Show Question."""
+    label, job, entry = uses[index]
+    lines, page, pages = table_page(table_rows(engine.SPECS[node.bl_idname], job, entry),
+                                    context.window_manager.openact_page)
+    box = layout.box()
+    head = box.row(align=True)
+    head.label(text=f"Table: {label}" if len(uses) > 1 else "Table", icon='SPREADSHEET')
+    if pages > 1:
+        for target, icon in ((page - 1, 'TRIA_LEFT'), (page + 1, 'TRIA_RIGHT')):
+            button = head.row(align=True)
+            button.enabled = 0 <= target < pages
+            op = button.operator("openact.table_view", text="", icon=icon)
+            op.context_index, op.page = index, min(max(target, 0), pages - 1)
+            if icon == 'TRIA_LEFT':
+                head.label(text=f"{page + 1} / {pages}")
+    for i, (name, answer, confidence, icon, active) in enumerate(lines):
+        row = box.row(align=True)
+        row.active = active
+        split = row.split(factor=0.45, align=True)
+        split.label(text=name, icon=icon)
+        right = split.row(align=True)
+        right.label(text=answer)
+        if confidence is not None:
+            right.progress(factor=min(max(confidence, 0.0), 1.0), type='BAR', text=f"{confidence:.2f}")
+        op = right.operator("openact.show_question", text="", icon='VIEWZOOM')
+        op.uid, op.context_index, op.row = node.uid, index, page * PAGE_ROWS + i
+
+
+def draw_files(layout, node):
+    """The files the node reads (§7.10): path, rows, text and payload columns, when read, the Import CSV note, and up
+    to FILE_PROBLEMS problems, with Open File."""
+    files = sorted(((ident, watched) for ident, watched in WATCH.files.items() if node.uid in watched.owners),
+                   key=lambda item: item[1].path.casefold())
+    if not files:
+        layout.label(text="This node reads no CSV file", icon='INFO')
+        return
+    notes = import_csv_notes()
+    for ident, watched in files:
+        box = layout.box()
+        head = box.row(align=True)
+        head.label(text=os.path.basename(watched.path), icon='CANCEL' if watched.problem else 'FILE')
+        head.operator("openact.open_file", text="", icon='FILEBROWSER').filepath = watched.path
+        col = box.column(align=True)
+        wrap(col, watched.path, icon='BLANK1')
+        doc = watched.doc
+        problems = doc.problems if doc is not None else ()
+        if watched.problem and all(problem.message != watched.problem for problem in problems):  # e.g. missing
+            wrap(col, watched.problem, icon='CANCEL')
+        if doc is not None and doc.stamp != (0, 0):
+            when = time.strftime("%H:%M:%S", time.localtime(watched.read))
+            col.label(text=f"{len(doc.rows)} data row{'s' if len(doc.rows) != 1 else ''} · read {when}", icon='BLANK1')
+            if doc.text_cols:
+                wrap(col, "Text columns: " + ", ".join(doc.text_cols), icon='BLANK1')
+            if doc.num_cols:
+                wrap(col, "Payload columns: " + ", ".join(f"{name} ({kind})" for name, kind in doc.num_cols.items()),
+                     icon='BLANK1')
+        if ident in notes:
+            wrap(col, notes[ident], icon='INFO')
+        for problem in problems[:FILE_PROBLEMS]:
+            text = problem.message
+            if problem.line and not text.startswith("Line "):
+                text = f"Line {problem.line}: {text}"
+            wrap(col, text, icon=PROBLEM_ICONS.get(problem.severity, 'INFO'))
+        if len(problems) > FILE_PROBLEMS:
+            col.label(text=f"... {len(problems) - FILE_PROBLEMS} more problems", icon='BLANK1')
+
+
+# ------------------------------------------------------------------------------------------- panels
+
+def _active(context):
+    """The active node of the edited tree when it is an OpenAct node."""
+    tree = getattr(context.space_data, "edit_tree", None)
+    node = tree.nodes.active if tree is not None else None
+    return node if node is not None and node.bl_idname in engine.OPENACT_TYPES else None
+
+
 class NODE_PT_openact(bpy.types.Panel):
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
@@ -92,27 +362,62 @@ class NODE_PT_openact(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        draw_server(layout)
-        tree = context.space_data.edit_tree
-        node = tree.nodes.active if tree is not None else None
-        if node is not None and node.bl_idname in engine.OPENACT_TYPES:
-            layout.label(text=node.name, icon='NODE')
-            node.draw_buttons_ext(context, layout)
-        else:
+        found = live_banners(context)
+        for banner in found:
+            if banner[0] not in SERVER_BANNERS:
+                draw_banner(layout.box(), banner)
+        draw_server(layout, next((banner for banner in found if banner[0] in SERVER_BANNERS), None))
+        if _active(context) is None:
             col = layout.column(align=True)
             col.label(text="Add nodes with Shift A > OpenAct", icon='INFO')
-            col.label(text="Ask: a question in, a number out", icon='BLANK1')
-            col.label(text="Pick: a prompt and a list in, one item out", icon='BLANK1')
+            col.label(text="Whole situation: Ask, Pick, Dials", icon='BLANK1')
+            col.label(text="Each item: Match, Classify", icon='BLANK1')
+            col.label(text="Each situation: Rules", icon='BLANK1')
 
 
-classes = (NODE_PT_openact,)
+class NODE_PT_openact_node(bpy.types.Panel):
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "OpenAct"
+    bl_label = "Active Node"
+
+    @classmethod
+    def poll(cls, context):
+        return NODE_PT_openact.poll(context) and _active(context) is not None
+
+    def draw(self, context):
+        node = _active(context)
+        self.layout.label(text=node.name, icon='NODE')
+        node.draw_buttons_ext(context, self.layout)
+
+
+class NODE_PT_openact_files(bpy.types.Panel):
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "OpenAct"
+    bl_label = "Files"
+
+    @classmethod
+    def poll(cls, context):
+        return NODE_PT_openact.poll(context) and _active(context) is not None
+
+    def draw(self, context):
+        draw_files(self.layout, _active(context))
+
+
+classes = (NODE_PT_openact, NODE_PT_openact_node, NODE_PT_openact_files)
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    # UI state, not file data: which context's table the sidebar shows, and its page
+    bpy.types.WindowManager.openact_context = bpy.props.IntProperty(name="Context", min=0)
+    bpy.types.WindowManager.openact_page = bpy.props.IntProperty(name="Page", min=0)
 
 
 def unregister():
+    del bpy.types.WindowManager.openact_page
+    del bpy.types.WindowManager.openact_context
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

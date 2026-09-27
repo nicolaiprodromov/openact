@@ -10,8 +10,8 @@
   that keeps the plans;
 - two contexts must agree on their Labels CSVs' payload headers and types, in any order (§6.0): other ones give the
   error, and the outputs, their links and the last good table stay, also while a CSV has an error; while a context
-  has no job (a missing CSV, an item-list error, a Context waiting for a Pick), the outputs and their links stay,
-  and another context's new words are still asked and shown.
+  has no job (a missing CSV, an item-list error, a Context waiting for a Pick, an Import CSV node without a Path, an
+  empty collection), the outputs and their links stay, and another context's new words are still asked and shown.
 With -- --model PORT GPU, also a spot check with the real model on that port and GPU: pan = yes and sofa = no for
 "Would you find it in a kitchen?"; "steel" -> metal and "oak planks" -> wood.
 
@@ -310,9 +310,9 @@ def phase_limits():
          Labels="; ".join(f"label {i}" for i in range(255)), Shift=0)
     with Capture() as capture:
         engine.run_pass()
-    status = engine.STATUS.get(node.uid, ("", ""))
-    check("limits: the node shows the error before anything is sent",
-          not capture.keys(node) and status[0] == 'ERROR' and "8 500" in status[1], status)
+    status = engine.STATUS.get(node.uid)
+    check("limits: the node shows the error before anything is sent", not capture.keys(node)
+          and status is not None and status.icon == 'CANCEL' and "8 500" in status.text, status)
 
     def costs(count, debias, n=3):
         return [row.cell.cost for row in CLASSIFY.job(gn, items[:n], labels_of(count), debias).rows]
@@ -362,8 +362,9 @@ def phase_pass_classify():
               and stored[0].shape["payload"] == [["roughness", "FLOAT"], ["metallic", "INT"]]
               and stored[0].shape["labels"] == ["metal", "wood", "stone", "fabric"],
               stored and (stored[0].rows.payload, stored[0].shape))
-        check("pass: the status summarises the table", engine.STATUS.get(node.uid) == (
-            'CHECKMARK', "4 items · 4 labels used · 0 unsure"), engine.STATUS.get(node.uid))
+        status = engine.STATUS[node.uid]
+        check("pass: the status summarises the table", (status.icon, status.text) == (
+            'CHECKMARK', "4 items · 4 labels used · 0 unsure"), status)
         words_key = stored[0].words_key
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
@@ -380,10 +381,11 @@ def phase_pass_classify():
             handle.write(text.replace("0.35", "0.355").replace("\nfabric,", "\n\nfabric,"))
         with Capture() as capture:
             engine.run_pass()
-        icon, status = engine.STATUS.get(node.uid, ("", ""))
-        check("pass: a Labels CSV warning (a blank line) shows before the summary, and asks nothing",
-              icon == 'ERROR' and status.startswith("families.csv: Line 5 is blank")
-              and status.endswith("(4 items · 4 labels used · 0 unsure)") and not capture.keys(node), (icon, status))
+        icon, status = engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text
+        check("pass: a Labels CSV warning (a blank line) shows after the summary, and asks nothing",
+              icon == 'ERROR' and status.startswith("4 items · 4 labels used · 0 unsure · 1 warning: families.csv: "
+                                                    "Line 5 is blank") and not capture.keys(node),
+              (icon, status))
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -396,8 +398,8 @@ def rewire(tree, node, outputs):
 
 
 def phase_draw_classify():
-    """The sidebar plans too (answers_for()), from a draw: that may never write the node. The pass syncs the payload
-    outputs on its next visit, whether it plans then or the draw already did."""
+    """The sidebar reads answers_for() from a draw, which may never write the node: it plans nothing and reads the last
+    pass's record. The pass syncs the payload outputs on its next visit, whether it plans then or reuses a plan."""
     folder = tempfile.mkdtemp(prefix="openact-draw-")
     try:
         path = os.path.join(folder, "families.csv")
@@ -420,7 +422,7 @@ def phase_draw_classify():
               got[0] == "ok" and face(node) == before, (got[0], face(node)[0]))
         with Capture():
             engine.run_pass()
-        check("draw: the next pass adds the payload outputs, with the plan the draw made",
+        check("draw: the next pass plans and adds the payload outputs",
               face(node)[0][2:] == [("roughness", 'NodeSocketFloat', "The Labels CSV's 'roughness' of the chosen label"),
                                     ("metallic", 'NodeSocketInt', "The Labels CSV's 'metallic' of the chosen label")],
               face(node)[0])
@@ -436,7 +438,7 @@ def phase_draw_classify():
         before = face(node)
         got = drawn(lambda: engine.answers_for(node))
         check("draw: after a Labels CSV header rename, a draw shows the answers and leaves the outputs, their links "
-              "and the group as they were", got[0] == "ok" and got[1] and got[1][0][1] is not None
+              "and the group as they were", got[0] == "ok" and got[1] and got[1][0][2] is not None
               and face(node) == before, (got[0], face(node)[:2]))
         with Capture() as capture:
             engine.run_pass()
@@ -482,8 +484,8 @@ def phase_agree_classify():
     share them with other values each show their own. Other headers or types give the error naming both contexts,
     and nothing is asked, stored or rebuilt: the outputs, the links to them and the last good table stay, also while
     either CSV has an error (§7.8). A context without a job (a CSV with errors, an item-list error, a Context that
-    waits for a Pick) keeps the outputs and their links as they are, and another context's new words that fit them
-    are still asked and shown."""
+    waits for a Pick, a hint that leaves its words: an Import CSV node without a Path, an empty collection) keeps the
+    outputs and their links as they are, and another context's new words that fit them are still asked and shown."""
     folder = tempfile.mkdtemp(prefix="openact-agree-")
     try:
         with open(FAMILIES, encoding="utf-8") as handle:
@@ -540,7 +542,8 @@ def phase_agree_classify():
                                                "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0]},
                                               {"Label": [0, 1, 2, 3, -1, -1], "metallic": [1, 0, 0, 0, 0, 0],
                                                "roughness": [0.4, 0.6, 0.8, 0.9, 0.0, 0.0]}]
-              and engine.STATUS.get(node.uid) == ('CHECKMARK', summary), (before, engine.STATUS.get(node.uid)))
+              and (engine.STATUS[node.uid].icon, engine.STATUS[node.uid].text) == ('CHECKMARK', summary),
+              (before, engine.STATUS.get(node.uid)))
         first, second = (CLASSIFY.gn(node, ctx)[3] for ctx in uses)  # first-wins would follow the first's CSV
         stored, shown = [(entry.gn, entry.words_key) for entry in S.load(node).entries], face(node)
 
@@ -551,18 +554,20 @@ def phase_agree_classify():
             with Capture() as capture:
                 engine.run_pass()
             kept = [(entry.gn, entry.words_key) for entry in S.load(node).entries] == stored and face(node) == shown
-            return engine.STATUS.get(node.uid), len(capture.keys(node)), kept, [read(obj, names) for obj in objs]
+            status = engine.STATUS.get(node.uid)
+            return ((status.icon, status.text) if status else None, len(capture.keys(node)), kept,
+                    [read(obj, names) for obj in objs])
 
         def edited(path, body):
             """Write a context's CSV and run a pass: after()."""
             return after(lambda: write(path, body))
 
         def broken(path):
-            return ('ERROR', f"{os.path.basename(path)}: Two columns are named 'Answer'"), 0, True, before
+            return ('CANCEL', f"{os.path.basename(path)}: Two columns are named 'Answer'"), 0, True, before
 
         labels = [ctx.label() for ctx in uses]
         conflict = "Classify: '{}' and '{}' use Labels CSVs with different payload columns ({})".format
-        headers = (('ERROR', conflict(*labels, "'hardness' (INT) vs 'roughness' (FLOAT), 'metallic' (INT)")), 0, True,
+        headers = (('CANCEL', conflict(*labels, "'hardness' (INT) vs 'roughness' (FLOAT), 'metallic' (INT)")), 0, True,
                    before)
         hardness = "answer,when,hardness\n" + "".join(f"{line.rsplit(',', 2)[0]},{value}\n" for line, value
                                                       in zip(text.splitlines()[1:], (9, 3, 7, 1)))
@@ -578,7 +583,7 @@ def phase_agree_classify():
               got == broken(first), got)
         got = edited(first, text.replace("0.35,1", "0.35,1.5"))
         check("agreement: readable again, with a payload column of another type: the error names it",
-              got == (('ERROR', conflict(*labels, "'metallic' (FLOAT) vs 'metallic' (INT)")), 0, True, before), got)
+              got == (('CANCEL', conflict(*labels, "'metallic' (FLOAT) vs 'metallic' (INT)")), 0, True, before), got)
         got = edited(first, bodies[first])
         check("agreement: once both agree again, each object reads its own payload with its links, 0 requests",
               got == (('CHECKMARK', summary), 0, True, before), got)
@@ -592,7 +597,7 @@ def phase_agree_classify():
                    "roughness": [0.4, 0.6, 0.8, 0.9, 0.8, 0.0]}
         check("agreement: while a Labels CSV is missing, another context's new item is asked, and shown once answered; "
               "the outputs keep their links, and the object whose CSV is missing its last table",
-              waited[0] == got[0] == ('ERROR', f"Can't find {os.path.normpath(first)}") and waited[1] == 1
+              waited[0] == got[0] == ('CANCEL', f"Can't find {os.path.normpath(first)}") and waited[1] == 1
               and got[1] == 0 and face(node)[:2] == shown[:2] and got[3] == [before[0], granite], (waited, got))
         got = after(lambda: (write(first, bodies[first]), use(objs[1], Items=items)))
         check("agreement: once the CSV is back, both contexts show their tables again with a checkmark, 0 requests",
@@ -603,7 +608,7 @@ def phase_agree_classify():
         got = after(lambda: use(objs[1], Items="steel, steel, marble, silk")), after(lambda: use(objs[1], Items=items))
         check("agreement: while the context whose columns the outputs show has an item-list error, the outputs, their "
               "links, the entries and the other object's values stay; fixed, the error is back",
-              got[0][:3] == (('ERROR', "Items: Entry 2: 'steel' appears twice"), 0, True)
+              got[0][:3] == (('CANCEL', "Items: Entry 2: 'steel' appears twice"), 0, True)
               and got[0][3][0] == before[0] and got[1] == headers, got)
         got = after(lambda: use(objs[1], Where="Where is it now?"))
         picked(uses[1])
@@ -620,6 +625,84 @@ def phase_agree_classify():
               got[0] == ('CHECKMARK', summary) and got[1] == 0 and got[3] == before and face(node)[1] == shown[1]
               and [s.name for s in node.outputs] == ["Label", "Confidence", "metallic", "roughness"],
               (got, [s.name for s in node.outputs]))
+
+        # A context whose Labels come through an Import CSV node without a Path, or whose collection is empty, shows a
+        # hint that leaves its words, so its last table shows: it holds the outputs as an error does. The helpers
+        # above read each scene below: its node, objs, idents, stored, shown and before
+        def scene_answered(tree_):
+            """Answer both contexts of the scene, and store its outputs: (its entries, face(), what both read)."""
+            for ctx in evaluator.find_uses()[tree_.as_pointer()]:
+                answered(ctx)
+            with Capture():
+                engine.run_pass()
+            store_outputs(tree_, node, {"Label": 'INT', "roughness": 'FLOAT', "metallic": 'INT'})
+            return ([(entry.gn, entry.words_key) for entry in S.load(node).entries], face(node),
+                    [read(obj, names) for obj in objs])
+
+        def hinted(what, hint, drop, back, second, summary_):
+            """drop() gives the first context the hint, the second context's Labels CSV (second) takes other payload
+            columns, back() ends the hint, and that CSV is restored."""
+            with open(second, encoding="utf-8") as handle:
+                body = handle.read()
+            got = after(drop), edited(second, hardness)
+            live = engine.STATUS[node.uid].contexts  # the table the hint leaves showing stays live
+            got += after(back), edited(second, body)
+            error = conflict(*(ctx.label() for ctx in evaluator.find_uses()[node.id_data.as_pointer()]),
+                             "'roughness' (FLOAT), 'metallic' (INT) vs 'hardness' (INT)")
+            check(f"agreement: while the first context's {what} (a hint that leaves its words), the other context's "
+                  "payload columns wait: nothing is asked, stored or rebuilt, the outputs keep their links, both "
+                  "objects their values and both tables stay live, and the status is the hint; back, the error "
+                  "names both",
+                  live == 2 and got == ((('CHECKMARK', summary_), 0, True, before), (('INFO', hint), 0, True, before),
+                                        (('CANCEL', error), 0, True, before),
+                                        (('CHECKMARK', f"{summary_}   +1 more"), 0, True, before)), (live, got))
+
+        paths = [os.path.join(folder, name) for name in ("pa.csv", "pb.csv")]
+        for path, body in zip(paths, bodies.values()):
+            write(path, body)
+        tree, node = make_tree("ClassifyPathless", ClassifySpec.idname, ("Context",))
+        node.inputs["Items"].default_value = items
+        tree.interface.new_socket("LabelsPath", in_out='INPUT', socket_type='NodeSocketString')
+        reader = tree.nodes.new("GeometryNodeImportCSV")
+        tree.links.new(next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput").outputs["LabelsPath"],
+                       reader.inputs["Path"])
+        tree.links.new(reader.outputs[0], node.inputs["Labels CSV"])
+        objs = [user(name, tree, Context=context, LabelsPath=path, Shift=0)
+                for name, context, path in zip(("CPA", "CPB"), ("In a workshop.", "In a studio."), paths)]
+        idents = {i.name: i.identifier for i in tree.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
+        stored, shown, before = scene_answered(tree)
+        hinted("Import CSV node has no Path", "Labels CSV: type a Path on 'Import CSV'",
+               lambda: use(objs[0], LabelsPath=""), lambda: use(objs[0], LabelsPath=paths[0]), paths[1],
+               "4 items · 4 labels used · 0 unsure")
+
+        members = [bpy.data.objects.new(name, None) for name in ("steel", "oak planks", "marble")]
+        kits = [bpy.data.collections.new(f"Kit {side}") for side in "AB"]
+        for kit in kits:
+            for member in members:
+                kit.objects.link(member)
+
+        def empty():
+            for member in members:
+                kits[0].objects.unlink(member)
+
+        def refill():
+            for member in members:
+                kits[0].objects.link(member)
+
+        paths = [os.path.join(folder, name) for name in ("ka.csv", "kb.csv")]
+        for path, body in zip(paths, bodies.values()):
+            write(path, body)
+        tree, node = make_tree("ClassifyKit", ClassifySpec.idname)
+        node.list_source = 'COLLECTION'
+        for name, kind in (("Labels", 'NodeSocketString'), ("Kit", 'NodeSocketCollection')):
+            tree.interface.new_socket(name, in_out='INPUT', socket_type=kind)
+        group_in = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+        tree.links.new(group_in.outputs["Labels"], node.inputs["Labels"])
+        tree.links.new(group_in.outputs["Kit"], node.inputs["Collection"])
+        objs = [user(name, tree, Labels=path, Kit=kit, Shift=0) for name, path, kit in zip(("CKA", "CKB"), paths, kits)]
+        stored, shown, before = scene_answered(tree)
+        hinted("collection is empty", "The collection 'Kit A' is empty", empty, refill, paths[1],
+               "3 items · 3 labels used · 0 unsure")
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -652,8 +735,9 @@ def phase_pass_match():
     check("pass: ID = material index; the empty slot reads the fallbacks and Selection uses Threshold 0.5",
           got == {"Probability": [0.9, 0.0, 0.1, 0.0, 0.0, 0.0], "Selection": [True] + [False] * 5,
                   "Confidence": [0.8, 0.0, 0.8, 0.0, 0.0, 0.0]} and not capture.keys(node), got)
-    check("pass: the status counts the materials only", engine.STATUS.get(node.uid) == (
-        'CHECKMARK', "1 of 2 yes · 0 unsure"), engine.STATUS.get(node.uid))
+    status = engine.STATUS[node.uid]
+    check("pass: the status counts the materials only", (status.icon, status.text) == (
+        'CHECKMARK', "1 of 2 yes · 0 unsure"), status)
 
 
 # ------------------------------------------------------------------------------ the real model
@@ -682,7 +766,7 @@ def phase_model(port, gpu):
     engine.schedule(immediate=True)
     started = time.time()
     finished = drive(engine, lambda: not pipeline.PENDING and all(
-        engine.STATUS.get(n.uid, ("",))[0] == 'CHECKMARK' for n in (match, classify)), timeout=300)
+        getattr(engine.STATUS.get(n.uid), "icon", "") == 'CHECKMARK' for n in (match, classify)), timeout=300)
     for n in (match, classify):
         print(f"  {n.name}: {engine.STATUS.get(n.uid)}", flush=True)
     check("model: both nodes answered", finished, f"{time.time() - started:.1f}s, server {server.status()}")

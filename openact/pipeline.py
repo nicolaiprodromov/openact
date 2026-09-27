@@ -84,6 +84,7 @@ class Job:
     answer_type: str = ""  # 'YES_NO', 'AMOUNT' or 'ONE_OF'
     debias: bool = True  # the node's Balance Option Order: its requests carry it
     problems: tuple[str, ...] = ()  # warnings of a usable plan (e.g. a CSV's), for the node's status
+    errors: tuple[str, ...] = ()  # rows in error in a usable plan (e.g. Rules cells no outcome applies to): an error
     options: tuple = ()  # the answer names rows choose among (Dials: per row), which Overrides answers name (§7.6)
     locks: dict = field(default_factory=dict)  # Overrides lock -> "" when a row uses it, else its orphan warning
 
@@ -348,3 +349,12 @@ def progress(uid: str) -> tuple[int, int, float] | None:
     done, total, rows_done, rows_total = fill
     scored = server.STATE.health.get("ms_per_row") or MS_PER_ROW
     return done, total, scored * (rows_total - rows_done) / (total - done)
+
+
+def queue_counts() -> tuple[list[int], int]:
+    """The queue as the Model box shows it (§17.2): the chunks waiting in each class (P0, P1, P2), and the cells in
+    flight, the pending ones that no queued chunk holds. Main thread only."""
+    with _QUEUED:
+        per_class = [sum(len(chunks) for chunks in jobs) for jobs in QUEUE]
+        queued = {cell.key for jobs in QUEUE for chunks in jobs for chunk in chunks for cell in chunk.cells}
+    return per_class, len(PENDING.keys() - queued)

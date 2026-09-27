@@ -20,6 +20,7 @@ from . import prefs as P
 from .csvfmt import identity as ident
 
 TRUST = {"opened": None}  # the .blend as load_post saw it: "" for a file created in this session; None: not seen
+BLOCKED = "Blocked reading"  # how a blocked read's message starts, which the sidebar's trust banner looks for
 
 
 def _inside(path, folder):
@@ -66,21 +67,25 @@ def blocked(path: str, writing: bool = False) -> str:
     full, folder = os.path.abspath(path), os.path.abspath(os.path.dirname(bpy.data.filepath))
     if _inside(os.path.normcase(full), os.path.normcase(folder)) and _inside(ident(full), ident(folder)):
         return ""
-    doing, verb = ("writing", "write") if writing else ("reading", "read")
-    return f"Blocked {doing} {full}: outside this file's folder. Allow this file (or trust its folder) to {verb} it"
+    doing, verb = ("Blocked writing", "write") if writing else (BLOCKED, "read")
+    return f"{doing} {full}: outside this file's folder. Allow this file (or trust its folder) to {verb} it"
 
 
-def allow(path: str | None = None) -> bool:
-    """Allow this file: trust one .blend, by path. False when it was trusted already."""
+def allow(path: str | None = None, folder: bool = False) -> bool:
+    """Allow this file: trust one .blend, by path. With folder, trust this folder: the .blend's folder and every
+    subfolder. False when it was trusted already."""
     path = os.path.normpath(path or bpy.data.filepath)
+    name = "trusted_folders" if folder else "trusted_files"
+    if folder:
+        path = os.path.dirname(path)
     prefs = P.get_prefs()
-    if any(p and ident(p) == ident(path) for p in _paths(prefs, "trusted_files")):
+    if any(p and ident(p) == ident(path) for p in _paths(prefs, name)):
         return False
-    files = prefs.trusted_files
-    if isinstance(files, list):  # prefs._Defaults: the add-on is not enabled
-        files.append(path)
+    paths = getattr(prefs, name)
+    if isinstance(paths, list):  # prefs._Defaults: the add-on is not enabled
+        paths.append(path)
     else:
-        files.add().path = path
+        paths.add().path = path
         bpy.context.preferences.is_dirty = True  # saved with the other preferences
     return True
 

@@ -146,7 +146,8 @@ def entry_of(node):
 
 
 def status(node):
-    return engine.STATUS.get(node.uid, ("", ""))
+    found = engine.STATUS.get(node.uid)
+    return (found.icon, found.text) if found else ("", "")
 
 
 def match_node(name, items="pan, sofa, kettle", answer_type='YES_NO', answers=""):
@@ -418,7 +419,7 @@ def phase_missing():
     node.inputs["Overrides"].default_value = target
     engine.run_pass()
     check("missing: a typed Overrides path to a file that doesn't exist yet is the node's error",
-          status(node)[0] == 'ERROR' and "Can't find" in status(node)[1], status(node))
+          status(node)[0] == 'CANCEL' and "Can't find" in status(node)[1], status(node))
     got = export(node)
     check("missing: the export creates that file, with the model's answers",
           got == "written" and os.path.isfile(target) and bytes_of(target) == csv_text([HEADER, *MODEL_ROWS]).encode(),
@@ -577,12 +578,21 @@ def phase_contexts():
     sun.modifiers["OpenAct"][overrides] = sun_file  # per object, through Group Input (§7.6 Scope)
     engine.run_pass()
     before = bytes_of(moon_file)
-    got = export(ask, [ctx.obj for ctx in evaluator.find_uses()[tree.as_pointer()]].index(sun))
+    got = export(ask, [ctx.obj for ctx, _job in ops.export_uses(ask)].index(sun))
     check("contexts: a per-object Overrides file that doesn't exist yet is created with its object's row; the other "
           "object's file is left as it was",
           got == "written" and os.path.isfile(sun_file) and bytes_of(sun_file) == csv_text(
               [["question", *HEADER[1:]], ["Is the sun up?", "0.7", "0", "0.7", "0.40", "0", "model"]]).encode()
           and bytes_of(moon_file) == before, (got, os.path.isfile(sun_file) and rows_of(sun_file)))
+    moon.modifiers["OpenAct"][overrides] = os.path.join(TMP, "moon_later.csv")  # Moon's context comes first
+    engine.run_pass()
+    got = ([label for label, _job, _entry in engine.answers_for(ask)],
+           [ctx.label() for ctx, _job in ops.export_uses(ask)], ops.export_context(ask, 0)[1].obj == sun)
+    check("contexts: the contexts that plan come first, in the order the sidebar lists them, so its selection exports "
+          "the context it shows; one whose Overrides CSV is missing follows",
+          got == (["Sun > OpenAct"], ["Sun > OpenAct", "Moon > OpenAct"], True), got)
+    moon.modifiers["OpenAct"][overrides] = moon_file
+    engine.run_pass()
 
 
 # ------------------------------------------------------------------------------ Rules: factor names
@@ -601,7 +611,7 @@ def phase_clash():
     target = os.path.join(TMP, "clash_overrides.csv")
     got = export(rules, 0, target)
     check("rules: a factor named after an Overrides CSV column is an error, so no export writes that column twice",
-          status(rules)[0] == 'ERROR'
+          status(rules)[0] == 'CANCEL'
           and "Line 2: rename factor 'source': it clashes with an Overrides CSV column" in status(rules)[1]
           and got == "Nothing to export: the node has no answered context" and not os.path.exists(target),
           (status(rules), got))

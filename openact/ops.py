@@ -1,5 +1,5 @@
-"""Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; open
-files; trust a .blend's file reads."""
+"""Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; show
+what a row asks; open files; trust a .blend's file reads."""
 
 from __future__ import annotations
 
@@ -11,12 +11,16 @@ import sys
 
 import bpy
 
-from . import csvfmt, engine, lists, server, store, trust
+from . import csvfmt, engine, lists, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
-from .specs.base import SOURCES, UNSURE_BELOW
+from .specs.base import UNSURE_BELOW, stored_rows, table_of
 
 PERMISSION = "Close the file in the other program (e.g. Excel) and try again."
+NEVER_SENT = {"lock": "Locked by the Overrides CSV: never sent to the model",
+              "code": "Decided by code (one option applies): never sent to the model",
+              "error": "No outcome applies to this cell: never sent to the model"}
+NEVER_OFFERED = "An empty material slot: never offered or sent"  # a code row without a name
 
 
 class OverridesError(Exception):
@@ -165,29 +169,178 @@ class OPENACT_OT_allow_file(bpy.types.Operator):
 
     def execute(self, context):
         trust.allow(bpy.data.filepath)
-        engine.schedule(immediate=True)  # the reads that were blocked
+        engine.schedule(immediate=True)  # trust is in every plan's fingerprint: the pass plans blocked reads again
+        return {'FINISHED'}
+
+
+class OPENACT_OT_trust_folder(bpy.types.Operator):
+    bl_idname = "openact.trust_folder"
+    bl_label = "Trust This Folder"
+    bl_description = ("Let every .blend file in this file's folder and its subfolders, now and in the future, read CSV "
+                      "and text files outside its own folder")
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def execute(self, context):
+        trust.allow(bpy.data.filepath, folder=True)
+        engine.schedule(immediate=True)  # as Allow This File: the pass plans blocked reads again
+        return {'FINISHED'}
+
+
+class OPENACT_OT_open_file(bpy.types.Operator):
+    bl_idname = "openact.open_file"
+    bl_label = "Open File"
+    bl_description = "Open this CSV file in the program your system opens CSV files with"
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH', options={'HIDDEN', 'SKIP_SAVE'})
+
+    def execute(self, context):
+        path = os.path.normpath(bpy.path.abspath(self.filepath))
+        if not lists.is_csv_path(path):  # the system would run anything else it can open
+            self.report({'ERROR'}, f"Only CSV files open from here, not {path}")
+            return {'CANCELLED'}
+        if not os.path.isfile(path):
+            self.report({'ERROR'}, f"Can't find {path}")
+            return {'CANCELLED'}
+        _open_path(path)
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------------------------ sidebar inspection (§17.2)
+
+def row_question(node, context=0, row=0) -> dict:
+    """What row `row` of the node's context `context` asks the model, from the plan its last pass cached: its source
+    ("lock", "code" and "error" rows are never sent), the state, question type, instructions, options in the order
+    sent and debias, as sent or as they would be sent now, the cell key, the ask key it was answered with ("" when not
+    answered), and whether that ask key is older than the one it would be answered with now. Asks nothing. Raises
+    ValueError when there is no such row."""
+    uses = engine.answers_for(node)
+    if not 0 <= context < len(uses):
+        raise ValueError("This context has no table yet")
+    _label, job, entry = uses[context]
+    if not 0 <= row < len(job.rows):
+        raise ValueError(f"The table has no row {row + 1}")
+    planned, source = job.rows[row], table_of(job, entry)[row][0]
+    ask = ""
+    if source == "model" and entry is not None:  # the entry row table_of() read: this one, or the one with its wkey
+        ask = (entry.asks[entry.rows.ask[row]] if entry.words_key == job.words_key
+               else next(old.ask for old in stored_rows(entry) if old.wkey == planned.wkey))
+    now, cell = engine.ask_key_now(engine.SPECS[node.bl_idname], job.debias), planned.cell
+    return {"name": planned.name, "source": source, "debias": job.debias, "ask": ask,
+            "older": bool(ask and now and ask != now), "state": cell and cell.state,
+            "type": cell and cell.question["type"], "instructions": cell and cell.question["instructions"],
+            "options": cell and cell.question.get("criteria"), "key": cell and cell.key}
+
+
+def question_text(found) -> str:
+    """row_question() as the Show Question popup writes it: every text exactly as sent, or as it would be sent now for
+    a row not answered yet or answered with older settings."""
+    lines = [f"Row: {found['name'] or ui.EMPTY_SLOT}"]
+    if found["state"] is None:
+        reason = NEVER_SENT.get(found["source"], "Never sent to the model") if found["name"] else NEVER_OFFERED
+        return "\n".join([*lines, reason])
+    lines += [f"State: {found['state']}", f"Question ({found['type']}): {found['instructions']}"]
+    options = found["options"]
+    if options is None:  # a Yes/No question without whens: the server offers these
+        lines.append("Options: Yes. / No.")
+    else:
+        pairs = options.items() if isinstance(options, dict) else enumerate(options)
+        lines += ["Options, in the order sent:", *(f"  {key}: {text}" for key, text in pairs)]
+    lines.append("Balance Option Order: " + ("on (asked in both option orders)" if found["debias"] else "off"))
+    if found["older"]:  # the templates, Balance Option Order or backend changed since it was answered
+        lines.append(f"Answered with older settings (templates, Balance Option Order or backend; ask key "
+                     f"{found['ask'][:12]}): this is what would be sent now. Ask Again re-asks it")
+    elif found["source"] == "error":  # its cell failed, and no pass sends it again
+        lines.append("Asking it failed (see the status): this is what was sent. Ask Again asks it again")
+    else:
+        lines.append(f"Answered with ask key {found['ask'][:12]}" if found["ask"] else
+                     "Not answered yet: this is what would be sent")
+    return "\n".join(lines)
+
+
+class OPENACT_OT_show_question(bpy.types.Operator):
+    bl_idname = "openact.show_question"
+    bl_label = "Show Question"
+    bl_description = "Show exactly what this row asks the model: the state, the question and its options. Asks nothing"
+    bl_options = {'INTERNAL'}
+
+    uid: bpy.props.StringProperty(options={'HIDDEN'})
+    context_index: bpy.props.IntProperty(options={'HIDDEN'})
+    row: bpy.props.IntProperty(options={'HIDDEN'})
+    copy: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    text: bpy.props.StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def question(self):
+        _tree, node = engine.find_node(self.uid)
+        if node is None:
+            raise ValueError("The node is gone")
+        return question_text(row_question(node, self.context_index, self.row))
+
+    def invoke(self, context, event):
+        try:
+            self.text = self.question()
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        return context.window_manager.invoke_popup(self, width=600)
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        for line in self.text.splitlines():
+            ui.wrap(col, line, width=96)
+        row = self.layout.row()
+        row.operator_context = 'EXEC_DEFAULT'
+        op = row.operator(self.bl_idname, text="Copy", icon='COPYDOWN')
+        op.uid, op.context_index, op.row, op.copy = self.uid, self.context_index, self.row, True
+
+    def execute(self, context):
+        try:
+            text = self.question()
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        if self.copy:
+            context.window_manager.clipboard = text
+        self.report({'INFO'}, "Copied the question" if self.copy else text.replace("\n", " | "))
+        return {'FINISHED'}
+
+
+class OPENACT_OT_table_view(bpy.types.Operator):
+    bl_idname = "openact.table_view"
+    bl_label = "Show Table"
+    bl_description = "Show this context's table, or another page of it"
+    bl_options = {'INTERNAL'}  # no undo step: which table shows is UI state
+
+    context_index: bpy.props.IntProperty(min=0, options={'HIDDEN'})
+    page: bpy.props.IntProperty(min=0, options={'HIDDEN'})
+
+    def execute(self, context):
+        wm = context.window_manager
+        wm.openact_context, wm.openact_page = self.context_index, self.page
         return {'FINISHED'}
 
 
 # ----------------------------------------------------------------------------- the Overrides CSV (§7.6)
 
 def export_uses(node):
-    """(ctx, Job) of each context of the node that plans, as the pass plans it. A context whose Overrides CSV can't
-    be applied (missing, with errors or blocked) gets its Job without that file, so the export can create it, or
-    refuse it with its own error."""
+    """(ctx, Job) of each context of the node that plans, as the pass plans it, then of each context whose Overrides
+    CSV alone can't be applied (missing, with errors or blocked), with its Job without that file, so the export can
+    create it, or refuse it with its own error. The first ones are the contexts the sidebar lists, in its order."""
     spec, tree = engine.SPECS[node.bl_idname], node.id_data
-    uses = []
+    uses, unlocked = [], []
     for ctx in find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
         try:
             uses.append((ctx, engine._plan(spec, node, ctx)))
         except (Hint, Unresolvable):  # perhaps its Overrides CSV alone
             try:
-                uses.append((ctx, spec.plan(node, ctx)))
+                unlocked.append((ctx, spec.plan(node, ctx)))
             except (Hint, Pending, Unresolvable):
                 continue
         except Pending:
             continue
-    return uses
+    return uses + unlocked
 
 
 def export_context(node, index=0):
@@ -301,14 +454,9 @@ def merged_rows(spec, answered, doc=None):
         key = csvfmt.lock_key(cells.get(k.casefold(), "") for k in keys)
         if key not in taken or (locked(cells) and not locked(old[taken[key]])):
             taken[key] = i
-    kinds = {src: source for source, src in SOURCES.items()}
     rows, seen, left = [], set(), set(range(len(old)))
     for job, entry in answered:
-        if entry is not None and len(entry.rows.name) == len(job.rows):
-            table = [(kinds.get(entry.rows.src[i], "model"), {column: v[i] for column, v in entry.rows.v.items()})
-                     for i in range(len(job.rows))]
-        else:  # not answered yet: lock and code rows have their values, the others are pending
-            table = [(row.source, dict(row.values)) for row in job.rows]
+        table = table_of(job, entry)
         for unit, indices in spec.override_units(job):
             key = csvfmt.lock_key(unit)
             if key in seen:  # a material in two slots, a question in two contexts: one row locks every use
@@ -440,6 +588,7 @@ class OPENACT_OT_write_overrides(bpy.types.Operator):
 
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
+           OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
            OPENACT_OT_write_overrides)
 
 

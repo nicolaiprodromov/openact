@@ -19,6 +19,7 @@ KEY = ('INPUT', "Key", 'NodeSocketString',
        "Tells apart objects that share every other word, e.g. typed per object on the modifier. Compared, never "
        "sent to the model", "word", True)  # the last word of every node (§6.0), hidden until Ctrl H
 SOURCES = {"lock": "l", "code": "c", "model": "m", "pending": "p", "stale": "s", "error": "e"}  # Row.source -> src
+KINDS = {src: source for source, src in SOURCES.items()}  # src -> Row.source
 OVERRIDES = ("Optional Overrides CSV (.csv path). Rows with lock = 1 replace the model's answer and are never asked. "
              "Write Overrides CSV (sidebar) starts one from the current answers")
 UNSURE_BELOW = 0.30  # 4.e: the exported unsure column
@@ -127,8 +128,8 @@ def orphaned(jobs) -> list[str]:
 
 def stored_rows(entry) -> list[pipeline.Row]:
     """The answered rows of a stored entry: model and code rows (locks come from the Overrides CSV every time)."""
-    rows, kinds = entry.rows, {src: source for source, src in SOURCES.items()}
-    return [pipeline.Row(rows.name[i], wkey, kinds[rows.src[i]], {column: v[i] for column, v in rows.v.items()},
+    rows = entry.rows
+    return [pipeline.Row(rows.name[i], wkey, KINDS[rows.src[i]], {column: v[i] for column, v in rows.v.items()},
                          entry.asks[rows.ask[i]])
             for i, wkey in enumerate(rows.wkey) if wkey and rows.src[i] in "mc"]
 
@@ -136,6 +137,31 @@ def stored_rows(entry) -> list[pipeline.Row]:
 def complete(entry) -> bool:
     """False for a partial table (§5.4): some row is still pending or stale."""
     return not {"p", "s"} & set(entry.rows.src)
+
+
+def table_of(job, entry=None) -> list[tuple[str, dict]]:
+    """(source, values) of each row of a context's table, as the table view, Show Question and the Overrides CSV show
+    it. From the entry it shows: row by row while the entry has the plan's words key, else from the entry's row with
+    the same wkey, as resolve() carries rows. Other rows are the plan's: a pending one has no values yet, and one
+    whose cell failed is in error. A pending row of a table so far has none either: its neutral values aren't an
+    answer."""
+    if entry is not None and entry.words_key == job.words_key:
+        rows = entry.rows
+        return [(KINDS.get(rows.src[i], "model"), {} if rows.src[i] == "p" else {c: v[i] for c, v in rows.v.items()})
+                for i in range(len(job.rows))]
+    carried = {}
+    for row in stored_rows(entry) if entry is not None else ():
+        carried.setdefault(row.wkey, row)
+    table = []
+    for row in job.rows:
+        old = carried.get(row.wkey) if row.source != "lock" else None  # a lock wins over any stored answer
+        if old is not None:
+            table.append((old.source, dict(old.values)))
+        elif row.cell is not None and row.cell.key in pipeline.FAILED:  # not asked again until Ask Again
+            table.append(("error", {}))
+        else:
+            table.append((row.source, dict(row.values)))
+    return table
 
 
 class Spec:
@@ -393,6 +419,10 @@ class Spec:
     def summary(self, entry) -> str:
         """The answer in a few words, for the status line and the sidebar."""
         raise NotImplementedError
+
+    def node_warnings(self, node) -> tuple[str, ...]:
+        """Warnings about the node itself once it is built, for its status."""
+        return ()
 
     def build(self, b, gi, go, entries) -> None:
         """Lay out the inner group's nodes for these entries (inner.build())."""

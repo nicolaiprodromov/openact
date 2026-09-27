@@ -659,8 +659,8 @@ def test_problems():
             "blank_factors.csv: Line 3 is blank: blank lines between rows are skipped",
             "status_outcomes.csv line 2: Column 'scale' has '1,5' in line 2; treated as text, no output",
             "status_outcomes.csv line 5: 'Ghost' is never offered: its 'if' matches no cell")
-    check("problems: the Job shows the cells without an outcome, then the Factors, Outcomes and plan warnings",
-          job.problems == want, job.problems)
+    check("problems: the Job shows the cells without an outcome (its error), then the Factors, Outcomes and plan "
+          "warnings", (job.errors, job.problems) == (want[:1], want[1:]), (job.errors, job.problems))
     amount = answers("snow_if.csv", "answer,when,if\nnone,bare,state=dead\nsome,thin,\n", "amount")
     job = RULES.job(("How much?",) + GN[1:], factors_csv("life_factors.csv"), amount, "AMOUNT", True)
     check("problems: 'if' in Amount answers is a warning the Job shows",

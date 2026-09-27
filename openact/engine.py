@@ -21,6 +21,7 @@ import math
 import time
 import traceback
 import uuid
+from dataclasses import dataclass, field
 
 import bpy
 from bpy.app.handlers import persistent
@@ -28,11 +29,12 @@ from bpy.app.handlers import persistent
 from . import csvfmt, evaluator, inner, pipeline, server, store, trust
 from . import prefs as P
 from . import tables
+from .csvfmt import ERROR, WARNING, Problem
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
-from .specs.base import orphaned
+from .specs.base import UNSURE_BELOW, orphaned
 from .specs.pick import PickSpec
 from .watch import WATCH
 
@@ -42,6 +44,9 @@ DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
+OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
+ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
+         "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
 P0_CELLS = 8
 PARTIAL = "openact_partial"  # ID property of the inner group: digest of the unstored partial tables its table holds
@@ -63,19 +68,40 @@ _has_nodes = False
 _group_count = -1  # number of node groups at the last pass that found no OpenAct nodes
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
 _pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
+passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
 
 
-class NodeStatus(tuple):
-    """STATUS[uid], the node's status record (§17.1) in skeleton: (icon, text) as the node body draws it, the rows of
-    the tables its contexts show, and the ETA of its fill. A tuple, so it unpacks and compares as (icon, text)."""
+@dataclass
+class NodeStatus:
+    """What a node shows (§17.1): its body the icon and text, the sidebar all of it."""
 
-    def __new__(cls, icon, text, shown=(), fill=None):
-        status = super().__new__(cls, (icon, text))
-        src = "".join(entry.rows.src for entry in shown)
-        status.rows, status.pending, status.stale = len(src), src.count("p"), src.count("s")
-        status.answered = status.rows - status.pending - status.stale
-        status.eta_s = None if fill is None else (fill[1] - fill[0]) * fill[2] / 1000  # fill: pipeline.progress()
-        return status
+    state: str  # a key of ICONS
+    text: str  # one line, e.g. "Filling 12/50 · ~2 s"
+    rows: int = 0
+    answered: int = 0
+    pending: int = 0
+    stale: int = 0
+    unsure: int = 0
+    locked: int = 0
+    code: int = 0
+    errors: int = 0
+    eta_s: float | None = None  # remaining scored rows × ms_per_row
+    contexts: int = 0  # distinct live word sets; above inner.MATERIALISED_MAX the node shows the over-cap error (§8.1)
+    problems: list = field(default_factory=list)  # csvfmt.Problem records: the errors, then the warnings
+    uses: list = field(default_factory=list)  # (context label, Job, entry shown or None) of each planned context
+    asking: frozenset = frozenset()  # keys of the cells the pass asks: sent, or sent once the starting model is ready
+
+    @property
+    def icon(self) -> str:
+        return ICONS[self.state]
+
+
+def _problem(severity, text):
+    return Problem(severity, "", 0, "", text)
+
+
+def _error(text):
+    return NodeStatus("error", text, problems=[_problem(ERROR, text)])
 
 
 # ----------------------------------------------------------------------------- plans
@@ -135,17 +161,11 @@ def _bump(uid):
     pipeline.cancel(uid, below=GENERATIONS[uid])
 
 
-def _jobs(node, contexts=None):
-    """(ctx, Job) for each of the contexts, by default every use of the node, that has a question."""
+def _jobs(node):
+    """(ctx, Job) for each use of the node that has a question."""
     tree = node.id_data
-    spec = SPECS[node.bl_idname]
-    jobs = []
-    for ctx in contexts or find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
-        try:
-            jobs.append((ctx, _plan(spec, node, ctx)))
-        except (Hint, Pending, Unresolvable):
-            continue
-    return jobs
+    uses = find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
+    return [(ctx, job) for ctx, job in _scan(SPECS[node.bl_idname], node, uses) if not isinstance(job, Exception)]
 
 
 # ------------------------------------------------------------------------ inner trees
@@ -220,7 +240,7 @@ def schedule(immediate=False, node=None):
 def run_pass(everything=True):
     """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. Main thread
     only."""
-    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans
+    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, passes
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
@@ -232,12 +252,14 @@ def run_pass(everything=True):
         dirty.add(uid)
     _dirty = _dirty_all = False
     _last_pass = time.monotonic()
+    passes += 1
     nodes = list(iter_nodes())
     _has_nodes = bool(nodes)
     _group_count = -1 if nodes else len(bpy.data.node_groups)
     if not nodes:
         for uid in LIVE:  # the nodes are gone: their queued chunks too
             pipeline.cancel(uid, below=math.inf)
+        STATUS.clear()
         PLANS.clear()
         LAST_SHOWN.clear()
         LIVE.clear()
@@ -261,7 +283,7 @@ def run_pass(everything=True):
                 stored |= _process(tree, node, uses.get(tree.as_pointer()))
             except Exception as error:
                 traceback.print_exc()
-                STATUS[node.uid] = NodeStatus('ERROR', f"Internal error: {error}")
+                STATUS[node.uid] = _error(f"Internal error: {error}")
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
         csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
@@ -284,20 +306,23 @@ def run_pass(everything=True):
         _bump(uid)
         schedule(immediate=True)
     for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
-        del LIVE[uid]
         pipeline.cancel(uid, below=math.inf)
+    for cache in (LIVE, STATUS):  # nodes that disappeared: undo and deleting a node group call no node's free()
+        for uid in [uid for uid in cache if uid not in contexts]:
+            del cache[uid]
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
     redraw()
 
 
 def _process(tree, node, contexts):
-    """Plan and answer the node's contexts, store new answers and rebuild its group. True if it stored any."""
+    """Plan and answer the node's contexts, store new answers, rebuild its group and set its status. True if it stored
+    any."""
     if tree.library is not None:  # read-only: the library file holds this node's answers
-        STATUS[node.uid] = NodeStatus('LINKED', f"Linked from {tree.library.name}: answers come from that file")
+        STATUS[node.uid] = NodeStatus("linked", f"Linked from {tree.library.name}: answers come from that file")
         return False
     node_store = store.load(node)
     if node_store.schema > store.SCHEMA:  # save() would refuse any answer, and the group holds the newer ones
-        STATUS[node.uid] = NodeStatus('ERROR', store.newer_message(node_store))
+        STATUS[node.uid] = _error(store.newer_message(node_store))
         return False
     spec = SPECS[node.bl_idname]
     entries = node_store.entries
@@ -306,14 +331,20 @@ def _process(tree, node, contexts):
     # Stored entries whose words mean something else now stay stored for their rows, but leave the graph (§5.4):
     hidden = {}  # their (gn, words key) -> the partial table shown in their place, or None while nothing is known
     instead = {}  # (uid, ctx key) -> the words key of the partial table that context shows in a hidden entry's place
-    problems, warnings, hints, failed = [], [], [], []
+    problems, warnings, failed = [], [], []
+    uses, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells missing
+    sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
     upstream = waiting = changed = False
     planned = _scan(spec, node, contexts)
     # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
-    # good table stays. A context without a job (Pending, or Unresolvable: a CSV with errors, too many items...) still
-    # shows its last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't
-    # fit them wait (None) until that context plans again or goes away; jobs that fit them are answered
-    unknown = any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
+    # good table stays. A context without a job (Pending; Unresolvable: a CSV with errors, too many items...; or a Hint
+    # whose words still name a stored entry: an Import CSV node without a Path, an empty collection) still shows its
+    # last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't fit them
+    # wait (None) until that context plans again or goes away; jobs that fit them are answered
+    gns = {entry.gn for entry in entries}
+    hinted = {ctx.key(): gn for ctx, job in planned if isinstance(job, Hint) and (gn := _gn(spec, node, ctx)) in gns}
+    hints = [str(job) for ctx, job in planned if ctx.key() in hinted]  # first: they are the hints that hold the node
+    unknown = bool(hinted) or any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
     conflict = spec.agree(node, [(ctx, job) for ctx, job in planned if not isinstance(job, Exception)], unknown,
                           entries) if hasattr(spec, "agree") else ""
     held = conflict is None
@@ -328,16 +359,26 @@ def _process(tree, node, contexts):
                 live.append(last.gn)
             continue
         if isinstance(job, Hint):
-            hints.append(str(job))
+            gn = hinted.get(ctx.key())
+            if gn is None:
+                hints.append(str(job))
+            elif gn not in live:  # the stored entry its words name still shows: kept, as for an error
+                live.append(gn)
             continue
         if isinstance(job, Unresolvable):  # e.g. a CSV with errors: its words stay live, so the last good table shows
             problems.append(str(job))
             _live(live, spec, node, ctx)
             continue
+        uses.append((ctx.label(), job))
         warnings += job.problems
+        problems += job.errors  # rows in error in a table that still shows, e.g. cells no outcome applies to
         if job.gn not in live:
             live.append(job.gn)
-        if conflict or held:
+        if conflict or held:  # nothing is answered: the sidebar shows the stored entry resolve() keeps, if any
+            found = next((entry for entry in entries if entry.gn == job.gn), None)
+            kept = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)[0] if found is not None else None
+            if kept is not None and kept.words_key == found.words_key:  # it, its table so far or a refreshed copy
+                resolved[job.gn] = found
             continue
         other = jobs.setdefault(job.gn, (job, ctx))
         if other[0] is not job and other[0].words_key != job.words_key:
@@ -357,6 +398,9 @@ def _process(tree, node, contexts):
         if entry is not None and found is not None and entry is not found and dataclasses.replace(
                 entry, t=found.t) == found:
             entry = found  # the partial table as stored already
+        if entry is not None:  # the table shown: the sidebar and the counts describe it, not a hidden entry
+            shown.append(entry)
+            resolved[job.gn] = entry
         # Words that mean something else now never show the old answer, but its rows carry over until the new table is
         # whole, also after a reload: the old entry stays stored, and the partial table shows in its place unstored.
         # LAST_SHOWN keeps naming the stored entry its stale rows come from.
@@ -364,11 +408,9 @@ def _process(tree, node, contexts):
                 entry is None or missing or errors):
             hidden[(found.gn, found.words_key)] = entry
             if entry is not None:
-                shown.append(entry)
                 instead[key] = entry.words_key
         elif entry is not None:
             LAST_SHOWN[key] = entry.words_key
-            shown.append(entry)
             if entry is not found:
                 if found is not None:  # in place: the graph keeps its entry order, so values only (§8.8)
                     entries[entries.index(found)] = entry
@@ -378,8 +420,12 @@ def _process(tree, node, contexts):
         failed += errors
         if missing:
             waiting = True
-            _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
-                                        generation=GENERATIONS.get(node.uid, 0)), missing)
+            asked.update(cell.key for cell in missing)
+            if _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
+                                           generation=GENERATIONS.get(node.uid, 0)), missing):
+                sent.update(cell.key for cell in missing)
+    if len(live) > inner.MATERIALISED_MAX:  # the first contexts stay materialised, the others show neutral values
+        problems.append(OVER_CAP.format(len(live), inner.MATERIALISED_MAX))
     rows = changed  # entries were added or replaced: the table object's rows change too
     showing = {entry.words_key for entry in shown}
     left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
@@ -417,19 +463,29 @@ def _process(tree, node, contexts):
         inner.build(node, graph, live, default)
     if partial != written:  # the table object holds the rows of the graph just laid out
         node.node_tree[PARTIAL] = partial
-    STATUS[node.uid] = NodeStatus(*_status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings),
-                                  shown, pipeline.progress(node.uid))
+    warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
+    faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
+    state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
+    STATUS[node.uid] = NodeStatus(
+        state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
+        problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings],
+        asking=frozenset(sent), **_counts(jobs, resolved, asked))
     return changed
 
 
 def _live(live, spec, node, ctx):
     """Add the words ctx has now to the live gns, when they can be read."""
-    try:
-        gn = spec.gn(node, ctx)
-    except (Hint, Pending, Unresolvable):
-        return
-    if gn not in live:
+    gn = _gn(spec, node, ctx)
+    if gn is not None and gn not in live:
         live.append(gn)
+
+
+def _gn(spec, node, ctx):
+    """The words ctx has now, or None when they can't be read."""
+    try:
+        return spec.gn(node, ctx)
+    except (Hint, Pending, Unresolvable):
+        return None
 
 
 def _scan(spec, node, contexts):
@@ -445,12 +501,16 @@ def _scan(spec, node, contexts):
 
 
 def _submit(job, missing):
-    """Ask for the missing cells once the model is ready, starting it if the preferences allow."""
+    """Ask for the missing cells once the model is ready, starting it if the preferences allow. True when they are
+    asked: sent now, or sent by the pass that runs once the model is ready, as a start is under way, queued or begun
+    here."""
     state, _message = server.status()
     if state == "ready":
         pipeline.submit(job, missing, job.priority, on_rows=lambda _job: schedule(immediate=True))
-    elif state in ("stopped", "unknown") and P.get_prefs().auto_start:
-        server.start()  # asked by the pass that runs when the server is ready
+        return True
+    if state in ("stopped", "unknown", "installing") and P.get_prefs().auto_start:
+        return server.start()  # asked by the pass that runs when the server is ready; an install starts it as it ends
+    return state == "starting" or server.STATE.start_queued
 
 
 def _priority(spec, node, missing):
@@ -467,53 +527,96 @@ def _priority(spec, node, missing):
     return 2
 
 
-def _status(spec, jobs, shown, problems, hints, failed, upstream, waiting, warnings=()):
-    if problems:
-        return ('ERROR', problems[0])
-    if failed:
-        return ('ERROR', failed[0])
+def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
+    """(state, text, ETA in seconds or None) of the node's status line (§17.1)."""
+    if faults:
+        return "error", faults[0], None
     if waiting or upstream:
         state, message = server.status()
         if state == "not_installed":
-            return ('ERROR', "Model not installed: open the OpenAct tab in the sidebar")
+            return "error", "Model not installed: open the OpenAct tab in the sidebar", None
         if state == "installing":
-            return ('SORTTIME', "Installing the model...")
+            return "starting", "Installing the model...", None
         if state == "error":
-            return ('ERROR', message or "Model server error")
+            return "error", message or "Model server error", None
         if state == "starting":
-            return ('SORTTIME', "Starting the model...")
+            return "starting", "Starting the model...", None
+        if message == server.CHECKING:  # a start waits for the runtime probe
+            return "starting", message, None
         if state in ("stopped", "unknown") and not P.get_prefs().auto_start:
-            return ('PAUSE', "Model server is stopped (OpenAct tab)")
+            return "paused", "Model server is stopped (OpenAct tab)", None
         if upstream and not waiting:
-            return ('SORTTIME', "Waiting for another OpenAct node...")
-        return ('SORTTIME', "Asking...")
+            return "waiting", "Waiting for another OpenAct node...", None
+        return ("filling", *_filling(uid))
     if not jobs:
-        return ('INFO', hints[0] if hints else spec.empty_hint)
+        return "hint", hints[0] if hints else spec.empty_hint, None
     text = spec.summary(shown[0])
+    locked = shown[0].rows.src.count("l")
+    if locked:
+        text += f" · {locked} locked"
     if len(jobs) > 1:
         text += f"   +{len(jobs) - 1} more"
-    if warnings:  # a usable list or answer set that has a warning (§17.1)
-        return ('ERROR', f"{warnings[0]}   ({text})")
-    return ('CHECKMARK', text)
+    if warnings:  # a usable table whose lists, answer sets or locks have warnings
+        return "warning", f"{text} · {len(warnings)} warning{'s' if len(warnings) > 1 else ''}: {warnings[0]}", None
+    return "complete", text, None
+
+
+def _filling(uid):
+    """The filling line and its ETA: n/N once the decision worker reports the node's progress, else "Asking..."."""
+    found = pipeline.progress(uid)
+    if not found or not found[1]:
+        return "Asking...", None
+    done, total, ms_per_row = found  # ms_per_row: per remaining cell, /health's rate and the §5.4 default folded in
+    eta = (total - done) * ms_per_row / 1000
+    left = f"~{max(math.ceil(eta), 1)} s" if eta < 60 else f"~{math.ceil(eta / 60)} min"
+    return f"Filling {done}/{total} · {left}", eta
+
+
+def _counts(jobs, resolved, asked):
+    """The row counts of the node's tables (§17.1): by the source of each row of the entry a table shows, else of its
+    plan's rows, whose cells are asked (pending), failed (errors) or answered this session."""
+    counts = dict.fromkeys(("rows", "answered", "pending", "stale", "unsure", "locked", "code", "errors"), 0)
+    letters = {"m": "answered", "p": "pending", "s": "stale", "l": "locked", "c": "code", "e": "errors"}
+    for gn, (job, _ctx) in jobs.items():
+        counts["rows"] += len(job.rows)
+        entry = resolved.get(gn)
+        if entry is not None:
+            for letter in entry.rows.src:
+                counts[letters.get(letter, "answered")] += 1
+            confidences = entry.rows.v.get("c") or ()
+            counts["unsure"] += sum(src == "m" and c < UNSURE_BELOW for src, c in zip(entry.rows.src, confidences))
+            continue
+        for row in job.rows:
+            if row.cell is None:
+                name = {"lock": "locked", "error": "errors"}.get(row.source, "code")
+            elif row.cell.key in asked:
+                name = "pending"
+            else:
+                name = "errors" if row.cell.key in pipeline.FAILED else "answered"
+            counts[name] += 1
+    return counts
 
 
 def answers_for(node):
-    """(context label, entry or None) for the node's current uses, for the sidebar. Nothing for a newer OpenAct's
-    answers, which can't be read: the node's status says why."""
-    spec = SPECS[node.bl_idname]
-    node_store = store.load(node)
-    if node_store.schema > store.SCHEMA:
-        return []
-    return [(ctx.label(), spec.resolve(job, node_store.entries, LAST_SHOWN.get((node.uid, ctx.key()), ""))[0])
-            for ctx, job in _jobs(node)]
+    """(context label, Job, entry shown or None) of each context the node's last pass planned, for the sidebar. Drawing
+    reads them and plans nothing: planning may rebuild the node, which Blender refuses while drawing. Nothing for a
+    newer OpenAct's answers, which can't be read: the node's status says why."""
+    status = STATUS.get(node.uid)
+    return status.uses if status is not None else []
+
+
+def ask_key_now(spec, debias):
+    """The ask key a row would be answered with now: templates, Balance Option Order and backend. "" until the model
+    server has reported its backend."""
+    model = pipeline.provenance(server.STATE.health)
+    return spec.ask_key(debias, model) if model else ""
 
 
 def older_settings(node, entry):
     """True when a row of the entry was asked with other templates, order balancing or backend than the node would
     use now. Unknown, so False, until the model server has reported its backend."""
-    model = pipeline.provenance(server.STATE.health)
-    current = SPECS[node.bl_idname].ask_key(node.balance_order, model)
-    return bool(model) and any(ask and ask != current for ask in entry.asks)  # "": code rows, no model asked
+    current = ask_key_now(SPECS[node.bl_idname], node.balance_order)
+    return bool(current) and any(ask and ask != current for ask in entry.asks)  # "": code rows, no model asked
 
 
 def reask(node):

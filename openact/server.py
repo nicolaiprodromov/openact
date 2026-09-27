@@ -74,6 +74,7 @@ class _State:
         self.poll_thread = None
         self.install_thread = None
         self.install_step = ""
+        self.install_warning = ""  # e.g. little VRAM: the status moves on to the start, the Model box keeps it
         self.log_path = ""
         self.conflict = ""  # the error shown while an OpenAct server this Blender can't use holds the port
         self.refused = None  # the pid of the one that refused this Blender's token (403), else None
@@ -805,6 +806,7 @@ def install(prefs=None, dry_run=False):
             if dry_run:
                 STATE.set(*previous)
                 return
+            STATE.install_warning = warning
             STATE.set("stopped", f"Runtime installed. {warning}" if warning else "Runtime installed")
             post(_became_installed)
         except Exception as error:

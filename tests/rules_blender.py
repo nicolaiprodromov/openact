@@ -198,7 +198,7 @@ def phase_cell_index():
     inner.build(rules, S.load(rules))
     engine.run_pass()  # plans with the files missing: an error, and the last good table stays
     check("rebuild with every CSV file deleted leaves the outputs unchanged (shape suffices)",
-          read(obj, ["Outcome", "Confidence"]) == before and engine.STATUS[rules.uid][0] == 'ERROR',
+          read(obj, ["Outcome", "Confidence"]) == before and engine.STATUS[rules.uid].icon == 'CANCEL',
           engine.STATUS.get(rules.uid))
 
 
@@ -322,7 +322,8 @@ def phase_life():
           [int(t in ("Birth", "Survives")) for t in reference], entries and entries[0].rows.payload)
     check("life: the node shows its sockets and '18 cells · 0 unsure'",
           all(name in rules.inputs for name in ("state", "neighbours")) and "alive" in rules.outputs
-          and engine.STATUS.get(rules.uid) == ('CHECKMARK', "18 cells · 0 unsure"), engine.STATUS.get(rules.uid))
+          and (engine.STATUS[rules.uid].icon, engine.STATUS[rules.uid].text) == ('CHECKMARK', "18 cells · 0 unsure"),
+          engine.STATUS.get(rules.uid))
     life_zone(tree, rules, gi, go)
     scene_ = bpy.context.scene
     scene_.frame_start, scene_.frame_end = 1, 40
@@ -548,7 +549,7 @@ def phase_long_header():
     names = sorted(a.name for a in table.data.attributes if a.name.startswith(tables.ATTR)) if table else []
     status = engine.STATUS.get(rules.uid)
     check("payload: a 62-byte header builds, its table column is named by position (oa_pl_0), and its output reads "
-          "it", status is not None and status[0] == 'CHECKMARK' and "oa_pl_0" in names
+          "it", status is not None and status.icon == 'CHECKMARK' and "oa_pl_0" in names
           and read(obj, [header])[header] == [2, 2], (status, names))
 
 
@@ -602,7 +603,9 @@ def phase_outcome_edits():
             passed(rules)
         got = read(obj, ["Outcome", "alive"])
         outcomes = [names[o] if 0 <= o < len(names) else o for o in got["Outcome"]]
-        return sum(len(missing) for _job, missing in asked), outcomes, got["alive"], engine.STATUS.get(rules.uid)
+        status = engine.STATUS.get(rules.uid)
+        return (sum(len(missing) for _job, missing in asked), outcomes, got["alive"],
+                status and (status.icon, status.text))
 
     got = settle((birth, empty, dies), first=True)
     check("outcome edits: Seeds answered through the pass (9 cells asked)",
@@ -639,11 +642,12 @@ def phase_status():
             "status_outcomes.csv line 2: Column 'scale' has '1,5' in line 2; treated as text, no output",
             "status_outcomes.csv line 5: 'Ghost' is never offered: its 'if' matches no cell")
     status = engine.STATUS.get(rules.uid)
-    check("status: nothing is asked, and the status shows the cells without an outcome first; the Job holds the "
-          "Factors, Outcomes and plan warnings after it",
-          not asked and job.problems == want and "scale" not in rules.outputs
-          and status == ('ERROR', f"{want[0]}   (18 cells · 0 unsure · 8 with no outcome)"),
-          (len(asked), job.problems, status))
+    check("status: nothing is asked, and the status shows the cells without an outcome first, as its error line; the "
+          "Job holds the Factors, Outcomes and plan warnings after it",
+          not asked and (job.errors, job.problems) == (want[:1], want[1:]) and "scale" not in rules.outputs
+          and (status.icon, status.text) == ('CANCEL', want[0])
+          and [problem.message for problem in status.problems] == list(want),
+          (len(asked), job.errors, job.problems, status))
 
 
 def shared_scene(name, words, values):
@@ -681,8 +685,9 @@ def phase_agreement():
     """§6.0: the contexts of one node must agree on what the graph bakes. Factors CSVs that differ only in their
     band edges, or Outcomes CSVs whose payload columns differ, give the error naming both contexts; nothing is
     asked, stored or rebuilt, so the last good table stays. Payload values and texts may differ. While a context has
-    no job (a missing or broken CSV, an inline error), the sockets, their links and the graph stay: another context's
-    new words are still asked and shown if they fit them, and wait if they would change them."""
+    no job (a missing or broken CSV, an inline error, an Import CSV node without a Path), the sockets, their links and
+    the graph stay: another context's new words are still asked and shown if they fit them, and wait if they would
+    change them."""
     a, b = write("agree_a.csv", EDGES.format("0.5")), write("agree_b.csv", EDGES.format("0.5"))
     sizes = "answer,when,size\nA,the first,{0}\nB,the second,{1}\n"
     oa, ob = write("agree_oa.csv", sizes.format(1, 2)), write("agree_ob.csv", sizes.format(3, 4))
@@ -697,7 +702,7 @@ def phase_agreement():
     check("agreement: two contexts with the same factors, and a payload column in both Outcomes CSVs, each show "
           "their own table", before == [{"Outcome": [0, 0, 1, 1], "size": [1, 1, 2, 2]},
                                         {"Outcome": [0, 0, 1, 1], "size": [3, 3, 4, 4]}]
-          and engine.STATUS[rules.uid][0] == 'CHECKMARK', (before, engine.STATUS.get(rules.uid)))
+          and engine.STATUS[rules.uid].icon == 'CHECKMARK', (before, engine.STATUS.get(rules.uid)))
 
     build, builds = inner.build, []
 
@@ -714,14 +719,16 @@ def phase_agreement():
         finally:
             inner.build = build
         kept = [(entry.gn, entry.words_key) for entry in S.load(rules).entries] == stored
-        return engine.STATUS.get(rules.uid), asked, any(builds), kept, [read(obj, ["Outcome", "size"]) for obj in objs]
+        status = engine.STATUS.get(rules.uid)
+        return ((status.icon, status.text) if status else None, asked, any(builds), kept,
+                [read(obj, ["Outcome", "size"]) for obj in objs])
 
     def edited(name, text, what):
         """Write one CSV, run a pass: (the status is the conflict, cells asked, builds, whether the entries and the
         outputs stayed)."""
         status, asked, built, kept, got = step(lambda: write(name, text))
         message = f"Rules: '{labels[0]}' and '{labels[1]}' use {what}"
-        return status == ('ERROR', message), len(asked), built, kept, got == before
+        return status == ('CANCEL', message), len(asked), built, kept, got == before
 
     got = edited("agree_b.csv", EDGES.format("0.2"), "Factors CSVs with different factors")
     check("agreement: Factors CSVs that differ only in their band edges give the error; nothing is asked, stored or "
@@ -732,7 +739,7 @@ def phase_agreement():
     asked = planned(rules)
     got = [read(obj, ["Outcome"])["Outcome"] for obj in objs]
     check("agreement: once both use the new edges the rows carry over (0 requests) and the graph follows them",
-          not asked and got == [[0, 1, 1, 1]] * 2 and engine.STATUS[rules.uid][0] == 'CHECKMARK',
+          not asked and got == [[0, 1, 1, 1]] * 2 and engine.STATUS[rules.uid].icon == 'CHECKMARK',
           (len(asked), got, engine.STATUS.get(rules.uid)))
     before = [read(obj, ["Outcome", "size"]) for obj in objs]
     got = edited("agree_ob.csv", sizes.format(3.5, 4), "Outcomes CSVs with different payload columns")
@@ -754,7 +761,7 @@ def phase_agreement():
     check("agreement: the payload column's type back, both agree again", got[0][0] == 'CHECKMARK' and not got[1]
           and good == [{"Outcome": [0, 1, 1, 1], "size": [1, 2, 2, 2]}, {"Outcome": [0, 1, 1, 1], "size": [3, 4, 4, 4]}],
           got)
-    missing = ('ERROR', f"Can't find {os.path.normpath(oa)}")
+    missing = ('CANCEL', f"Can't find {os.path.normpath(oa)}")
     os.remove(oa)
     waited = step(lambda: use(objs[1], "Context", "On a windy hill."))
     answer_cells(waited[1], lambda name: 1 if name == "cold" else 0)
@@ -767,12 +774,12 @@ def phase_agreement():
     got = step(lambda: (write("agree_oa.csv", sizes.format(1, 2)), use(objs[1], "Context", "")))
     check("agreement: once the CSV is back, both show their tables with a checkmark, 0 requests",
           got[0][0] == 'CHECKMARK' and not got[1] and got[4] == good, got)
-    payload = ('ERROR', f"Rules: '{labels[0]}' and '{labels[1]}' use Outcomes CSVs with different payload columns")
+    payload = ('CANCEL', f"Rules: '{labels[0]}' and '{labels[1]}' use Outcomes CSVs with different payload columns")
     got = (step(lambda: write("agree_oa.csv", "answer,when,weight\nA,the first,5\nB,the second,6\n")),
            step(lambda: use(objs[1], "Outcomes", "A: the first; A: again")), step(lambda: use(objs[1], "Outcomes", ob)))
     check("agreement: while the context whose payload the outputs show has an error of its own, the sockets, their "
           "links, the entries and the other object's table stay; fixed, the error is back",
-          got[0][0] == got[2][0] == payload and got[1][0] == ('ERROR', "Outcomes: Entry 2: 'A' appears twice")
+          got[0][0] == got[2][0] == payload and got[1][0] == ('CANCEL', "Outcomes: Entry 2: 'A' appears twice")
           and all(not g[1] and g[3] and g[4][0] == good[0] for g in got) and sockets() == face,
           (got, sockets()))
     got = step(lambda: write("agree_oa.csv", sizes.format(1, 2)))
@@ -782,13 +789,44 @@ def phase_agreement():
                         write("agree_a.csv", EDGES.format("0.5"))))
     check("agreement: while an Outcomes CSV has errors, another context's new band edges wait: nothing is asked, "
           "stored or rebuilt, so the object whose CSV has errors is never read through them",
-          got[0] == ('ERROR', "agree_ob.csv: Line 3: 'A' appears twice") and not got[1] and not got[2] and got[3]
+          got[0] == ('CANCEL', "agree_ob.csv: Line 3: 'A' appears twice") and not got[1] and not got[2] and got[3]
           and got[4] == good, got)
     got = edited("agree_ob.csv", sizes.format(3, 4), "Factors CSVs with different factors")
     check("agreement: that CSV fixed, the band edges give the error, and both objects keep the last good table",
           got == (True, 0, False, True, True), got)
     got = step(lambda: write("agree_a.csv", EDGES.format("0.2")))
     check("agreement: the band edges back, a checkmark", got[0][0] == 'CHECKMARK' and got[4] == good, got)
+
+    # A context whose Factors come through an Import CSV node without a Path shows a hint that leaves its words, so its
+    # last table shows: it holds the sockets and the graph as an error does. step(), use() and sockets() read this
+    # scene now
+    fa, fb = write("hint_fa.csv", EDGES.format("0.5")), write("hint_fb.csv", EDGES.format("0.5"))
+    tree, rules, objs, gi, go = shared_scene("AgreeHint", {"Context": ["On a hill.", "By the sea."]},
+                                             [{"in_heat": ('FLOAT', heat)}] * 2)
+    rules.inputs["Outcomes"].default_value = "A: the first; B: the second"
+    tree.interface.new_socket("FactorsPath", in_out='INPUT', socket_type='NodeSocketString')
+    reader = tree.nodes.new("GeometryNodeImportCSV")
+    tree.links.new(gi.outputs["FactorsPath"], reader.inputs["Path"])
+    tree.links.new(reader.outputs[0], rules.inputs["Factors CSV"])
+    for obj, path in zip(objs, (fa, fb)):
+        use(obj, "FactorsPath", path)
+    answer_cells(planned(rules), lambda name: 0 if name == "cold" else 1)
+    wire(tree, rules, gi, go, ["Outcome"])
+    planned(rules)
+    labels = [ctx.label() for ctx in evaluator.find_uses()[tree.as_pointer()]]
+    good, face = step(lambda: None)[4], sockets()
+    got = (step(lambda: use(objs[0], "FactorsPath", "")), step(lambda: write("hint_fb.csv", EDGES.format("0.2"))),
+           step(lambda: use(objs[0], "FactorsPath", fa)))
+    check("agreement: while a context's Import CSV node has no Path (a hint that leaves its words), another context's "
+          "new band edges wait: nothing is asked, stored or rebuilt, the sockets keep their links, both objects the "
+          "last good table, and the status is the hint; the Path back, the error names both",
+          good == [{"Outcome": [0, 0, 1, 1], "size": None}] * 2
+          and got[1][0] == ('INFO', "Factors CSV: type a Path on 'Import CSV'")
+          and got[2][0] == ('CANCEL', f"Rules: '{labels[0]}' and '{labels[1]}' use Factors CSVs with different factors")
+          and all(not g[1] and not g[2] and g[3] and g[4] == good for g in got) and sockets() == face,
+          (got, sockets()))
+    got = step(lambda: write("hint_fb.csv", EDGES.format("0.5")))
+    check("agreement: those band edges back, a checkmark", got[0][0] == 'CHECKMARK' and got[4] == good, got)
 
 
 class _PollProbe(bpy.types.Operator):
@@ -893,7 +931,8 @@ def phase_model(port, gpu):
                 print(f"  ... {server.status()} {engine.STATUS.get(rules.uid)} pending {len(pipeline.PENDING)}",
                       flush=True)
             entries = [e for e in S.load(rules).entries if e.gn[3] == path]
-            return bool(entries) and not pipeline.PENDING and engine.STATUS.get(rules.uid, ("",))[0] == 'CHECKMARK'
+            return bool(entries) and not pipeline.PENDING and getattr(engine.STATUS.get(rules.uid), "icon", "") == \
+                'CHECKMARK'
 
         answered = drive(engine, done, timeout=600)
         entry = next((e for e in S.load(rules).entries if e.gn[3] == path), None)

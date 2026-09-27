@@ -138,7 +138,7 @@ class DialsSpec(Spec):
         if not gn[0].strip():
             raise Hint("Type a prompt")
         job = self.job(gn, settings, node.balance_order, node.uid, hashes)
-        job.problems, job.context = problems, ctx.label()
+        job.problems = problems
         return job
 
     def job(self, gn, settings, debias, uid="", csv_hashes=()):
@@ -242,6 +242,9 @@ class DialsSpec(Spec):
     def summary(self, entry):
         count = len(entry.rows.name)
         return f"{count} setting{'s' if count != 1 else ''} · lowest confidence {entry.single['Confidence']:.2f}"
+
+    def node_warnings(self, node):
+        return (WARNINGS[node.uid],) if node.uid in WARNINGS else ()
 
     # ------------------------------------------------------------------------------- the inner group
 

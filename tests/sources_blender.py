@@ -510,9 +510,9 @@ finally:
     builtins.open = real_open
 engine.run_pass()  # the safety pass
 check("watch: a CSV another program holds open is planned once, not again on every poll",
-      made == [1, 0, 0, 0] and during[1].startswith("Can't read"), (made, during))
+      made == [1, 0, 0, 0] and during.text.startswith("Can't read"), (made, during))
 check("watch: let go, the safety pass reads it again, a Rules node's too",
-      planned[0] == engine.STATUS[held.uid][0] == 'PAUSE', (planned, engine.STATUS.get(held.uid)))
+      planned.icon == engine.STATUS[held.uid].icon == 'PAUSE', (planned, engine.STATUS.get(held.uid)))
 
 # ------------------------------------------------------------------------ the trust rule
 proj, outside = os.path.join(TMP, "proj"), os.path.join(TMP, "outside")
@@ -578,7 +578,7 @@ check("trust: a CSV outside the file's folder is blocked", blocked_csv == f"<Unr
 check("trust: Import Text outside the folder is blocked",
       blocked_text == f"<Unresolvable: Answers ← {text_name}: Blocked reading {far_text}: outside this file's "
       "folder. Allow this file (or trust its folder) to read it>", blocked_text)
-statuses = [engine.STATUS.get(node.uid, ("", ""))[1] for node in (rules, far_pick)]
+statuses = [getattr(engine.STATUS.get(node.uid), "text", "") for node in (rules, far_pick)]
 check("trust: the pass blocks them for a Rules node and a Pick node",
       statuses[0].startswith(f"Blocked reading {far_rules[0]}:") and statuses[1] == message, statuses)
 check("trust: blocked files are never opened, by the pass neither",
@@ -620,7 +620,8 @@ check("trust: Allow This File", bpy.ops.openact.allow_file() == {'FINISHED'} and
 check("trust: a trust change is in every plan's fingerprint, also where no read was blocked",
       near_spec.fingerprint(near_pick, ctx) != before)
 engine.run_pass()
-statuses = [engine.STATUS.get(node.uid, ("", "")) for node in (rules, far_pick)]
+statuses = [(getattr(engine.STATUS.get(node.uid), "icon", ""), getattr(engine.STATUS.get(node.uid), "text", ""))
+            for node in (rules, far_pick)]
 check("trust: after Allow This File the pass reads them, for the Rules node too (its plan cache sees the change)",
       statuses[0][0] == 'PAUSE' and statuses[1][1].startswith("secret item"), statuses)  # one item: decided by code
 reader.inputs["Items"].default_value = far

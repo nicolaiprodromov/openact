@@ -237,7 +237,7 @@ def phase_pass():
           node_.entries.startswith('{"schema":2,') and [e.gn[0] for e in saved[:1] + saved[-1:]] == ["Old words", "New words"]
           and [e.gn[0] for e in saved[1:-1]] == [f"Warm {i}?" for i in range(2, S.MAX_ENTRIES + 2)],
           [e.gn[0] for e in saved])
-    check("pass: the inner group shows the stored answers, the live ones materialised", engine.STATUS[node_.uid][0]
+    check("pass: the inner group shows the stored answers, the live ones materialised", engine.STATUS[node_.uid].icon
           == 'CHECKMARK' and inner.update_values(node_, S.load(node_), [job.gn for job in jobs.values()])
           and len(inner.materialised(saved, [job.gn for job in jobs.values()])) == inner.WARM_TOTAL,
           engine.STATUS[node_.uid])
@@ -252,7 +252,7 @@ def phase_pass():
             Spec.PROMPT_VERSION -= 1
             node_.balance_order = True
     check("pass: a new PROMPT_VERSION and Balance Option Order ask nothing and keep every answer",
-          not questions and node_.entries == before and engine.STATUS[node_.uid][0] == 'CHECKMARK', len(questions))
+          not questions and node_.entries == before and engine.STATUS[node_.uid].icon == 'CHECKMARK', len(questions))
     node_.inputs["Key"].default_value = "left"
     with asking(node_, questions):
         engine.run_pass()
@@ -286,9 +286,10 @@ def phase_pass():
         engine.run_pass()
     finally:
         engine._submit = submit
+    status = engine.STATUS[node_.uid]
     check("pass: a newer OpenAct's answers show an error, and are not asked for, written over or rebuilt",
           node_.entries == newer and node_.uid not in asked and pointers(node_) == group
-          and engine.STATUS[node_.uid] == ('ERROR', S.newer_message(S.load(node_))), engine.STATUS[node_.uid])
+          and (status.icon, status.text) == ('CANCEL', S.newer_message(S.load(node_))), status)
     try:
         bpy.ops.openact.reask(uid=node_.uid)
         shown = ""
@@ -354,7 +355,7 @@ def phase_pick_pass():
     stored, got = S.load(picker).entries, table_read(users["P1"])
     check("pass, Pick (Collection): the answer is stored for words with Items \"\", and the inner group matches it",
           not questions and [e.gn for e in stored] == [(light, "", "", "", "")] and got["idx"] == [1] * 4
-          and engine.STATUS[picker.uid][0] == 'CHECKMARK', (engine.STATUS[picker.uid], got))
+          and engine.STATUS[picker.uid].icon == 'CHECKMARK', (engine.STATUS[picker.uid], got))
     top = stored[0].rows.v["prob"] if stored else [0.0]
     check("pass, Pick: Probability at the picked ID is the stored top probability, and Selection marks that ID",
           got["prob"][1] == max(top) == 0.75 and got["prob"] == [0.125, 0.75, 0.125, 0.0]
@@ -377,8 +378,8 @@ def phase_pick_pass():
         engine.run_pass()
     status = engine.STATUS[picker.uid]
     check("pass, Pick: two contexts that differ only by collection: \"only one answer can show\", naming the Key",
-          status[0] == 'ERROR' and "only one answer can show" in status[1] and "Key" in status[1] and not questions,
-          status)
+          status.icon == 'CANCEL' and "only one answer can show" in status.text and "Key" in status.text
+          and not questions, status)
     use("P1", Key="shelf")
     use("P2", Key="kitchen")
     with asking(picker, questions):
@@ -393,7 +394,7 @@ def phase_pick_pass():
     got = table_read(users["P1"])["idx"], table_read(users["P2"])["idx"]
     check("pass, Pick: with a Key each, both show their own answer; the context already answered sends 0 requests",
           asked == [kitchen] and questions == asked and got == ([1] * 4, [0] * 4)
-          and engine.STATUS[picker.uid][0] == 'CHECKMARK', (asked == [kitchen], got, engine.STATUS[picker.uid]))
+          and engine.STATUS[picker.uid].icon == 'CHECKMARK', (asked == [kitchen], got, engine.STATUS[picker.uid]))
 
 
 def phase_converted_default():
@@ -641,7 +642,7 @@ def phase_live_set():
         engine.run_pass()
         kept = [e.gn for e in S.load(asker).entries]
         check("live set: the entry of a context whose CSV now has errors is never evicted, as it still shows",
-              errored in kept and ("Warm 0?", "", "", "", "") not in kept and engine.STATUS[asker.uid][0] == 'ERROR',
+              errored in kept and ("Warm 0?", "", "", "", "") not in kept and engine.STATUS[asker.uid].icon == 'CANCEL',
               (errored in kept, len(kept), engine.STATUS[asker.uid]))
     finally:
         pipeline.forget(keys)
@@ -687,9 +688,10 @@ def phase_statuses():
     with asking(reader, []):
         engine.run_pass()
     status = engine.STATUS[reader.uid]
-    check("status: an empty Pick asks for its prompt first", empty == ('INFO', "Type a prompt"), empty)
+    check("status: an empty Pick asks for its prompt first", (empty.icon, empty.text) == ('INFO', "Type a prompt"),
+          empty)
     check("status: a node that reads a newer OpenAct's answers as words says why, rather than waiting",
-          status[0] == 'ERROR' and "newer OpenAct" in status[1], status)
+          status.icon == 'CANCEL' and "newer OpenAct" in status.text, status)
 
 
 # ------------------------------------------------------------------ stand-ins for later nodes

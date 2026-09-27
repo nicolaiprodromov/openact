@@ -136,8 +136,9 @@ def phase_old_server(engine, server, P, root):
 
     engine.run_pass()  # the node needs an answer, so auto-start meets the old server
     check("old server: the status names it", server.status() == legacy, server.status())
-    check("old server: the node shows it", engine.STATUS.get(ask.uid) == ('ERROR', legacy[1]),
-          engine.STATUS.get(ask.uid))
+    status = engine.STATUS.get(ask.uid)
+    check("old server: the node shows it", status is not None and (status.icon, status.text) == ('CANCEL', legacy[1]),
+          status)
     check("old server: nothing is launched", not FakeProcess.launched, FakeProcess.launched)
     server.refresh()
     check("old server: the message stays while it runs", server.status() == legacy, server.status())

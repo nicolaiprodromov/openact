@@ -78,7 +78,8 @@ class PerItemSpec(Spec):
         return [(name, value) for name, value in zip(entry.rows.name, entry.rows.v[column]) if name]
 
     def unsure(self, entry) -> int:
-        return sum(c < UNSURE_BELOW for _name, c in self.offered(entry, "c"))
+        """Model rows below UNSURE_BELOW: a pending or stale row of a table so far is no answer (§5.4)."""
+        return sum(src == "m" and c < UNSURE_BELOW for src, c in zip(entry.rows.src, entry.rows.v["c"]))
 
 
 class MatchSpec(PerItemSpec):
@@ -154,11 +155,6 @@ class MatchSpec(PerItemSpec):
             mean = sum(values) / len(values) if values else 0.0
             return f"{len(values)} items · mean {mean:.2f} · {self.unsure(entry)} unsure"
         return f"{sum(p >= 0.5 for p in values)} of {len(values)} yes · {self.unsure(entry)} unsure"
-
-    def preview(self, entry):
-        """(item, answer) rows for the sidebar."""
-        amount = entry.answer_type == 'AMOUNT'
-        return [(name, f"{p:.2f}" if amount else f"{p * 100:.0f}% yes") for name, p in self.offered(entry, "p")]
 
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy

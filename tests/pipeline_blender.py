@@ -233,6 +233,12 @@ def whole(node, rows):
     return entry is not None and entry.rows.src == "m" * rows
 
 
+def line(node):
+    """The node's status line as its body draws it: (icon, text)."""
+    found = engine.STATUS.get(node.uid)
+    return (found.icon, found.text) if found else ("", "")
+
+
 def answers_health(port):
     """True while a server answers /health on the port."""
     try:
@@ -279,7 +285,7 @@ def phase_refused():
         _tree, (node,), _obj = match_tree("Foreign", ("Is it foreign?", "coin, stamp, flag"))
         start = len(TAP.log)
         engine.run_pass()  # auto-start attaches to that server, and the next pass asks it
-        refused = drive(engine, lambda: engine.STATUS.get(node.uid) == ('ERROR', message), 15)
+        refused = drive(engine, lambda: line(node) == ('CANCEL', message), 15)
         keys = [cell.key for cell in cells(engine._jobs(node)[0][1])]
         got = (server.status(), [code for _body, code, _reply in TAP.since(start)],
                [key for key in keys if key in pipeline.FAILED or key in pipeline.PENDING])
@@ -299,7 +305,7 @@ def phase_refused():
         server.refresh()  # as tick() does every 5 s
         done = drive(engine, lambda: whole(node, 3), 30)
         check("403: once it has gone, the pass starts this Blender's own server and the node is answered, with no Ask "
-              "Again", done and server.STATE.process is not None and engine.STATUS[node.uid][0] == 'CHECKMARK',
+              "Again", done and server.STATE.process is not None and line(node)[0] == 'CHECKMARK',
               (server.status(), engine.STATUS.get(node.uid)))
     finally:
         if foreign.poll() is None:
@@ -549,7 +555,7 @@ def phase_failed():
     try:
         node.inputs["Items"].default_value = items.replace("lamp", "lamp: a glass lamp")
         engine.run_pass()
-        failed = drive(engine, lambda: engine.STATUS.get(node.uid) == ('ERROR', error) and not pipeline.PENDING, 15)
+        failed = drive(engine, lambda: line(node) == ('CANCEL', error) and not pipeline.PENDING, 15)
     finally:
         TAP.rewrite = None
     entry, got, status = entry_of(node), read(obj), engine.STATUS[node.uid]
@@ -610,9 +616,9 @@ def phase_idle():
         P._Defaults.auto_start = True
     counts = (status.rows, status.answered, status.stale, status.pending)
     check("partial in place: an Items CSV edit with the model stopped shows the table so far in the old entry's place "
-          "(2 rows answered, 1 stale), and the old entry stays stored", status[0] == 'PAUSE' and counts == (3, 2, 1, 0)
+          "(2 rows answered, 1 stale), and the old entry stays stored", status.icon == 'PAUSE' and counts == (3, 2, 1, 0)
           and [entry.words_key for entry in S.load(node).entries] == stored and read(obj) == first,
-          (tuple(status), counts))
+          ((status.state, status.text), counts))
     check("partial in place: with nothing to refill it, its table object is written once, and then only the 2 s "
           "safety passes run, writing nothing", edited <= 1 and idle[1] == 0 and 2 <= len(idle[0]) <= 4
           and all(idle[0]), (edited, idle))

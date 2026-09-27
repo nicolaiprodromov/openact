@@ -1216,6 +1216,15 @@ per node.
 - **What happens otherwise.** The node shows an error naming the conflicting contexts, e.g.
   "Rules: 'Cube' and 'Plane' use Factors CSVs with different factors". It keeps its last good
   table and does not rebuild.
+- **While a context has no job.** A context has no job while it waits for another node, has an
+  error of its own, or shows a hint while its words still name a stored entry (an Import CSV node
+  without a Path, an empty collection: a path traced to Import CSV and a datablock are not words,
+  §8.2). It still shows its last table, so the node keeps its shape: sockets, links and, for
+  Rules, the baked layout. Other contexts are answered if their jobs fit that shape. A job that
+  would change it waits, asking and storing nothing, until that context plans again or goes away;
+  then it is answered, or gets the error above. Meanwhile the status shows that context's error,
+  wait or hint. A hint whose words name no stored entry (e.g. a new object with an empty Prompt)
+  holds nothing.
 - **What may differ, because it is per-entry data** (in the table object, or selected by `k`):
   - option and level texts, and payload **values**;
   - Dials `min`/`max` (§8.6);
@@ -1826,7 +1835,9 @@ This file is the only override channel (4.f). The artist writes it, or starts fr
 
 **Export** (`openact.write_overrides`). The context selected in the sidebar (`context_index`, the
 first by default) picks the file. The contexts it chooses from are the node's contexts that plan
-(`ops.export_uses()`), including one whose Overrides CSV is missing, has errors or is blocked. Every
+(`ops.export_uses()`), including one whose Overrides CSV is missing, has errors or is blocked. Such
+a context comes after the others, which the sidebar lists in the same order, so a selection there
+exports the context it shows. Every
 context of the node that uses that file, with the same key columns, adds its rows, so exporting any
 of them writes the same file. A per-object file (**Scope**) gets only its object's rows.
 1. **Target.** The selected context's Overrides value. If it is empty and unlinked, a file dialog
@@ -1936,7 +1947,7 @@ alive,2,Survives,0,Survives,1.00,0,model
 | Only numeric columns edited | `num_hash` differs, `text_hash` equal | Values-only update (re-bake payload); 0 requests |
 | Saved without real changes | both hashes equal | Nothing |
 | Overrides edited | same watcher | Words keys change (through `lock_digest`) → values-only update; 0 requests for locked rows |
-| File missing or unreadable | `stat`/`open` fails | Node error; the **last good table stays** (entries untouched, nothing rebuilt) |
+| File missing or unreadable | `stat`/`open` fails | Node error; that context keeps its **last good table** (its entry untouched); the node's other contexts are still answered while they fit the node's shape (§6.0) |
 | Path word changed | socket update / depsgraph → pass | Re-plan. The same content elsewhere hits the cache |
 | Edited while Blender was closed | the first pass after `load_post` re-reads every referenced file (stamps are not trusted across sessions) | As above |
 
@@ -1960,8 +1971,9 @@ The watcher (`engine.WATCH: {path_id: (stamp, CsvDoc)}`) behaves as follows:
 ### 7.9 Validation and error reporting
 
 `Problem(severity, file, line, column, message)` has three severities:
-- **error**: the node keeps its last good table and sends nothing that depends on the file. Its
-  status shows the first error with file and line.
+- **error**: that context keeps its last good table, and nothing that depends on the file is sent;
+  the node's other contexts are still answered while they fit its shape (§6.0). The node's status
+  shows the first error with file and line.
 - **warning**: the file is used. `⚠` plus the first warning appears in the status line once the
   table is complete and there are no errors.
 - **info**: shown in the sidebar only.
@@ -3818,11 +3830,20 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 - **Active node.**
   - The status record, and one summary line per context: the object and modifier label, as in the
     prototype's `answers_for`.
+  - **A context with no table to show** says "Asking..." while the pass asks one of its cells (sent,
+    or sent once the model that is starting is ready), else "Not asked: see the status above": the
+    model is stopped, not installed or in error, the context waits or disagrees (§6.0), or its cell
+    failed. Once a row has an answer (a model or stale one), a context being filled shows its table so
+    far (§5.4), and its line sums it up. A context that waits or disagrees shows its stored entry,
+    also a table so far, while that entry's words key is its plan's; a Dials context shows its last
+    good table, each row matched to the plan's by wkey.
   - **Table view**, 50 rows per page. Paging uses a `WindowManager` IntProperty, which is UI state,
     not file data. Each row shows its name, answer, a confidence bar and a source icon:
     - `QUESTION`: unsure;
     - `LOCKED`: lock;
     - `CHECKBOX_HLT`: decided by code;
+    - `CANCEL`: in error: a Rules cell no outcome applies to, or a cell whose ask failed (Show
+      Question says so, and Ask Again asks it again);
     - greyed out: stale or pending.
   - Pick also shows its top 5 items with probabilities, as today.
   - **Show Question** (`openact.show_question`) on the selected row rebuilds that row's request

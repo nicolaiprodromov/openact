@@ -190,9 +190,9 @@ class RulesSpec(Spec):
 
     def job(self, gn, factors, answers, answer_type, debias, hashes=(), uid="", problems=()):
         """The Job for these words, factors and outcomes (an AnswerSet: sources.default_set() for an empty Yes/No or
-        Amount input). Pure, so the pure suites plan exactly like the pass. Its problems, which the pass shows: the
-        cells no outcome applies to, then the warnings of the Factors CSV (`problems`), of the Outcomes and of the
-        plan. Raises RulesHint, RulesError or CsvError."""
+        Amount input). Pure, so the pure suites plan exactly like the pass. What the pass shows: its errors, the cells
+        no outcome applies to; then its problems, the warnings of the Factors CSV (`problems`), of the Outcomes and of
+        the plan. Raises RulesHint, RulesError or CsvError."""
         question, context = gn[0].strip(), gn[1].strip()
         planned = rules_core.plan_table(factors, answer_type, answers, question, context, debias)
         options = answers.options
@@ -219,10 +219,10 @@ class RulesSpec(Spec):
             columns = ((rules_core.value_column(answer_type), "FLOAT"), ("c", "FLOAT"), ("ok", "FLOAT"))
         shape = RulesShape(len(rows), columns, tuple(declare(f) for f in factors), payload, outcomes)
         words_key = pipeline.words_key(gn, list(hashes), answer_type, shape.digest(), [row.wkey for row in rows])
-        shown = ((planned.error,) if planned.error else ()) + warnings((*problems, *answers.problems,
-                                                                       *planned.warnings))
         return pipeline.Job(uid, tuple(gn), words_key, shape, rows, answer_type=answer_type, debias=debias,
-                            problems=shown, options=tuple(option.name for option in options))
+                            problems=warnings((*problems, *answers.problems, *planned.warnings)),
+                            errors=(planned.error,) if planned.error else (),
+                            options=tuple(option.name for option in options))
 
     # ------------------------------------------------------------------ the Overrides CSV (§7.6)
 
