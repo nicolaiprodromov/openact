@@ -6,8 +6,9 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 - table_page(): rows, icons and paging; table_rows() of answered and pending tables, of an entry whose rows are in
   another order (by wkey, Show Question's ask key too) and of an empty material slot;
 - while a Classify context's CSV has errors or the contexts disagree, a context whose words didn't change shows its
-  stored answer and one without says it is not asked; a failed cell is in error in the table, the counts and Show
-  Question, and not asked again;
+  stored answer and one without says it is not asked, as does one whose job waits while another context waits for
+  another node, where a context whose cells are asked says "Asking..."; a failed cell is in error in the table, the
+  counts and Show Question, and not asked again;
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
   trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
   node reads the blocked node's answer, a sidebar draw that resolves no path while nothing is blocked, an Import CSV
@@ -356,7 +357,8 @@ def phase_table(pick, ask):
 def phase_held():
     """A Classify node used by two objects, each with its own Labels CSV (§6.0). While one CSV has errors, or their
     payload columns disagree, nothing is asked: a context whose words didn't change shows its stored answer, and one
-    without it says it is not asked, where the sidebar said "Asking..."."""
+    without it says it is not asked, where the sidebar said "Asking...". So does a context whose job waits while
+    another waits for another node's answer; "Asking..." is for a context whose cells are asked."""
     folder = os.path.join(TMP, "held")
     os.makedirs(folder)
     body = "answer,when,roughness\nmetal,steel or iron,{}\nwood,planks or bark,0.6\n"
@@ -398,6 +400,48 @@ def phase_held():
           and "Not asked: see the status above" in got[3] and "Asking..." not in got[3], got)
     bpy.data.node_groups.remove(tree)
     engine.run_pass()
+
+    # a job also waits while another context waits for another node's answer: then nothing asks for it either
+    tree = new_tree("Waits")
+    for name in ("Labels", "Where"):
+        tree.interface.new_socket(name, in_out='INPUT', socket_type='NodeSocketString')
+    group_in = tree.nodes.new("NodeGroupInput")
+    pick = tree.nodes.new(engine.PICK_ID)  # its answer is the Classify's Context
+    pick.inputs["Items"].default_value = "a kitchen, a forge"
+    tree.links.new(group_in.outputs["Where"], pick.inputs["Prompt"])
+    classify = tree.nodes.new(ClassifySpec.idname)
+    classify.inputs["Items"].default_value = "pan, spoon"
+    tree.links.new(group_in.outputs["Labels"], classify.inputs["Labels"])
+    tree.links.new(pick.outputs["Item"], classify.inputs["Context"])
+    wa = user("WA", tree, Labels=write(folder, "wa.csv", body.format(0.3)), Where="Where is it made?")
+    user("WB", tree, Labels=write(folder, "wb.csv", body.format(0.4)), Where="Where is it made?")
+    engine.schedule(immediate=True)
+    done, _seen = settle(lambda: state(classify) == "complete", 60)
+
+    def drawn_lines():
+        """The status, and the line under each context's button in the Active Node panel."""
+        log = sidebar(classify)
+        return status(classify), [log[i + 1] for i, entry in enumerate(log)
+                                  if entry == ("openact.table_view", "page", 0)]
+
+    classify.inputs["Items"].default_value = "pan, spoon, fork"
+    engine.run_pass()  # asks fork's cell for both contexts; no tick, so no answer arrives meanwhile
+    asking = drawn_lines()
+    settle(lambda: state(classify) == "complete", 30)
+    wa.modifiers["OpenAct"][next(i.identifier for i in tree.interface.items_tree if i.name == "Where")] = "Where to?"
+    write(folder, "wb.csv", "answer,when,hardness\nmetal,steel or iron,9\nwood,planks or bark,3\n")
+    engine.run_pass()  # WA's Pick is asked again, so WA's Context waits, and WB's new payload columns with it
+    got, log = status(classify), sidebar(classify)
+    check("asking: while both contexts' cells are asked, the sidebar says 'Asking...' under each",
+          done and asking[0].state == "filling" and asking[1] == ["Asking...", "Asking..."], asking)
+    check("waits: while one context waits for another node's answer, the other's new payload columns wait too: the "
+          "status is the wait, and the sidebar says that context is not asked instead of 'Asking...'",
+          (got.state, got.text) == ("waiting", "Waiting for another OpenAct node...")
+          and [(label, entry) for label, _job, entry in got.uses] == [("WB > OpenAct", None)]
+          and log[log.index("WB > OpenAct") + 1] == "Not asked: see the status above" and "Asking..." not in log,
+          (got, log))
+    bpy.data.node_groups.remove(tree)
+    settle(lambda: True, 30)  # WA's Pick answer arrives for a node that is gone
 
 
 def phase_failed():

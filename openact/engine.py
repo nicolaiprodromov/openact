@@ -143,17 +143,11 @@ def _plan(spec, node, ctx):
     return cached[1]
 
 
-def _jobs(node, contexts=None):
-    """(ctx, Job) for each of the contexts, by default every use of the node, that has a question."""
+def _jobs(node):
+    """(ctx, Job) for each use of the node that has a question."""
     tree = node.id_data
-    spec = SPECS[node.bl_idname]
-    jobs = []
-    for ctx in contexts or find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
-        try:
-            jobs.append((ctx, _plan(spec, node, ctx)))
-        except (Hint, Pending, Unresolvable):
-            continue
-    return jobs
+    uses = find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
+    return [(ctx, job) for ctx, job in _scan(SPECS[node.bl_idname], node, uses) if not isinstance(job, Exception)]
 
 
 # ------------------------------------------------------------------------ inner trees
@@ -303,10 +297,13 @@ def _process(tree, node, contexts):
     upstream = waiting = changed = False
     planned = _scan(spec, node, contexts)
     # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
-    # good table stays. A context without a job (Pending, or Unresolvable: a CSV with errors, too many items...) still
-    # shows its last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't
-    # fit them wait (None) until that context plans again or goes away; jobs that fit them are answered
-    unknown = any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
+    # good table stays. A context without a job (Pending; Unresolvable: a CSV with errors, too many items...; or a Hint
+    # whose words still name a stored entry: an Import CSV node without a Path, an empty collection) still shows its
+    # last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't fit them
+    # wait (None) until that context plans again or goes away; jobs that fit them are answered
+    gns = {entry.gn for entry in entries}
+    hinted = {ctx.key(): gn for ctx, job in planned if isinstance(job, Hint) and (gn := _gn(spec, node, ctx)) in gns}
+    unknown = bool(hinted) or any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
     conflict = spec.agree(node, [(ctx, job) for ctx, job in planned if not isinstance(job, Exception)], unknown,
                           entries) if hasattr(spec, "agree") else ""
     held = conflict is None
@@ -322,6 +319,9 @@ def _process(tree, node, contexts):
             continue
         if isinstance(job, Hint):
             hints.append(str(job))
+            gn = hinted.get(ctx.key())
+            if gn is not None and gn not in live:  # the stored entry its words name still shows: kept, as for an error
+                live.append(gn)
             continue
         if isinstance(job, Unresolvable):  # e.g. a CSV with errors: its words stay live, so the last good table shows
             problems.append(str(job))
@@ -412,12 +412,17 @@ def _process(tree, node, contexts):
 
 def _live(live, spec, node, ctx):
     """Add the words ctx has now to the live gns, when they can be read."""
-    try:
-        gn = spec.gn(node, ctx)
-    except (Hint, Pending, Unresolvable):
-        return
-    if gn not in live:
+    gn = _gn(spec, node, ctx)
+    if gn is not None and gn not in live:
         live.append(gn)
+
+
+def _gn(spec, node, ctx):
+    """The words ctx has now, or None when they can't be read."""
+    try:
+        return spec.gn(node, ctx)
+    except (Hint, Pending, Unresolvable):
+        return None
 
 
 def _scan(spec, node, contexts):

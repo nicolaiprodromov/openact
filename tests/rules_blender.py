@@ -685,8 +685,9 @@ def phase_agreement():
     """§6.0: the contexts of one node must agree on what the graph bakes. Factors CSVs that differ only in their
     band edges, or Outcomes CSVs whose payload columns differ, give the error naming both contexts; nothing is
     asked, stored or rebuilt, so the last good table stays. Payload values and texts may differ. While a context has
-    no job (a missing or broken CSV, an inline error), the sockets, their links and the graph stay: another context's
-    new words are still asked and shown if they fit them, and wait if they would change them."""
+    no job (a missing or broken CSV, an inline error, an Import CSV node without a Path), the sockets, their links and
+    the graph stay: another context's new words are still asked and shown if they fit them, and wait if they would
+    change them."""
     a, b = write("agree_a.csv", EDGES.format("0.5")), write("agree_b.csv", EDGES.format("0.5"))
     sizes = "answer,when,size\nA,the first,{0}\nB,the second,{1}\n"
     oa, ob = write("agree_oa.csv", sizes.format(1, 2)), write("agree_ob.csv", sizes.format(3, 4))
@@ -795,6 +796,37 @@ def phase_agreement():
           got == (True, 0, False, True, True), got)
     got = step(lambda: write("agree_a.csv", EDGES.format("0.2")))
     check("agreement: the band edges back, a checkmark", got[0][0] == 'CHECKMARK' and got[4] == good, got)
+
+    # A context whose Factors come through an Import CSV node without a Path shows a hint that leaves its words, so its
+    # last table shows: it holds the sockets and the graph as an error does. step(), use() and sockets() read this
+    # scene now
+    fa, fb = write("hint_fa.csv", EDGES.format("0.5")), write("hint_fb.csv", EDGES.format("0.5"))
+    tree, rules, objs, gi, go = shared_scene("AgreeHint", {"Context": ["On a hill.", "By the sea."]},
+                                             [{"in_heat": ('FLOAT', heat)}] * 2)
+    rules.inputs["Outcomes"].default_value = "A: the first; B: the second"
+    tree.interface.new_socket("FactorsPath", in_out='INPUT', socket_type='NodeSocketString')
+    reader = tree.nodes.new("GeometryNodeImportCSV")
+    tree.links.new(gi.outputs["FactorsPath"], reader.inputs["Path"])
+    tree.links.new(reader.outputs[0], rules.inputs["Factors CSV"])
+    for obj, path in zip(objs, (fa, fb)):
+        use(obj, "FactorsPath", path)
+    answer_cells(planned(rules), lambda name: 0 if name == "cold" else 1)
+    wire(tree, rules, gi, go, ["Outcome"])
+    planned(rules)
+    labels = [ctx.label() for ctx in evaluator.find_uses()[tree.as_pointer()]]
+    good, face = step(lambda: None)[4], sockets()
+    got = (step(lambda: use(objs[0], "FactorsPath", "")), step(lambda: write("hint_fb.csv", EDGES.format("0.2"))),
+           step(lambda: use(objs[0], "FactorsPath", fa)))
+    check("agreement: while a context's Import CSV node has no Path (a hint that leaves its words), another context's "
+          "new band edges wait: nothing is asked, stored or rebuilt, the sockets keep their links, both objects the "
+          "last good table, and the status is the hint; the Path back, the error names both",
+          good == [{"Outcome": [0, 0, 1, 1], "size": None}] * 2
+          and got[1][0] == ('INFO', "Factors CSV: type a Path on 'Import CSV'")
+          and got[2][0] == ('CANCEL', f"Rules: '{labels[0]}' and '{labels[1]}' use Factors CSVs with different factors")
+          and all(not g[1] and not g[2] and g[3] and g[4] == good for g in got) and sockets() == face,
+          (got, sockets()))
+    got = step(lambda: write("hint_fb.csv", EDGES.format("0.5")))
+    check("agreement: those band edges back, a checkmark", got[0][0] == 'CHECKMARK' and got[4] == good, got)
 
 
 class _PollProbe(bpy.types.Operator):

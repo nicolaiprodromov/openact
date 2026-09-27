@@ -11,8 +11,9 @@ valid link; renaming a setting warns (in the CSV or inline) until its new socket
 (File > Revert), and typed back it warns until linked again; after Ask Again, or while an edited question is asked
 again, the outputs and their links stay; a CSV whose rows only move keeps each output on its own setting; a new
 setting gets its output before its answer; a node reading a setting as a word waits while Dials shows a hint; while a
-context has no job (a missing Settings CSV, an inline error), every output keeps its link, another context's new
-prompt is still asked and shown, and a rename in it waits.
+context has no job (a missing Settings CSV, an inline error, an Import CSV node without a Path), every output keeps
+its link, another context's new prompt is still asked and shown, and a rename in it waits; a setting retyped then, or
+in a conflict, is exported unanswered.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -540,9 +541,10 @@ def phase_chained_hint():
 
 
 def phase_hold():
-    """§6.0: a context without a job (its Settings CSV missing, an inline error) may still show the outputs as they
-    are, so they stay, with their links. Another context's new prompt, which fits them, is still asked and shown;
-    a rename, which would change them, waits, and gives the error once that context plans again."""
+    """§6.0: a context without a job (its Settings CSV missing, an inline error, an Import CSV node without a Path)
+    may still show the outputs as they are, so they stay, with their links. Another context's new prompt, which fits
+    them, is still asked and shown; a rename, which would change them, waits, and gives the error once that context
+    plans again. A setting retyped meanwhile, or in a conflict, is exported unanswered (§7.6)."""
     csv_a, csv_b = weather("hold_a.csv"), weather("hold_b.csv")
     tree, node, users = scene("DialsHold", [("HA", STORM, csv_a), ("HB", STORM, csv_b)])
     calls = []
@@ -554,7 +556,7 @@ def phase_hold():
         with asking(calls):
             settle(times)
         status = engine.STATUS[node.uid]
-        return ((status.icon, status.text), (read(users["HA"]), read(users["HB"])), linked(node),
+        return ((status.icon, status.text), tuple(read(obj) for obj in users.values()), linked(node),
                 [cell for job, missing in calls if job.uid == node.uid for cell in missing])
 
     passes(lambda: None)  # the weather cells are cached
@@ -586,6 +588,59 @@ def phase_hold():
               links, []) and not dials.WARNINGS.get(node.uid), got)
     got = passes(lambda: weather("hold_b.csv"))
     check("hold: the rename undone, a checkmark", got[0][0] == 'CHECKMARK' and got[1:] == (good, links, []), got)
+
+    def exported(name):
+        """Write the first context's Overrides CSV into the empty socket: setting -> (answer, source)."""
+        target = os.path.join(TMP, name)
+        ops.write_overrides(node, 0, target)
+        node.inputs["Overrides"].default_value = ""  # the export filled the empty socket: the words stay as they were
+        with open(target, encoding="utf-8") as handle:
+            return {row[0]: (row[1], row[-1]) for row in (line.split(",") for line in handle.read().splitlines()[1:])}
+
+    with open(csv_a, encoding="utf-8") as handle:
+        lines = handle.read().split("\n")[:6]
+    retype = passes(lambda: rewrite(csv_a, [*lines[:2], "Wind speed,yes/no,Is it windy?,,,", *lines[3:]]))
+    retype = retype, exported("retype_conflict.csv"), passes(lambda: os.remove(csv_b)), exported("retype_held.csv")
+    own = {"Rain": ("yes", "model"), "Wind speed": ("", "pending"), "Time of day": ("night", "model"),
+           "Street lights": ("no", "model"), "Fog": ("0.5", "model")}
+    check("export: the first context retypes a setting, in a conflict and while it waits for another context's "
+          "missing Settings CSV; its export writes that setting unanswered, never with an old type's or another "
+          "setting's answer, and each other setting with its own",
+          retype[0] == (('CANCEL', "Dials: 'HA > Dials' and 'HB > Dials' use different settings ('Wind speed' "
+                                   "(yes/no) vs 'Wind speed' (amount)); setting names and types must agree"),
+                        good, links, [])
+          and retype[2] == (('CANCEL', f"Can't find {os.path.normpath(csv_b)}"), good, links, [])
+          and retype[1] == retype[3] == own, retype)
+    got = passes(lambda: (weather("hold_a.csv"), weather("hold_b.csv")))
+    check("export: both CSVs back, a checkmark", got[0][0] == 'CHECKMARK' and got[1:] == (good, links, []), got)
+
+    # A context whose Settings come through an Import CSV node without a Path shows a hint that leaves its words, so
+    # its last table shows: it holds the outputs as an error does. passes() reads this scene now
+    path_a, path_b = weather("hint_a.csv"), weather("hint_b.csv")
+    tree, node, users = scene("DialsHint", [("IA", STORM, path_a), ("IB", CALM, path_b)])
+    reader = tree.nodes.new("GeometryNodeImportCSV")  # the modifier's Settings path is its Path now
+    tree.links.remove(node.inputs["Settings"].links[0])
+    tree.links.new(next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput").outputs["Settings"],
+                   reader.inputs["Path"])
+    tree.links.new(reader.outputs[0], node.inputs["Settings CSV"])
+    answer(passes(lambda: None)[3])
+    passes(lambda: None)
+    wire(tree, node)
+    good, links = (read(users["IA"]), read(users["IB"])), linked(node)
+    got = (passes(lambda: words(users["IA"], Settings="")),
+           passes(lambda: weather("hint_b.csv", ("Wind speed,amount", "Gust,amount"))),
+           passes(lambda: words(users["IA"], Settings=path_a)))
+    check("hold: while a context's Import CSV node has no Path (a hint that leaves its words), another context's "
+          "rename waits: every output keeps its link and both objects their tables, with 0 requests, the hint as the "
+          "status and no rename warning; the Path back, the error is back",
+          [g[1:] for g in got] == [(good, links, [])] * 3
+          and got[0][0] == ('CHECKMARK', "5 settings · lowest confidence 0.50")
+          and got[1][0] == ('INFO', "Settings CSV: type a Path on 'Import CSV'")
+          and got[2][0] == ('CANCEL', "Dials: 'IA > Dials' and 'IB > Dials' use different settings ('Wind speed' "
+                                      "(amount) vs 'Gust' (amount)); setting names and types must agree")
+          and not dials.WARNINGS.get(node.uid), got)
+    got = passes(lambda: weather("hint_b.csv"))
+    check("hold: that rename undone, a checkmark", got[0][0] == 'CHECKMARK' and got[1:] == (good, links, []), got)
     phase_revert()
 
 

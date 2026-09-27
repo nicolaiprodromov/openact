@@ -1210,6 +1210,15 @@ per node.
 - **What happens otherwise.** The node shows an error naming the conflicting contexts, e.g.
   "Rules: 'Cube' and 'Plane' use Factors CSVs with different factors". It keeps its last good
   table and does not rebuild.
+- **While a context has no job.** A context has no job while it waits for another node, has an
+  error of its own, or shows a hint while its words still name a stored entry (an Import CSV node
+  without a Path, an empty collection: a path traced to Import CSV and a datablock are not words,
+  §8.2). It still shows its last table, so the node keeps its shape: sockets, links and, for
+  Rules, the baked layout. Other contexts are answered if their jobs fit that shape. A job that
+  would change it waits, asking and storing nothing, until that context plans again or goes away;
+  then it is answered, or gets the error above. Meanwhile the status shows that context's error,
+  wait or hint. A hint whose words name no stored entry (e.g. a new object with an empty Prompt)
+  holds nothing.
 - **What may differ, because it is per-entry data** (in the table object, or selected by `k`):
   - option and level texts, and payload **values**;
   - Dials `min`/`max` (§8.6);
@@ -1932,7 +1941,7 @@ alive,2,Survives,0,Survives,1.00,0,model
 | Only numeric columns edited | `num_hash` differs, `text_hash` equal | Values-only update (re-bake payload); 0 requests |
 | Saved without real changes | both hashes equal | Nothing |
 | Overrides edited | same watcher | Words keys change (through `lock_digest`) → values-only update; 0 requests for locked rows |
-| File missing or unreadable | `stat`/`open` fails | Node error; the **last good table stays** (entries untouched, nothing rebuilt) |
+| File missing or unreadable | `stat`/`open` fails | Node error; that context keeps its **last good table** (its entry untouched); the node's other contexts are still answered while they fit the node's shape (§6.0) |
 | Path word changed | socket update / depsgraph → pass | Re-plan. The same content elsewhere hits the cache |
 | Edited while Blender was closed | the first pass after `load_post` re-reads every referenced file (stamps are not trusted across sessions) | As above |
 

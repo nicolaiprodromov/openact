@@ -138,7 +138,7 @@ class DialsSpec(Spec):
         if not gn[0].strip():
             raise Hint("Type a prompt")
         job = self.job(gn, settings, node.balance_order, node.uid, hashes)
-        job.problems, job.context = problems, ctx.label()
+        job.problems = problems
         return job
 
     def job(self, gn, settings, debias, uid="", csv_hashes=()):

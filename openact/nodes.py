@@ -83,8 +83,10 @@ class _OpenActNode:
     def draw_answers(self, layout, uses, selected):
         """One summary per context; with several, each one a button that shows its table."""
         spec = engine.SPECS[self.bl_idname]
-        # else nothing is asked: a hold, a conflict or a failed cell, which the status line names
-        asking = getattr(engine.STATUS.get(self.uid), "state", "") in ("filling", "starting", "waiting")
+        # "Asking..." only while cells of this node are asked; else nothing asks for that context: it waits (§6.0),
+        # disagrees or failed, which the status line names
+        status = engine.STATUS.get(self.uid)
+        asking = status is not None and status.state in ("filling", "starting") and status.pending > 0
         box = layout.box()
         for i, (label, _job, answer) in enumerate(uses):
             col = box.column(align=True)
