@@ -45,7 +45,6 @@ def load_package():
     from openact import prefs as P
 
     nodes.register()
-    engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
     return engine, server, P
 
 

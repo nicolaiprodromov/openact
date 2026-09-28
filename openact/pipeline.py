@@ -87,7 +87,7 @@ class Job:
     errors: tuple[str, ...] = ()  # rows in error in a usable plan (e.g. Rules cells no outcome applies to): an error
     options: tuple = ()  # the answer names rows choose among (Dials: per row), which Overrides answers name (§7.6)
     locks: dict = field(default_factory=dict)  # Overrides lock -> "" when a row uses it, else its orphan warning
-    csv: dict = field(default_factory=dict)  # path as written -> [text_hash, num_hash] of each CSV it was planned from
+    csv: dict = field(default_factory=dict)  # path as written (node or Import CSV) -> [text_hash, num_hash] per CSV
 
 
 @dataclass(frozen=True, eq=False)

@@ -82,7 +82,6 @@ P._Defaults.port, P._Defaults.auto_start = PORT, True  # the add-on isn't enable
 server.FAKE_ARGS[:] = ["--record", RECORD]
 nodes.register()
 engine.register()
-engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 
 
 class Tap:

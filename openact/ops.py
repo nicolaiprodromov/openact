@@ -134,6 +134,17 @@ class OPENACT_OT_server_stop(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _tables_writable(cls):
+    """False, with the reason as the poll message, while the node tables stay as they are (§7.8): a render job renders
+    them, or a background session renders the saved answers only."""
+    held = ("A render is running: the tables stay as it renders them" if engine._rendering() else
+            "Background mode renders the saved answers: call allow_background_passes(True) first"
+            if engine._saved_only() else "")
+    if held:
+        cls.poll_message_set(held)
+    return not held
+
+
 class OPENACT_OT_reask(bpy.types.Operator):
     bl_idname = "openact.reask"
     bl_label = "Ask Again"
@@ -141,6 +152,10 @@ class OPENACT_OT_reask(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     uid: bpy.props.StringProperty(options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return _tables_writable(cls)
 
     def execute(self, context):
         _tree, node = engine.find_node(self.uid)
@@ -163,7 +178,7 @@ class OPENACT_OT_prepare_playback(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return not (engine._stepping or engine._rendering())  # either would move the frame under the other
+        return not engine._stepping and _tables_writable(cls)  # a run stepping frames or a render would clash with it
 
     def execute(self, context):  # run from a script, the fallback sets every frame here without a modal loop
         run = engine.Playback(context.scene)

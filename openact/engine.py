@@ -70,6 +70,7 @@ DUE = set()  # uids saved without their live set since their last pass (pins, Un
 NOTES = {}  # node uid -> what its last save evicted or kept above the soft cap (NodeStore.note), for its status
 DRIFT = {}  # node uid -> {path: note} of the CSVs that differed from its saved tables when the file loaded (R23)
 REPORTED = set()  # CSV paths whose "differs" line was printed since the file loaded (§7.8)
+RENDERED = set()  # (node uid, words) the running background render compared, from its render_init on
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -83,7 +84,6 @@ _pass_plans = None  # the PLANS keys the running pass planned, contexts only an 
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
 _quiet_since = time.monotonic()  # the stall clock: since a chunk was last answered, or cells were first asked
 _slow_since = None  # since when /health's ms_per_row has been above SLOW_MS, cells asked all along
-_background_passes = os.environ.get("OPENACT_BACKGROUND_PASSES") == "1"  # headless authoring runs passes (§7.8)
 _opened = True  # no pass has run since the file loaded: the next one compares its files with the saved tables
 
 
@@ -273,28 +273,39 @@ def schedule(immediate=False, node=None):
     _last_change = 0.0 if immediate else time.monotonic()
 
 
+def _env_opt_in(environ=os.environ):
+    """OPENACT_BACKGROUND_PASSES as set before Blender starts: 1, true or yes, spaces ignored (Windows cmd's
+    `set OPENACT_BACKGROUND_PASSES=1 && blender ...` keeps the one before &&)."""
+    return environ.get("OPENACT_BACKGROUND_PASSES", "").strip().lower() in ("1", "true", "yes")
+
+
+_background_passes = _env_opt_in()  # headless authoring runs passes (§7.8)
+
+
 def allow_background_passes(flag=True):
-    """Let passes run in background mode (blender -b) for headless authoring: test suites, demos/build_demos.py and
-    scripts that set words and save. Without it, or OPENACT_BACKGROUND_PASSES=1 set before Blender starts, a background
-    session renders the saved answers only (§7.8). Call it after enabling the add-on."""
+    """Let passes run in background mode (blender -b) for headless authoring: scripts that set words, fill the tables
+    and save. Unless this or OPENACT_BACKGROUND_PASSES=1 (read at import) opts in, a background session renders the
+    saved answers only (§7.8). Call it after enabling the add-on."""
     global _background_passes
     _background_passes = bool(flag)
     schedule(immediate=True)
 
 
 def _saved_only():
-    """True while passes leave the saved answers and payload as they are: in a render job, and in background mode
-    unless headless authoring opted in (§7.8)."""
-    return _rendering() or (bpy.app.background and not _background_passes)
+    """True in background mode unless headless authoring opted in: passes and the operators that plan and write the
+    tables leave the saved answers and payload as they are (§7.8). A render job holds them too: tick() starts no pass
+    then, and those operators' polls refuse."""
+    return bpy.app.background and not _background_passes
 
 
 def run_pass(everything=True):
     """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. While
-    _saved_only(), it only reports the CSVs that differ from the saved tables. Main thread only."""
+    _saved_only(), it only reports the CSVs that differ from the saved tables. Main thread only, and never during a
+    render job (tick())."""
     global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, passes, _opened
     if _saved_only():  # a farm renders exactly the saved answers and payload (§7.8)
         _dirty, _last_pass = False, time.monotonic()  # what else is due (DIRTY, WATCH) waits for a pass that writes
-        _report(iter_nodes())
+        _report()
         return
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
@@ -456,14 +467,17 @@ def _process(tree, node, contexts):
             if any(entry is found for entry in shown):
                 LAST_SHOWN[key] = found.words_key
             continue
-        if _opened and (drift := _differs(job, found)):  # edited elsewhere: re-baked as usual, with a note (R23)
-            DRIFT.setdefault(node.uid, {}).update((path, DIFFERS.format(path, kinds)) for path, kinds in drift)
         # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
         entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)
         if entry is not None and found is not None and entry is not found:
             entry.pinned, entry.frames = found.pinned, found.frames  # a pin holds its words, whatever they mean
             if dataclasses.replace(entry, t=found.t) == found:
                 entry = found  # the partial table as stored already
+        if found is not None and entry is found:  # the stored table holds
+            if found.csv != job.csv:  # edited where no table follows it: loads and farms compare with it now (§14.2)
+                entry = dataclasses.replace(found, csv=dict(job.csv))
+        elif _opened and (drift := _differs(job, found)):  # edited elsewhere: re-baked as usual, with a note (R23)
+            DRIFT.setdefault(node.uid, {}).update((path, DIFFERS.format(path, kinds)) for path, kinds in drift)
         if entry is not None:  # the table shown: the sidebar and the counts describe it, not a hidden entry
             shown.append(entry)
             resolved[job.gn] = entry
@@ -593,25 +607,44 @@ def _differs(job, entry):
     return found
 
 
-def _report(nodes):
-    """Print once per file each CSV that differs from the one the stored table of its words was read from, for passes
-    that leave the saved tables as they are (§7.8). Each context is planned afresh; nothing is asked, stored or
-    built."""
-    uses = find_uses()
-    for tree, node in nodes:
-        entries = store.load(node).entries if tree.library is None else ()  # a library's answers are its own
+def _report(scene=None):
+    """Print once per file each CSV that differs from the one the stored table of its words was read from, for a pass
+    or a background render, which leave the saved tables as they are (§7.8). Only where the table its words plan now
+    differs from the stored one: an edit that changes no table reports nothing.
+
+    The words are the ones each context has now or, given a render's scene, at the frame it renders: a background
+    render sets its frame without evaluating the original data, so they are read through the F-curves, as Prepare for
+    Playback reads them. Where only setting the frame would tell (a driver, NLA, a keyframed menu socket), they are
+    read as the file holds them. Each context is planned afresh, a render's once per word set; nothing is asked,
+    stored or built. Linked nodes, whose answers are their library's, are left out."""
+    run = Playback(scene or bpy.context.scene)
+    values = None
+    if scene is not None:
+        run.first = run.last = scene.frame_current
+        values = run.values.get(run.first) if run.read_curves() else None
+    for node, spec, ctx in run.contexts:
+        entries = store.load(node).entries
         if not entries:
             continue
-        spec = SPECS[node.bl_idname]
-        for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
-            try:
-                job = _planned(spec, node, ctx)
-            except (Hint, Pending, Unresolvable):
-                continue
-            for path, kinds in _differs(job, next((entry for entry in entries if entry.gn == job.gn), None)):
-                if path not in REPORTED:
-                    REPORTED.add(path)
-                    print(DIFFERS.format(path, kinds) + RENDERING, flush=True)
+        evaluator.OVERRIDES = values
+        try:
+            if scene is not None:
+                words = _read(node, spec, ctx)[0]
+                if words is None or (node.uid, words) in RENDERED:
+                    continue
+                RENDERED.add((node.uid, words))
+            job = _planned(spec, node, ctx)
+        except (Hint, Pending, Unresolvable):
+            continue
+        finally:
+            evaluator.OVERRIDES = None
+        found = next((entry for entry in entries if entry.gn == job.gn), None)
+        if found is None or spec.resolve(job, entries, partial=True)[0] is found:  # the files give the stored table
+            continue
+        for path, kinds in _differs(job, found):
+            if path not in REPORTED:
+                REPORTED.add(path)
+                print(DIFFERS.format(path, kinds) + RENDERING, flush=True)
 
 
 def _submit(job, missing):
@@ -1311,10 +1344,15 @@ def on_load_post(*_args):
 
 @persistent
 def on_render_init(*_args):
-    # blender -b -f runs no timer, so no pass: a farm's render prints its "differs" lines here (§7.8). Only in
-    # background mode, where the render runs on the main thread
-    if bpy.app.background and _saved_only():
-        _report(iter_nodes())
+    RENDERED.clear()  # a new render job compares each word set again
+
+
+@persistent
+def on_render_pre(scene, *_args):
+    # blender -b -f / -a runs no timer, so no pass: a farm render compares the words of each frame it renders here
+    # (§7.8). _saved_only() means background mode, where the render runs on the main thread
+    if _saved_only():
+        _report(scene)
 
 
 @persistent
@@ -1330,7 +1368,8 @@ def on_server_status():
 def _handlers():
     h = bpy.app.handlers
     return ((h.depsgraph_update_post, on_depsgraph_update), (h.load_post, on_load_post),
-            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo), (h.render_init, on_render_init))
+            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo), (h.render_init, on_render_init),
+            (h.render_pre, on_render_pre))
 
 
 def register():

@@ -45,7 +45,6 @@ from openact.specs.base import lock_answer  # noqa: E402
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 ops.register()
-engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 TMP = tempfile.mkdtemp(prefix="openact_overrides_")
 POINTS = 4
 _stamp = [1_700_000_000 * 10**9]

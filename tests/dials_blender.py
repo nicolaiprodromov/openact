@@ -59,7 +59,6 @@ ASK = "GeometryNodeOpenActAsk"
 
 nodes.register()
 ops.register()
-engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 
 
 # ------------------------------------------------------------------------------------------ helpers

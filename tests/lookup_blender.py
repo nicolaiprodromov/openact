@@ -34,7 +34,6 @@ from openact.specs.rules import RulesSpec  # noqa: E402
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 ops.register()
-engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 MATERIALISED_MAX = 16  # the cap of §8.1: every worst shape has this many entries
 DIALS_MAX_SETTINGS = 32  # §7.5

@@ -450,10 +450,8 @@ def phase_both_enabled():
         setattr(old, name, value)
     enabled = addon_utils.enable("openact", default_set=True, handle_error=print)
     check("both enabled: OpenAct enables", enabled is not None)
-    from openact import engine, ui
+    from openact import ui
     from openact import prefs as P
-
-    engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 
     got = {name: getattr(P.get_prefs(), name) for name in custom}
     check("both enabled: OpenAct takes jev_nodes' runtime folder, port, device, GPU, auto-start and order balancing",

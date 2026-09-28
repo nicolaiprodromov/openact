@@ -121,8 +121,8 @@ def load_csv(node, source: CsvSource, schema: str = "answer_set") -> csvfmt.CsvD
         raise Unresolvable(message)
     doc = csvfmt.load(path, source.delimiter, schema)
     WATCH.use(getattr(node, "uid", "") or node.name, doc, source.delimiter)
-    if HASHES is not None:  # by the path as written, which a farm or another machine shares (§14.2)
-        HASHES[source.path] = [doc.text_hash, doc.num_hash]
+    if HASHES is not None:  # by the path as written, on the node or its Import CSV node: a farm shares it (§14.2)
+        HASHES[source.written or source.path] = [doc.text_hash, doc.num_hash]
     return doc
 
 

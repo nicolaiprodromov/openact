@@ -40,17 +40,22 @@ on your GPU. Nothing leaves your computer.
 
 ## Render farms and headless scripts
 
-In background mode (`blender -b`, e.g. a render farm's `blender -b scene.blend -f 1`) and while a render job
-runs, OpenAct renders the answers and CSV payload saved in the file: it doesn't plan again or re-bake from the CSV
-files. If a CSV differs from the one a saved table was made from, it prints once per file, e.g.
-`CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. Opened
-interactively, the file re-bakes from its CSVs as usual, and the node's status notes each file that differed.
+In background mode (`blender -b`, e.g. a render farm's `blender -b scene.blend -f 1`), OpenAct renders the
+answers and CSV payload saved in the file: it doesn't plan again or re-bake from the CSV files. For each frame it
+renders, it prints once per file each CSV that differs from the one a saved table was made from, e.g.
+`CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. A render job in an
+open Blender leaves the tables as they are too. Opened interactively, the file re-bakes from its CSVs as usual, and
+the node's status notes each file that differed.
 
 A script that authors headlessly (sets words, fills tables, saves) opts back in, either way:
-- set the environment variable `OPENACT_BACKGROUND_PASSES=1` before starting Blender;
-- or call `openact.engine.allow_background_passes(True)` after enabling the add-on.
+- set the environment variable `OPENACT_BACKGROUND_PASSES=1` (or `true`) before starting Blender;
+- or, after enabling the add-on, call `allow_background_passes(True)` in its `engine` module. Installed from disk
+  as above, that is `import bl_ext.user_default.openact.engine as engine`; from another extension repository, use
+  its name instead of `user_default`.
 
-The test suites use the second.
+Blender runs no timers while a `--python` script runs, so the script then calls `engine.tick()` every few
+hundredths of a second until its nodes are answered, and saves, as `drive()` in `tests/_harness.py` does. The test
+suites set the variable (`tests/_harness.py`).
 
 ## Repository
 

@@ -37,7 +37,6 @@ trust.register()
 watch.register()
 bpy.app.handlers.load_post.append(engine.on_load_post)  # the pass's caches start afresh with each file
 bpy.utils.register_class(ops.OPENACT_OT_allow_file)
-engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 real_open = builtins.open
 QUESTION = "What happens to this cell in the next generation?"
 
@@ -241,8 +240,8 @@ imp = N.new("GeometryNodeImportCSV")
 imp.inputs["Path"].default_value = PROPS
 plug(imp.outputs[0], stand.inputs["Items CSV"])
 src = lists.csv_source(stand, "Items", ctx)
-check("hand-off: a direct link reads the Import CSV node's Path and Delimiter",
-      src == csvfmt.CsvSource(PROPS, ",", (imp.name,)), src)
+check("hand-off: a direct link reads the Import CSV node's Path and Delimiter, and keeps the Path as written",
+      src == csvfmt.CsvSource(PROPS, ",", (imp.name,), written=PROPS), src)
 got = lists.resolve_items(stand, ctx, source='TEXT')
 check("hand-off: its file gives the items", got.names[8] == "anvil" and got.csv == src, got.names)
 stand.inputs["Items"].default_value = "//typed.csv"
@@ -263,7 +262,7 @@ for _ in range(2):
     socket = reroute.outputs[0]
 plug(socket, stand.inputs["Items CSV"])
 check("hand-off: through Reroutes", outcome(lambda: lists.csv_source(stand, "Items", ctx))
-      == csvfmt.CsvSource(PROPS, ",", (imp.name,)))
+      == csvfmt.CsvSource(PROPS, ",", (imp.name,), written=PROPS))
 
 source_group = bpy.data.node_groups.new("CSV Source", 'GeometryNodeTree')  # a path exposed on the modifier
 source_group.interface.new_socket("Path", in_out='INPUT', socket_type='NodeSocketString')
@@ -280,8 +279,8 @@ mod[ids["CSV Path"]] = PROPS
 mod2[ids["CSV Path"]] = FAMILIES
 got = [outcome(lambda c=c: lists.csv_source(stand, "Items", c)) for c in (ctx, ctx2)]
 check("hand-off: out of a nested group, with the Path from the modifier, per context", got == [
-    csvfmt.CsvSource(PROPS, ",", (group.name, nested_import.name)),
-    csvfmt.CsvSource(FAMILIES, ",", (group.name, nested_import.name))], got)
+    csvfmt.CsvSource(PROPS, ",", (group.name, nested_import.name), written=PROPS),
+    csvfmt.CsvSource(FAMILIES, ",", (group.name, nested_import.name), written=FAMILIES)], got)
 
 user_group = bpy.data.node_groups.new("CSV User", 'GeometryNodeTree')  # the node inside a group, fed from outside
 user_group.interface.new_socket("Table", in_out='INPUT', socket_type='NodeSocketGeometry')
@@ -295,7 +294,7 @@ outer_import.inputs["Path"].default_value = FAMILIES
 L.new(outer_import.outputs[0], user.inputs["Table"])
 got = outcome(lambda: lists.csv_source(user_stand, "Items", ctx.push(user)))
 check("hand-off: into a nested group through its Group Input",
-      got == csvfmt.CsvSource(FAMILIES, ",", (user.name, outer_import.name)), got)
+      got == csvfmt.CsvSource(FAMILIES, ",", (user.name, outer_import.name), written=FAMILIES), got)
 
 menu = N.new("GeometryNodeMenuSwitch")
 menu.data_type = 'GEOMETRY'
@@ -322,7 +321,7 @@ plug(index_switch.outputs[0], sock(switch.inputs, "True"))
 plug(switch.outputs[0], stand.inputs["Items CSV"])
 got = outcome(lambda: lists.csv_source(stand, "Items", ctx))
 check("hand-off: Switch and Index Switch of type Geometry",
-      got == csvfmt.CsvSource(PROPS, ",", (switch.name, index_switch.name, imp.name)), got)
+      got == csvfmt.CsvSource(PROPS, ",", (switch.name, index_switch.name, imp.name), written=PROPS), got)
 
 grid = N.new("GeometryNodeMeshGrid")
 plug(grid.outputs[0], stand.inputs["Items CSV"])
@@ -389,8 +388,9 @@ bare = N.new("GeometryNodeImportCSV")
 bare.inputs["Path"].default_value = "data.csv"
 plug(bare.outputs[0], stand.inputs["Items CSV"])
 got = outcome(lambda: lists.csv_source(stand, "Items", ctx))
-check("paths: an Import CSV Path without '//' is in Blender's working folder, where Import CSV reads it",
-      got == csvfmt.CsvSource(os.path.abspath("data.csv"), ",", (bare.name,)), got)
+check("paths: an Import CSV Path without '//' is in Blender's working folder, where Import CSV reads it; its hashes "
+      "are kept under the Path as written", got == csvfmt.CsvSource(os.path.abspath("data.csv"), ",", (bare.name,),
+                                                                    written="data.csv"), got)
 plug(None, stand.inputs["Items CSV"])
 
 # ---------------------------------------------------------------------- answer sets

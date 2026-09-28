@@ -11,6 +11,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # suites import openact from this checkout; Blender does not install it
+os.environ["OPENACT_BACKGROUND_PASSES"] = "1"  # the suites author headlessly (§7.8): openact.engine reads it on import
 FAILURES = []
 _NO_DETAIL = object()  # details like 0, None or [] must still print
 
@@ -42,7 +43,6 @@ def enable_addon():
     from openact import engine, server
     from openact import prefs as P
 
-    engine.allow_background_passes(True)  # the suites author headlessly: passes run in background mode (§7.8)
     return engine, server, P
 
 
