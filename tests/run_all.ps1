@@ -87,7 +87,7 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
     if ((Split-Path -Leaf $Exe) -ieq "blender.exe") { $Arguments = @("-t", "$Threads") + $Arguments }
     $start = [Diagnostics.ProcessStartInfo]::new($Exe, ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join " ")
     $start.UseShellExecute = $false
-    $start.WorkingDirectory = Split-Path $PSScriptRoot  # the repository root, like the README's per-suite commands
+    $start.WorkingDirectory = Split-Path $PSScriptRoot  # the repository root, like CONTRIBUTING.md's per-suite commands
     $start.RedirectStandardOutput = $start.RedirectStandardError = $true
     $start.StandardOutputEncoding = $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"  # else CPython writes the ANSI code page into the pipe

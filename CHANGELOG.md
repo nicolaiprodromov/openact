@@ -1,0 +1,25 @@
+# Changelog
+
+All notable changes to OpenAct. Versions follow the extension manifest (`openact/blender_manifest.toml`).
+
+## 1.0.0
+
+The first release of OpenAct.
+
+- Six nodes: **Ask**, **Pick** and **Dials** judge the whole situation, **Match** and **Classify** each item of a
+  list, and **Rules** each measured situation. Lists come from text, CSV files, collections, material slots or
+  attribute names.
+- Answers apply per element, through an ID or the Rules factor inputs, from a table stored in the node. Saved files,
+  per-element tables included, evaluate and render without the add-on.
+- CSV authoring: answer sets written as "answer + when", Factors and Settings files, and payload columns that become
+  outputs. A node takes a typed path or a plugged-in Import CSV node, and sees edits while Blender runs.
+- An Overrides CSV with locks on all six nodes, and *Write Overrides CSV*.
+- A confidence for every answer, unsure flags (*Unsure Below*), and *Balance Option Order* on each node.
+- The sidebar shows each node's status, tables, questions and file problems, and offers starter templates and *Copy
+  Diagnostics*; the *Log Requests* preference keeps a request log.
+- *Prepare for Playback* for animated words.
+- Several Blender sessions can share one model server.
+- The installer checks the disk and the GPU, and can locate an existing runtime.
+- Background renders use the saved answers; headless scripts can opt in to asking.
+- Blender 4.5 or newer.
+- Six demo scenes.
