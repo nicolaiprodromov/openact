@@ -302,7 +302,7 @@ Neither of these is built or scheduled.
 
 - `openact/`: the add-on (extension) package.
 - `tests/`: headless Blender tests.
-- `demos/`: the demo scenes' build script and CSV files.
+- `demos/`: the six demo scenes (`.blend`), their CSV files and the script that builds them.
 - `docs/DESIGN.md`: the v1 design.
 - `tools/make_locks.ps1`: regenerates the runtime's hash-locked package list.
 
@@ -338,6 +338,10 @@ file with `tests/fixtures/jev_nodes-0.1.0.zip`, the release of the Jev Nodes pro
 grew from (same author, GPL-3.0-or-later), so it needs nothing outside the repository.
 
 ## Demos
+
+The six scenes ship in `demos/`, answered and saved: open any `.blend` there and press play. They
+need neither the model nor the add-on to play and render; with OpenAct installed, the sidebar shows
+their tables, and editing their prompts or CSVs asks the model again.
 
 `demos/build_demos.py` builds the six demo scenes headlessly, one `.blend` each, beside copies of
 their CSV files, which the scenes read through `//` paths. The out folder defaults to `demos/`:
