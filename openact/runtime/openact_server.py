@@ -130,19 +130,14 @@ class SemIfTorchBackend(Backend):
         import torch
         from semif_phase1.core import load_causal_model
 
-        device = self.args.device
-        dtype = self.args.dtype
-        if device == "auto":
-            device = "cuda"  # never a silent CPU load: 16 GB of RAM and far too slow
-        if device == "cuda" and not torch.cuda.is_available():
+        device, dtype = "cuda", self.args.dtype  # auto too: never a silent CPU load, 16 GB of RAM and far too slow
+        if not torch.cuda.is_available():
             if torch.version.cuda is None:
                 raise RuntimeError("The runtime's PyTorch has no CUDA support (a CPU-only build): "
                                    "reinstall the runtime")
             # --gpu becomes CUDA_VISIBLE_DEVICES, so a GPU index the machine lacks looks the same as an old driver
             raise RuntimeError(NO_CUDA if self.args.gpu is None else
                                f"{NO_CUDA} Or does GPU {self.args.gpu} not exist? Pick another GPU in the preferences.")
-        if device == "cpu" and dtype == "bfloat16":
-            dtype = "float32"  # SemIf's documented CPU reference path
         log(f"loading {self.args.model}@{self.args.revision[:12]} on {device} ({dtype})")
         self.model, self.tokenizer, self.metadata = load_causal_model(
             self.args.model, self.args.revision, device=device, dtype=dtype
@@ -712,7 +707,7 @@ def main(argv=None):
                         help="fake: deterministic answers without torch or a GPU, for tests")
     parser.add_argument("--model", default=DEFAULT_SOURCE)
     parser.add_argument("--revision", default=DEFAULT_REVISION)
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--device", choices=("auto", "cuda"), default="auto")  # CUDA only (NG9)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--gpu", type=int, default=None, help="CUDA device index to use")
     parser.add_argument("--parent-pid", type=int, default=None)

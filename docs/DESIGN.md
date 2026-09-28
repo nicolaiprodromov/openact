@@ -1339,6 +1339,9 @@ Property `list_source` (default `TEXT`). There is no `answer_type`: Pick is alwa
 | Material | output | Material | none | `list_source = MATERIALS`: the picked slot's material, via Index Switch of type `MATERIAL` (verified) |
 | *payload columns* | output | Int/Float, single | fallback | `list_source = TEXT` with a `.csv`: baked numeric columns, looked up at Index |
 
+**Not built in 1.0.0:** Pick's payload outputs. The Items CSV's numeric columns are parsed, and the
+sidebar lists them, but they give no sockets (README, *Formats*).
+
 **Behaviour.**
 - There is one `choice` question per context, with at most 255 options (a tournament above 16).
   The instruction is the prototype's: "Which item best fits: `<prompt>`?".
@@ -3851,7 +3854,7 @@ records which file was opened).
 2. **uv 0.8.17** is fetched from GitHub releases into `<runtime>/tools/`, and checked against a
    pinned SHA-256 per platform asset. That check is new. A `uv` on PATH is **ignored**: the
    prototype preferred `shutil.which("uv")`, and this machine has two, so "pinned" would not hold.
-3. **torch 2.10.0** comes from the official PyTorch index (`cu128` or `cpu`) over HTTPS.
+3. **torch 2.10.0** comes from the official PyTorch index (`cu128`) over HTTPS.
 4. **SemIf** is pinned to commit `23cf1f39…`. **Qwen3.5-4B** is pinned to revision `851bf6e8…`,
    whose Hugging Face snapshots are content-addressed by commit.
 5. **Hash-locked environment (new).** Today SemIf's transitive dependencies are not locked.

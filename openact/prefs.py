@@ -47,6 +47,12 @@ def get_prefs():
     return addon.preferences if addon else _Defaults()
 
 
+def device(prefs) -> str:
+    """The Device preference, or "auto" for a value the server doesn't take: Blender reads a profile saved with the
+    old CPU choice as "". Both values mean CUDA."""
+    return prefs.device if prefs.device in ("auto", "cuda") else "auto"
+
+
 def is_jev(module: str) -> bool:
     """True for jev_nodes' module name: a legacy install, or an extension (bl_ext.<repo>.jev_nodes)."""
     return module == "jev_nodes" or module.endswith(".jev_nodes")
@@ -165,7 +171,7 @@ class OpenActPreferences(bpy.types.AddonPreferences):
         name="Runtime Folder",
         subtype='DIR_PATH',
         default="",
-        description="Where the model runtime (Python environment and model weights, about 12 GB) lives. "
+        description="Where the model runtime (Python environment and model weights, about 13 GB) lives. "
                     "Leave empty for the default location",
     )
     port: bpy.props.IntProperty(
@@ -178,7 +184,6 @@ class OpenActPreferences(bpy.types.AddonPreferences):
             ('auto', "Auto", "Use the NVIDIA GPU. Without CUDA the model server reports an error instead of "
                              "using the CPU"),
             ('cuda', "GPU (CUDA)", "Use an NVIDIA GPU"),
-            ('cpu', "CPU", "Use the CPU (much slower)"),
         ),
         default='auto',
     )

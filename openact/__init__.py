@@ -1,14 +1,14 @@
 """OpenAct: decision nodes for Geometry Nodes, run by a local model.
 
-Two nodes: Ask (a question in, a number out) and Pick (a prompt and a list in, one item out).
-The model runs on this computer: SemIf's open "System One" method on Qwen3.5-4B, served by a
+Six nodes: Ask, Pick and Dials judge the whole situation, Match and Classify each item of a list, and Rules each
+measured situation. The model runs on this computer: SemIf's open "System One" method on Qwen3.5-4B, served by a
 small Jev-compatible server in its own Python environment.
 """
 
 bl_info = {  # legacy add-on installs (the extension manifest is used on Blender 4.2+)
     "name": "OpenAct",
     "author": "Nic",
-    "version": (0, 1, 0),
+    "version": (1, 0, 0),
     "blender": (4, 5, 0),
     "location": "Geometry Node Editor > Add > OpenAct, Sidebar > OpenAct",
     "description": "Decision nodes for Geometry Nodes, run by a local model",

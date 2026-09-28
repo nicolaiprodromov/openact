@@ -640,10 +640,9 @@ def start(prefs=None):
         "PYTHONIOENCODING": "utf-8",
         "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
     })
-    args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--backend", backend, "--device", prefs.device,
-            "--parent-pid", str(os.getpid()), "--token-file", os.path.abspath(_token_file(STATE.port))]
-    if prefs.device != "cpu":
-        args += ["--gpu", str(prefs.gpu)]
+    args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--backend", backend, "--device", P.device(prefs),
+            "--parent-pid", str(os.getpid()), "--token-file", os.path.abspath(_token_file(STATE.port)),
+            "--gpu", str(prefs.gpu)]
     if backend == "fake":
         args += FAKE_ARGS
     try:

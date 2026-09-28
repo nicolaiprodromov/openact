@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "openact"
-version = "0.1.0"
+version = "1.0.0"
 name = "OpenAct"
 tagline = "Decision nodes for Geometry Nodes, run by a local model"
 maintainer = "Nic"

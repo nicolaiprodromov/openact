@@ -5,8 +5,8 @@
   structure type of each input per version; a socket declared hidden is hidden when it is created, and
   stays visible once revealed.
 - The verified facts the nodes rely on: default_input='INDEX' with hide_value gives [0, 1, 2, 3]; Index
-  Switch MATERIAL works; a string field linked into a SINGLE word stays valid, so the evaluator is the
-  guard.
+  Switch MATERIAL works; a string field (5.1+) linked into a SINGLE word stays valid, so the evaluator is
+  the guard.
 - copy() plus ensure_owned() gives every copy its own inner group, also when the whole tree is duplicated.
 
 Run:  blender -b --factory-startup --python tests/interface_blender.py
@@ -27,6 +27,7 @@ from openact.inner import SocketDef  # noqa: E402
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 FIELDS = bpy.app.version >= (5, 0, 0)
+STRING_FIELDS = bpy.app.version >= (5, 1, 0)  # before 5.1 a per-element condition can't drive a String Switch
 
 tree = bpy.data.node_groups.new("Interface", 'GeometryNodeTree')
 tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
@@ -144,11 +145,11 @@ def phase_structure_types():
         refused = True
     check("structure types: Blender refuses FIELD on a String input", refused, string.structure_type)
 
-    # A string field: a String Switch whose condition is one per element (5.0+; on 4.5 that condition link is
-    # already red, strings being no fields there).
+    # A string field: a String Switch whose condition is one per element (5.1+; on 4.5 and 5.0 that condition link
+    # is red, strings being no fields there).
     per_element = N.new("GeometryNodeSwitch")
     per_element.input_type = 'STRING'
-    L.new(N.new("GeometryNodeInputIndex").outputs[0], sock(per_element.inputs, "Switch"))
+    condition = L.new(N.new("GeometryNodeInputIndex").outputs[0], sock(per_element.inputs, "Switch"))
     word_link = L.new(per_element.outputs[0], ask.inputs["Context"])
     bpy.context.view_layer.update()
     try:
@@ -156,9 +157,11 @@ def phase_structure_types():
         refused = False
     except evaluator.Unresolvable as error:
         caught, refused = str(error), True
-    check("structure types: a string field linked into a SINGLE word stays valid; the evaluator refuses it",
-          word_link.is_valid and refused and (caught.endswith("fields can't be words") or not FIELDS),
-          (word_link.is_valid, caught))
+    refusal = "fields can't be words" if STRING_FIELDS else "An input has an invalid (red) link"
+    check("structure types: a per-element String Switch linked into a SINGLE word stays a valid link, and the "
+          "evaluator refuses the word: a string field on 5.1+, a red condition link on 4.5 and 5.0",
+          word_link.is_valid and condition.is_valid == STRING_FIELDS and refused and caught.endswith(refusal),
+          (word_link.is_valid, condition.is_valid, caught))
     L.remove(word_link)
 
 

@@ -29,7 +29,9 @@ headless Blender, against the fake model server the add-on starts itself (OPENAC
   exits further apart don't;
 - the stalled-fill alert, time-scaled, while the scripted question stalls; the queued chunk stays queued;
 - the slow-server note once a faked ms_per_row stays above 3 x 21 ms for a minute while cells are asked (never while
-  idle), time-scaled.
+  idle), time-scaled;
+- a profile saved with the Device preference's old CPU choice, which Blender reads as "", starts the server with
+  --device auto.
 
 Run:  blender -b --factory-startup --python tests/support_blender.py
 (The second Blender runs this file with -- attach <port>.)
@@ -1179,6 +1181,28 @@ def phase_slow():
           and engine.SLOW in box, (early, late, box))
 
 
+# ------------------------------------------------------------------------------------ preferences
+
+def phase_old_device():
+    """A profile saved with the Device preference's old CPU choice, which Blender now reads as "": the server starts
+    with --device auto, a value it takes, and the diagnostics say so."""
+    device = P._Defaults.device
+    server.stop()
+    P._Defaults.device = ""  # AddonPreferences refuse the old value, so the defaults stand in for such a profile
+    try:
+        started = server.start()
+        argv = list(server.STATE.process.args) if server.STATE.process else []
+        ready = drive(engine, lambda: server.status()[0] in ("ready", "error"), 30) and server.is_ready()
+        shown = re.search(r"\(device (\w*), GPU", ops.diagnostics())
+    finally:
+        P._Defaults.device = device
+    at = argv.index("--device") + 1 if "--device" in argv else len(argv)
+    check("old device preference: a profile saved with the CPU choice, read as \"\", starts the server with --device "
+          "auto, and the diagnostics say device auto",
+          started and ready and argv[at:at + 1] == ["auto"] and shown is not None and shown[1] == "auto",
+          (server.status(), argv[at:at + 1], shown and shown[0]))
+
+
 # -------------------------------------------------------------------------------------------- run
 
 def main():
@@ -1203,6 +1227,7 @@ def main():
         phase_crash_loop()
         phase_stall()
         phase_slow()
+        phase_old_device()
     except Exception:
         check("no unexpected error", False, traceback.format_exc())
     finally:

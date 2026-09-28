@@ -827,7 +827,7 @@ def diagnostics() -> str:
     lines = [
         f"OpenAct {'.'.join(map(str, bl_info['version']))}, Blender {bpy.app.version_string}, "
         f"{platform.platform()}, Python {platform.python_version()}",
-        f"GPU: {health.get('device') or 'unknown'} (device {prefs.device}, GPU {prefs.gpu})",
+        f"GPU: {health.get('device') or 'unknown'} (device {P.device(prefs)}, GPU {prefs.gpu})",
         f"Backend: {health.get('backend') or 'unknown'}, model {health.get('model_id') or 'unknown'}, revision "
         f"{health.get('revision') or 'unknown'}",
         f"Runtime: {root}{legacy}" + (f"; Python from {python}" if python else ""),
