@@ -70,7 +70,7 @@ DUE = set()  # uids saved without their live set since their last pass (pins, Un
 NOTES = {}  # node uid -> what its last save evicted or kept above the soft cap (NodeStore.note), for its status
 DRIFT = {}  # node uid -> {path: note} of the CSVs that differed from its saved tables when the file loaded (R23)
 REPORTED = set()  # CSV paths whose "differs" line was printed since the file loaded (§7.8)
-RENDERED = set()  # (node uid, words) the running background render compared, from its render_init on
+RENDERED = set()  # (node uid, words) a background render compared since the file loaded
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -614,18 +614,21 @@ def _report(scene=None):
 
     The words are the ones each context has now or, given a render's scene, at the frame it renders: a background
     render sets its frame without evaluating the original data, so they are read through the F-curves, as Prepare for
-    Playback reads them. Where only setting the frame would tell (a driver, NLA, a keyframed menu socket), they are
-    read as the file holds them. Each context is planned afresh, a render's once per word set; nothing is asked,
-    stored or built. Linked nodes, whose answers are their library's, are left out."""
+    Playback reads them, one context at a time. A context whose words only setting the frame would tell (a driver, an
+    NLA-animated or blended owner, Time Stretching, a keyframed menu socket) is read as the file holds it; the others
+    still at the frame. Each context is planned afresh, a render's once per word set; nothing is asked, stored or
+    built. Linked nodes, whose answers are their library's, are left out."""
     run = Playback(scene or bpy.context.scene)
-    values = None
     if scene is not None:
         run.first = run.last = scene.frame_current
-        values = run.values.get(run.first) if run.read_curves() else None
-    for node, spec, ctx in run.contexts:
+    for node, spec, ctx in list(run.contexts):
         entries = store.load(node).entries
         if not entries:
             continue
+        values = None
+        if scene is not None:  # its own reads only: another context's driver leaves this one's frame readable
+            run.contexts = [(node, spec, ctx)]
+            values = run.values.get(run.first) if run.read_curves() else None
         evaluator.OVERRIDES = values
         try:
             if scene is not None:
@@ -1335,16 +1338,12 @@ def on_load_post(*_args):
     NOTES.clear()
     DRIFT.clear()
     REPORTED.clear()
+    RENDERED.clear()
     DUE.clear()
     REBAKES.clear()
     PLAYBACK, PLAYBACK_NOTE = None, ""  # the closed file's run
     _opened = True
     schedule(immediate=True)
-
-
-@persistent
-def on_render_init(*_args):
-    RENDERED.clear()  # a new render job compares each word set again
 
 
 @persistent
@@ -1368,8 +1367,7 @@ def on_server_status():
 def _handlers():
     h = bpy.app.handlers
     return ((h.depsgraph_update_post, on_depsgraph_update), (h.load_post, on_load_post),
-            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo), (h.render_init, on_render_init),
-            (h.render_pre, on_render_pre))
+            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo), (h.render_pre, on_render_pre))
 
 
 def register():

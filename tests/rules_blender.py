@@ -1105,10 +1105,11 @@ def phase_background():
 
 def phase_farm_frames():
     """§7.8 on a farm: blender -b -f / -a runs no timer, so no pass, and a background render sets its frames without
-    evaluating the original data; it compares each frame's words, read through the F-curves. A keyframed Switch picks
-    another Outcomes CSV from frame 6, both tables are stored, the file is saved at frame 1, and only frame 6's file is
-    edited. A real render of frames 5-6 without the opt-in prints that file's line once and re-bakes nothing. It opens
-    files, so it runs last."""
+    evaluating the original data; it compares each frame's words, read through the F-curves context by context. A
+    keyframed Switch picks another Outcomes CSV from frame 6, both tables are stored, the file is saved at frame 1, and
+    only frame 6's file is edited; another node, in a tree no object uses, reads a driven word, which only setting the
+    frame tells. A real render of frames 5-6 without the opt-in prints frame 6's line once and re-bakes nothing. It
+    opens files, so it runs last."""
     engine.register()  # its render handlers
     here = os.path.join(TMP, "frames")
     project(here, "frames.blend")
@@ -1132,6 +1133,22 @@ def phase_farm_frames():
             for job, _missing in passed(rules):
                 gol_answers(job, {3}, {2, 3}, LIFE_NAMES)
             passed(rules)
+        driven = bpy.data.node_groups.new("Driven", 'GeometryNodeTree')  # no object uses it: a context of its own
+        driven.use_fake_user = True
+        other = driven.nodes.new(R.RulesSpec.idname)
+        other.answer_type = 'ONE_OF'
+        for word, text in (("Context", "Life, driven."), ("Factors", "//frames_factors.csv"),
+                           ("Outcomes", "//frames_a.csv")):
+            other.inputs[word].default_value = text
+        pick = driven.nodes.new("GeometryNodeSwitch")
+        pick.input_type = 'STRING'
+        pick.inputs["False"].default_value, pick.inputs["True"].default_value = GOL_QUESTION, "Later on?"
+        driven.links.new(pick.outputs[0], other.inputs["Question"])
+        driver = pick.inputs["Switch"].driver_add("default_value").driver
+        driver.type, driver.expression = 'SCRIPTED', "0"
+        for job, _missing in passed(other):
+            gol_answers(job, {3}, {2, 3}, LIFE_NAMES)
+        passed(other)
         camera = bpy.data.objects.new("Camera", bpy.data.cameras.new("Camera"))
         scene_.collection.objects.link(camera)
         scene_.camera = camera
@@ -1142,12 +1159,13 @@ def phase_farm_frames():
         bpy.ops.wm.save_mainfile()
         edit(os.path.join(here, "frames_b.csv"), "comes to life.,state=dead,1", "comes to life.,state=dead,7")
         engine.allow_background_passes(False)
-        stored = [len(S.load(rules).entries), rules.entries]
+        stored = [len(S.load(rules).entries), rules.entries, len(S.load(other).entries), other.entries]
         printed = differs(lambda: bpy.ops.render.render(animation=True))
-        check("farm: a background render of frames 5-6 compares each frame's words, read through the F-curves: the "
-              "Outcomes CSV of frame 6, edited, prints its line once, frame 5's none, and nothing is re-baked",
+        check("farm: a background render of frames 5-6 compares each frame's words, read through the F-curves context "
+              "by context: the Outcomes CSV of frame 6, edited, prints its line once, frame 5's none, although another "
+              "node reads a driven word (compared as the file holds it), and nothing is re-baked",
               printed == ["CSV //frames_b.csv differs from the saved table (numbers); rendering the saved answers"]
-              and stored == [2, rules.entries], (printed, stored[0]))
+              and stored == [2, rules.entries, 1, other.entries], (printed, stored[0], stored[2]))
     finally:
         engine.allow_background_passes(True)
         engine.unregister()

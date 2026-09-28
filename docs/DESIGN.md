@@ -1974,6 +1974,9 @@ The watcher (`engine.WATCH: {path_id: (stamp, CsvDoc)}`) behaves as follows:
   neither re-plans nor re-bakes from files. A farm renders exactly the saved answers and payload.
   If a referenced CSV's `text_hash` or `num_hash` differs from the stored ones, it prints once per
   file: "CSV <path> differs from the saved table (text/numbers); rendering the saved answers" (R23).
+  A background render compares the words of each frame it renders, read through the F-curves; a
+  context whose words only a frame change reveals (a driver, NLA, or another fallback case of
+  §5.5) is compared as the file holds it, and the render shows the saved answers either way.
   - **Headless authoring opts back in.** This covers the test suites, `demos/build_demos.py`, and
     any script that sets prompts headlessly and saves. There are two ways:
     - the environment variable `OPENACT_BACKGROUND_PASSES=1`, set before Blender starts;

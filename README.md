@@ -42,10 +42,11 @@ on your GPU. Nothing leaves your computer.
 
 In background mode (`blender -b`, e.g. a render farm's `blender -b scene.blend -f 1`), OpenAct renders the
 answers and CSV payload saved in the file: it doesn't plan again or re-bake from the CSV files. For each frame it
-renders, it prints once per file each CSV that differs from the one a saved table was made from, e.g.
-`CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. A render job in an
-open Blender leaves the tables as they are too. Opened interactively, the file re-bakes from its CSVs as usual, and
-the node's status notes each file that differed.
+renders, it prints once per file each CSV whose edits would change a saved table, e.g.
+`CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. Words that only a
+frame change reveals (a driver, NLA, a keyframed menu socket) are compared as the file holds them; the render shows
+the saved answers either way. A render job in an open Blender leaves the tables as they are too. Opened
+interactively, the file re-bakes from its CSVs as usual, and the node's status notes each file that differed.
 
 A script that authors headlessly (sets words, fills tables, saves) opts back in, either way:
 - set the environment variable `OPENACT_BACKGROUND_PASSES=1` (or `true`) before starting Blender;
