@@ -462,7 +462,7 @@ def trace_csv_source(node, csv_socket, ctx) -> CsvSource:
             if not path:
                 raise Hint(f"{label}: type a Path on '{up.name}'")
             delimiter = as_text(_read(_by_id(up, "Delimiter"), ctx, up, label))
-            return CsvSource(import_path(path, up), delimiter, tuple(via + [up.name]))
+            return CsvSource(import_path(path, up), delimiter, tuple(via + [up.name]), written=path)
         if kind == "NodeReroute":
             sock = up.inputs[0]
         elif kind == "NodeGroupInput":

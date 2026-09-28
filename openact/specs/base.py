@@ -311,8 +311,8 @@ class Spec:
         return {column: -1 if kind == "INT" else 0.0 for column, kind in job.shape.columns}
 
     def entry(self, job: pipeline.Job, rows: list[pipeline.Row], model: str = "") -> store.Entry:
-        """An answered table as the entry the node stores (§14.2): columnar rows and the ask keys behind them. A row
-        that asked nothing (a lock or code row) has the ask key ""."""
+        """An answered table as the entry the node stores (§14.2): columnar rows and the ask keys behind them, and the
+        hashes of the CSVs it was planned from. A row that asked nothing (a lock or code row) has the ask key ""."""
         asks = list(dict.fromkeys(row.ask or "" for row in rows))
         return store.Entry(
             words_key=job.words_key, asks=asks, pv=self.PROMPT_VERSION, t=time.time(), gn=job.gn, model=model,
@@ -321,7 +321,7 @@ class Spec:
                             ask=[asks.index(row.ask or "") for row in rows],
                             src="".join(SOURCES[row.source] for row in rows),
                             v={column: [row.values[column] for row in rows] for column, _type in job.shape.columns}),
-            single=self.single(rows))
+            single=self.single(rows), csv=dict(job.csv))
 
     # ------------------------------------------------------------------ the Overrides CSV (§7.6)
 

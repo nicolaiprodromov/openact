@@ -38,6 +38,26 @@ on your GPU. Nothing leaves your computer.
      place, so nothing is downloaded.
 4. Add nodes with **Shift A > OpenAct**.
 
+## Render farms and headless scripts
+
+In background mode (`blender -b`, e.g. a render farm's `blender -b scene.blend -f 1`), OpenAct renders the
+answers and CSV payload saved in the file: it doesn't plan again or re-bake from the CSV files. For each frame it
+renders, it prints once per file each CSV whose edits would change a saved table, e.g.
+`CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. Words that only a
+frame change reveals (a driver, NLA, a keyframed menu socket) are compared as the file holds them; the render shows
+the saved answers either way. A render job in an open Blender leaves the tables as they are too. Opened
+interactively, the file re-bakes from its CSVs as usual, and the node's status notes each file that differed.
+
+A script that authors headlessly (sets words, fills tables, saves) opts back in, either way:
+- set the environment variable `OPENACT_BACKGROUND_PASSES=1` (or `true`) before starting Blender;
+- or, after enabling the add-on, call `allow_background_passes(True)` in its `engine` module. Installed from disk
+  as above, that is `import bl_ext.user_default.openact.engine as engine`; from another extension repository, use
+  its name instead of `user_default`.
+
+Blender runs no timers while a `--python` script runs, so the script then calls `engine.tick()` every few
+hundredths of a second until its nodes are answered, and saves, as `drive()` in `tests/_harness.py` does. The test
+suites set the variable (`tests/_harness.py`).
+
 ## Repository
 
 - `openact/`: the add-on (extension) package.

@@ -108,6 +108,7 @@ class CsvSource:
     delimiter: str | None = None  # the Import CSV node's Delimiter; None sniffs it (a typed path)
     via: tuple[str, ...] = ()  # node names from the companion socket to the Import CSV node, which comes last
     warning: str = ""  # "Items: using the linked Import CSV; the typed path is ignored"
+    written: str = ""  # the Import CSV node's Path as written, e.g. "//a.csv": the same in a moved project or on a farm
 
 
 @dataclass(frozen=True)
