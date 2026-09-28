@@ -1,7 +1,7 @@
 """The runtime installer and the runtime probe, in a headless Blender. Nothing is downloaded or installed.
 
 Every runtime is a temporary folder, and so is OPENACT_STATE_DIR. Downloads, nvidia-smi, the free disk space and
-every subprocess are fakes; the installed JevNodes runtime is only read (design section 20.6):
+every subprocess are fakes; the user's own OpenAct runtime, if any, is never touched (design section 20.6):
   - the lock pins every package with hashes;
   - the dry run logs the pinned cu128 commands with the runtime's own uv, even with another uv on PATH;
   - refused before any download: online access off (also through the Install operator), a runtime folder whose path
@@ -10,7 +10,7 @@ every subprocess are fakes; the installed JevNodes runtime is only read (design 
     the user's;
   - a download whose SHA-256 differs (uv, then SemIf) stops the install with a clear status;
   - an existing venv that fails the probe is rebuilt before the lock goes in; one that passes is kept;
-  - runtime_installed() rejects a legacy runtime whose venv home is missing (a copy of its pyvenv.cfg);
+  - runtime_installed() rejects a runtime whose venv home is missing, and accepts it once the home is back;
   - the import probe, in a runtime folder with a '#': register() returns at once while it runs, a start waits for
     it, the next session reads probe.json without a subprocess, a changed venv probes again, a failure cancels the
     start;
@@ -26,7 +26,6 @@ import io
 import json
 import os
 import pathlib
-import re
 import shutil
 import socket
 import subprocess
@@ -47,7 +46,7 @@ import openact  # noqa: E402  (from this checkout, which _harness puts on sys.pa
 from openact import engine, server  # noqa: E402
 from openact import prefs as P  # noqa: E402
 
-JEVNODES = os.path.join(os.path.dirname(P.default_runtime_root()), "JevNodes")  # the installed one: read only
+USER_RUNTIME = P.default_runtime_root()  # the user's own, before the tests move the default: never touched
 BASE = tempfile.mkdtemp(prefix="openact_installer_")
 os.environ["LOCALAPPDATA" if sys.platform == "win32" else "XDG_DATA_HOME"] = BASE
 os.environ["OPENACT_STATE_DIR"] = os.path.join(BASE, "state")
@@ -405,25 +404,18 @@ def phase_hashes():
         server.UV_SHA256[asset], server.SEMIF_SHA256 = real_uv_sha, real_semif_sha
 
 
-def phase_legacy_home():
-    legacy, new = os.path.join(BASE, "JevNodes"), os.path.join(BASE, "OpenAct")
-    fake_runtime(legacy)
-    copied = os.path.join(JEVNODES, "venv", "pyvenv.cfg")
-    try:
-        with open(copied, encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:  # no Jev Nodes runtime on this machine: the same keys
-        copied, text = "(written)", "home = C:\\x\nimplementation = CPython\nuv = 0.8.17\nversion_info = 3.12.11\n"
-    missing = os.path.join(BASE, "uv", "python", "cpython-3.12.11-removed")
-    with open(os.path.join(legacy, "venv", "pyvenv.cfg"), "w", encoding="utf-8") as handle:
-        handle.write(re.sub(r"(?m)^home\s*=.*$", lambda _match: f"home = {missing}", text))
+def phase_venv_home():
+    root = os.path.join(BASE, "OpenAct")  # the default folder, as the tests set LOCALAPPDATA
+    fake_runtime(root)
+    missing = os.path.join(BASE, "uv", "python", "cpython-3.12.11-removed")  # a global uv Python, since removed
+    with open(os.path.join(root, "venv", "pyvenv.cfg"), "w", encoding="utf-8") as handle:
+        handle.write(f"home = {missing}\nimplementation = CPython\nuv = 0.8.17\nversion_info = 3.12.11\n")
     P._Defaults.runtime_dir = ""
-    check("legacy: a runtime whose venv home is missing is not installed", not P.runtime_installed(legacy), copied)
-    check("legacy: runtime_root() passes over it to a new install", P.runtime_root() == new, P.runtime_root())
+    check("venv home: runtime_root() is the default folder", P.runtime_root() == root, P.runtime_root())
+    check("venv home: a runtime whose venv home is missing is not installed", not P.runtime_installed(root))
     os.makedirs(missing)
-    check("legacy: with its home back it is used in place",
-          P.runtime_installed(legacy) and P.runtime_root() == legacy, P.runtime_root())
-    shutil.rmtree(legacy)
+    check("venv home: with its home back it is installed", P.runtime_installed(root))
+    shutil.rmtree(root)
 
 
 def phase_probe():
@@ -617,7 +609,7 @@ def phase_install_operator():
 
 
 def main():
-    before = snapshot(JEVNODES)
+    before = snapshot(USER_RUNTIME)
     P._Defaults.auto_start = False  # a finished install must not start anything here
     phase_lock()
     phase_online_off()
@@ -625,12 +617,12 @@ def main():
     phase_refusals()
     phase_hashes()
     server.pump()  # the installer's posted callbacks, before the add-on registers
-    phase_legacy_home()
+    phase_venv_home()
     phase_probe()
     phase_late_probe()
     phase_locate()
     phase_install_operator()
-    check("the installed JevNodes runtime is untouched", snapshot(JEVNODES) == before, f"{len(before)} entries")
+    check("the user's own runtime folder is untouched", snapshot(USER_RUNTIME) == before, f"{len(before)} entries")
     finish()
 
 

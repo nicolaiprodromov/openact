@@ -1,6 +1,6 @@
 """Operators: install or locate the runtime, start and stop the model; re-ask a node; write its Overrides CSV; start
 its CSVs from templates; show what a row asks; open files; trust a .blend's file reads; copy diagnostics; prepare
-animated words for playback, and unpin them; upgrade the old Jev nodes of a v0.1.0 file."""
+animated words for playback, and unpin them."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from collections import Counter
 
 import bpy
 
-from . import csvfmt, engine, inner, lists, migrate, pipeline, server, store, trust, ui
+from . import csvfmt, engine, inner, lists, pipeline, server, store, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
 from .specs.base import stored_rows, table_of, unsure_below
@@ -83,8 +83,8 @@ class OPENACT_OT_install_runtime(bpy.types.Operator):
 class OPENACT_OT_locate_runtime(bpy.types.Operator):
     bl_idname = "openact.locate_runtime"
     bl_label = "Locate Existing Runtime..."
-    bl_description = ("Use a model runtime that is already installed, such as the one Jev Nodes installed, "
-                      "instead of downloading it again")
+    bl_description = ("Use a model runtime that is already installed on this computer, instead of downloading it "
+                      "again")
 
     directory: bpy.props.StringProperty(subtype='DIR_PATH')
     filter_folder: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
@@ -815,9 +815,8 @@ def diagnostics() -> str:
 
     prefs, health = P.get_prefs(), server.STATE.health
     root, home = P.runtime_root(prefs), os.path.expanduser("~")
-    legacy = " (the legacy Jev Nodes runtime)" if os.path.basename(root).casefold() == "jevnodes" else ""
-    # The folder's name only: the Jev Nodes runtime's venv uses the user's uv Python (§12.2), which a roaming profile
-    # can put on a server
+    # The folder's name only: a venv can use a global uv Python outside the runtime, which a roaming profile can put
+    # on a server
     python = re.split(r"[\\/]", P.venv_home(root).rstrip("\\/"))[-1]
     if os.path.normcase(root + os.sep).startswith(os.path.normcase(home) + os.sep):  # the home folder itself too
         root = "~" + root[len(home):]
@@ -830,7 +829,7 @@ def diagnostics() -> str:
         f"GPU: {health.get('device') or 'unknown'} (device {P.device(prefs)}, GPU {prefs.gpu})",
         f"Backend: {health.get('backend') or 'unknown'}, model {health.get('model_id') or 'unknown'}, revision "
         f"{health.get('revision') or 'unknown'}",
-        f"Runtime: {root}{legacy}" + (f"; Python from {python}" if python else ""),
+        f"Runtime: {root}" + (f"; Python from {python}" if python else ""),
         f"Server: {state} on port {server.STATE.port}" + (f": {redact(message)[:200]}" if message else ""),
         "Health: " + (", ".join(f"{key} {health[key]}" for key in HEALTH if health.get(key) is not None) or "none"),
         f"Queue: {per_class[0]}/{per_class[1]}/{per_class[2]} chunks (P0/P1/P2), {flight} cells in flight, "
@@ -868,58 +867,11 @@ class OPENACT_OT_copy_diagnostics(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ---------------------------------------------------------------------------- the upgrade from v0.1.0 (§12.3)
-
-class OPENACT_OT_upgrade_legacy(bpy.types.Operator):
-    bl_idname = "openact.upgrade_legacy"
-    bl_label = "Upgrade"
-    bl_description = ("Replace this file's old Jev nodes with OpenAct nodes, keeping their words, links and answers. "
-                      "One undo step")
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        upgraded, trees, problems, changed = migrate.upgrade_all()
-        if not (upgraded or problems):
-            self.report({'INFO'}, "This file has no old Jev nodes")
-            return {'CANCELLED'}
-        self.report({'WARNING'} if problems else {'INFO'}, migrate.report(upgraded, trees, problems))
-        return {'FINISHED'} if changed else {'CANCELLED'}  # the undo step also reverts what an internal error left
-
-
-class OPENACT_OT_legacy_report(bpy.types.Operator):
-    """Say that the file just opened has old Jev nodes, and where to upgrade them"""
-
-    bl_idname = "openact.legacy_report"
-    bl_label = "Old Jev Nodes"
-    bl_options = {'INTERNAL'}
-
-    def invoke(self, context, event):
-        # The window manager keeps a modal step's report, for the status bar and the Info editor: a report made while
-        # bpy.ops runs the operator stays with its Python caller
-        self.timer = context.window_manager.event_timer_add(0.0, window=context.window)
-        context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
-
-    def modal(self, context, event):
-        if event.type != 'TIMER':
-            return {'PASS_THROUGH'}
-        context.window_manager.event_timer_remove(self.timer)
-        return self.execute(context)
-
-    def execute(self, context):
-        text = migrate.notice()
-        if not text:
-            return {'CANCELLED'}
-        self.report({'INFO'}, text)
-        return {'FINISHED'}
-
-
 classes = (OPENACT_OT_install_runtime, OPENACT_OT_locate_runtime, OPENACT_OT_server_start, OPENACT_OT_server_stop,
            OPENACT_OT_reask, OPENACT_OT_open_log, OPENACT_OT_open_runtime_folder, OPENACT_OT_allow_file,
            OPENACT_OT_trust_folder, OPENACT_OT_open_file, OPENACT_OT_show_question, OPENACT_OT_table_view,
            OPENACT_OT_write_overrides, OPENACT_OT_new_csv_from_template, OPENACT_OT_copy_diagnostics,
-           OPENACT_OT_prepare_playback, OPENACT_OT_cancel_playback, OPENACT_OT_unpin, OPENACT_OT_upgrade_legacy,
-           OPENACT_OT_legacy_report)
+           OPENACT_OT_prepare_playback, OPENACT_OT_cancel_playback, OPENACT_OT_unpin)
 
 
 def register():

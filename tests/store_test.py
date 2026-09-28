@@ -1,9 +1,7 @@
-"""The node store, openact/store.py: the schema-2 entries JSON, the v0.1.0 conversion and eviction; and the
-entries the specs make from their plans (§5.4): the two key families and the validity rule.
+"""The node store, openact/store.py: the schema-2 entries JSON and eviction; and the entries the specs make from
+their plans (§5.4): the two key families and the validity rule.
 
-No bpy and no model. tests/fixtures/jev_v010_entries.json holds the exact entries strings that the
-v0.1.0 prototype's set_entries() wrote for Ask Yes/No, Ask Amount, Pick from text and Pick from a
-collection, once with an empty Items text and once with Items text that the collection overrode.
+No bpy and no model: the sample entries are the ones the specs make from a parsed answer.
 
 Run:  python tests/store_test.py
       blender -b --factory-startup --python tests/store_test.py
@@ -25,14 +23,12 @@ from _harness import ROOT, check, finish  # noqa: E402
 _package = types.ModuleType("openact")
 _package.__path__ = [os.path.join(ROOT, "openact")]
 sys.modules["openact"] = _package
-from openact import csvfmt, pipeline, store  # noqa: E402
+from openact import pipeline, store  # noqa: E402
 from openact.specs import ask, base, pick  # noqa: E402
 
 NodeStore, MB, SOFT_CAP = store.NodeStore, store.MB, store.SOFT_CAP
 EMPTY = '{"schema":2,"entries":[]}'
 KEPT = "live and pinned contexts are kept; pin fewer word sets to shrink the file"
-with open(os.path.join(ROOT, "tests", "fixtures", "jev_v010_entries.json"), encoding="utf-8") as handle:
-    V010 = json.load(handle)
 
 
 class Node:
@@ -57,11 +53,6 @@ def words(entries):
 
 def gn(first):
     return (first, "", "//factors.csv", "//outcomes.csv", "", "")
-
-
-def parse_v0(text):
-    """Items as an upgraded Pick parses its Items text while it keeps v0.1.0's rule (§12.3)."""
-    return csvfmt.parse_inline(text, mode="v0")
 
 
 def saving(node, kept, live_gns=None):
@@ -115,88 +106,25 @@ def life():
         csv={"//life_factors.csv": ["a41f", "0000"], "//life_outcomes.csv": ["9c2e", "77b1"]})
 
 
-def phase_conversion():
-    for case in ("ask_yes_no", "ask_amount", "pick_text", "pick_collection", "pick_collection_and_text"):
-        old = json.loads(V010[case])
-        node = Node(V010[case])
-        new = store.load(node).entries
-        pairs = list(zip(new, old))
-        check(f"{case}: every v0.1.0 entry is converted", len(new) == len(old) > 0, len(new))
-        check(f"{case}: load does not rewrite the v0.1.0 JSON", node.entries == V010[case])
-        check(f"{case}: legacy, pv 0, model and ask key 'jev_nodes 0.1.0', t kept, not pinned",
-              all((e.legacy, e.pv, e.model, e.asks, e.t, e.pinned) ==
-                  (True, 0, "jev_nodes 0.1.0", ["jev_nodes 0.1.0"], o["t"], False) for e, o in pairs))
-        if case.startswith("ask"):
-            mode = "YES_NO" if case == "ask_yes_no" else "AMOUNT"
-            column = "amount" if mode == "AMOUNT" else "p"
-            check(f"{case}: gn (Question, Context) becomes (Question, Context, '', '', '')",
-                  all(e.gn == (o["gn"][0], o["gn"][1], "", "", "") for e, o in pairs), [e.gn for e in new])
-            check(f"{case}: kind ask, answer type {mode}, one model row with the answer, as v1 stores it",
-                  all((e.kind, e.answer_type, e.rows.name, e.rows.src, e.rows.ask, e.rows.v)
-                      == ("ask", mode, [o["gn"][0].strip()], "m", [0],
-                          {column: [o["a"]["value"]], "c": [o["a"]["confidence"]]}) for e, o in pairs),
-                  [(e.rows.name, e.rows.v) for e in new])
-            check(f"{case}: single holds Answer, Yes and Confidence",
-                  all(e.single == {"Answer": o["a"]["value"], "Yes": o["a"]["value"] >= 0.5,
-                                   "Confidence": o["a"]["confidence"]} for e, o in pairs), [e.single for e in new])
-            plans = [[ASK.job(e.gn, mode, debias) for debias in (True, False)] for e in new]
-        else:
-            check(f"{case}: gn (Prompt, Items) becomes (Prompt, '', Items, '', ''), with no Items for a collection",
-                  all(e.gn == (o["gn"][0], "", "" if o["a"]["collection"] else o["gn"][1], "", "") for e, o in pairs),
-                  [e.gn for e in new])
-            check(f"{case}: kind pick, answer type ONE_OF",
-                  all((e.kind, e.answer_type) == ("pick", "ONE_OF") for e in new))
-            check(f"{case}: single holds Index, Item and Confidence",
-                  all(e.single == {"Index": o["a"]["index"], "Item": o["a"]["item"],
-                                   "Confidence": o["a"]["confidence"]} for e, o in pairs), [e.single for e in new])
-            check(f"{case}: one model row per item, with its probability",
-                  all((e.rows.name, e.rows.v, e.rows.src, e.rows.ask) ==
-                      (o["a"]["items"], {"prob": o["a"]["probabilities"]}, "m" * len(o["a"]["items"]),
-                       [0] * len(o["a"]["items"])) for e, o in pairs),
-                  [(e.rows.name, e.rows.src) for e in new])
-            # the items the upgraded node plans: a collection's children, or its Items text parsed as v0.1.0 did
-            items = [o["a"]["items"] if o["a"]["collection"] else [name for name, _ in parse_v0(o["gn"][1])]
-                     for o in old]
-            if case == "pick_text":
-                check(f"{case}: legacy parsing of the Items text gives the stored items",
-                      items == [o["a"]["items"] for o in old], items)
-            plans = [[PICK.job(e.gn, names, debias) for debias in (True, False)] for e, names in zip(new, items)]
-        check(f"{case}: the words key, wkeys and shape are the ones the spec plans for the same words, with either "
-              "Balance Option Order (§14.4)",
-              all((e.words_key, e.rows.wkey, e.shape) == (job.words_key, wkeys(job), job.shape.as_dict())
-                  for e, jobs in zip(new, plans) for job in jobs), [e.words_key for e in new])
-        saved = Node()
-        store.save(saved, store.load(node))
-        data = json.loads(saved.entries)
-        check(f"{case}: saved as schema 2, without the old key",
-              data["schema"] == 2 and all("key" not in entry for entry in data["entries"]), saved.entries[:60])
-        check(f"{case}: converted entries survive save and load", store.load(saved).entries == new)
+SAMPLE_ITEMS = ["table", "lamp", "armchair", "bookshelf", "rug"]
 
-    answers = [e.single["Yes"] for e in store.load(Node(V010["ask_yes_no"])).entries]
-    check("ask_yes_no: the fixture has a Yes and a No", answers == [True, False], answers)
-    for case, prompt, text in (("pick_collection", "something that gives light", ""),
-                               ("pick_collection_and_text", "something to put a cup on", "tray, saucer")):
-        stored = json.loads(V010[case])[0]["gn"][1]
-        new = [(e.gn, e.rows.name) for e in store.load(Node(V010[case])).entries]
-        check(f"{case}: the Items text {text!r} is left out, and the rows are the collection's children",
-              stored == text and new == [((prompt, "", "", "", ""),
-                                          ["Armchair", "Bookshelf", "Floor Lamp", "Rug", "Table"])], new)
 
-    # As set_entries() writes it: v0.1.0 split this Items text on commas only, and kept ": " in the names
-    text, names = "Chair: comfy; Stool, Bench: long", ["Chair: comfy; Stool", "Bench: long"]
-    entry = store.load(Node(json.dumps([{"key": "k", "gn": ["somewhere to rest", text], "t": 1.0, "a": {
-        "index": 1, "item": names[1], "confidence": 0.5, "probabilities": [0.25, 0.75], "items": names,
-        "collection": ""}}], ensure_ascii=False))).entries[0]
-    v1 = [name for name, _when in csvfmt.parse_inline(text)]
-    check("Items with ';' and ': ': legacy parsing keeps v0.1.0's names, and with them the words key; v1's parsing "
-          "would not",
-          [name for name, _ in parse_v0(text)] == names == entry.rows.name
-          and entry.words_key == PICK.job(entry.gn, names, True).words_key
-          and entry.words_key != PICK.job(entry.gn, v1, True).words_key, (entry.rows.name, v1))
+def sample_ask(mode='YES_NO'):
+    """An Ask entry as the spec makes it from a parsed answer, with a non-ASCII word in its Context."""
+    job = ASK.job(("How cold is it?", "A sunny tropical beach at noon \u2014 people swimming.", "", "", ""), mode, True)
+    if mode == 'AMOUNT':
+        return answered(ASK, job, {"probabilities": [0.6, 0.3, 0.1, 0.0, 0.0], "amount": 0.5 / 4})
+    return answered(ASK, job, {"p": 0.08})
+
+
+def sample_pick():
+    """A Pick entry over five items, as the spec makes it from a parsed answer."""
+    job = PICK.job(("something to sit on", "", ", ".join(SAMPLE_ITEMS), "", ""), SAMPLE_ITEMS, True)
+    return answered(PICK, job, {"probabilities": [0.05, 0.02, 0.85, 0.05, 0.03]})
 
 
 def phase_round_trip():
-    ask = store.load(Node(V010["ask_amount"])).entries[1]  # entry-level values and a non-ASCII word
+    ask = sample_ask('AMOUNT')  # entry-level values and a non-ASCII word
     full = NodeStore([life(), ask])
     node = Node()
     store.save(node, full)
@@ -204,7 +132,7 @@ def phase_round_trip():
     data = json.loads(node.entries)
     pinned, plain = data["entries"]
     check("round trip: the documented schema-2 fields, in order",
-          data["schema"] == 2 and list(pinned) == ["words_key", "asks", "pv", "t", "legacy", "pinned", "frames", "gn",
+          data["schema"] == 2 and list(pinned) == ["words_key", "asks", "pv", "t", "pinned", "frames", "gn",
                                                    "model", "kind", "answer_type", "shape", "rows", "single", "csv"]
           and list(pinned["rows"]) == ["name", "wkey", "ask", "src", "v", "payload", "top"], list(pinned))
     check("round trip: frames only on pinned entries, top only when given",
@@ -331,17 +259,18 @@ def phase_hard_cap():
 
 def phase_damaged():
     for label, text in (("the node default '[]'", "[]"), ("an empty string", ""), ("broken JSON", '{"schema": 2, "en'),
-                        ("a store without a schema", '{"entries": []}'), ("a JSON string", '"entries"')):
+                        ("a store without a schema", '{"entries": []}'), ("a JSON string", '"entries"'),
+                        ("a bare list of entries", '[{"gn": ["Is it night?", ""], "t": 1.0}]')):
         check(f"damaged: {label} loads as an empty store", store.load(Node(text)) == NodeStore())
 
-    ask, pick = (store.load(Node(V010[case])).entries[0] for case in ("ask_yes_no", "pick_text"))
+    ask, pick = sample_ask(), sample_pick()
     written = Node()
     store.save(written, NodeStore([ask, pick]))
     a, p = json.loads(written.entries)["entries"]
     damaged = [
         42, {"words_key": "no gn"}, dict(a, gn="Is it night?"), dict(a, gn=["Is it night?", 7]), dict(a, rows=[]),
         dict(a, pv="1e400"), dict(a, pv=float("inf")), dict(a, t=10 ** 400), dict(a, t=float("nan")),
-        dict(a, t=float("inf")), dict(a, pinned="false"), dict(a, legacy=1), dict(a, words_key=None),
+        dict(a, t=float("inf")), dict(a, pinned="false"), dict(a, words_key=None),
         dict(a, kind=["ask"]), dict(a, single=[]),
         *(dict(p, rows=dict(p["rows"], **change)) for change in (
             {"name": ["table", 7, "armchair", "bookshelf", "rug"]}, {"wkey": [None] * 5}, {"wkey": [""]},
@@ -350,21 +279,6 @@ def phase_damaged():
     text = json.dumps({"schema": 2, "entries": [a, *damaged, p]}).replace('"1e400"', "1e400")
     loaded = loading(text)
     check("damaged: schema 2 skips only the damaged entries, overflowing numbers included",
-          loaded == words([ask, pick]) and store.load(Node(text)).entries == [ask, pick], loaded)
-
-    old_ask, old_pick = (json.loads(V010[case])[0] for case in ("ask_yes_no", "pick_text"))
-    damaged = ["junk", {"key": "k"}, dict(old_pick, gn=["one word"]),
-               dict(old_pick, a=dict(old_pick["a"], probabilities=[1.0])),
-               dict(old_pick, a=dict(old_pick["a"], index="1e400")), dict(old_pick, t=10 ** 400),
-               dict(old_pick, t=float("nan")), dict(old_ask, a=dict(old_ask["a"], value=10 ** 400)),
-               dict(old_ask, a=dict(old_ask["a"], mode=None)),
-               # shapes that would unpack or iterate into well-typed but wrong words and numbers
-               dict(old_pick, gn="pq"), dict(old_ask, gn={"Question": 1, "Context": 2}),
-               dict(old_pick, a=dict(old_pick["a"], probabilities="12345")),
-               dict(old_pick, a=dict(old_pick["a"], probabilities={str(i): 0.2 for i in range(5)}))]
-    text = json.dumps([old_ask, *damaged, old_pick]).replace('"1e400"', "1e400")
-    loaded = loading(text)
-    check("damaged: v0.1.0 skips only the damaged entries, including overflowing numbers and non-list shapes",
           loaded == words([ask, pick]) and store.load(Node(text)).entries == [ask, pick], loaded)
 
     for label, bad in (
@@ -539,7 +453,6 @@ def phase_validity():
 
 
 def main():
-    phase_conversion()
     phase_round_trip()
     phase_max_entries()
     phase_soft_cap()

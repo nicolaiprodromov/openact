@@ -15,7 +15,7 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
   trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
   node reads the blocked node's answer, a sidebar draw that resolves no path while nothing is blocked, an Import CSV
-  node on a file a node reads, the old Jev nodes hook, over-cap, and jev_nodes enabled (in stand-in preferences);
+  node on a file a node reads, and over-cap;
 - show_question returns exactly the state, instructions and options that the --record log shows for that row, and
   asks nothing; a row answered with older settings says so;
 - the pass drops the status records of nodes that are gone;
@@ -660,46 +660,21 @@ def phase_banners():
                                                      ("openact.locate_runtime",))]),
         (ui.banners("error", probe, probe=probe), [("runtime", 'ERROR', probe, ("openact.locate_runtime",))]),
         (ui.banners("error", port), [("port", 'ERROR', port, ())]),
-        (ui.banners("error", server.LEGACY_SERVER_MESSAGE), [("port", 'ERROR', server.LEGACY_SERVER_MESSAGE, ())]),
         (ui.banners("error", "Could not start the model server: denied"), []),
         (ui.banners("ready", "Qwen/Qwen3.5-4B on cuda"), []),
         (ui.banners("ready", "", blocked=2), [("trust", 'ERROR', "This file is not trusted, so 2 reads outside its "
                                                "folder were blocked", ("openact.allow_file", "openact.trust_folder"))]),
-        (ui.banners("ready", "", addons=["cycles", "bl_ext.user_default.jev_nodes"]),
-         [("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ())]),
-        (ui.banners("ready", "", addons=["jev_nodes_plus"]), []),
         (ui.banners("ready", "", notes=["a.csv: note"]), [("import_csv", 'INFO', "a.csv: note", ())]),
-        (ui.banners("ready", "", legacy=[("This file has 2 old Jev nodes: Upgrade", "openact.upgrade_legacy")]),
-         [("legacy", 'INFO', "This file has 2 old Jev nodes: Upgrade", ("openact.upgrade_legacy",))]),
         (ui.banners("ready", "", over=["Ask: too many"]), [("over_cap", 'CANCEL', "Ask: too many", ())]),
     ]
     wrong = [(got, wanted) for got, wanted in cases if got != wanted]
-    check("banners: model not installed, checking the runtime, a failed probe, port conflicts, an untrusted file's "
-          "blocked reads, jev_nodes enabled, Import CSV notes, old Jev nodes and over-cap; nothing otherwise",
-          not wrong, wrong)
-    both = ui.banners("not_installed", "", blocked=1, addons=["jev_nodes"])
-    check("banners: most urgent first", [banner[0] for banner in both] == ["install", "trust", "jev_nodes"], both)
+    check("banners: model not installed, checking the runtime, a failed probe, a port conflict, an untrusted file's "
+          "blocked reads, Import CSV notes and over-cap; nothing otherwise", not wrong, wrong)
+    both = ui.banners("not_installed", "", blocked=1, notes=["a.csv: note"], over=["Ask: too many"])
+    check("banners: most urgent first", [banner[0] for banner in both] == ["install", "trust", "over_cap", "import_csv"],
+          both)
     check("banners: while the fake server is ready, no server banner", server.status()[0] == "ready"
           and not set(banner_kinds()) & set(ui.SERVER_BANNERS), (server.status(), banner_kinds()))
-    hook = lambda: ("This file has 1 old Jev node: Upgrade", "openact.upgrade_legacy")  # noqa: E731
-    ui.LEGACY.append(hook)
-    try:
-        found = [banner for banner in ui.live_banners(bpy.context) if banner[0] == "legacy"]
-    finally:
-        ui.LEGACY.remove(hook)
-    check("banners: the old Jev nodes hook adds its banner and button", found == [
-        ("legacy", 'INFO', "This file has 1 old Jev node: Upgrade", ("openact.upgrade_legacy",))], found)
-
-
-def phase_jev_nodes():
-    # Stand-in preferences: addon_utils.disable() would sync the extension wheels of the user's own Blender profile
-    # (factory settings enable none, so it removes them all).
-    for modules in (["jev_nodes"], ["bl_ext.user_default.jev_nodes", "cycles"]):
-        context = SimpleNamespace(preferences=SimpleNamespace(addons={name: None for name in modules}))
-        found = [banner for banner in ui.live_banners(context) if banner[0] == "jev_nodes"]
-        check(f"jev_nodes banner: shown while {modules[0]} is enabled",
-              found == [("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ())], found)
-    check("jev_nodes banner: not shown without it", "jev_nodes" not in banner_kinds(), banner_kinds())
 
 
 def phase_import_csv(tree, answers):
@@ -1014,7 +989,6 @@ try:
     phase_crowd()
     phase_banners()
     phase_import_csv(lines_tree, answers_csv)
-    phase_jev_nodes()
     phase_draw(picked, warned_node)
     phase_queue()
     phase_open_file(answers_csv)

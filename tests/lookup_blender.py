@@ -98,6 +98,14 @@ def pick_entry(key, index, confidence):
                    single={"Index": index, "Item": names[index], "Confidence": confidence})
 
 
+def asked(question, p, t):
+    """The entry the pass stores once an Ask whose only word is this Question is answered p, last used at t."""
+    spec = engine.SPECS[engine.ASK_ID]
+    job = spec.job((question, "", "", "", ""), 'YES_NO', True)
+    rows = spec.rows(job, {job.rows[0].cell.key: {"p": p, "model": "fake"}})
+    return dataclasses.replace(spec.entry(job, rows, "fake"), t=t)
+
+
 def read(key):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     depsgraph.update()
@@ -165,22 +173,15 @@ def phase_lookup():
           {key: read(key) for key in WORDS} == got, got)
 
 
-def phase_converted():
-    """Entries converted from schema 1 hold v1's 5-word gn (§14.4), so the match chain compares each word at its
-    position: a converted text Pick matches only its prompt and Items text, a converted collection Pick only its
-    prompt with no Items text. An entry with the prototype's 2-word gn (saved before the fixed word tuples)
-    matches nothing, and the entries after it keep their numbers."""
-    pick.entries = json.dumps([
-        {"key": "a", "gn": [WORDS["A"]["Prompt"], WORDS["A"]["Items"]], "t": 1.0,
-         "a": {"index": 1, "item": "chair", "confidence": 0.5, "probabilities": [0.25, 0.75],
-               "items": ["table", "chair"], "collection": ""}},
-        {"key": "b", "gn": [WORDS["B"]["Prompt"], ""], "t": 1.0,
-         "a": {"index": 0, "item": "book", "confidence": 0.5, "probabilities": [0.75, 0.25],
-               "items": ["book", "lamp"], "collection": "Shelf"}}])  # v0.1.0, schema 1
-    converted = S.load(pick)
-    old = S.Entry(words_key="old", gn=(WORDS["C"]["Prompt"], WORDS["C"]["Items"]), kind="pick", answer_type='ONE_OF',
-                  single={"Index": 1, "Item": "pear", "Confidence": 0.5})
-    inner.build(pick, S.NodeStore(converted.entries + [old, pick_entry("C", 0, 0.5)]))
+def phase_positions():
+    """The match chain compares each word at its position (§8.2): a text Pick's entry matches only its prompt and
+    Items text, a collection Pick's entry only its prompt with no Items text. An entry with too few words, not a
+    tuple the node makes, matches nothing, and the entries after it keep their numbers."""
+    collection = S.Entry(words_key="B", gn=(WORDS["B"]["Prompt"], "", "", "", ""), kind="pick", answer_type='ONE_OF',
+                         single={"Index": 0, "Item": "book", "Confidence": 0.5})
+    short = S.Entry(words_key="short", gn=(WORDS["C"]["Prompt"], WORDS["C"]["Items"]), kind="pick",
+                    answer_type='ONE_OF', single={"Index": 1, "Item": "pear", "Confidence": 0.5})
+    inner.build(pick, S.NodeStore([pick_entry("A", 1, 0.5), collection, short, pick_entry("C", 0, 0.5)]))
     got = {key: read(key)["index"] for key in WORDS}
     mod = objects["C"].modifiers["Lookup"]
     for key in ("A", "B"):  # C with that prompt and no Items text: a collection Pick's words
@@ -189,11 +190,9 @@ def phase_converted():
         got[f"C with {key}'s prompt"] = read("C")["index"]
     mod[ids["Prompt"]], mod[ids["Items"]] = WORDS["C"]["Prompt"], WORDS["C"]["Items"]
     objects["C"].update_tag()
-    check("converted entries: each matches its own words at v1's positions, a 2-word entry matches nothing, and the "
-          "entries after it keep their numbers",
-          [e.gn for e in converted.entries] == [(WORDS["A"]["Prompt"], "", WORDS["A"]["Items"], "", ""),
-                                                (WORDS["B"]["Prompt"], "", "", "", "")]
-          and got == {"A": 1, "B": -1, "C": 0, "C with A's prompt": -1, "C with B's prompt": 0}, got)
+    check("word positions: each entry matches its own words at their positions, an entry with too few words matches "
+          "nothing, and the entries after it keep their numbers",
+          got == {"A": 1, "B": -1, "C": 0, "C with A's prompt": -1, "C with B's prompt": 0}, got)
 
 
 @contextlib.contextmanager
@@ -210,9 +209,8 @@ def asking(node_, questions):
 def phase_pass():
     """The pass works on Jobs by the validity rule (§5.4) and keeps entries through store.py. A stored entry whose
     words key holds is reused, and a cached answer becomes a new entry; a new PROMPT_VERSION or Balance Option Order
-    asks nothing, and a new Key carries every row over. Schema 1 is converted on read, schema 2 is written, the
-    live set it passes to save() keeps a live entry that eviction would otherwise remove, and a newer OpenAct's
-    JSON is left as it is."""
+    asks nothing, and a new Key carries every row over. Schema 2 is written, the live set it passes to save() keeps
+    a live entry that eviction would otherwise remove, and a newer OpenAct's JSON is left as it is."""
     live = bpy.data.node_groups.new("Pass", 'GeometryNodeTree')
     live.interface.new_socket("Question", in_out='INPUT', socket_type='NodeSocketString')
     node_ = live.nodes.new(engine.ASK_ID)
@@ -264,19 +262,17 @@ def phase_pass():
           not questions and keyed == {"Old words": 0.25, "New words": 0.875}, (len(questions), keyed))
     node_.inputs["Key"].default_value = ""
 
-    node_.entries = ('[{"key": "k", "gn": ["Old words", ""], "t": 1.0,'
-                     ' "a": {"mode": "YES_NO", "value": 1.0, "confidence": 1.0}}]')  # v0.1.0, schema 1
+    S.save(node_, S.NodeStore([old]))  # only the live words' entries, which Ask Again then forgets
     pipeline.remember(new_cell, {"p": 0.875, "model": "fake"})
     try:
         with asking(node_, questions):
             engine.run_pass()
     finally:
         pipeline.forget([new_cell])
-    saved = [(e.gn, e.legacy, e.single["Answer"]) for e in S.load(node_).entries]
-    check("pass: a schema 1 list is converted on read with v1's words keys, so its words are answered from it with 0 "
-          "requests, and the store is written as schema 2",
+    saved = [(e.gn, e.single["Answer"]) for e in S.load(node_).entries]
+    check("pass: a stored entry answers its words and a cached answer the others, with 0 requests, written as schema 2",
           node_.entries.startswith('{"schema":2,') and not questions
-          and saved == [(("Old words", "", "", "", ""), True, 1.0), (("New words", "", "", "", ""), False, 0.875)],
+          and saved == [(("Old words", "", "", "", ""), 0.25), (("New words", "", "", "", ""), 0.875)],
           (questions, saved))
     engine.reask(node_)
     check("Ask Again: the node's answers are forgotten, saved as schema 2 and the group rebuilt",
@@ -401,11 +397,11 @@ def phase_pick_pass():
           and engine.STATUS[picker.uid].icon == 'CHECKMARK', (asked == [kitchen], got, engine.STATUS[picker.uid]))
 
 
-def phase_converted_default():
-    """Entries converted from v0.1.0 have v1's words keys (§14.4), so a single context whose words changed keeps
-    showing its own last answer, a converted one too, while it waits, never another converted entry's (§8.2). The
-    words key "" names no entry: with that default, the warm entries are the most recent ones, never the keyless."""
-    group = bpy.data.node_groups.new("Converted", 'GeometryNodeTree')
+def phase_stored_default():
+    """A single context whose words changed keeps showing its own last answer while it waits, a stored one too, never
+    another stored entry's (§8.2). The words key "" names no entry: with that default, the warm entries are the most
+    recent ones, never the keyless."""
+    group = bpy.data.node_groups.new("Stored", 'GeometryNodeTree')
     for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Question", 'NodeSocketString')):
         group.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
     group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -413,18 +409,16 @@ def phase_converted_default():
     asker = group.nodes.new(engine.ASK_ID)
     group.links.new(gi.outputs["Question"], asker.inputs["Question"])
     group.links.new(store(group, gi.outputs["Geometry"], asker.outputs["Answer"], "answer", 'FLOAT'), go.inputs[0])
-    asker.entries = json.dumps([  # v0.1.0 (schema 1): two answers of this node, converted on read
-        {"key": "n", "gn": ["Is it night?", ""], "t": 1.0, "a": {"mode": "YES_NO", "value": 0.875, "confidence": 0.75}},
-        {"key": "c", "gn": ["Is it cold?", ""], "t": 2.0, "a": {"mode": "YES_NO", "value": 0.125, "confidence": 0.75}}])
-    mesh = bpy.data.meshes.new("Converted")
+    S.save(asker, S.NodeStore([asked("Is it night?", 0.875, 1.0), asked("Is it cold?", 0.125, 2.0)]))
+    mesh = bpy.data.meshes.new("Stored")
     mesh.from_pydata([(0, 0, 0)], [], [])
-    user = bpy.data.objects.new("Converted", mesh)
+    user = bpy.data.objects.new("Stored", mesh)
     bpy.context.scene.collection.objects.link(user)
-    user.modifiers.new("Converted", 'NODES').node_group = group
+    user.modifiers.new("Stored", 'NODES').node_group = group
     ident = group.interface.items_tree["Question"].identifier
 
     def shown(question):
-        user.modifiers["Converted"][ident] = question
+        user.modifiers["Stored"][ident] = question
         user.update_tag()
         with asking(asker, []):  # nothing answers: edited words wait
             engine.run_pass()
@@ -438,10 +432,10 @@ def phase_converted_default():
             evaluated.to_mesh_clear()
 
     before, after = shown("Is it cold?"), shown("Is it cold outside?")
-    check("converted entries: a single context whose words changed keeps showing its own converted answer, never the "
-          "other converted entry's", before == 0.125 and after == 0.125, (before, after))
+    check("stored entries: a single context whose words changed keeps showing its own stored answer, never the other "
+          "stored entry's", before == 0.125 and after == 0.125, (before, after))
     live = S.Entry(words_key="live", gn=("Live?", "", "", "", ""))
-    old = [S.Entry(words_key="", gn=(f"Keyless {i}?", "", "", "", ""), t=float(i), legacy=True) for i in range(3)]
+    old = [S.Entry(words_key="", gn=(f"Keyless {i}?", "", "", "", ""), t=float(i)) for i in range(3)]
     recent = [S.Entry(words_key=f"recent {i}", gn=(f"Recent {i}?", "", "", "", ""), t=10.0 + i) for i in range(3)]
     warm = [e.gn[0] for e in inner.materialised(old + recent + [live], [live.gn], "")]
     check("entries without a words key: with the default \"\", the warm entries are the most recent, never the keyless",
@@ -653,28 +647,26 @@ def phase_live_set():
         shutil.rmtree(folder, ignore_errors=True)
 
 
-def phase_converted_last_shown():
-    """k_default names a converted v0.1.0 entry like any other, by its v1 words key (§14.4): a single context showing
-    one gets new words that no model answers, and keeps showing its own answer, never another question's (§8.2)."""
-    group = bpy.data.node_groups.new("Converted", 'GeometryNodeTree')
+def phase_last_shown():
+    """k_default names a stored entry by its words key: a single context showing one gets new words that no model
+    answers, and keeps showing its own answer, never another question's (§8.2)."""
+    group = bpy.data.node_groups.new("LastShown", 'GeometryNodeTree')
     group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
     asker = group.nodes.new(engine.ASK_ID)
     geometry = store(group, group.nodes.new("NodeGroupInput").outputs["Geometry"], asker.outputs["Answer"], "prob",
                      'FLOAT')
     group.links.new(geometry, group.nodes.new("NodeGroupOutput").inputs[0])
-    user = user_of(group, "Converted")
-    asker.entries = json.dumps([  # v0.1.0, schema 1
-        {"key": "a", "gn": ["Is it cold?", ""], "t": 1.0, "a": {"mode": "YES_NO", "value": 0.125, "confidence": 0.75}},
-        {"key": "b", "gn": ["Is it night?", ""], "t": 2.0, "a": {"mode": "YES_NO", "value": 0.875, "confidence": 0.75}}])
+    user = user_of(group, "LastShown")
+    S.save(asker, S.NodeStore([asked("Is it cold?", 0.125, 1.0), asked("Is it night?", 0.875, 2.0)]))
     got = []
     with asking(asker, []):
         for question in ("Is it night?", "Is it dark?"):
             asker.inputs["Question"].default_value = question
             engine.run_pass()
             got.append(table_read(user)["prob"][0])
-    check("converted entries: a context shows its own, and with new words keeps showing it while they wait, never "
-          "another question's converted answer", got == [0.875, 0.875], got)
+    check("stored entries: a context shows its own, and with new words keeps showing it while they wait, never "
+          "another question's stored answer", got == [0.875, 0.875], got)
 
 
 def phase_statuses():
@@ -1684,7 +1676,7 @@ def plan_4096():
 
 def phase_bench(shapes):
     stand_ins = []
-    if "demo" in shapes:  # the demo scenes of §18.4, one context each (Ask and Pick: the prototype's two)
+    if "demo" in shapes:  # the demo scenes of §18.4, one context each
         bench_shape("ask", ask, ask_store(2), ask_store(2, 1.0), "demo")
         bench_shape("pick", pick, pick_store(2), pick_store(2, 1), "demo")
         stand_ins += [("classify-materials", ClassifyStandIn(2), 1, "demo", "build demo"),
@@ -1710,14 +1702,14 @@ def phase_bench(shapes):
 
 
 phase_lookup()
-phase_converted()
+phase_positions()
 phase_pass()
 phase_pick_pass()
-phase_converted_default()
+phase_stored_default()
 phase_table_only()
 phase_carry()
 phase_live_set()
-phase_converted_last_shown()
+phase_last_shown()
 phase_statuses()
 phase_single_value_sample()
 phase_materialised()

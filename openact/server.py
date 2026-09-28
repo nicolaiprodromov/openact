@@ -37,9 +37,6 @@ from . import prefs as P
 
 SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime", "openact_server.py")
 SERVER_ID = "openact-semif"
-LEGACY_SERVER_ID = "jev-nodes-semif"  # started by the jev_nodes v0.1.0 add-on
-LEGACY_SERVER_MESSAGE = ("An old Jev Nodes model server is running on this port: disable the Jev Nodes add-on "
-                         "or choose another port.")
 TOKEN_REFUSED = ("A model server started elsewhere is running on port {} without a readable token: stop it or choose "
                  "another port")
 CRASH_EXITS, CRASH_WINDOW = 3, 600.0  # unexpected exits of this Blender's server within 10 minutes that pause auto-start
@@ -558,7 +555,7 @@ def _observe(outcome, health, epoch, poller=False):
             STATE.detached = False  # the server this Blender detached from has gone
             if STATE.process is not None:
                 return False  # its own server doesn't listen yet, or has exited: the poller or _reap() says which
-            conflict = (STATE.status, STATE.message) in (("error", LEGACY_SERVER_MESSAGE), ("error", STATE.conflict))
+            conflict = (STATE.status, STATE.message) == ("error", STATE.conflict)
             if STATE.status in ("ready", "starting") or conflict:  # the server it used or couldn't use has gone
                 if attached():
                     STATE.token = ""  # another Blender's token is of no use any more
@@ -566,8 +563,7 @@ def _observe(outcome, health, epoch, poller=False):
                 STATE.set("stopped", "" if conflict else "The model server stopped")  # auto-start may start one
             return True
         if health.get("server") != SERVER_ID:
-            STATE.set("error", LEGACY_SERVER_MESSAGE if health.get("server") == LEGACY_SERVER_ID else
-                      f"Port {STATE.port} is used by another program. Pick another port in the preferences")
+            STATE.set("error", f"Port {STATE.port} is used by another program. Pick another port in the preferences")
             return True
         other = _other_backend(health)
         if other:

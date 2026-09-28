@@ -242,8 +242,8 @@ def ensure_owned(nodes):
 
 
 def iter_nodes(types=OPENACT_TYPES):
-    """(tree, node) of each node of these types outside inner groups: the OpenAct nodes, which the pass visits, or the
-    old Jev nodes (migrate.LEGACY_TYPES), which stay frozen until the upgrade (§12.3)."""
+    """(tree, node) of each node of these types outside inner groups: by default the OpenAct nodes, which the pass
+    visits."""
     for tree in bpy.data.node_groups:
         if tree.bl_idname != 'GeometryNodeTree' or tree.name.startswith(INNER_PREFIX):
             continue

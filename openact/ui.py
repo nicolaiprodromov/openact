@@ -15,7 +15,7 @@ import time
 
 import bpy
 
-from . import csvfmt, engine, evaluator, inner, lists, migrate, pipeline, server, trust
+from . import csvfmt, engine, evaluator, inner, lists, pipeline, server, trust
 from . import prefs as P
 from .specs.base import table_of, unsure_below
 from .watch import WATCH
@@ -45,7 +45,6 @@ PROBLEM_ICONS = {csvfmt.ERROR: 'CANCEL', csvfmt.WARNING: 'ERROR', csvfmt.INFO: '
 SERVER_BANNERS = ("install", "runtime", "port")  # shown in the Model box, above its buttons
 IMPORT_CSV_NOTE = ("Import CSV '{}' reads the same file; Blender won't re-read it after edits in this session. Use "
                    "this node's payload outputs, or restart Blender")
-LEGACY = []  # callables giving the old Jev nodes banner as (text, operator idname), or None (§12.3)
 EMPTY_SLOT = "(empty slot)"  # a row without a name: an empty material slot, never offered
 
 
@@ -125,11 +124,10 @@ def pin_rows(pins) -> list[tuple[str, str]]:
     return rows
 
 
-def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(), over=()) -> list[tuple]:
+def banners(state, message, probe="", blocked=0, notes=(), over=()) -> list[tuple]:
     """The sidebar's banners (§17.2), most urgent first: (kind, icon, text, operator idnames of its buttons). Plain
     data: live_banners() passes the live state. state, message: server.status(); probe: the runtime probe's failure;
-    blocked: how many reads of this untrusted file were blocked; addons: the enabled add-on modules; notes: Import CSV
-    notes; legacy: the old Jev nodes banners as (text, operator idname); over: the over-cap errors."""
+    blocked: how many reads of this untrusted file were blocked; notes: Import CSV notes; over: the over-cap errors."""
     found = []
     if state == "not_installed":
         found.append(("install", 'ERROR', "Model not installed: Install Model downloads it once (about 12 GB); Locate "
@@ -139,29 +137,15 @@ def banners(state, message, probe="", blocked=0, addons=(), notes=(), legacy=(),
         found.append(("runtime", 'ERROR', probe, ("openact.locate_runtime",)))
     elif message == server.CHECKING:
         found.append(("runtime", 'SORTTIME', message, ("openact.locate_runtime",)))
-    elif state == "error" and (message == server.LEGACY_SERVER_MESSAGE or message.startswith("Port ")):
+    elif state == "error" and message.startswith("Port "):
         found.append(("port", 'ERROR', message, ()))
     if blocked:
         found.append(("trust", 'ERROR', f"This file is not trusted, so {blocked} read{'s' if blocked > 1 else ''} "
                       f"outside its folder {'were' if blocked > 1 else 'was'} blocked",
                       ("openact.allow_file", "openact.trust_folder")))
-    if any(map(P.is_jev, addons)):
-        found.append(("jev_nodes", 'ERROR', "Disable Jev Nodes: OpenAct replaces it", ()))
-    found += [("legacy", 'INFO', text, (idname,)) for text, idname in legacy]
     found += [("over_cap", 'CANCEL', text, ()) for text in over]
     found += [("import_csv", 'INFO', text, ()) for text in notes]
     return found
-
-
-def runtime_line(prefs=None) -> str:
-    """§12.2's line while the runtime is the Jev Nodes one, used in place, else "": its folder, and the base Python its
-    venv uses, which can live outside it. No size: walking 13 GB of files while drawing is too slow."""
-    root = P.runtime_root(prefs)
-    legacy = os.path.normpath(os.path.join(os.path.dirname(P.default_runtime_root()), "JevNodes"))
-    if os.path.normcase(root) != os.path.normcase(legacy):
-        return ""
-    home = P.venv_home(root)
-    return f"Using the Jev Nodes runtime at {root}" + (f"; Python from {home}" if home else "")
 
 
 def import_csv_notes() -> dict:
@@ -197,8 +181,8 @@ def _import_csv_notes(_pass):
     return notes
 
 
-def live_banners(context) -> list[tuple]:
-    """banners() for this session: the server and the runtime probe, this file's trust, the add-ons, the nodes."""
+def live_banners(_context) -> list[tuple]:
+    """banners() for this session: the server and the runtime probe, this file's trust, the nodes."""
     state, message = server.status()
     records = list(engine.STATUS.values())
     # from BLOCKED on: a node that reads a blocked node's answer repeats its read behind a breadcrumb
@@ -213,9 +197,7 @@ def live_banners(context) -> list[tuple]:
                 if (status := engine.STATUS.get(node.uid)) and status.contexts > inner.MATERIALISED_MAX]
     notes = [f"{os.path.basename(WATCH.files[ident].path)}: {note}" for ident, note in import_csv_notes().items()
              if ident in WATCH.files]
-    legacy = [found for hook in LEGACY if (found := hook()) is not None]
-    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", len(blocked),
-                   context.preferences.addons.keys(), notes, legacy, over)
+    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", len(blocked), notes, over)
 
 
 # ------------------------------------------------------------------------------------------ drawing
@@ -246,11 +228,6 @@ def draw_server(layout, banner=None):
     shared = state in ("ready", "starting") and server.attached()
     if shared:
         box.label(text=server.SHARED, icon='LINKED')
-    line = runtime_line()
-    if line:
-        row = box.row()
-        wrap(row.column(), line, icon='FILE_FOLDER')
-        row.operator("openact.open_runtime_folder", text="", icon='FILEBROWSER')
     health = server.STATE.health
     if state == "ready" and health:
         col = box.column(align=True)
@@ -499,11 +476,9 @@ def register():
     # UI state, not file data: which context's table the sidebar shows, and its page
     bpy.types.WindowManager.openact_context = bpy.props.IntProperty(name="Context", min=0)
     bpy.types.WindowManager.openact_page = bpy.props.IntProperty(name="Page", min=0)
-    LEGACY.append(migrate.banner)
 
 
 def unregister():
-    LEGACY.remove(migrate.banner)
     del bpy.types.WindowManager.openact_page
     del bpy.types.WindowManager.openact_context
     for cls in reversed(classes):

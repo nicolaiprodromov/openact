@@ -1140,7 +1140,7 @@ def build_weather():
 
 FURNITURE = (("Armchair", "box", 0.45, 0.9), ("Bookshelf", "box", 0.5, 1.8), ("Floor Lamp", "rod", 0.1, 1.7),
              ("Rug", "box", 1.0, 0.02), ("Table", "box", 0.6, 0.75))
-SCENES = {  # the prototype's e2e scene: object -> its Scene and Pick Prompt
+SCENES = {  # the ask_pick scene: object -> its Scene and Pick Prompt
     "A": ("A snowy mountain village at night, warm windows glowing.", "something to sit on"),
     "B": ("A sunny tropical beach at noon, people swimming.", "something to put books on"),
 }

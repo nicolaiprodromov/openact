@@ -1,7 +1,7 @@
 """A node's stored answers: the `entries` JSON, schema 2.
 
 The JSON is the single source of truth: the inner group and the table object are rebuilt from it.
-Pure Python (no bpy), so the conversion and the eviction rules also run under plain CPython.
+Pure Python (no bpy), so the reading and the eviction rules also run under plain CPython.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ MAX_ENTRIES = 16  # warm or cold entries per node; live and pinned entries come 
 MB = 1024 * 1024
 SOFT_CAP = 2 * MB  # per node; only warm and cold entries are evicted to meet it
 HARD_CAP = 4 * MB  # per entry
-V010 = "jev_nodes 0.1.0"  # model and ask key of the entries converted from v0.1.0
 _HEAD, _TAIL = f'{{"schema":{SCHEMA},"entries":[', "]}"
 
 
@@ -40,7 +39,6 @@ class Entry:
     asks: list[str] = field(default_factory=list)
     pv: int = 0
     t: float = 0.0  # last use: warm and cold entries are evicted least recently used first
-    legacy: bool = False
     pinned: bool = False
     frames: list[list[int]] = field(default_factory=list)  # [start, end] ranges of a pinned entry's words
     gn: tuple[str, ...] = ()
@@ -63,17 +61,15 @@ class NodeStore:
 
 
 def load(node) -> NodeStore:
-    """The node's entries. A v0.1.0 list (schema 1) is converted but not written back, because opening
-    a file must not rewrite it. A damaged entry is skipped, and unreadable JSON gives an empty store.
-    JSON of a newer schema also gives an empty store, and save() refuses to write over that JSON."""
+    """The node's entries. A damaged entry is skipped, and unreadable JSON gives an empty store, as does a node with
+    none yet (a new node holds "[]"). JSON of a newer schema also gives an empty store, and save() refuses to write
+    over that JSON."""
     try:
         data = json.loads(node.entries or "[]")
     except (ValueError, RecursionError):
         return NodeStore()
-    if isinstance(data, list):
-        items, read = data, _from_v010
-    elif isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("entries"), list):
-        items, read = data["entries"], _read
+    if isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("entries"), list):
+        items = data["entries"]
     elif isinstance(data, dict) and type(data.get("schema")) is int and data["schema"] > SCHEMA:
         return NodeStore(schema=data["schema"])
     else:
@@ -81,7 +77,7 @@ def load(node) -> NodeStore:
     store = NodeStore()
     for item in items:
         try:
-            entry = read(item)
+            entry = _read(item)
             _check(entry)
         except Exception:  # whatever the damage, it costs only this entry's answers
             continue
@@ -162,9 +158,9 @@ def _check(entry):
     texts = (entry.words_key, entry.model, entry.kind, entry.answer_type)
     if not (isinstance(entry.gn, tuple) and set(map(type, entry.gn + texts)) <= {str} and _list_of(entry.asks, str)):
         raise ValueError("an entry's gn must be a tuple of strings, and its keys and names strings")
-    if not (type(entry.pv) is int and type(entry.legacy) is bool and type(entry.pinned) is bool
+    if not (type(entry.pv) is int and type(entry.pinned) is bool
             and type(entry.t) in (int, float) and math.isfinite(entry.t)):
-        raise ValueError("an entry's pv, legacy, pinned or t has the wrong type")
+        raise ValueError("an entry's pv, pinned or t has the wrong type")
     if not (isinstance(entry.frames, list)
             and all(isinstance(table, dict) for table in (entry.shape, entry.single, entry.csv))):
         raise ValueError("an entry's frames, shape, single or csv has the wrong type")
@@ -199,35 +195,3 @@ def _known(cls, data):
     if not isinstance(data, dict):
         raise TypeError(f"{cls.__name__} must be a JSON object")
     return cls(**{f.name: data[f.name] for f in fields(cls) if f.name in data})
-
-
-def _from_v010(item):
-    """A v0.1.0 entry {"key", "gn", "a", "t"}, as v1 stores the same words and answer (§14.4): its words at their
-    positions in the fixed word tuples, and its words key, rows and wkeys from the spec's own plan of those words, so
-    an upgraded node's plan reuses it. The old key is dropped."""
-    from .specs.ask import AskSpec  # the specs import this module
-    from .specs.pick import PickSpec
-
-    if not _list_of(item["gn"], str):  # else a string or an object would unpack into wrong words
-        raise TypeError("gn must be a list of strings")
-    first, second = item["gn"]
-    answer = item["a"]
-    if "mode" in answer:  # Ask: (Question, Context) -> Question, Context, Answers, Overrides, Key
-        spec, value, confidence = AskSpec(), float(answer["value"]), float(answer["confidence"])
-        job = spec.job((first, second, "", "", ""), answer["mode"], True)
-        values = {"amount" if answer["mode"] == 'AMOUNT' else "p": [value], "c": [confidence]}
-        single = {"Answer": value, "Yes": value >= 0.5, "Confidence": confidence}
-    else:  # Pick: (Prompt, Items) -> Prompt, Context, Items, Overrides, Key
-        spec, names = PickSpec(), answer["items"]
-        if not _list_of(names, str):  # else a string would plan one item per character
-            raise TypeError("items must be a list of strings")
-        # v0.1.0 ignored the Items text when a collection was set, and a live COLLECTION Pick has "" there
-        job = spec.job((first, "", "" if answer.get("collection") else second, "", ""), names, True)
-        values = {"prob": answer["probabilities"]}
-        single = {"Index": int(answer["index"]), "Item": str(answer["item"]), "Confidence": float(answer["confidence"])}
-    count = len(job.rows)
-    return Entry(words_key=job.words_key, asks=[V010], t=float(item.get("t", 0.0)), legacy=True, gn=job.gn,
-                 model=V010, kind=spec.name, answer_type=job.answer_type, shape=job.shape.as_dict(),
-                 rows=Rows(name=[row.name for row in job.rows], wkey=[row.wkey for row in job.rows], ask=[0] * count,
-                           src="m" * count, v=values),
-                 single=single)

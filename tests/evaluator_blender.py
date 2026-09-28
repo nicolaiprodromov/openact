@@ -261,7 +261,7 @@ S.save(answered, saved)
 inner.build(answered, saved)
 cases.append(("OpenAct Ask answer used as a word", answered.outputs["Answer"], 'FLOAT'))
 
-muted_pick = N.new(engine.PICK_ID)  # muted, it passes its ID on to Index (§12.3)
+muted_pick = N.new(engine.PICK_ID)  # muted, Blender passes its ID on to Index, the output of the same type
 three = N.new("FunctionNodeInputInt")
 three.integer = 3
 L.new(three.outputs[0], muted_pick.inputs["ID"])

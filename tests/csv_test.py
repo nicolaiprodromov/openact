@@ -1054,18 +1054,6 @@ def test_inline():
             parse(text),
         )
     check("inline: lists offers csvfmt's parser", lists.parse_inline is csvfmt.parse_inline)
-    for text, names in (
-        ("Chair: comfy; Stool, Bench: long", ["Chair: comfy; Stool", "Bench: long"]),  # commas only, no whens
-        ("a, b\n", ["a, b"]),  # any new line splits on new lines, even a trailing one
-        ("a\r\nb, c\rd", ["a", "b, c", "d"]),
-        (" , a,, b ", ["a", "b"]),
-        ("", []),
-    ):
-        check(
-            f"inline v0: v0.1.0's Items rule ({text!r})",
-            parse(text, mode="v0") == [(name, "") for name in names],
-            parse(text, mode="v0"),
-        )
     error = csvfmt.CsvError([csvfmt.Problem("warning", "f.csv", 1, "", "just a warning")])
     check("CsvError: built without an error, it still builds", str(error) == "" and len(error.problems) == 1)
     paths = ("//life_outcomes.csv", "  C:\\data\\Life.CSV \n")

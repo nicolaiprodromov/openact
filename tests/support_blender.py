@@ -400,7 +400,7 @@ def phase_diagnostics():
     done = settle(lambda: complete(node) and line(missing)[0] == line(doubled)[0] == "error"
                   and "No outcome applies" in line(uncovered)[1], 60)
     quoted, pathed, named = line(doubled)[1], line(missing)[1], line(uncovered)[1]
-    config = os.path.join(P._Defaults.runtime_dir, "venv", "pyvenv.cfg")  # names the venv's base Python (§12.2)
+    config = os.path.join(P._Defaults.runtime_dir, "venv", "pyvenv.cfg")  # names the venv's base Python
     os.makedirs(os.path.dirname(config), exist_ok=True)
     roaming = os.path.join(os.sep * 2 + "fileserver", "users$", "artist", "AppData", "Roaming", "uv", "python",
                            "cpython-3.12.11-windows-x86_64-none")  # uv's Pythons in a %APPDATA% redirected to a share

@@ -7,7 +7,6 @@ picks a CSV-capable input's route: an Import CSV node linked to the '<Input> CSV
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field, replace
 
@@ -27,7 +26,7 @@ if bpy is not None:
 
 SOURCES = ("TEXT", "COLLECTION", "MATERIALS", "ATTRIBUTES")
 MAX_ITEMS = 255
-DECISION_PREFIXES = ("GeometryNodeOpenAct", "GeometryNodeJev")  # OpenAct nodes and their legacy aliases
+DECISION_PREFIX = "GeometryNodeOpenAct"  # the bl_idnames of the OpenAct nodes
 STORE = "GeometryNodeStoreNamedAttribute"
 HASHES = None  # while the engine plans a context: path as written -> [text_hash, num_hash] of each CSV it reads
 
@@ -175,33 +174,11 @@ def _text_items(node, ctx, spec):
 
     raw = as_text(_word(node, "Items", ctx))
     hint = "Type items separated by commas, or a .csv path"
-    companion = find_input(node, "Items CSV")
-    if getattr(node, "items_parse_v0", False) and not (companion is not None and _linked(companion)):
-        # An upgraded Pick parses its old Items texts, kept at the upgrade, as v0.1.0 did: their names and words keys
-        # hold, also after Ask Again (§12.3). Another text is a change, and v1 parsing takes over for good.
-        if raw in _v0_texts(node):
-            items = tuple(Item(name) for name, _when in parse_inline(raw, mode="v0"))
-            if not items:
-                raise Hint(hint)
-            return ItemList("TEXT", items, raw, fingerprint=("TEXT", raw, "v0"))
-        try:
-            node.items_parse_v0, node.items_v0_texts = False, "[]"
-        except AttributeError:  # read-only now: linked data, or while Blender draws
-            pass
     answers = sources.answer_set(node, ctx, "Items", "items", spec, hint)
     doc, source = answers.doc, answers.source
     items = tuple(Item(o.name, o.when, dict(o.payload)) for o in answers.options)
     fingerprint = ("TEXT", raw) + ((doc.path, source.delimiter, doc.stamp) if doc is not None else ())
     return ItemList("TEXT", items, raw, doc, source, None, fingerprint, answers.problems)
-
-
-def _v0_texts(node):
-    """The Items texts an upgraded Pick keeps v0.1.0's parsing for: its items_v0_texts, a JSON list."""
-    try:
-        texts = json.loads(node.items_v0_texts)
-    except (AttributeError, ValueError):
-        return ()
-    return texts if isinstance(texts, list) else ()
 
 
 def _collection_items(node, ctx):
@@ -292,7 +269,7 @@ def _from_decision(sock, ctx):
             if link.is_muted:
                 continue
             up, out = link.from_node, link.from_socket
-            if up.bl_idname.startswith(DECISION_PREFIXES):
+            if up.bl_idname.startswith(DECISION_PREFIX):
                 return True
             if up.bl_idname == "NodeGroupInput":
                 if ctx.path:

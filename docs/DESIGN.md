@@ -6,9 +6,8 @@
 | Reviewers | _&lt;reviewers&gt;_ |
 | Date | 2026-09-26 |
 | Status | Draft |
-| Supersedes | `jev_nodes` v0.1.0 prototype (`X:\interzis\CHUMP_KIT\jev_nodes\`) |
 | Target | OpenAct 1.0.0 on Blender 4.5 LTS to 5.1; NVIDIA GPU first |
-| Audience | Senior engineers who know the prototype; the agent implementing the PR Plan |
+| Audience | Engineers working on OpenAct; the agent implementing the PR Plan |
 
 ## Table of Contents
 
@@ -23,7 +22,7 @@
 9. [Rules Engine Details](#9-rules-engine-details): factors, bands, state index math, Amount interpolation, dithering, exact-fact restrictions
 10. [Engine & Server Changes](#10-engine--server-changes): static evaluator generalization, batching, debias cost, tournaments
 11. [Minimum Blender Version](#11-minimum-blender-version)
-12. [Migration from jev_nodes v0.1.0](#12-migration-from-jev_nodes-v010)
+12. [(Removed before 1.0)](#12-removed-before-10)
 13. [API / Interface Changes](#13-api--interface-changes)
 14. [Data Model](#14-data-model)
 15. [Alternatives Considered](#15-alternatives-considered)
@@ -41,8 +40,8 @@
 
 ## 1. Overview
 
-OpenAct turns the working `jev_nodes` v0.1.0 prototype into a product: six Geometry Nodes that
-make judgments with a local "System One" decision model. The model reads text and returns
+OpenAct is six Geometry Nodes that make judgments with a local "System One" decision model.
+The model reads text and returns
 calibrated probabilities over a fixed set of typed answers in one forward pass. This is SemIf
 letter-logit scoring on Qwen3.5-4B, and no text is ever generated. Geometry Nodes cannot run
 Python while it evaluates. So every OpenAct node is a `GeometryNodeCustomGroup` whose hidden
@@ -52,15 +51,15 @@ Geometry Nodes then applies the table **per element** through an ID or state fie
 and Geometry Nodes data comes out. The model runs only when the words change. It never runs
 during evaluation, playback or rendering, and the answers are saved in the .blend.
 
-v1 keeps what already works in the prototype:
+v1 rests on four foundations:
 - the static input evaluator;
 - per-context answers keyed by the exact input strings;
 - the runtime split: a separate Python environment behind a Jev-compatible API on 127.0.0.1;
 - answers saved in the file.
 
-It adds the following:
-1. **Four new nodes and new Pick outputs.** Match, Classify, Rules and Dials are new. Pick gains
-   Selection and Probability fields.
+On top of them it builds the following:
+1. **Six nodes.** Ask, Pick, Match, Classify, Rules and Dials. Pick also gives Selection and
+   Probability fields.
 2. **Per-element tables read through an ID field.** Every per-element column lives in a hidden
    table object read with `Sample Index`. `Index Switch` is used only for single values (§8.4).
 3. **Rules, answer lists and labels written as CSV files.** The node takes each file through a
@@ -76,21 +75,19 @@ It adds the following:
 4. **Caching per cell and batched requests.** Many questions that share one state go into one
    request.
 5. **Artist overrides written in an Overrides CSV.** Locked cells are never asked again.
-6. **The rename to OpenAct**, with an upgrade path for old files and the 13 GB runtime already
-   installed.
 
-The minimum Blender version rises from 4.2 to **4.5 LTS** (§11).
+The minimum Blender version is **4.5 LTS** (§11).
 
 ### 1.1 The six nodes at a glance
 
 | Node | Judges | Answer types | Words in (read statically) | Per-element input (field) | Outputs |
 |---|---|---|---|---|---|
-| **Ask** (exists) | the whole situation | Yes/No, Amount | Question, Context, Answers (optional), Overrides | none | Answer, Yes, Confidence (single values) |
-| **Pick** (extend) | the whole situation | one entry of a list | Prompt, Context, Items, Overrides | ID | Index, Item, Confidence; **Selection**, **Probability** (fields); Instance / Material / CSV columns, depending on the list source |
-| **Match** (new) | each named item | Yes/No, Amount | Question, Context, Items, Answers (optional), Overrides | ID | Probability, Selection, Confidence (fields) |
-| **Classify** (new) | each named item | One-of (labels) | Question, Context, Items, Labels, Overrides | ID | Label, Confidence (fields); numeric columns of the Labels CSV |
-| **Rules** (new) | each measured situation | Yes/No, Amount, One-of | Question, Context, Factors (CSV), Outcomes, Overrides | one socket per factor (Float band / Int category / Bool flag) | Outcome or Probability+Yes or Amount; Confidence; numeric columns of the Outcomes CSV |
-| **Dials** (new) | the whole situation | per setting: Yes/No, Amount, One-of | Prompt, Settings, Overrides | none | one output per setting, Confidence |
+| **Ask** | the whole situation | Yes/No, Amount | Question, Context, Answers (optional), Overrides | none | Answer, Yes, Confidence (single values) |
+| **Pick** | the whole situation | one entry of a list | Prompt, Context, Items, Overrides | ID | Index, Item, Confidence; **Selection**, **Probability** (fields); Instance / Material / CSV columns, depending on the list source |
+| **Match** | each named item | Yes/No, Amount | Question, Context, Items, Answers (optional), Overrides | ID | Probability, Selection, Confidence (fields) |
+| **Classify** | each named item | One-of (labels) | Question, Context, Items, Labels, Overrides | ID | Label, Confidence (fields); numeric columns of the Labels CSV |
+| **Rules** | each measured situation | Yes/No, Amount, One-of | Question, Context, Factors (CSV), Outcomes, Overrides | one socket per factor (Float band / Int category / Bool flag) | Outcome or Probability+Yes or Amount; Confidence; numeric columns of the Outcomes CSV |
+| **Dials** | the whole situation | per setting: Yes/No, Amount, One-of | Prompt, Settings, Overrides | none | one output per setting, Confidence |
 
 Every node also has a hidden `Key` word. It is compared by the match chain to tell contexts apart,
 but it is never sent to the model (§6.0).
@@ -149,34 +146,19 @@ The rest of the document specifies:
 
 ## 2. Background & Motivation
 
-### 2.1 The prototype today (`jev_nodes` v0.1.0)
+### 2.1 The approach
 
-The prototype lives in `X:\interzis\CHUMP_KIT\jev_nodes\`. It has no git repository and is built
-with `blender --command extension build` into `dist/jev_nodes-0.1.0.zip`. Every test passes on
-Blender 4.2 and 5.1.
-
-| File | What it does today | What happens to it in OpenAct |
-|---|---|---|
-| `jev_nodes/__init__.py` | Registers `JevPreferences`, then `ops`, `nodes`, `ui`, then `engine.register()` and `server.refresh()` | Package becomes `openact`; same registration order |
-| `jev_nodes/prefs.py` | Preferences: `runtime_dir`, `port` (18765), `device`, `gpu`, `auto_start`, `debias`. `runtime_installed()` checks the venv and every shard in `model.safetensors.index.json` (result cached by mtime) | Becomes `OpenActPreferences`; adds legacy-runtime detection, backend choice and the "unsure below" setting |
-| `jev_nodes/server.py` | Runs the subprocess with a `--parent-pid` watchdog. Uses `ThreadPoolExecutor(max_workers=4)` for all HTTP; `post()`/`pump()` hand results to the main thread; status machine `unknown/not_installed/stopped/starting/ready/error/installing`. The uv installer pins torch 2.10.0 (cu128 or cpu), SemIf commit `23cf1f39…` and model revision `851bf6e8…`, and honours `bpy.app.online_access` | Kept. Adds a launch token and one priority-ordered decision worker; installers are split per backend |
-| `jev_nodes/engine.py` | Static evaluator (`eval_input`, `eval_output`, `_HANDLERS`, `_group_input` incl. modifier values and `*_use_attribute`). Contexts (`find_uses`, `Ctx`). Node specs (`AskSpec`, `PickSpec`). Inner builder (`_Builder.match_chain`, `_Builder.lookup`). Caches (`MEMORY`, `PENDING`, `FAILED`, `STATUS`). Passes (`run_pass`, `_process`, `tick` every 0.1 s, `DEBOUNCE` 0.25 s, `SAFETY_PASS` 2 s, paused during playback and render jobs). Ownership fix-up `ensure_owned` | Split into `evaluator.py`, `engine.py`, `pipeline.py`, `store.py`, `inner.py`, `tables.py` and `specs/` |
-| `jev_nodes/nodes.py` | `GeometryNodeJevAsk` ("Ask Jev", mode `YES_NO`/`AMOUNT`) and `GeometryNodeJevPick` ("Jev Pick"). Both use the `_JevNode` mixin with hidden `uid` and `entries` JSON. `copy()` only clears `uid`. Add menu *Shift A > Jev* | Six `GeometryNodeOpenAct*` classes plus two hidden legacy aliases used only for migration |
-| `jev_nodes/ops.py`, `jev_nodes/ui.py` | Install, start, stop, re-ask, open log, open runtime folder. Sidebar tab "Jev"; preferences UI | Renamed to `openact.*`. The sidebar adds table inspection, CSV templates and "Upgrade old nodes" |
-| `jev_nodes/natsort.py` | Port of `BLI_strcasecmp_natural` (unsigned bytes) | Unchanged |
-| `jev_nodes/runtime/jev_server.py` | `POST /v1/systemone`, `GET /health`, `GET /v1/models`, `POST /shutdown`. SemIf `score`/`score_shared` in chunks of 32 rows that share one state; forward+reverse order debiasing; tournament for 17–255 options; LRU cache (4096) keyed on the **whole request** | Becomes `openact_server.py`. Adds a per-question cache, token check, a backend interface and `/v1/capabilities` |
-| `tests/e2e_blender.py`, `tests/evaluator_blender.py` | Real-model end-to-end test (phases build / noaddon / reopen); evaluator checked against Geometry Nodes | Kept and extended; new suites for CSV, lookup, simulation zone, migration and a fake backend |
-
-**How one answer flows today:**
-1. `run_pass()` lists the nodes (`iter_jev_nodes`) and calls `ensure_owned()`.
-2. It maps every tree to the modifier contexts that use it (`find_uses`, up to 64 per tree).
-3. For each context, `spec.request()` evaluates the node's strings and builds a `Req`. A `Req`
-   has two parts: `gn`, the raw input strings that Geometry Nodes can compare, and `key`, a
-   sha1 of the normalised meaning.
-4. `_process()` keeps at most 16 `entries` per node (`MAX_ENTRIES`).
-5. For every missing key, `_submit()` sends one HTTP request.
-6. `build_inner()` runs `tree.nodes.clear()` and rebuilds a Compare(`A_STR`/`B_STR`) chain.
-   That chain feeds a Switch(INT), which drives one Index Switch per output.
+Geometry Nodes cannot run Python while it evaluates, so no node can ask a model during
+evaluation. OpenAct answers outside evaluation instead, and lets Geometry Nodes look the answers
+up:
+1. A pass lists the OpenAct nodes and gives each one its own hidden inner group
+   (`ensure_owned()`).
+2. It maps every tree to the modifier contexts that use it (`find_uses`).
+3. For each context, the static evaluator reads the node's words: `gn`, the raw input strings
+   that Geometry Nodes can compare, and keys over their meaning.
+4. The answers that are missing are asked of the model in the background, off the main thread.
+5. The inner group holds a match chain: Compare(`A_STR`/`B_STR`) nodes over the words feed a
+   Switch(INT) that picks the entry, and the entry's answers are read out per output.
 
 Geometry Nodes then picks the entry whose strings equal the live inputs. This lets one tree
 serve many objects with different prompts, and switching between them is instant.
@@ -201,26 +183,27 @@ serve many objects with different prompts, and switching between them is instant
   must be turned into words by code. A band name or an exact category goes to the model, never a
   raw 0.73.
 
-### 2.3 Pain points and gaps
+### 2.3 What the design has to solve
 
-1. **Single values only.** The README says: "Fields and geometry can't be used as inputs: the
-   question is asked once per node." Nothing can judge each instance, material or cell state.
-2. **Unstructured answers.** Pick items are bare names, which gives low confidence (above). There
-   is no way to give conditions, restrictions or payload values, and no CSV.
-3. **No overrides.** An artist can correct a wrong answer only by rewording the prompt.
-4. **One request per node-context, and a server cache keyed on whole requests.** A 216-cell table
-   would be either 216 round trips or one request whose cache entry any single edit invalidates.
-5. **No scheduling.** The executor is FIFO and shared with `/health` probes. It has no
-   priorities, no chunking, no cancellation of superseded work and no progress reporting.
-6. **Rebuild cost.** `build_inner()` rebuilds every node on every change. Setting `node.location`
-   alone costs about 6 ms per node in 5.1 (measured in a sibling project). A 255-row table with 4
-   outputs would stall the UI.
+1. **Per-element judgments.** A question asked once per node can't judge each instance, material
+   or cell state.
+2. **Structured answers.** Bare item names give low confidence (above). Options need conditions,
+   restrictions and payload values, and they belong in CSV files.
+3. **Overrides.** An artist must be able to correct a wrong answer without rewording the prompt.
+4. **Requests and caching.** With one request per node-context and a server cache keyed on whole
+   requests, a 216-cell table would be either 216 round trips or one request whose cache entry
+   any single edit invalidates.
+5. **Scheduling.** A FIFO executor shared with `/health` probes has no priorities, no chunking,
+   no cancellation of superseded work and no progress reporting.
+6. **Rebuild cost.** Rebuilding every node on every change is too slow: setting `node.location`
+   alone costs about 6 ms per node in 5.1 (measured in a sibling project), and a 255-row table
+   with 4 outputs would stall the UI.
 7. **Blender 4.2 limits.** 4.2 lacks Import CSV, Import Text, `GeometrySet`, and the Object and
    Collection input nodes. Without the add-on, 4.2 evaluates saved OpenAct nodes as zeros.
-8. **Naming.** "Jev" is TypeSafe's trademark for its hosted model. SemIf renamed itself from
-   "OpenJev" for that reason, so the product cannot be called Jev Nodes.
-9. **Status is a single line per node.** There is no notion of partially filled tables, unsure
-   cells, locked cells or an ETA.
+8. **Naming.** "Jev" is TypeSafe's trademark for its hosted model, and SemIf renamed itself from
+   "OpenJev" for that reason. The product's name must not use it.
+9. **Status.** A single status line per node can't show partially filled tables, unsure cells,
+   locked cells or an ETA.
 
 ### 2.4 Why now
 
@@ -269,13 +252,12 @@ localhost Jev-compatible API, and Blender stays pure Python. Backends are swappa
 API. **Only NVIDIA/CUDA is built in v1.** A CPU backend (llama.cpp) is future work, outside this
 plan.
 
-**G8. Rename to OpenAct and migrate cleanly.** New package id, bl_idnames, UI strings and
-runtime folder. The installed 13 GB runtime is reused in place. Old files are upgraded with
-their stored answers intact (§12).
+**G8. One identity.** The package id, bl_idnames, UI strings and the runtime folder all use the
+name OpenAct.
 
 **G9. Tested and demoable.** Automated suites cover the evaluator, CSV parsing, table lookup
-(including main-thread cost budgets), simulation-zone use, migration, a fake-model pipeline and
-real-model end to end, on Blender 4.5, 5.0 and 5.1. Demo scenes for the promo video are built by script (§18).
+(including main-thread cost budgets), simulation-zone use, a fake-model pipeline and real-model
+end to end, on Blender 4.5, 5.0 and 5.1. Demo scenes for the promo video are built by script (§18).
 
 **G10. Don't preclude agents.** v1 ships a job queue with priorities and cancellation,
 per-element tables that can be rewritten without rebuilding node graphs (table objects), and
@@ -301,7 +283,7 @@ reading of evaluated geometry through `GeometrySet`.
 | Per-element lookup cost, 1M elements | ≤ 5 ms above a no-lookup baseline, up to 8 interpolation corners (review measurement: within ~1 ms on 4.5.2 and 5.1.1) | §8.7 |
 | Main-thread cost per pass | ≤ 5 ms per unchanged node; ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts | §5.3 |
 | Graph edits on the main thread | `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and ≤ 1 s at each derived worst shape (§8.4), run only on shape or materialised-set changes, at most one per edit; `update_values()` (entry-level Index Switches only) ≤ 30 ms when one entry's values change, ≤ 150 ms when all 16 entries' values change at once; a table-object write ≤ 5 ms | §8.4, §8.8 |
-| Add-on upgrade (new templates), toggling a node's *Balance Option Order*, or upgrade of a v0.1.0 file | 0 requests until the words change | §5.4, §10.3 |
+| Add-on upgrade (new templates) or toggling a node's *Balance Option Order* | 0 requests until the words change | §5.4, §10.3 |
 | Prepare for Playback over 250 frames | < 1 s on the F-curve path (channelbag F-curves, no scene evaluation). The fallback for drivers, NLA, tweak mode or blended actions costs frames × one scene evaluation, with progress and Esc | §5.5 |
 | Blender versions | 4.5 LTS, 5.0, 5.1 | §11 |
 
@@ -329,8 +311,7 @@ reading of evaluated geometry through `GeometrySet`.
   - A CPU backend (llama.cpp, GGUF Q4_K_M) is **future work, not in this plan**. So is Apple
     Silicon.
   - AMD/Intel GPUs and multi-GPU serving are out of scope.
-  - The CPU path of torch that the prototype's installer could fall back to is **removed** in v1
-    (§10.5).
+  - The installer has no CPU path for torch (§10.5).
 - **NG10. Model training, fine-tuning or retrieval.** The model and SemIf revision are pinned.
 
 **v1 support matrix.**
@@ -413,7 +394,7 @@ columns are stored in the group's hidden table object (§8). Geometry Nodes appl
 field (Pick, Match, Classify) or through **factor** fields (Rules). This is an O(1) lookup per
 element, so evaluation cost does not depend on the model.
 
-The model runs only after the words change: a debounced pass, as in the prototype's `tick()`. It
+The model runs only after the words change: a debounced pass, run from `tick()`. It
 never runs during evaluation, during playback or while a render job runs (`_playing()`). Answers
 persist in three places, all saved in the .blend:
 - the node's `entries` JSON;
@@ -450,13 +431,13 @@ Every row carries a confidence *c* in the range 0–1:
 
 | Answer type | Confidence | Source |
 |---|---|---|
-| Yes/No | `c = abs(2p − 1)` | as in the prototype's `AskSpec.parse` |
+| Yes/No | `c = abs(2p − 1)` | `AskSpec` |
 | One-of | `c = p1 − p2` (top minus runner-up of the tournament-merged distribution, order-balanced when the node's toggle is on, §10.3) | server `_confidence()` |
 | Amount | `c = clamp(1 − σ / σu(L), 0, 1)`, where σ is the standard deviation of the level distribution and `σu(L) = sqrt((L² − 1) / 12)` is the spread of a uniform answer over L levels | **new**; computed in Blender from the `probabilities` the server already returns |
 | Decided by code, or locked | `c = 1` | shown as "decided" or "locked", never as "unsure" |
 
-The Amount formula replaces the prototype's top-minus-runner-up because that measure misreads
-ordinal answers that sit between two neighbouring levels:
+Amount does not use top-minus-runner-up because that measure misreads ordinal answers that sit
+between two neighbouring levels:
 - `[0, .45, .55, 0, 0]` scores 0.10 with top-minus-runner-up but 0.65 with σ;
 - a split `[.5, 0, 0, 0, .5]` correctly scores 0 (σ = 2 exceeds σu = 1.41);
 - a uniform answer scores exactly 0 for **any** number of levels.
@@ -506,37 +487,34 @@ add-on". Everything an artist authors lives in one of three places:
 - **files the tree can read** (CSV, text).
 
 The sidebar and preferences are secondary. They cover install/start/stop of the model, status,
-inspection, starter templates and the one-time upgrade of old nodes. No per-file state lives
-outside the .blend and its CSV files.
+inspection and starter templates. No per-file state lives outside the .blend and its CSV files.
 
 ## 5. Architecture
 
 ### 5.1 Components
 
-Package `openact/`. It replaces `jev_nodes/` and keeps the prototype's flat style. `engine.py`
-(940 lines) is split along its existing seams.
+Package `openact/`, in a flat style: one module per concern.
 
-| Module | Responsibility | Main entry points | Comes from |
-|---|---|---|---|
-| `__init__.py` | Registers prefs → ops → nodes → ui → `engine.register()`, then `server.refresh()` | `register()`, `unregister()` | `jev_nodes/__init__.py` |
-| `prefs.py` | `OpenActPreferences`. Runtime root resolution: explicit `runtime_dir` → `…/OpenAct` → legacy `…/JevNodes` (§12). Backend enum, `unsure_below` | `get_prefs()`, `runtime_root()`, `runtime_installed()` | `prefs.py` |
-| `nodes.py` | The six node classes on an `_OpenActNode` mixin; two hidden legacy aliases; Add menu | `GeometryNodeOpenAct*` | `nodes.py` |
-| `engine.py` | Passes, handlers, timer, file watcher, per-node status, ownership fix-up | `run_pass()`, `tick()`, `schedule()`, `ensure_owned()` | `engine.py` (passes) |
-| `evaluator.py` | Static evaluator and contexts, including tracing a plugged-in Import CSV node to its Path and Delimiter (§6.0) | `eval_input()`, `find_uses()`, `trace_csv_source()`, `Ctx`, `Unresolvable`, `Pending`, `Hint` | `engine.py` (evaluator) |
-| `lists.py` | The four list sources → `ItemList([Item(name, when, row)])` | `resolve_items(node, ctx)`, `parse_inline()` | `parse_items`, `collection_items` |
-| `csvfmt.py` | Pure-Python CSV reader (no `bpy`): header conventions, numeric/text split mirroring Import CSV, validation, `text_hash` | `read_csv(path) -> CsvDoc` | new |
-| `specs/base.py`, `specs/{ask,pick,match,classify,rules,dials}.py` | Per node: wanted interface, `plan()` → `Job`, answers → rows, output spec for the builder | `Spec.interface()`, `Spec.plan()`, `Spec.rows()` | `AskSpec`, `PickSpec` |
-| `pipeline.py` | `Cell`/`Job` model, per-cell `MEMORY`/`PENDING`/`FAILED`, priority queue, chunking, request build and parse | `submit()`, `cancel()`, `cached()` | `_submit`, `_on_answer` |
-| `store.py` | Versioned `entries` JSON (schema 2, §14), override merge, legacy entries | `load(node)`, `save(node, store, live_gns=None)` (§13.3) | `get_entries`, `set_entries` |
-| `inner.py` | Inner-group construction: interface sync, match chain, entry-level Index Switches, the per-element sampled lookup on the table object, Rules banding/interpolation/dither graph; value-only updates of entry-level values | `sync_interface()`, `build()`, `update_values()` | `_Builder`, `build_inner`, `create_inner` |
-| `tables.py` | Hidden table objects (mesh of loose vertices plus attributes), linked to no collection and referenced only by Object Info (§8.5) | `ensure_table()`, `write_rows()`, `copy_for()` | new |
-| `geometry.py` | Attribute names from an object's **original** data (the Attributes list source, §6.0); safe `GeometrySet` access (4.5+) for the agents hook, which keeps the set referenced and never chains on temporaries | `attribute_names(obj)`, `read_attributes(obj, names)` | new |
-| `server.py` | Runtime lifecycle, installer, HTTP client with the launch token, decision worker thread | `start()`, `stop()`, `install()`, `Worker` | `server.py` |
-| `migrate.py` | `jev_nodes` → OpenAct upgrade of nodes, inner groups and entries | `find_legacy()`, `upgrade_all()` | new |
-| `ops.py`, `ui.py` | `openact.*` operators; sidebar tab "OpenAct"; preferences UI | — | `ops.py`, `ui.py` |
-| `natsort.py` | `BLI_strcasecmp_natural` port | `sort_key` | unchanged |
-| `runtime/openact_server.py` | Local model server: Engine (debias, tournament, cache) plus pluggable backends | HTTP endpoints (§5.2) | `runtime/jev_server.py` |
-| `templates/*.csv` | Starter CSVs written by the sidebar's "New CSV from Template" | — | new |
+| Module | Responsibility | Main entry points |
+|---|---|---|
+| `__init__.py` | Registers prefs → ops → nodes → ui → `engine.register()`, then `server.refresh()` | `register()`, `unregister()` |
+| `prefs.py` | `OpenActPreferences`. Runtime root resolution: the explicit `runtime_dir`, else `…/OpenAct`. Backend enum, `unsure_below` | `get_prefs()`, `runtime_root()`, `runtime_installed()` |
+| `nodes.py` | The six node classes on an `_OpenActNode` mixin; Add menu | `GeometryNodeOpenAct*` |
+| `engine.py` | Passes, handlers, timer, file watcher, per-node status, ownership fix-up | `run_pass()`, `tick()`, `schedule()`, `ensure_owned()` |
+| `evaluator.py` | Static evaluator and contexts, including tracing a plugged-in Import CSV node to its Path and Delimiter (§6.0) | `eval_input()`, `find_uses()`, `trace_csv_source()`, `Ctx`, `Unresolvable`, `Pending`, `Hint` |
+| `lists.py` | The four list sources → `ItemList([Item(name, when, row)])` | `resolve_items(node, ctx)`, `parse_inline()` |
+| `csvfmt.py` | Pure-Python CSV reader (no `bpy`): header conventions, numeric/text split mirroring Import CSV, validation, `text_hash` | `read_csv(path) -> CsvDoc` |
+| `specs/base.py`, `specs/{ask,pick,match,classify,rules,dials}.py` | Per node: wanted interface, `plan()` → `Job`, answers → rows, output spec for the builder | `Spec.interface()`, `Spec.plan()`, `Spec.rows()` |
+| `pipeline.py` | `Cell`/`Job` model, per-cell `MEMORY`/`PENDING`/`FAILED`, priority queue, chunking, request build and parse | `submit()`, `cancel()`, `cached()` |
+| `store.py` | Versioned `entries` JSON (schema 2, §14), override merge | `load(node)`, `save(node, store, live_gns=None)` (§13.3) |
+| `inner.py` | Inner-group construction: interface sync, match chain, entry-level Index Switches, the per-element sampled lookup on the table object, Rules banding/interpolation/dither graph; value-only updates of entry-level values | `sync_interface()`, `build()`, `update_values()` |
+| `tables.py` | Hidden table objects (mesh of loose vertices plus attributes), linked to no collection and referenced only by Object Info (§8.5) | `ensure_table()`, `write_rows()`, `copy_for()` |
+| `geometry.py` | Attribute names from an object's **original** data (the Attributes list source, §6.0); safe `GeometrySet` access (4.5+) for the agents hook, which keeps the set referenced and never chains on temporaries | `attribute_names(obj)`, `read_attributes(obj, names)` |
+| `server.py` | Runtime lifecycle, installer, HTTP client with the launch token, decision worker thread | `start()`, `stop()`, `install()`, `Worker` |
+| `ops.py`, `ui.py` | `openact.*` operators; sidebar tab "OpenAct"; preferences UI | — |
+| `natsort.py` | `BLI_strcasecmp_natural` port | `sort_key` |
+| `runtime/openact_server.py` | Local model server: Engine (debias, tournament, cache) plus pluggable backends | HTTP endpoints (§5.2) |
+| `templates/*.csv` | Starter CSVs written by the sidebar's "New CSV from Template" | — |
 
 ### 5.2 Runtime split
 
@@ -564,16 +542,16 @@ flowchart TB
   H -.->|"parent-pid watchdog: exits when Blender dies"| M
 ```
 
-**Process model.** The prototype's model is unchanged:
+**Process model:**
 - `server.start()` launches `venv/python -u runtime/openact_server.py`, with the script taken
   from the add-on folder;
 - arguments: `--port <port> --backend semif --device <auto|cuda> [--gpu N] --parent-pid
   <blender pid> --token-file <state>/server-<port>.token`. v1 has no CPU device option at all:
   only NVIDIA/CUDA is built (NG9).
-  - **In v1, `auto` means CUDA only.** The prototype's `Engine.load` resolved `auto` to `"cpu"`
-    whenever `torch.cuda.is_available()` was False, and switched bf16 to fp32. `openact_server.py`
-    instead reports `status: "error"` with "CUDA is not available to PyTorch (is the NVIDIA driver
-    too old for cu128?)". The add-on shows that message.
+  - **In v1, `auto` means CUDA only.** When `torch.cuda.is_available()` is False,
+    `openact_server.py` reports `status: "error"` with "CUDA is not available to PyTorch (is the
+    NVIDIA driver too old for cu128?)" instead of falling back to the CPU in fp32. The add-on
+    shows that message.
   - It never loads the model on the CPU silently, which would take about 16 GB of RAM and miss
     every target (R3).
   - The fake backend's `--fake-no-cuda` flag lets `server_test.py` and `pipeline_blender.py` cover
@@ -582,8 +560,8 @@ flowchart TB
   `OPENACT_STATE_DIR`.
   - `OPENACT_STATE_DIR` holds **writable state**: `server.log`, `probe.json`,
     `server-<port>.token` and `logs/`. It defaults to the runtime folder.
-  - Parallel build workers point it at their own temporary folder, so the shared runtime at
-    `%LOCALAPPDATA%\JevNodes` stays read-only (§20.6).
+  - Parallel build workers point it at their own temporary folder, so the shared runtime stays
+    read-only (§20.6).
 
 `OPENACT_TOKEN` is new. It holds a 32-byte random launch token and is passed in the environment,
 never in argv, which other local users can read.
@@ -625,15 +603,14 @@ class Backend(Protocol):
   It can optionally follow a JSON answer script. The whole Blender pipeline can therefore be
   tested without a GPU (§18).
 
-**Status machine.** Unchanged (`unknown/not_installed/stopped/starting/ready/error/installing`),
-with one new message: if `/health` on the port reports `server == "jev-nodes-semif"`, the status
-becomes *error* with "An old Jev Nodes model server is running on this port: disable the Jev Nodes
-add-on or choose another port."
+**Status machine.** `unknown/not_installed/stopped/starting/ready/error/installing`. If `/health`
+on the port reports any server other than `"openact-semif"`, the status becomes *error* with
+"Port N is used by another program. Pick another port in the preferences".
 
 ### 5.3 Request pipeline
 
-The prototype had one `Req` per node-context and one HTTP request per `Req`. v1 generalises this
-into a **Job** per (node, context) that owns one **row** per table row. Each row is resolved from
+One request per node-context does not scale to tables (§2.3). v1 uses a **Job** per
+(node, context) that owns one **row** per table row. Each row is resolved from
 one of four sources, in this order:
 1. a **lock** from the Overrides CSV;
 2. a **code decision** (4.d);
@@ -706,10 +683,9 @@ sequenceDiagram
 ```
 
 **Pass steps** (main thread; `engine.run_pass()`):
-1. `iter_nodes()` yields every `GeometryNodeOpenAct*` node and every legacy alias in all
-   non-inner Geometry Node trees.
-2. `ensure_owned()` does the prototype's work: unique `uid`, one owned inner group per node. It
-   now also gives each node its own table object when the node uses one (§8).
+1. `iter_nodes()` yields every `GeometryNodeOpenAct*` node in all non-inner Geometry Node trees.
+2. `ensure_owned()` gives every node a unique `uid` and its own inner group, and its own table
+   object when the node uses one (§8).
 3. `find_uses()` maps every tree to its `Ctx` list. The limit stays at 64 contexts per tree.
 4. For each context, the words are evaluated statically (§10) and hashed into a **fingerprint**:
    - the raw word strings;
@@ -757,9 +733,8 @@ sequenceDiagram
 7. The node's status is computed (§17): hint, waiting, filling *n/N*, complete (with unsure and
    locked counts), or error.
 
-**Chaining.** The single-value outputs of Ask, Pick and Dials can feed another node's words. This
-works exactly as in the prototype: the evaluator reads them from `MEMORY` or the stored entry, or
-raises `Pending`. Field outputs (Probability, Label, Outcome and so on) can never be words. The
+**Chaining.** The single-value outputs of Ask, Pick and Dials can feed another node's words. The
+evaluator reads them from `MEMORY` or the stored entry, or raises `Pending`. Field outputs (Probability, Label, Outcome and so on) can never be words. The
 evaluator raises `Unresolvable("… is a field; words must be single values")`.
 
 ### 5.4 Per-context caching and versioning
@@ -773,7 +748,7 @@ evaluator raises `Unresolvable("… is a field; words must be single values")`.
 | Server cache | `openact_server`, LRU of 65 536 **questions** (was 4096 whole requests) | sha256 of `[state, question, debias]` | server process | restart |
 
 **Keys.** There are two families, which keep **what the artist said** separate from **how OpenAct
-asked**. Both follow the prototype's `_key()` (sha1 over canonical JSON):
+asked**. Both are made by `_key()` (sha1 over canonical JSON):
 
 ```python
 # What the artist said: decides whether a stored answer is still valid
@@ -810,10 +785,9 @@ cell_key  = _key("cell", kind, state, instructions, options_in_order, debias)   
   and shown in the sidebar (§14.2).
 - **Tests pin the rule:**
   - template bump → 0 requests;
-  - toggling a node's *Balance Option Order* → 0 requests until the words change;
-  - upgrade of a v0.1.0 file → 0 requests.
+  - toggling a node's *Balance Option Order* → 0 requests until the words change.
 
-  They live in `store_test`, `pipeline_blender` and `migrate_blender` (§18).
+  They live in `store_test` and `pipeline_blender` (§18).
 - Placing each cell's facts in `instructions` and the shared situation in `state` (§10) gives
   every table exactly one state. Batching is maximal, and editing one factor level's `when` only
   changes the cells that include that level.
@@ -992,8 +966,7 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
 - **Undo and redo.** Entries JSON, inner groups and table objects are ordinary data inside undo
   steps. `on_undo_redo` schedules an immediate pass, and `MEMORY` makes re-applying answers free.
 - **Operators take the context as it is.** A timer's context has the first window, so the pins'
-  own undo step (`ed.undo_push`) and the old-nodes report (`openact.legacy_report`) need no
-  `temp_override`, and OpenAct calls none. Under one, Blender 4.5 and 5.0 (Python 3.11) read the
+  own undo step (`ed.undo_push`) needs no `temp_override`, and OpenAct calls none. Under one, Blender 4.5 and 5.0 (Python 3.11) read the
   override without the GIL during `bpy.ops`, which crashes while the worker or a probe runs Python
   (`playback_blender.py` stresses it). Blender's own calls of that kind (the node editor's viewer
   shortcuts, Ctrl+1…9 and 1…9; Quick Effects) and other add-ons' can still crash those versions
@@ -1037,8 +1010,7 @@ on them:
 
 **Class and menu.**
 - All six nodes subclass `bpy.types.GeometryNodeCustomGroup` through the `_OpenActNode` mixin.
-  The mixin keeps the prototype's behaviour: hidden `uid` and `entries`, `init()` creates the
-  inner group, `copy()` only clears `uid`, `free()` only drops status, and `update()` and
+  The mixin gives each node a hidden `uid` and `entries`; `init()` creates the inner group, `copy()` only clears `uid`, `free()` only drops status, and `update()` and
   `socket_value_update()` call `engine.schedule()`.
 - Default width is 240 and minimum 160. `poll()` rejects inner trees (name prefix `.OpenAct `).
 - Add menu: *Shift A > OpenAct*, with the three labelled groups above.
@@ -1098,7 +1070,8 @@ default, seeded from the `debias` preference when the node is created.
     (4.5.2, 5.1.1), and `UNLINKED` reads as the index there as well; the 0 copied before gave
     entry 0, even with OpenAct.
   - A muted Match, Classify or Pick passes its ID on to some outputs, e.g. Classify's Label and
-    Confidence (Blender's mute rule, §12.3): the index with OpenAct, the socket's value without it
+    Confidence (Blender passes a muted node's inputs to outputs of the same type): the index with
+    OpenAct, the socket's value without it
     (`UNLINKED`; 0 in a file saved before). A muted node shows no answers either way.
 - `ID_OR_INDEX` also exists, but it is deliberately **not** used. An ID means "entry number".
   Points made by Distribute Points on Faces carry a large random stable `id`, which is not an
@@ -1123,9 +1096,9 @@ value, for invalid IDs and for rows in error:
 
 **Answer-set format.** Answers, Labels, Outcomes and each setting's answers use one format
 (`lists.parse_inline()`, `csvfmt`):
-- **Inline text.** Split on newlines if there are any, else on `;` if present, else on `,`. The
-  prototype's rule is extended with `;` because Blender's single-line socket field cannot hold a
-  newline, while `when` texts contain commas.
+- **Inline text.** Split on newlines if there are any, else on `;` if present, else on `,`. `;`
+  is there because Blender's single-line socket field cannot hold a newline, while `when` texts
+  contain commas.
   - Within an entry, the first `": "` separates `name` from `when`. For example:
     `yes: it is cold, wet or windy; no: warm and calm`.
 - **CSV path.** A single-line value whose stripped text ends in `.csv` (any case). It is resolved
@@ -1159,7 +1132,7 @@ interface and never clears it:
 - Items are matched by `(in_out, name, socket_type)`, so their identifiers, and the links to them,
   survive.
 - Obsolete items are removed, and order is fixed with `interface.move()`.
-- Tooltips come from `item.description`, as in the prototype's `create_inner`.
+- Tooltips come from `item.description`.
 - **Socket shapes come from `structure_type`.** Allowed values differ per version (review
   measurement, round 2, on 4.5.2, 5.0.0 and 5.1.1):
   - **4.5:** input sockets accept only `AUTO` and `SINGLE`; the feature sits behind the
@@ -1278,14 +1251,13 @@ per node.
 
 ### 6.1 Ask: the whole situation, Yes/No or Amount
 
-Property `answer_type` ∈ {`YES_NO` (default), `AMOUNT`}. It replaces the prototype's `mode`
-enum; migration copies the value.
+Property `answer_type` ∈ {`YES_NO` (default), `AMOUNT`}.
 
 | Socket | Kind | Type | Default | Meaning |
 |---|---|---|---|---|
 | Question | word | String | "" | "Is it night?" / "How weathered should the stone look?". Empty → hint "Type a question" |
-| Context | word | String | "" | Facts the question is about. Empty → state "No additional context." (prototype `NO_CONTEXT`) |
-| Answers | word | String | "" | Optional answer set (§6.0). Yes/No: entries named `yes` and `no` whose `when` texts become the noul criteria. Amount: 2–16 ordered levels, lowest first. Empty → `Yes.`/`No.`, or the prototype's `AMOUNT_LEVELS` (Not at all, Slightly, Moderately, Very, Extremely) |
+| Context | word | String | "" | Facts the question is about. Empty → state "No additional context." (`NO_CONTEXT`) |
+| Answers | word | String | "" | Optional answer set (§6.0). Yes/No: entries named `yes` and `no` whose `when` texts become the noul criteria. Amount: 2–16 ordered levels, lowest first. Empty → `Yes.`/`No.`, or `AMOUNT_LEVELS` (Not at all, Slightly, Moderately, Very, Extremely) |
 | Overrides | word | String | "" | Optional Overrides CSV with one row per question, keyed by `question` (§7.6). A locked row replaces the model's answer for that question |
 | **Answer** | output | Float, single | 0.0 | Yes/No: P(yes). Amount: `score / (L − 1)`, the probability-weighted level position |
 | **Yes** | output | Bool, single | False | `Answer ≥ 0.5` |
@@ -1293,11 +1265,10 @@ enum; migration copies the value.
 
 **Behaviour.**
 - There is one question per context, forming a one-row table. It runs at priority P0.
-- The inner group is the prototype's: a match chain over (Question, Context, Answers, Overrides,
-  Key) (§8.2) feeding
-  Switch(INT), then one Index Switch per output.
-- The prototype's `AskSpec` moves unchanged into `specs/ask.py`. `Answers` extends it, and the
-  new Amount confidence (4.e) replaces top-minus-runner-up.
+- The inner group is a match chain over (Question, Context, Answers, Overrides, Key) (§8.2)
+  feeding Switch(INT), then one Index Switch per output.
+- `AskSpec` lives in `specs/ask.py`. Amount answers use the σ confidence of 4.e, not
+  top-minus-runner-up.
 
 **Request** (one chunk):
 
@@ -1312,7 +1283,7 @@ enum; migration copies the value.
 **Examples.**
 - **Night switch.** Put the scene description on the modifier panel (Group Input → Context) and
   set Question to "Is it night?". Yes → Switch between day and night lighting geometry. One tree
-  on many objects gives one answer per object, as in the prototype's e2e test.
+  on many objects gives one answer per object, as in the e2e test.
 - **Weathering amount.** Amount mode, "How weathered should the stone look?", Context "An
   abandoned 18th-century lighthouse". Answer (about 0.8) → Mix factor of an edge-wear mask.
 - **Custom rubric.** Amount mode, Answers `none: bare ground; dusting: a thin white layer; patchy:
@@ -1326,7 +1297,7 @@ Property `list_source` (default `TEXT`). There is no `answer_type`: Pick is alwa
 | Socket | Kind | Type | Default | Meaning |
 |---|---|---|---|---|
 | Prompt | word | String | "" | What to pick: "something to sit on" |
-| Context | word | String | "" | **New.** Optional situation: "a beach bar at noon". Empty → the prototype's `PICK_STATE` |
+| Context | word | String | "" | Optional situation: "a beach bar at noon". Empty → `PICK_STATE` |
 | Items / Collection / Object | word | per §6.0 | — | The list, swapped by `list_source`. Inline items may carry descriptions (`Pine: grows in cold places`) |
 | ID | field | Int | Index | Which entry the per-element outputs describe |
 | Overrides | word | String | "" | Optional Overrides CSV with one row per prompt, keyed by `prompt` (§7.6). A locked row forces the picked item by name; its probability becomes 1 and the others 0 |
@@ -1335,7 +1306,7 @@ Property `list_source` (default `TEXT`). There is no `answer_type`: Pick is alwa
 | **Confidence** | output | Float, single | 0.0 | 4.e (top minus runner-up) |
 | **Selection** | output | Bool, field | False | `ID == Index` |
 | **Probability** | output | Float, field | 0.0 | P(entry `ID`) from the stored distribution; 0 outside `0…N−1` |
-| Instance | output | Geometry | empty | `list_source = COLLECTION`: the picked child, via Collection Info → Delete Geometry(Index ≠ picked), as in the prototype |
+| Instance | output | Geometry | empty | `list_source = COLLECTION`: the picked child, via Collection Info → Delete Geometry(Index ≠ picked) |
 | Material | output | Material | none | `list_source = MATERIALS`: the picked slot's material, via Index Switch of type `MATERIAL` (verified) |
 | *payload columns* | output | Int/Float, single | fallback | `list_source = TEXT` with a `.csv`: baked numeric columns, looked up at Index |
 
@@ -1344,13 +1315,14 @@ sidebar lists them, but they give no sockets (README, *Formats*).
 
 **Behaviour.**
 - There is one `choice` question per context, with at most 255 options (a tournament above 16).
-  The instruction is the prototype's: "Which item best fits: `<prompt>`?".
+  The instruction is "Which item best fits: `<prompt>`?".
 - Option descriptions come from `when`, formatted as `"<name>: <when>"`.
 - Single-value outputs come from the match chain. Selection and Probability read a per-row table
   of the stored probabilities through ID. That table lives in the node's table object (§8). The
   object is created only while Selection or Probability is linked; without it, those outputs give
   their fallbacks.
-- Pick adds no model cost over v0.1.0: the probabilities were already returned and stored.
+- Selection and Probability add no model cost: the choice question returns every option's
+  probability, and the entry stores them.
 - Pick's answer can be forced through its Overrides CSV (§7.6). An earlier draft left Ask and Pick
   without overrides, which contradicted principle 4.f.
 
@@ -2125,7 +2097,7 @@ those columns: a values-only update (§7.8).
 
 ### 8.2 Selecting the context: the match chain
 
-This is the prototype's `_Builder.match_chain`, unchanged in principle:
+The match chain (`_Builder.match_chain`):
 - **Joined key.**
   - One `Join Strings` node joins **every position of the node's fixed word tuple** with the
     delimiter `"\x1f"` (the ASCII unit separator).
@@ -2148,7 +2120,7 @@ This is the prototype's `_Builder.match_chain`, unchanged in principle:
   socket is absent under the current `list_source` (Items under Collection, Materials or
   Attributes) holds `""` in `gn`, and is joined as a constant `""` on the live side (above). Tuple
   lengths therefore never change, and a stored entry's `gn` stays comparable across dropdown
-  changes and upgrades (§14.4).
+  changes.
   - Ask: Question, Context, Answers, Overrides, Key.
   - Pick: Prompt, Context, Items, Overrides, Key.
   - Match: Question, Context, Items, Answers, Overrides, Key.
@@ -2157,8 +2129,8 @@ This is the prototype's `_Builder.match_chain`, unchanged in principle:
   - Dials: Prompt, Settings, Overrides, Key.
 
   `Key` is compared but never sent to the model, and is excluded from every `wkey` (§6.0).
-- Collection and Object sockets cannot be compared in Geometry Nodes. The prototype's rule stays:
-  if two contexts share every string but not the collection or object, the node reports an error
+- Collection and Object sockets cannot be compared in Geometry Nodes. So if two contexts share
+  every string but not the collection or object, the node reports an error
   ("only one answer can show"). §6.0 gives the shape-agreement rule and the `Key` remedy.
 - **No match: `k_default`, single-context nodes only.** When the live words match no materialised
   entry, the Switch chain's final value is `k_default`. The inner group is shared by every context
@@ -2170,8 +2142,8 @@ This is the prototype's `_Builder.match_chain`, unchanged in principle:
       last answers, marked stale, instead of flashing to fallbacks.
     - During playback, unprepared animated words keep the object's own last rules instead of
       breaking a simulation (§5.5).
-  - **Two or more live contexts:** `k_default = 0`, so a no-match gives the neutral fallbacks, as
-    in the prototype. While OpenAct is running, one object can never show another object's answers.
+  - **Two or more live contexts:** `k_default = 0`, so a no-match gives the neutral fallbacks.
+    While OpenAct is running, one object can never show another object's answers.
     (Without the add-on, `k_default` stays as saved; see R6.) *Prepare for Playback*
     (§5.5) remains the tool for animated words on shared trees.
   - **A hint or error state** (a cleared Question, "only one answer can show", a file error):
@@ -2310,7 +2282,7 @@ so about 34 nodes (§8.2).
 
   | Shape | Nodes | 4.5.2 | 5.1.1 |
   |---|---|---|---|
-  | Ask / Pick, the prototype's scene (2 entries) | 13 / 17 | 2 / 3 ms | 2 / 3 ms |
+  | Ask / Pick, the ask_pick demo scene (2 entries) | 13 / 17 | 2 / 3 ms | 2 / 3 ms |
   | Classify (materials), Rules One-of (biome), Dials (weather), 1 entry | 24 / 45 / 51 | 4 / 14 / 19–20 ms | 4 / 12 / 16–18 ms |
   | Rules Amount, interpolated (snow), 1 entry | 169 | 166–168 ms | 115–163 ms |
   | Ask / Pick, 16 entries | 69 / 73 | 75–76 / 61–83 ms | 54–75 / 60–83 ms |
@@ -2403,21 +2375,20 @@ The per-element data is not visible inside the inner group; the sidebar's table 
 
 ### 8.6 Single-value outputs
 
-Entry-level outputs use the prototype's `_Builder.lookup`: one Index Switch per output, indexed by
-`k`, with items `[fallback, v_1 … v_E]`.
+Entry-level outputs use `_Builder.lookup`: one Index Switch per output, indexed by `k`, with
+items `[fallback, v_1 … v_E]`.
 
 | Output | Graph |
 |---|---|
 | Ask: Answer, Yes, Confidence | Index Switch (FLOAT / BOOLEAN / FLOAT) on `k` |
 | Pick: Index, Item, Confidence, payload | Index Switch (INT / STRING / FLOAT / INT or FLOAT) on `k` |
-| Pick: Instance | As in the prototype: Collection Info (Separate Children, Reset Children) → Delete Geometry (INSTANCE, `Index ≠ picked`) |
+| Pick: Instance | Collection Info (Separate Children, Reset Children) → Delete Geometry (INSTANCE, `Index ≠ picked`) |
 | Pick: Material | Index Switch (**MATERIAL**, verified) on `k`, with items `[None, m_1 … m_E]`, where `m_e` is entry *e*'s **picked** material. It is stored by name in `single` (§14.2) and resolved with `bpy.data.materials.get()` at build time; a missing material gives None and a warning. Contexts on different objects therefore each get their own material |
 | Dials: each setting | `Sample Index` on the node's **one-row-per-entry table object** at `k − 1`, behind a `Switch` on `k > 0`, with fallback (§8.4). Amount settings then go through `Map Range` (FLOAT, Linear, no clamp, From 0–1), whose *To Min* and *To Max* are sampled from the same row (`min_<s>`, `max_<s>`, per-entry data, §6.0). Single-value sampling was verified by the PR-08 spike; Index Switches on `k` with at most 16 settings remain a contingency only (§8.4) |
 | Dials: Confidence | Sampled from the same table row (`conf`): the minimum confidence of each entry |
 
 These outputs are **single values**: their graphs use no field input. They therefore connect to
-single-value sockets such as a Grid's *Vertices X* or Mesh Line's *Count*, just as in the
-prototype.
+single-value sockets such as a Grid's *Vertices X* or Mesh Line's *Count*.
 
 ### 8.7 Fields, zones and performance
 
@@ -2456,7 +2427,7 @@ prototype.
 | The materialised set changes (a live context's words changed, or a warm entry is dropped, §8.1) | **Rebuild** of the match chain and entry-level switches: at most one per edit |
 | Answer type, list source, factor layout, or the payload column set changes | **Rebuild**, after `inner.sync_interface()` |
 
-A rebuild keeps the prototype's approach (`tree.nodes.clear()`, then build), plus the batched
+A rebuild clears the inner nodes (`tree.nodes.clear()`) and builds them again, with a batched
 location write. The interface is never cleared: `sync_interface()` diffs it (§6.0). Links from the
 outer tree therefore survive every rebuild.
 
@@ -2720,7 +2691,7 @@ The evaluator moves out of `engine.py` **without behaviour changes**:
 
 | Change | Why | Detail |
 |---|---|---|
-| `_jev_output` → `_openact_output` | Six node types plus the legacy aliases | **Single-value** outputs resolve from `MEMORY` or the stored entry via `spec.output(entry, out.identifier)`, else raise `Pending`. They are: Ask Answer/Yes/Confidence; Pick Index/Item/Confidence/payload; each Dials setting and its Confidence. **Field** outputs raise `Unresolvable("'Match' output 'Probability' is a field; words must be single values")`. Geometry and Material outputs raise `Unresolvable`, as today |
+| `_openact_output` | The six node types | **Single-value** outputs resolve from `MEMORY` or the stored entry via `spec.output(entry, out.identifier)`, else raise `Pending`. They are: Ask Answer/Yes/Confidence; Pick Index/Item/Confidence/payload; each Dials setting and its Confidence. **Field** outputs raise `Unresolvable("'Match' output 'Probability' is a field; words must be single values")`. Geometry and Material outputs raise `Unresolvable`, as today |
 | New handler: Menu Switch (`GeometryNodeMenuSwitch`) | Modifier dropdowns choose rule sets and presets (§7.7) | Algorithm, from the review's measured storage (4.2–5.1). `NodeEnumItem` exposes only `name` and `description`. 1) **A socket value is matched by name**: a Menu socket's `default_value` is the item name. 2) **A modifier value is an int identifier** (for a Menu reaching the modifier through Group Input). It is mapped to a name through `mod.id_properties_ui(key).as_dict()["items"]`, whose tuples end with the int, e.g. `('A','A','',0,0)`. The int is **never** used as a position in `enum_items`, because identifiers stay fixed when items are removed or reordered. 3) **`-1`** (a fresh modifier; the UI default is −1 on 4.4+ and 0 on 4.2/4.3) means the group interface socket's default item; the evaluator test verifies this. 4) The name is matched against `node.enum_items`, and that item's input socket is evaluated. 5) An unknown name or value raises `Unresolvable` naming the menu. The evaluator test pins each step against Geometry Nodes ground truth on 4.5, 5.0 and 5.1, including deleted and reordered items and a Menu inside a nested group |
 | New handler: Special Characters (`FunctionNodeInputSpecialCharacters`) | Multi-line Items or Labels built with Join Strings | "Line Break" → `"\n"`, "Tab" → `"\t"` |
 | New handler: String Length (`FunctionNodeStringLength`) | Int words, e.g. an Index Switch index | `len(text)` in code points; parity checked by the evaluator test |
@@ -2739,7 +2710,7 @@ The evaluator moves out of `engine.py` **without behaviour changes**:
 - The single-value outputs of OpenAct nodes.
 
 Anything that needs geometry or fields (Named Attribute, Sample Index, Import CSV, …) raises
-`Unresolvable` naming the node, which is the prototype's rule. So does an unlinked group node
+`Unresolvable` naming the node. So does an unlinked group node
 input that Geometry Nodes gives an implicit field (its interface's `default_input` isn't `VALUE`),
 such as the ID a muted OpenAct node passes on: its hidden socket value is never read (§6.0). The
 one intentional data-derived word source is the **Attributes** list source (§6.0). It reads
@@ -2772,9 +2743,8 @@ class Spec:                                        # specs/base.py
 - `option_text(o)` returns `"name: when"`, or `name` when there is no `when`;
 - `confidence(kind, distribution)` implements the 4.e formulas.
 
-**Templates.** `{…}` marks a substitution. `NO_CONTEXT = "No additional context."` and
-`PICK_STATE = "Choose one of the listed items."` are kept from the prototype. The criteria keys
-are row indices as strings, as in the prototype's Pick.
+**Templates.** `{…}` marks a substitution, with `NO_CONTEXT = "No additional context."` and
+`PICK_STATE = "Choose one of the listed items."`. The criteria keys are row indices as strings.
 
 | Node | `state` (shared per job) | `instructions` (per question) | Type and criteria |
 |---|---|---|---|
@@ -2846,7 +2816,7 @@ options in the given order and reversed, and the two distributions are averaged.
   cells/s. Without it, roughly double.
   - Measuring accuracy with and without it is a follow-up, not a blocker (§21 F2).
 
-**Tournaments** (more than 16 options) keep the prototype's server algorithm:
+**Tournaments** (more than 16 options) run on the server:
 1. Balanced groups: sizes differ by at most 1, and every group has at least 8 options.
 2. A final between the group winners.
 3. `P(item) = P(item | group) × P(group winner wins the final)`.
@@ -2861,31 +2831,31 @@ so tournament confidence is conservative, and the unsure flag surfaces this. Whe
 or Rules question has more than 16 options, every item or cell pays the tournament cost. The
 8192-row budget (§5.4) bounds this before any request is sent.
 
-### 10.4 Server changes (`runtime/openact_server.py`, from `jev_server.py`)
+### 10.4 The model server (`runtime/openact_server.py`)
 
-| Area | `jev_server.py` today | `openact_server.py` |
-|---|---|---|
-| Identity | `SERVER_NAME = "jev-nodes-semif"`, 0.1.0 | `"openact-semif"`, 1.0.0; handler `OpenActSemIf/1.0.0` |
-| Model code | inside `Engine.load` / `Engine._score_rows` | `SemIfTorchBackend(Backend)` and `FakeBackend(Backend)`; flags `--backend {semif,fake}` and `--fake-script <json>` |
-| Cache | LRU of 4096 **whole requests**, key `[state, questions, debias]` | LRU of 65 536 **questions**, key `sha256([state, question, debias])`. `decide()` serves cached questions first and scores only the rest |
-| Auth | none | `OPENACT_TOKEN` → `X-OpenAct-Token` required on every POST (`hmac.compare_digest`). The server **refuses to start** without `OPENACT_TOKEN`, except with `--backend fake` (tests only). Reject any `Origin` header and any `Host` outside the allow-list (403, §16) |
-| Endpoints | `/v1/systemone`, `/health`, `/v1/models`, `/shutdown` | adds `GET /v1/capabilities` (§5.2) |
-| `/health` | status, model, device, requests, … | adds `backend`, `model_id`, `questions`, `rows_scored`, `cache_hits`, `ms_per_row` (EMA over the last 64 scoring calls) |
-| Limits | `MAX_BODY` 4 MB | adds at most 256 questions per request (422 above) |
-| While loading | `do_POST` blocks on `ENGINE.loaded.wait(timeout=300)`, returning 503 only after a failed load or 300 s. The client timeout is 180 s | **Returns 503 immediately** with `{"status": "loading"}` while `status == "loading"`, and `{"status": "error", "error": …}` after a failed load. The worker never blocks behind a cold load |
-| 422 body | `{"error"}` | `{"error", "question": qid}`, so the client can isolate the bad question |
+| Area | `openact_server.py` |
+|---|---|
+| Identity | `"openact-semif"`, 1.0.0; handler `OpenActSemIf/1.0.0` |
+| Model code | `SemIfTorchBackend(Backend)` and `FakeBackend(Backend)`; flags `--backend {semif,fake}` and `--fake-script <json>` |
+| Cache | LRU of 65 536 **questions**, key `sha256([state, question, debias])`. `decide()` serves cached questions first and scores only the rest. A cache of whole requests would be invalidated by any single edit (§2.3) |
+| Auth | `OPENACT_TOKEN` → `X-OpenAct-Token` required on every POST (`hmac.compare_digest`). The server **refuses to start** without `OPENACT_TOKEN`, except with `--backend fake` (tests only). Reject any `Origin` header and any `Host` outside the allow-list (403, §16) |
+| Endpoints | `/v1/systemone`, `/health`, `/v1/models`, `/shutdown`, and `GET /v1/capabilities` (§5.2) |
+| `/health` | status, model, device, requests, `backend`, `model_id`, `questions`, `rows_scored`, `cache_hits`, `ms_per_row` (EMA over the last 64 scoring calls) |
+| Limits | `MAX_BODY` 4 MB, and at most 256 questions per request (422 above) |
+| While loading | **Returns 503 immediately** with `{"status": "loading"}` while `status == "loading"`, and `{"status": "error", "error": …}` after a failed load. The worker never blocks behind a cold load |
+| 422 body | `{"error", "question": qid}`, so the client can isolate the bad question |
 
-**Unchanged:**
+**Also:**
 - binding to 127.0.0.1, `ThreadingHTTPServer`, and background load with a warm-up row;
 - the `--parent-pid` watchdog (`OpenProcess`/`WaitForSingleObject` on Windows);
 - `CUDA_VISIBLE_DEVICES` from `--gpu`, SemIf `score`/`score_shared` in chunks of 32 rows, and the
   debias and tournament code.
 
-**The per-question cache wraps today's `decide()` body**, renamed `_decide_uncached()`:
+**The per-question cache wraps the scoring**, in `_decide_uncached()`:
 
 ```python
 def decide(self, request):
-    state, questions, debias = self._validate(request)          # today's checks + 256-question limit
+    state, questions, debias = self._validate(request)          # the checks + 256-question limit
     answers, todo = {}, {}
     for qid, question in questions.items():
         key = _sha256_json([state, question, debias])
@@ -2909,7 +2879,7 @@ def decide(self, request):
 (§5.5).
 - It pops the highest-priority chunk, sends it with the token header and a 180 s timeout, and
   posts `(chunk, answers)` back to the main thread.
-- An `offline` result keeps the prototype's `_lost_connection()`.
+- An `offline` result goes through `_lost_connection()`.
 - A 503 with `status: "loading"` puts the chunk back at the head of the queue. The worker then
   polls `GET /health` every 0.5 s until `ready`. P0 work can overtake and cancellation acts during
   that time, because nothing is blocked in flight.
@@ -2982,7 +2952,7 @@ It still honours `bpy.app.online_access`. It adds:
   SHA-256 (user decision); bundling may come later;
 - installation from **hash-locked requirement files** (`--require-hashes`, §16.2);
 - the install-log header "OpenAct runtime install";
-- runtime-root resolution as in §12.2.
+- runtime-root resolution: the *Runtime Folder* preference, else the default folder (KD15).
 
 **Backends (preference `backend`).**
 - `SEMIF_CUDA` is the default in v1.
@@ -2996,7 +2966,7 @@ The pipeline adapts to each backend through `/v1/capabilities`: `slots`, `batch_
 
 ### 10.6 Pass engine (`engine.py`)
 
-Kept from the prototype:
+The engine's rhythm:
 - the 0.1 s `tick()` timer and the 0.25 s debounce;
 - the depsgraph / `load_post` / undo / redo handlers;
 - `SAFETY_PASS` (2 s), which now only **recomputes fingerprints** and re-plans nothing unless a
@@ -3004,9 +2974,8 @@ Kept from the prototype:
 - pausing during playback and render jobs;
 - skipping passes in files with no OpenAct nodes (`_has_nodes`, `_group_count`).
 
-New:
-- `iter_nodes()` covers the six node types plus the legacy aliases (§12.3), which are shown as
-  frozen.
+And its work:
+- `iter_nodes()` covers the six node types.
 - The file watcher runs in `tick()` (§7.8).
 - `run_pass()` follows §5.3, including the plan cache (`PLANS`), per-node dirty flags and the
   materialised-set choice (§8.1).
@@ -3021,7 +2990,7 @@ New:
 ## 11. Minimum Blender Version
 
 **Decision: Blender 4.5 LTS.** The manifest sets `blender_version_min = "4.5.0"`, with no maximum.
-v1 is tested on 4.5.x, 5.0.x and 5.1.x. The prototype supported 4.2. OpenAct does not.
+v1 is tested on 4.5.x, 5.0.x and 5.1.x. OpenAct does not support 4.2.
 
 | Capability | 4.2 LTS | 4.5 LTS+ | What depends on it |
 |---|---|---|---|
@@ -3033,7 +3002,7 @@ v1 is tested on 4.5.x, 5.0.x and 5.1.x. The prototype supported 4.2. OpenAct doe
 | Integer Math node | absent (added in 4.3) | present | Index and cell math (§8.3, §9.3) |
 | `default_input = 'INDEX'`, Index Switch `MATERIAL`, live interface edits on custom groups | not verified | **verified** (4.5.2, 5.1.1) | ID sockets, Pick Material, dynamic sockets |
 
-**Why not keep 4.2.**
+**Why not 4.2.**
 - **Support has ended.** 4.2 LTS was released in July 2024. Its two-year LTS window closed before
   this design's date, so no Blender support remains.
 - **The core promise fails there.** Without the add-on, a saved OpenAct file on 4.2 evaluates to
@@ -3041,9 +3010,6 @@ v1 is tested on 4.5.x, 5.0.x and 5.1.x. The prototype supported 4.2. OpenAct doe
 - **Two code paths.** Keeping 4.2 would need a Python-only CSV path with no in-tree equivalent, no
   Attributes source, and a second lookup graph without Integer Math. The test matrix would double
   for a Blender with no support.
-
-**What 4.2 users can do.** Keep using `jev_nodes` v0.1.0 (`dist/jev_nodes-0.1.0.zip`), which is
-unchanged, or upgrade Blender. The OpenAct runtime folder and the old one can coexist (§12.2).
 
 **Enforcement.**
 - The extension platform refuses installation below 4.5.0 because of the manifest.
@@ -3058,233 +3024,32 @@ unchanged, or upgrade Blender. The OpenAct runtime folder and the old one can co
 and holds that switch, keyed on `bpy.app.version`. Any further 5.x difference goes there too, and
 the PR that adds it must test both versions.
 
-## 12. Migration from jev_nodes v0.1.0
+## 12. (Removed before 1.0)
 
-### 12.1 Rename map
-
-| Item | `jev_nodes` v0.1.0 | OpenAct 1.0.0 |
-|---|---|---|
-| Extension id / Python package | `jev_nodes` | `openact` |
-| Name / tagline | Jev Nodes / "Ask a local decision model from Geometry Nodes" | OpenAct / "Decision nodes for Geometry Nodes, run by a local model" |
-| Node bl_idnames | `GeometryNodeJevAsk`, `GeometryNodeJevPick` | `GeometryNodeOpenActAsk`, `…Pick`, `…Match`, `…Classify`, `…Rules`, `…Dials` |
-| Node labels | "Ask Jev", "Jev Pick" | "Ask", "Pick" (plus the four new nodes) |
-| Inner group prefix | `.Jev ` (`INNER_PREFIX`) | `.OpenAct ` |
-| Add menu / sidebar tab | *Shift A > Jev* / "Jev" | *Shift A > OpenAct* / "OpenAct" |
-| Operators | `jev.install_runtime`, `jev.server_start`, `jev.server_stop`, `jev.reask`, `jev.open_log`, `jev.open_runtime_folder` | the same verbs under `openact.*`, plus new operators (§13.4) |
-| Preferences class | `JevPreferences` | `OpenActPreferences`. Settings are keyed by add-on id, so on first registration OpenAct imports `runtime_dir`, `port`, `device`, `gpu`, `auto_start` and `debias` from the `jev_nodes` preferences when they are available (§12.2) |
-| Ask property | `mode` (`YES_NO`/`AMOUNT`) | `answer_type` (same identifiers) |
-| `entries` JSON | schema 1: a list | schema 2: an object (§14.2) |
-| Server script / id | `runtime/jev_server.py` / `jev-nodes-semif` | `runtime/openact_server.py` / `openact-semif` |
-| Runtime folder | `%LOCALAPPDATA%\JevNodes` | `%LOCALAPPDATA%\OpenAct`; the legacy folder is reused in place |
-| Port | 18765 | 18765 (an old server there is detected, §5.2) |
-| Thread names | `jev`, `jev-poll`, `jev-install` | `openact-*` |
-| Docs and credits | README "Jev Nodes"; "Not affiliated with TypeSafe or Jev" | README "OpenAct"; the non-affiliation line is kept, and "Jev" appears only in credits and API-compatibility notes |
-
-### 12.2 Reusing the installed runtime (13 GB)
-
-`prefs.runtime_root()` resolves the folder in this order:
-1. an explicit `runtime_dir`;
-2. `<base>/OpenAct`, if `runtime_installed()`;
-3. `<base>/JevNodes`, if `runtime_installed()` (**legacy, used in place**);
-4. `<base>/OpenAct`, the target of a new install.
-
-`<base>` is `%LOCALAPPDATA%` on Windows, and `$XDG_DATA_HOME` or `~/.local/share` on Linux (best
-effort; `default_runtime_root()`). macOS is not a v1 target (NG9).
-
-**The legacy folder is never moved or renamed.** The venv's `pyvenv.cfg` holds an absolute `home`,
-and uv's console-script shims embed absolute paths, so moving would break the environment.
-
-**What the installed legacy runtime actually looks like** (review, read-only, on this machine):
-- `pyvenv.cfg` has `home = C:\Users\Nic\AppData\Roaming\uv\python\cpython-3.12.11-windows-x86_64-none`.
-  The base interpreter lives in the user's **global uv folder**, not inside `JevNodes`.
-- There is no `python\`, no `tools\uv.exe` and no `install.log`. There are `bootstrap_env.log` and
-  `bootstrap_model.log` instead: the runtime was created by a bootstrap script, not by the
-  add-on's installer.
-- The packages and model revision match the pins: torch 2.10.0+cu128, semif_phase1 0.1.0,
-  huggingface_hub, snapshot `851bf6e8…`.
-
-Consequences:
-- **Two checks, and neither blocks the main thread.**
-  - **`runtime_installed()` stays a cheap file-system check.** It checks the venv's
-    `Scripts\python.exe`, that the `home` directory named in `pyvenv.cfg` exists, and the model
-    shards. It runs where the prototype calls it: `server.refresh()`, `tick()` and `start()`.
-  - **The import probe runs on the executor thread**, never inside `runtime_installed()`.
-    - It runs `python -c "import torch, semif_phase1"`, which takes seconds on a cold disk.
-    - It runs once per session at registration and before the first start. Meanwhile the status
-      reads "Checking the runtime…".
-    - A start requested before the probe finishes, by auto-start or *Start Model*, is **queued, not
-      blocking**. The operator returns at once, the main thread never waits, and the start runs
-      when the probe posts its result. If the probe fails, the start is cancelled with the probe's
-      message.
-    - The result is cached on disk in `<runtime>/probe.json`, keyed by the mtimes of `pyvenv.cfg`
-      and torch's `dist-info`, so later sessions skip the subprocess.
-    - On failure it reports "The runtime's Python at <home> is missing or broken (was it removed
-      with `uv python uninstall`?): reinstall the runtime".
-
-  Checking only `Scripts\python.exe` and the model shards would call a broken runtime
-  "installed".
-- **Custom locations.** If `jev_nodes` preferences are available at first registration, OpenAct
-  imports `runtime_dir`, `port`, `device`, `gpu`, `auto_start` and `debias`. It does so once: a
-  hidden preference (`jev_imported`) remembers it, so later changes are the user's. Otherwise the
-  sidebar offers **Locate Existing Runtime…** (`openact.locate_runtime`, PR-07), a folder picker
-  that sets `runtime_dir` and runs the background probe.
-  A user with a custom `runtime_dir` is therefore never pushed into a fresh 13 GB install.
-
-Using the folder in place costs nothing. The server script ships inside the add-on (`SERVER_SCRIPT`
-is resolved from the package folder), and the venv needs only torch, SemIf and huggingface_hub,
-all of which are already installed. `openact_server.py` needs no new packages.
-
-- **Sidebar and preferences** show "Using the Jev Nodes runtime at …\JevNodes; Python from <home>"
-  in the Model box, which the preferences show too, while the runtime is that folder. An *Open
-  Runtime Folder* button is next to it. It gives no size: walking 13 GB of files while drawing is
-  too slow. Diagnostics (§17.5, PR-23) include the runtime folder, with the home folder as `~`,
-  and the name of its Python's folder.
-- **Deleting the old runtime.** Users can delete `JevNodes` after installing a fresh `OpenAct`
-  runtime. The external uv-managed Python it used may be shared with other tools, so the README
-  says to remove it only with `uv python uninstall` and only if nothing else uses it. OpenAct
-  itself never deletes anything.
-- **Both add-ons enabled.** Two add-ons would register two timers and could start two servers
-  (17 GB of VRAM). OpenAct therefore:
-  1. detects `jev_nodes` (or `bl_ext.<repo>.jev_nodes`) in `bpy.context.preferences.addons`;
-  2. shows a persistent sidebar banner: "Disable Jev Nodes: OpenAct replaces it";
-  3. registers the legacy alias classes only while no class holds those bl_idnames (§12.3), so
-     jev_nodes' own classes win while it runs. When it unregisters, or is listed but failed to
-     load, a one-second timer registers the aliases: the old nodes are defined again and the
-     upgrade is offered, with no restart.
-- **An old server on the port.** If the old add-on started one, the status reports it (§5.2).
-
-### 12.3 Old .blend files
-
-**Legacy aliases.** `nodes.py` registers two hidden classes named `GeometryNodeJevAsk` and
-`GeometryNodeJevPick`, so old files load them as *defined* nodes instead of `NodeUndefined`:
-- `poll()` returns False, so they never appear in the Add menu.
-- They are **frozen**. They keep evaluating their stored inner groups (`.Jev Ask <uid>`,
-  `.Jev Pick <uid>`) and are never asked anything.
-- Their status line reads "Old Jev node: upgrade in the OpenAct sidebar".
-- They are registered only while no class holds those bl_idnames: jev_nodes' own classes win while
-  it is enabled (§12.2). Then, and on Blender 4.5+ without any add-on, the old nodes still evaluate
-  from their saved inner groups.
-
-**Upgrade.** `openact.upgrade_legacy` is offered by the sidebar banner "This file has 9 old Jev
-nodes: Upgrade". After `load_post`, a one-line INFO report points to it: a timer runs the report's
-operator modal in a window, as only a modal step's report reaches the status bar and the Info
-editor, while a report made during a `bpy.ops` call stays with its Python caller. In background
-mode it goes to the console. The upgrade is explicit, not automatic, so opening a file never
-silently rewrites it. For each legacy node, inside a single undo step:
-
-1. **Create** the new node (`GeometryNodeOpenActAsk` or `…Pick`) in the same tree. Copy `name`,
-   `label`, `location`, `width`, `parent` frame, `mute`, `hide`, `select` and `color`, and keep it
-   the active node if it was.
-2. **Copy settings.**
-   - Ask: `mode` → `answer_type`.
-   - Pick: the prototype's precedence is kept, a set Collection winning over the Items text
-     (`collection_items(coll) if coll is not None else parse_items(items)`), so old files keep
-     their answers:
-     - an old Pick with a collection becomes `list_source = COLLECTION` (the Collection socket
-       is set, or has an unmuted link: v0.1.0 ignored muted links), and its Items text is ignored;
-     - otherwise `TEXT`.
-   - Pick nodes also get the hidden property `items_parse_v0 = True` (below).
-   - `balance_order` is seeded from the `debias` preference. The imported value of `jev_nodes`'
-     global `debias`, when available, keeps the prototype's behaviour (§10.3, §12.2).
-   - `uid` is kept.
-3. **Inputs, by socket name.** Copy default values and re-create links (muted ones stay muted) for
-   Question and Context (Ask), and for Prompt and, by the list source, Items or Collection (Pick):
-   the Items text of a collection Pick is dropped, as v0.1.0 ignored it. The new optional inputs
-   (Answers, Pick's Context, ID, Overrides) stay at their defaults, so the words are unchanged.
-   - **Legacy item parsing.** v1 splits inline items on newlines, else `;`, else `,`, and separates
-     `name: when`. The prototype split on newlines, else commas, with no descriptions.
-   - While `items_parse_v0` is set, `lists.parse_inline(text, mode="v0")` parses the Items text
-     with the prototype's rule, so an item string containing `;` or `": "` keeps its v0.1.0 item
-     names, and its words key.
-   - The upgrade keeps the node's old Items texts, its typed text and those of its converted
-     answers, in the hidden `items_v0_texts`. The flag is cleared the first time the Items text
-     changes, that is, when the node meets a text outside them; the node then uses v1 parsing.
-     Ask Again and eviction don't clear it: they remove answers, not texts. An Import CSV linked
-     to *Items CSV* wins over the text, as always.
-4. **Outputs, by name.** Re-link Answer, Yes and Confidence (Ask), and Index, Item, Confidence and
-   Instance (Pick). The names are identical by design. A multi-input socket they feed (Join
-   Strings, Join Geometry) keeps its links' order, which decides the joined result.
-5. **Answers.**
-   - Convert `entries` from schema 1 to schema 2 (§14.4), and save them with
-     `store.save(node, store)` (`live_gns=None`, no eviction, §13.3).
-   - Rename the old inner group `.Jev Ask <uid>` → `.OpenAct Ask <uid>` and assign it to the new
-     node.
-   - Run `inner.sync_interface()` and `inner.build()`, which regenerate the group from the entries.
-6. **Remove** the legacy node. Its old inner group is now used by the new node, so nothing is
-   orphaned.
-
-The operator reports a count, e.g. "Upgraded 9 nodes in 3 node groups; 0 problems". A problem
-leaves that node as a frozen legacy node and names it, so no output changes silently:
-- a linked output the new node lacks (the Instance of a Pick that picks from text);
-- a muted Pick whose Index or Confidence is linked. Blender passes a muted node's inputs to outputs
-  of their type, so a muted OpenAct Pick outputs its new ID input there, where v0.1.0's gave 0.
-  "Unmute or unlink it, then upgrade". A muted Pick without such links upgrades, muted.
-
-An internal error is named too. It may leave its node half done, so the operator then still ends
-with FINISHED, and its undo step reverts it. Legacy nodes in linked (library) trees are upgraded in
-their library file.
-
-### 12.4 Answers survive the upgrade
-
-- Converted entries are marked `legacy: true` and keep their v0.1.0 words (the raw `gn` strings),
-  except the Items text that a collection Pick ignored, which becomes `""` (§14.4).
-- The conversion (§14.4) computes each entry's `words_key`, and each row's `wkey`, with v1's
-  own definition (§5.4), using the stored words and item names. The live plan of the upgraded node
-  produces the same `words_key`, so the entry is reused under the validity rule. The rows' ask key
-  is `jev_nodes 0.1.0`, and they are labelled "asked with older settings". **Reopening an upgraded
-  file needs no model**, sends 0 requests (asserted by `migrate_blender.py`), and rendering is
-  unaffected.
-- A legacy Amount entry keeps its stored confidence (the prototype's top-minus-runner-up) until the
-  words change or the artist clicks *Ask Again*. After that the 4.e formula applies.
-- Pick's legacy entries already stored `probabilities`, so the new Probability and Selection
-  fields work immediately after the upgrade.
-
-### 12.5 Compatibility matrix
-
-| File \ runtime | Blender 4.5+ with OpenAct | Blender 4.5+ without any add-on | Blender 4.2 |
-|---|---|---|---|
-| v0.1.0 file, not upgraded | Evaluates (frozen legacy nodes); upgrade offered | Evaluates stored answers (undefined nodes) | With `jev_nodes`: works as today; without it: zeros |
-| v0.1.0 file, upgraded and saved | Full OpenAct | Evaluates stored answers | Not supported (OpenAct needs 4.5) |
-| New OpenAct file | Full OpenAct | Evaluates stored answers, including table objects (§8.5) | Not supported |
-
-**Downgrading** an OpenAct file to `jev_nodes` is not supported. v0.1.0 would see undefined nodes,
-which Blender 4.5+ still evaluates from their stored answers.
-
-**Test.** `tests/migrate_blender.py` (§18) runs these steps:
-1. Build a v0.1.0 file with the prototype's own 0.1.0 release, vendored as
-   `tests/fixtures/jev_nodes-0.1.0.zip` (GPL-3.0-or-later, same author) and extracted to a
-   temporary folder, so the suite needs nothing outside the repository: the scene of the
-   prototype's `tests/e2e_blender.py build` plus the upgrade's other cases, answered by the
-   prototype through a fake Jev server (that `build` phase itself needs the real model).
-2. Reopen it with OpenAct and run `openact.upgrade_legacy`.
-3. Assert, on 4.5 and 5.1:
-   - evaluated outputs equal the v0.1.0 values;
-   - 0 requests were sent;
-   - inner groups are renamed and owned;
-   - undo restores the legacy nodes (a real `ed.undo`: `ed.undo_push` starts the undo system in
-     background mode).
+This section was dropped before the 1.0 release. Its number is kept so that the section numbers
+cited in the code stay valid.
 
 ## 13. API / Interface Changes
 
 ### 13.1 Node interfaces (artist-facing)
 
-Full socket tables are in §6. This table is the before/after summary:
+Full socket tables are in §6. This table is the summary:
 
-| Node | v0.1.0 inputs → outputs | OpenAct 1.0 inputs → outputs | Breaking? |
-|---|---|---|---|
-| Ask | Question, Context → Answer, Yes, Confidence | Question, Context, **Answers**, **Overrides** → Answer, Yes, Confidence | No: new optional inputs. Amount confidence switches to the normalised σ formula after a re-ask (§4.e) |
-| Pick | Prompt, Items, Collection → Index, Item, Confidence, Instance | Prompt, **Context**, Items / Collection / **Object** (by `list_source`), **ID**, **Overrides** → Index, Item, Confidence, **Selection**, **Probability**, Instance / **Material** / payload | Mostly additive. Items and Collection are no longer shown together: the dropdown picks one, and the upgrade sets it (§12.3) |
-| Match | — | Question, Context, Items/…, Answers, ID, Threshold, Overrides → Probability, Selection, Confidence | new |
-| Classify | — | Question, Context, Items/…, Labels, ID, Overrides → Label, Confidence, payload | new |
-| Rules | — | Question, Context, Factors, Outcomes, Overrides, *factor sockets*, Dither, Seed → Outcome / Probability + Yes / Amount, Confidence, payload | new |
-| Dials | — | Prompt, Settings, Overrides → *one output per setting*, Confidence | new |
+| Node | OpenAct 1.0 inputs → outputs |
+|---|---|
+| Ask | Question, Context, Answers, Overrides → Answer, Yes, Confidence |
+| Pick | Prompt, Context, Items / Collection / Object (by `list_source`), ID, Overrides → Index, Item, Confidence, Selection, Probability, Instance / Material / payload |
+| Match | Question, Context, Items/…, Answers, ID, Threshold, Overrides → Probability, Selection, Confidence |
+| Classify | Question, Context, Items/…, Labels, ID, Overrides → Label, Confidence, payload |
+| Rules | Question, Context, Factors, Outcomes, Overrides, *factor sockets*, Dither, Seed → Outcome / Probability + Yes / Amount, Confidence, payload |
+| Dials | Prompt, Settings, Overrides → *one output per setting*, Confidence |
 
 **Every node also has the hidden input `Key`** (String, word; compared by the match chain, never
 sent to the model, §6.0). It is part of the 1.x interface.
 
 **Stability promise from 1.0:**
 - Socket **names** and **types** in these tables, `Key` included, do not change within 1.x,
-  because links and migrations depend on them.
+  because links depend on them.
 - Dynamic sockets (factors, settings, payload) take their names from the CSV (§6.0).
 - New optional inputs may be appended.
 
@@ -3336,7 +3101,7 @@ still work):
 
 `GET /health`, `GET /v1/models` and `POST /shutdown` keep their paths. `/shutdown` now needs the
 token. `/health` gains counters (§10.4) and stays readable without a token, so it can serve as the
-probe that distinguishes "ours", "old Jev Nodes" and "another program".
+probe that distinguishes "ours" from "another program".
 
 ### 13.3 Internal Python interfaces (contracts between PRs)
 
@@ -3353,7 +3118,7 @@ def parse_overrides(doc: CsvDoc, keys: list[str]) -> dict[str, Lock]: ...   # §
 
 # lists.py
 def resolve_items(node, ctx) -> ItemList: ...                   # §6.0; raises Hint / Unresolvable
-def parse_inline(text: str, mode: str = "v1") -> list[tuple[str, str]]: ...  # newline, then ";", then "," (§6.0); "v0": v0.1.0's Items rule (§12.3)
+def parse_inline(text: str) -> list[tuple[str, str]]: ...      # newline, then ";", then "," (§6.0)
 def is_csv_path(text: str) -> bool: ...
 def csv_source(node, input_name: str, ctx) -> CsvSource | None: ...   # the linked "<input> CSV" wins, else the String path (§6.0)
 
@@ -3366,15 +3131,14 @@ def cancel(uid: str, below: int) -> None: ...                   # drop queued ch
 def cached(cell_key: str) -> dict | None: ...                   # MEMORY lookup
 
 # store.py
-def load(node) -> NodeStore: ...                                # schema 2; converts schema 1 on read (§14.4)
+def load(node) -> NodeStore: ...                                # schema 2 (§14.4)
 def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = None) -> None: ...
     # live_gns: the gn tuples of the node's live contexts, computed by the pass (find_uses + evaluator).
     # "Live" is not saved in entries, so eviction (16 warm/cold, 2 MB soft cap) needs it:
     # it never removes an entry whose gn is in live_gns, nor one with pinned: true (§8.1, §14.7).
     # None (the default) means "live set unknown": save() then evicts NOTHING.
     # Only engine.run_pass() passes a live set. Every other writer saves with None and leaves
-    # eviction to the next pass: openact.reask, openact.unpin, Prepare for Playback,
-    # openact.upgrade_legacy, and the schema 1 → 2 conversion on load.
+    # eviction to the next pass: openact.reask, openact.unpin and Prepare for Playback.
 
 # inner.py / tables.py
 def sync_interface(node, wanted: list[SocketDef]) -> None: ...  # diff, never clear (§6.0)
@@ -3389,35 +3153,40 @@ def attribute_names(obj, exclude: set[str] = ()) -> list[str]: ...  # original d
 
 ### 13.4 Operators and preferences
 
-| Operator | v0.1.0 | OpenAct |
-|---|---|---|
-| Install / start / stop model | `jev.install_runtime`, `jev.server_start`, `jev.server_stop` | `openact.install_runtime`, `openact.server_start`, `openact.server_stop` (same behaviour; install adds the uv SHA-256 check) |
-| Ask again | `jev.reask` (forgets the node's answers, clears **all** `FAILED`) | `openact.reask`: forgets only this node's cell keys and failures; locked and code rows are kept. Saves with `live_gns=None`, so no eviction; the next pass evicts (§13.3) |
-| Logs and folders | `jev.open_log`, `jev.open_runtime_folder` | `openact.open_log`, `openact.open_runtime_folder` |
-| New | — | `openact.write_overrides` (§7.6), `openact.new_csv_from_template` (§7.10), `openact.open_file`, `openact.upgrade_legacy` (§12.3), `openact.copy_diagnostics` (§17), `openact.allow_file` ("Allow this file": adds this .blend's path to `trusted_files`, §16.1), `openact.trust_folder` ("Trust this folder": adds the folder, and so its subfolders, to `trusted_folders`), `openact.prepare_playback` (answers and pins animated words; modal only on the driver fallback, §5.5), `openact.unpin` (one entry, or all, §5.5), `openact.show_question` (shows the exact request of a table row without calling the model, §17.2), `openact.locate_runtime` (picks an existing runtime folder and runs the probe, §12.2; PR-07). Conditional: `openact.refresh_import_csv`, which ships only if follow-up F1 shows the trick works on 4.5 and 5.1 (§7.1) |
+| Operator | What it does |
+|---|---|
+| `openact.install_runtime`, `openact.server_start`, `openact.server_stop` | Install, start and stop the model; the install checks uv's SHA-256 |
+| `openact.reask` | Forgets only this node's cell keys and failures; locked and code rows are kept. Saves with `live_gns=None`, so no eviction; the next pass evicts (§13.3) |
+| `openact.open_log`, `openact.open_runtime_folder` | Logs and folders |
+| `openact.write_overrides` (§7.6), `openact.new_csv_from_template` (§7.10), `openact.open_file`, `openact.copy_diagnostics` (§17) | CSV files and diagnostics |
+| `openact.allow_file`, `openact.trust_folder` | "Allow this file" adds this .blend's path to `trusted_files` (§16.1); "Trust this folder" adds the folder, and so its subfolders, to `trusted_folders` |
+| `openact.prepare_playback`, `openact.unpin` | Answer and pin animated words, modal only on the driver fallback; unpin one entry, or all (§5.5) |
+| `openact.show_question` | Shows the exact request of a table row without calling the model (§17.2) |
+| `openact.locate_runtime` | Picks an existing runtime folder and runs the probe (§10.5; PR-07) |
+| `openact.refresh_import_csv` | Conditional: ships only if follow-up F1 shows the trick works on 4.5 and 5.1 (§7.1) |
 
-| Preference | v0.1.0 | OpenAct |
-|---|---|---|
-| `runtime_dir`, `port` (18765), `gpu`, `auto_start` | yes | kept, same meaning. Imported from the `jev_nodes` preferences on first registration when available (§12.2) |
-| `debias` | global on/off | **"Balance option order for new nodes"**, default on. It only seeds each new node's own `balance_order` toggle; existing nodes keep theirs (§10.3). Imported from `jev_nodes` when available |
-| `device` | `auto`/`cuda`/`cpu` | `auto`/`cuda` only, and `auto` **means CUDA only**: no run-time CPU fallback. Without CUDA the server reports an error with a driver hint (§5.2). There is no `cpu` option in v1 (NG9) |
-| `backend` | — | `SEMIF_CUDA` (v1); `FAKE` via the environment only. `LLAMACPP_CPU` is future work, not in this plan |
-| `unsure_below` | — | Float, default **0.30**, adjustable here, and tuned later from beta feedback (user decision; 4.e, §21 F3) |
-| `log_requests` | — | Bool, default off. Writes JSONL of requests and responses to `<runtime>/logs/` (§17) |
-| `trusted_folders` | — | Folders (and their subfolders) whose .blend files OpenAct trusts for file reads outside their own folder tree (§16.1). Edited in the preferences; *Trust this folder* adds to it |
-| `trusted_files` | — | Individual .blend paths trusted the same way. *Allow this file* adds to it, which is the safer default for a Downloads folder |
+| Preference | Meaning |
+|---|---|
+| `runtime_dir`, `port` (18765), `gpu`, `auto_start` | Where the runtime lives, the server's port, the GPU, and whether a node that needs an answer starts the server |
+| `debias` | **"Balance option order for new nodes"**, default on. It only seeds each new node's own `balance_order` toggle; existing nodes keep theirs (§10.3) |
+| `device` | `auto`/`cuda` only, and `auto` **means CUDA only**: no run-time CPU fallback. Without CUDA the server reports an error with a driver hint (§5.2). There is no `cpu` option in v1 (NG9) |
+| `backend` | `SEMIF_CUDA` (v1); `FAKE` via the environment only. `LLAMACPP_CPU` is future work, not in this plan |
+| `unsure_below` | Float, default **0.30**, adjustable here, and tuned later from beta feedback (user decision; 4.e, §21 F3) |
+| `log_requests` | Bool, default off. Writes JSONL of requests and responses to `<runtime>/logs/` (§17) |
+| `trusted_folders` | Folders (and their subfolders) whose .blend files OpenAct trusts for file reads outside their own folder tree (§16.1). Edited in the preferences; *Trust this folder* adds to it |
+| `trusted_files` | Individual .blend paths trusted the same way. *Allow this file* adds to it, which is the safer default for a Downloads folder |
 
 ### 13.5 Extension manifest (`openact/blender_manifest.toml`)
 
 ```toml
 schema_version = "1.0.0"
-id = "openact"                                    # was "jev_nodes"
+id = "openact"
 version = "1.0.0"
 name = "OpenAct"
 tagline = "Decision nodes for Geometry Nodes, run by a local model"      # 55 chars
 maintainer = "Nic"
 type = "add-on"
-blender_version_min = "4.5.0"                     # was "4.2.0" (§11)
+blender_version_min = "4.5.0"                     # §11
 license = ["SPDX:GPL-3.0-or-later"]
 tags = ["Geometry Nodes", "Node"]                 # from Blender's allowed list, unchanged
 
@@ -3465,7 +3234,6 @@ classDiagram
     rows : columnar rows
     single : dict
     csv : path to hashes
-    legacy : bool
   }
   class InnerGroup {
     name : .OpenAct Node uid
@@ -3490,7 +3258,7 @@ classDiagram
 
 - **The node's `entries` JSON is the single source of truth.** The inner group and the table object
   are *derived*: `inner.build(node, store.load(node))` can regenerate both at any time. Ownership
-  repair, upgrades and "shape changed" rebuilds all rely on this.
+  repair and "shape changed" rebuilds rely on this.
 - **CSV files are inputs**, never stored in the .blend. Entries keep only their hashes, which is
   enough to tell whether the baked text and payload are current (§7.8).
 
@@ -3499,7 +3267,7 @@ classDiagram
 | RNA property | Type | Nodes | Notes |
 |---|---|---|---|
 | `uid` | `StringProperty(options={'HIDDEN'})` | all | 12 hex characters (`uuid4().hex[:12]`); cleared by `copy()` (§3.4) |
-| `entries` | `StringProperty(options={'HIDDEN'})` | all | schema-2 JSON (below). A dynamic-length string, as in the prototype |
+| `entries` | `StringProperty(options={'HIDDEN'})` | all | schema-2 JSON (below), a dynamic-length string |
 | `answer_type` | `EnumProperty` | Ask, Match, Rules | the update callback runs `sync_interface()` and `schedule(immediate=True)` |
 | `balance_order` | `BoolProperty` (*Balance Option Order*) | all | per-node order balancing (§10.3). `init()` seeds it from the `debias` preference. It is part of the ask key, so toggling it sends 0 requests and discards nothing (KD13, KD26) |
 | `list_source` | `EnumProperty` | Pick, Match, Classify | same |
@@ -3510,8 +3278,7 @@ classDiagram
 ```json
 {"schema": 2,
  "entries": [{
-   "words_key": "5e1c0b…", "asks": ["b77a…"], "pv": 1, "t": 1790000123.4, "legacy": false,
-   "pinned": false,
+   "words_key": "5e1c0b…", "asks": ["b77a…"], "pv": 1, "t": 1790000123.4, "pinned": false,
    "gn": ["What happens to this cell in the next generation?", "A cellular automaton…",
           "//life_factors.csv", "//life_outcomes.csv", "", ""],
    "model": "semif-torch Qwen/Qwen3.5-4B@851bf6e8 debias",
@@ -3537,7 +3304,7 @@ classDiagram
 
 | Field | Meaning |
 |---|---|
-| `schema` | always 2. Schema 1 (the v0.1.0 list) is converted on read (§14.4) |
+| `schema` | always 2 (§14.4) |
 | `words_key` | what the artist said (§5.4). The entry is reused while it matches, whatever its ask keys. On a mismatch for the same `gn`, a new entry is built and rows with an unchanged `wkey` carry over |
 | `pinned`, `frames` | `pinned: true` for entries answered by *Prepare for Playback* (§5.5), with `frames: [[start, end], …]`, the frame ranges where those words occur. Pinned entries are saved, never evicted, materialised before warm ones (§8.1), and count towards the cap. They expire only on the next Prepare for Playback run or through `openact.unpin` |
 | `asks` | the ask keys (templates, debias, backend) that produced this entry's rows; `rows.ask` indexes into it. A key other than the current one only labels rows "asked with older settings" |
@@ -3554,7 +3321,6 @@ classDiagram
 | `rows.top` | optional top 3 `(answer row, probability)` per row, for the sidebar. Stored only when the table has at most 1024 rows |
 | `single` | entry-level values of Ask, Pick and Dials, e.g. `{"Answer": 0.93, "Yes": true, "Confidence": 0.86}`. Pick also stores `"Material": "<picked material name>"`, resolved to the ID at build time (§8.6) |
 | `csv` | per referenced file, `[text_hash, num_hash]` when the entry was written |
-| `legacy` | true for entries converted from v0.1.0 (§12.4) |
 
 ### 14.3 Derived data in the .blend
 
@@ -3568,44 +3334,20 @@ Rebuilding derived data must never change evaluated outputs. The lookup test com
 before and after `inner.build()` on the same entries, once with the CSV files present and once
 with every referenced CSV file **deleted** (§18).
 
-### 14.4 Schema 1 → 2 conversion (`store.load`, used by the upgrade)
+### 14.4 Reading the `entries` JSON (`store.load`)
 
-Schema 1 is the v0.1.0 list `[{"key", "gn", "a", "t"}]`. `store.load` converts it as follows:
+`store.load(node)` never raises and never rewrites the node. It reads a schema-2 object and checks each
+entry:
+- **Unknown keys are ignored** and missing ones take their defaults (except `gn`), so an entry written
+  by a later 1.x with an extra field still loads.
+- **A damaged entry is skipped**, whatever the damage (wrong types, columns of different lengths, a
+  non-finite number): it costs only that entry's answers.
+- **Anything that is not a schema-2 object loads as an empty store:** unreadable JSON, the node
+  default `"[]"`, a bare list, or an object without a schema.
+- **A newer schema is left unread:** the store is empty, and `save()` refuses to write over that JSON.
+  The node says the answers were saved by a newer OpenAct, which is needed to change them.
 
-| v0.1.0 `a` | Schema-2 entry |
-|---|---|
-| Ask `{"mode", "value", "confidence", "levels"?}` | `kind "ask"`, `answer_type = mode`, `single = {"Answer": value, "Yes": value ≥ 0.5, "Confidence": confidence}`. One row, as v1 stores an Ask: `name` = the stripped Question, `v.p` (Yes/No) or `v.amount` (Amount) = value, `v.c` = confidence, `src = "m"`, so the sidebar table, Show Question, the Overrides CSV and carry-over by `wkey` work as for any Ask entry |
-| Pick `{"index", "item", "confidence", "probabilities", "items", "collection"}` | `kind "pick"`, `single = {"Index", "Item", "Confidence"}`. Rows: `name = items`, `v.prob = probabilities`, `src = "m" × N` |
-
-In both cases `gn` is re-ordered to v1's fixed-length `spec.words()` tuple (§8.2):
-- Ask `(Question, Context)` becomes `(Question, Context, "", "", "")`. The `""` are the new empty
-  Answers, Overrides and Key words.
-- Pick `(Prompt, Items)` becomes `(Prompt, "", Items, "", "")`. The `""` are the new empty Context,
-  Overrides and Key words.
-  - For a collection Pick, the collection applied because it was set, not because the Items text
-    was empty: the prototype ignored any Items text then (§12.3). A set Collection wins over the
-    Items text, so the conversion writes `""` at the Items position, and the upgraded node picks
-    from the collection. Under `COLLECTION` the absent Items socket also contributes `""`, so the
-    converted tuple matches the live words exactly.
-  - The row names are the stored `items`: for a text Pick, what the prototype's parser made of
-    the Items text. The upgraded node parses its old Items texts the same way (`items_parse_v0`,
-    §12.3), so the words key matches too.
-
-Every converted entry gets:
-- `legacy = true`, `pv = 0` and `model = "jev_nodes 0.1.0"`;
-- `asks = ["jev_nodes 0.1.0"]`, so its rows are labelled "asked with older settings";
-- a `words_key`, its `shape`, and a `wkey` per row (Ask's one row, Pick's item rows), from the
-  spec's own plan of the same words (`AskSpec.job()`, `PickSpec.job()`): **v1's own definition**
-  (§5.4).
-
-The words-key inputs come from the stored raw words, the answer type and the stored item names
-(for a collection Pick, the prototype stored the child names in `items`). The upgraded node's live
-plan therefore produces the same `words_key`, and the entry is reused with 0 requests (§12.4). The
-prototype's old `key` is dropped.
-
-Conversion is pure Python. `tests/store_test.py` covers it with the exact JSON the prototype
-writes (`set_entries`), and asserts that the converted `words_key` equals the one `plan()`
-computes for the same words.
+Reading is pure Python. `tests/store_test.py` covers these rules under CPython and inside Blender.
 
 ### 14.5 Session-only state (never saved)
 
@@ -3622,7 +3364,7 @@ computes for the same words.
 ### 14.6 Files on disk
 
 ```
-%LOCALAPPDATA%\OpenAct\                      (or the legacy JevNodes folder, §12.2)
+%LOCALAPPDATA%\OpenAct\                      (or the Runtime Folder preference)
   venv\                                      Python 3.12: torch 2.10.0, semif-phase1, huggingface_hub (~4.4 GB)
   python\                                    uv-managed CPython 3.12
   hf\hub\models--Qwen--Qwen3.5-4B\snapshots\851bf6e8…\   model weights (~8.7 GB)
@@ -3636,13 +3378,9 @@ computes for the same words.
 ```
 
 This is the layout **OpenAct's installer** creates, with its managed Python kept inside the runtime
-folder. The **legacy `JevNodes` runtime on this machine** differs (§12.2):
-- it has `venv\` and `hf\`, plus `bootstrap_env.log` and `bootstrap_model.log`;
-- it has no `python\`, no `tools\` and no `install.log`;
-- its venv's `home` points at the user's global uv Python
-  (`%APPDATA%\uv\python\cpython-3.12.11-…`).
-
-The start-up probe checks that external interpreter (§12.2).
+folder. A runtime found with *Locate Existing Runtime…* may differ: its venv's `home` can point at a
+global uv Python outside the folder (`%APPDATA%\uv\python\cpython-3.12.11-…`). `runtime_installed()`
+requires that interpreter's folder to exist, and the start-up probe checks that it runs (§10.5).
 
 ### 14.7 Storage estimates and caps
 
@@ -3662,8 +3400,8 @@ The start-up probe checks that external interpreter (§12.2).
     - "Pinned" is saved in each entry (`pinned: true`).
     - "Live" is not: the pass passes it to `store.save(node, store, live_gns)` (§13.3) as the `gn`
       tuples of its current contexts.
-    - Every other writer (*Ask Again*, *Unpin*, Prepare for Playback, the legacy upgrade) saves
-      with `live_gns=None`, which evicts nothing; the next pass evicts with the real live set.
+    - Every other writer (*Ask Again*, *Unpin*, Prepare for Playback) saves with `live_gns=None`,
+      which evicts nothing; the next pass evicts with the real live set.
   - If live plus pinned entries alone exceed 2 MB, they are **kept**. The status notes the size,
     e.g. "entries use 3.1 MB: live and pinned contexts are kept; pin fewer word sets to shrink the
     file".
@@ -3690,7 +3428,6 @@ The start-up probe checks that external interpreter (§12.2).
 | Discoverability | One Shift A entry, and the artist must learn a 3 × 3 mode matrix | The menu entry says what it does: "Match: each item, yes/no or amount" |
 | Sockets | The union of all sockets, most hidden per mode. Tooltips must describe every mode | Each node shows only its own sockets. Dynamic sockets are limited to Rules factors, Dials settings and payload |
 | Code | One large spec with branches per mode | Six small specs over shared helpers (`specs/base.py`, `lists.py`, `csvfmt.py`) |
-| Migration | Ask and Pick become modes of something new | Ask and Pick keep their identity and output names (§12) |
 | Future | Every new idea grows the matrix | New verbs are new nodes (the agents design may add its own) |
 
 **Decision.** One node per verb. Consistency (4.g) comes from shared code and formats, not from
@@ -3724,7 +3461,7 @@ self-contained, and the payload uses the same lookup as the answers. **Decision:
 
 ### 15.4 The model inside Blender's Python, or a separate runtime server (chosen)
 
-| | In-process (torch inside Blender's Python) | Separate server (chosen, as in the prototype) |
+| | In-process (torch inside Blender's Python) | Separate server (chosen) |
 |---|---|---|
 | Install | pip into Blender's bundled Python 3.11: ~3 GB of CUDA wheels in the Blender folder, often under Program Files (admin), lost on every Blender update | Own venv with managed Python 3.12, per user, survives Blender updates; downloaded once (13 GB) |
 | Crashes | A CUDA or torch fault kills Blender and the unsaved work | A server fault becomes a status message; Blender survives |
@@ -3773,7 +3510,7 @@ updates for everything per element.
 | Option | Pros | Cons | Verdict |
 |---|---|---|---|
 | **JSON string on the node** (chosen) | Holds text (row names, `wkey`s, option names) and numbers in one versioned schema; copies with the node; undo-safe; human-inspectable; easy to migrate | A large table's JSON is up to about 250 KB per entry, and rewriting it after every chunk costs undo memory | Chosen, with writes **throttled**: during a fill the JSON is written at most every 2 s and once at completion. The table object carries the live values in between (§14.7) |
-| Nested ID properties on the node (`node["oa"] = {"gn": [...], "rows": {"name": [...], "p": [...]}}`) | String lists, float lists and nested dicts all round-trip on custom nodes (review, round 2, on 4.5–5.1). A throttled write could replace one list instead of re-serialising the whole blob | Needs `bpy`, so `store.load`/`save` and the schema 1 → 2 conversion could no longer run as pure-Python tests under CPython (§18). Migration becomes an in-place mutation of a live IDProperty tree instead of one pure `dict → dict` transform. The write saving is small: `json.dumps` of a 250 KB entry takes about 1–3 ms, at most every 2 s | Rejected on those grounds, not for lack of string support. Revisit if profiling ever shows JSON writes mattering |
+| Nested ID properties on the node (`node["oa"] = {"gn": [...], "rows": {"name": [...], "p": [...]}}`) | String lists, float lists and nested dicts all round-trip on custom nodes (review, round 2, on 4.5–5.1). A throttled write could replace one list instead of re-serialising the whole blob | Needs `bpy`, so `store.load`/`save` could no longer run as pure-Python tests under CPython (§18). A future schema change would become an in-place mutation of a live IDProperty tree instead of one pure `dict → dict` transform. The write saving is small: `json.dumps` of a 250 KB entry takes about 1–3 ms, at most every 2 s | Rejected on those grounds, not for lack of string support. Revisit if profiling ever shows JSON writes mattering |
 | Table-object attributes as the truth for large tables | No large JSON rewrites | Numbers only, so the text still needs JSON. The truth would split between two data-blocks, and a lost object would lose answers. Rebuild-from-entries (§14.1) would no longer hold | Rejected; the table object stays derived |
 
 ### 15.7 Declaring Rules factors
@@ -3852,8 +3589,8 @@ records which file was opened).
 1. Every download needs an explicit click, a confirmation showing size and path, and
    `bpy.app.online_access`. This is unchanged.
 2. **uv 0.8.17** is fetched from GitHub releases into `<runtime>/tools/`, and checked against a
-   pinned SHA-256 per platform asset. That check is new. A `uv` on PATH is **ignored**: the
-   prototype preferred `shutil.which("uv")`, and this machine has two, so "pinned" would not hold.
+   pinned SHA-256 per platform asset. A `uv` on PATH is **ignored**: a machine can have several,
+   and with `shutil.which("uv")` "pinned" would not hold.
 3. **torch 2.10.0** comes from the official PyTorch index (`cu128`) over HTTPS.
 4. **SemIf** is pinned to commit `23cf1f39…`. **Qwen3.5-4B** is pinned to revision `851bf6e8…`,
    whose Hugging Face snapshots are content-addressed by commit.
@@ -3892,7 +3629,7 @@ records which file was opened).
   - Qwen3.5-4B (Apache-2.0) is downloaded by the user from Hugging Face, not redistributed.
   - PyTorch is BSD-3-Clause.
 
-  Credits appear in the README and in the preferences, as in the prototype's `draw_preferences`.
+  Credits appear in the README and in the preferences (`draw_preferences`).
 - **Naming.** "Jev" is TypeSafe's trademark. The product is OpenAct. "Jev-compatible API" appears
   only as a factual statement of request compatibility, and "Not affiliated with TypeSafe or Jev"
   is kept.
@@ -3932,8 +3669,8 @@ class NodeStatus:
 | warning | `ERROR` (triangle) | "18 cells · 1 warning: column 'scale' has an empty cell (line 7)" |
 | error | `CANCEL` | "life_outcomes.csv:4 'if' names unknown level 'alvie' of factor 'state'" |
 
-The glyphs in §6.0's examples (✓ ⏳ ⓘ ⚠) stand for these Blender icons. The prototype's `ERROR`
-icon for hard errors becomes `CANCEL`, so that warnings and errors look different.
+The glyphs in §6.0's examples (✓ ⏳ ⓘ ⚠) stand for these Blender icons. Hard errors use `CANCEL`
+and warnings `ERROR`, so that they look different.
 
 ### 17.2 Sidebar (OpenAct tab, inspection only)
 
@@ -3943,8 +3680,7 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
   - Throughput: `ms_per_row`, and the cache hit rate `cache_hits / questions`.
   - Buttons: Install / Start / Stop, and *Open Log*.
 - **Active node.**
-  - The status record, and one summary line per context: the object and modifier label, as in the
-    prototype's `answers_for`.
+  - The status record, and one summary line per context: the object and modifier label.
   - **A context with no table to show** says "Asking..." while the pass asks one of its cells (sent,
     or sent once the model that is starting is ready), else "Not asked: see the status above": the
     model is stopped, not installed or in error, the context waits or disagrees (§6.0), or its cell
@@ -3971,11 +3707,9 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 - **Files panel** (§7.10) and the **problems** list (up to 50 per file), each with *Open File*.
 - **Banners.** Shown for:
   - model not installed;
-  - "Checking the runtime…" and runtime-probe failures, with *Locate Existing Runtime…* (§12.2);
+  - "Checking the runtime…" and runtime-probe failures, with *Locate Existing Runtime…* (§10.5);
   - an untrusted file whose reads were blocked, with *Allow this file* / *Trust this folder*
     (§16.1);
-  - `jev_nodes` still enabled (§12.2);
-  - old Jev nodes in the file (§12.3);
   - a port conflict;
   - the Import CSV cache note (§7.1);
   - more than 16 distinct live word sets on a node (§8.1).
@@ -4005,8 +3739,8 @@ icon for hard errors becomes `CANCEL`, so that warnings and errors look differen
 - OpenAct, Blender and OS versions;
 - GPU and device;
 - backend, `model_id` and revision;
-- the runtime root, marked when it is the legacy folder, and the name of the folder of the base
-  Python its venv uses (§12.2: outside the runtime for the Jev Nodes one);
+- the runtime root, and the name of the folder of the base Python its venv uses (which can be outside
+  the runtime, §14.6);
 - server status and `/health` counters;
 - a node count per type, with rows per table, materialised entries and inner-group node counts;
 - queue state;
@@ -4033,8 +3767,8 @@ There is no remote alerting. The "alerts" are user-facing messages that name the
 
 ### 17.7 Test and benchmark output
 
-Tests keep the prototype's line protocol: `PASS …` / `FAIL …` / `RESULT OK|FAILED: …`, then
-`os._exit` with the matching code. They add:
+Tests use one line protocol: `PASS …` / `FAIL …` / `RESULT OK|FAILED: …`, then `os._exit` with the
+matching code. They add:
 - `TIMING <table> rows=<n> <s>s <rows/s>` lines, compared against §3.2;
 - `BENCH <path> <elements> <ms>` lines from `tests/lookup_blender.py --bench`;
 - `WARN …` lines for a timing above its budget but within twice it (§18.2), which the runner counts
@@ -4068,7 +3802,6 @@ A later run can diff these lines to spot performance regressions.
   - `life_*.csv`, `highlife_outcomes.csv`, `seeds_outcomes.csv`, `daynight_outcomes.csv`;
   - `biome_*.csv`, `material_families.csv`, `weather_dials.csv`;
   - one broken CSV per §7.9 message;
-  - `jev_v010_entries.json`, the exact JSON the prototype's `set_entries` writes;
   - fake-answer scripts.
 
 ### 18.2 Suites
@@ -4076,16 +3809,16 @@ A later run can diff these lines to spot performance regressions.
 | Suite | Runs in | Model | What it checks |
 |---|---|---|---|
 | `tests/csv_test.py` | CPython + Blender | none | `csvfmt` dialect (BOM, CRLF and CR, `;` and tab delimiters, quoting); INT/FLOAT/text classification; limits; every §7.9 message by fixture; the `parse_answer_set` / `parse_factors` / `parse_settings` / `parse_overrides` parsers; the `if` grammar; `lists.parse_inline` (newline, then `;`, then `,`); `text_hash` unchanged by numeric edits and `num_hash` unchanged by text edits |
-| **`tests/store_test.py`** | CPython + Blender | none | **Schema 1 → 2 conversion** of the prototype's exact JSON (Ask Yes/No and Amount, Pick from text and from a collection); `gn` re-ordering (`""` inserted for Answers and Context); `legacy = true`, `pv = 0`; the converted `words_key` and `wkey`s equal what `plan()` computes for the same words (§14.4); a changed `PROMPT_VERSION` or `debias` changes the ask key but no words key; save/load round trip; 2 MB soft-cap eviction removes only warm and cold entries and **keeps live and pinned entries**, even when live plus pinned alone exceed 2 MB (with the size note) |
+| **`tests/store_test.py`** | CPython + Blender | none | The reading rules of §14.4 (damaged entries skipped, anything but schema 2 read as empty, a newer schema left unread); a changed `PROMPT_VERSION` or `debias` changes the ask key but no words key; save/load round trip with the documented field order; 2 MB soft-cap eviction removes only warm and cold entries and **keeps live and pinned entries**, even when live plus pinned alone exceed 2 MB (with the size note) |
 | `tests/rules_math_test.py` | CPython + Blender | none | The 4.e confidence formulas: uniform answers give exactly 0 for L = 2…16, point masses give 1, near-uniform answers stay below 0.30, and the documented examples (0.65; the bimodal split gives 0). `itertools.product` order equals `ravel`; allowed sets and code-decided cells; the reference interpolation (corners, weights, renormalisation); dithering probabilities, analytic versus 100 000 samples within ±1 % |
 | **`tests/evaluator_blender.py`** (extended) | Blender | none | Every existing case, plus **Menu Switch**: a value typed on the socket and a value coming from a modifier's Group Input menu, for String, Int and Float, covering both storage forms (§10.1). Also Special Characters, String Length, OpenAct single-value outputs used as words, field outputs rejected with the breadcrumb message, a muted Pick that passes a linked ID on (and its unlinked ID, the index, rejected as a field, §6.0), and the per-pass memo returning identical values. All are checked against Geometry Nodes ground truth with Compare nodes, the existing technique. **`trace_csv_source()`** (added by PR-13): a direct link; a Path exposed on the modifier; Reroute, nested-group and Geometry Menu Switch pass-through; the Import CSV Path/Delimiter socket identifiers pinned on 4.5, 5.0 and 5.1; both error messages |
 | `tests/csv_probe_blender.py` | Blender | none | **Import CSV parity** per fixture: point count equals `csvfmt` data rows; kept attributes equal `csvfmt` numeric columns with the same INT/FLOAT types and values. It records Blender's behaviour for blank lines, quoted line breaks, BOM and `;` in `tests/fixtures/import_csv_behaviour.json`. It re-asserts the path-cache fact (an edited file still returns old rows), so a future Blender change is noticed |
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
-| `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick, an upgraded collection Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
+| `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
 | `tests/playback_blender.py` | Blender + fake server | fake | **Prepare for Playback and pins (§5.5, §8.1, §14.7):** a keyframed Menu Switch cycling through three rule sets is answered and pinned, and playing the range then sends 0 requests and never shows a fallback; the F-curve path reads 250 frames in under 1 s with no scene evaluation, reads a context whose words read nothing animated once, finds the F-curves through the action slot's channelbag on 4.5 and 5.1, and clamps to the hard range; drivers, NLA tracks and Time Stretching take the `frame_set` fallback, which restores the frame and can be cancelled (the modal operator's functions on stand-ins); 13 word sets are refused, asking nothing; pins survive save and reload, and *Unpin* and *Unpin All* remove them. **Undo, for real:** pins a pass writes get a step of their own, and wait while a redo is possible, in Edit Mode and during a modal tool, but land in Pose Mode, Weight Paint and Vertex Paint; re-bake flags follow undo and redo. Pin order once live plus pinned exceeds 16; pins above 2 MB are kept, with the size note. **Stress:** the pins' undo step is checked and pushed for 3 s while another thread runs Python, and OpenAct's code calls no `temp_override` (§5.5) |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
-| **`tests/migrate_blender.py`** | Blender 4.5 and 5.1 | none | §12.5: a v0.1.0 file built with the prototype's own 0.1.0 release (`tests/fixtures/jev_nodes-0.1.0.zip`) → `openact.upgrade_legacy` → identical outputs, 0 requests, inner groups renamed and owned, links kept, and undo restores the old nodes. It covers the prototype's **collection Pick** (the e2e scene's `lamp` node), which must **match its converted entry through the joined key**, with the absent Items position joined as `""` (§8.2), a Pick whose Items text contains `;` and `": "` (legacy parsing keeps its names), and a Pick with both Items text and a Collection (collection wins, its answers kept). It also imports custom `jev_nodes` preferences (§12.2) |
+| `tests/startup_blender.py` | Blender | none | On 4.5 and newer: `runtime_root()` follows the Runtime Folder preference, else the default folder; a server of another program on the port gives the port error and launches nothing until it has gone and *Start Model* runs. On older Blender, enabling the add-on fails before anything is registered (§11) |
 | `tests/e2e_blender.py` (extended) | Blender + real model | real | The existing `build` / `noaddon` / `reopen` phases, now covering all six nodes. **Game of Life acceptance:** Conway, HighLife, Seeds and Day & Night, each 18/18 exact with 0 unsure. Biome: mean confidence ≥ 0.55 with all 7 outcomes used. Sanity checks for Match, Classify and Dials; Pick's Probability field; `noaddon` with table objects and entry-level Index Switches; `reopen` sends 0 requests. TIMING lines are compared with §3.2 |
 
 **Timing checks.** They print always and fail only above 2× the §3.2 target, so a busy GPU does
@@ -4101,7 +3834,7 @@ of Life tables and the biome thresholds) are hard failures.
 | Every PR | Pure suites, evaluator, interface and lookup suites on Blender 4.5 and 5.1, the lookup suite with `--bench` (the §8.4 budgets, under the timing rule of §18.2), as `tests/run_all.ps1` runs them. None needs a model; together they take a few minutes |
 | PRs that touch `server.py`, `pipeline.py` or `openact_server.py` | Also `tests/pipeline_blender.py` (fake backend) |
 | PRs that touch specs, templates or scoring | Also `tests/e2e_blender.py` with the real model, on the RTX 3090 machine |
-| PRs that touch migration or storage | Also `tests/store_test.py` and `tests/migrate_blender.py` |
+| PRs that touch storage | Also `tests/store_test.py` |
 | Release | Every suite on 4.5, 5.0 and 5.1; e2e on 4.5 and 5.1; demo scenes rebuilt and rendered **without** the add-on |
 
 ### 18.4 Demo scenes (for the promo video)
@@ -4123,7 +3856,7 @@ of Life tables and the biome thresholds) are hard failures.
 | `kitchen.blend`: **Clutter** | Match "Would you find it in a kitchen?" (Yes/No) and "How heavy is it?" (Amount) on a 40-prop collection; Classify into rooms (Labels) | Per-instance Selection with Delete Geometry; weight → Scale; room labels → anchors | Spot checks: e.g. pan = yes, sofa = no |
 | `materials.blend`: **Material families** | Classify materials (ID = Material Index), with `material_families.csv` payload `roughness` and `metallic` given by **plugging an Import CSV node into `Labels CSV`** (the hand-off, §6.0); Match "metal?" per face | The model decides the family and the CSV supplies the numbers (4.a). Editing a roughness value updates instantly with 0 requests | The payload edit sends 0 requests (pipeline counter) |
 | `weather.blend`: **Weather dials** | Dials with `weather_dials.csv`: Rain, Wind speed (0–30), Time of day, Street lights, Fog | One prompt on the modifier drives the whole environment. Switching "a stormy night in a fishing village" ↔ "a calm summer morning" re-answers five dials in one request | ≤ 0.6 s per new prompt; switching back is instant (cached) |
-| `ask_pick.blend`: **Ask and Pick** | The prototype's e2e scene, **rebuilt by the script with OpenAct nodes**, not produced by the legacy upgrade: Ask (night switch) on two objects with different modifier prompts; Pick from a props collection | One tree gives different answers per object. Pick's Probability field drives a "fitness" heat map over Collection Info children | The prototype's e2e values: A night > 0.9, B night < 0.1, armchair for A, bookshelf for B |
+| `ask_pick.blend`: **Ask and Pick** | Ask (night switch) on two objects with different modifier prompts; Pick from a props collection, built by the script | One tree gives different answers per object. Pick's Probability field drives a "fitness" heat map over Collection Info children | The e2e values: A night > 0.9, B night < 0.1, armchair for A, bookshelf for B |
 
 **Video beats (about 90 s).**
 1. Title card: "Words in, Geometry Nodes data out".
@@ -4146,7 +3879,7 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 |---|---|---|---|---|
 | R1 | **Accuracy on artists' own rules and prompts** is worse than on the measured, well-framed rule sets: wrong cells in real scenes | High | Medium | Templates enforce "outcome + when" (4.c); `if` restrictions (4.d); confidence flags and the sidebar table (4.e); locks (4.f); good starter templates; README "Writing good whens"; e2e acceptance on four rule sets and the biome (§18) |
 | R2 | **Hardware barrier.** 8.4 GB of VRAM on an NVIDIA GPU excludes many artists | High | High | Saved answers make files work everywhere; only *authoring* needs the model. Sessions share one server (§10.5). The installer refuses up front, before any download, on machines without an NVIDIA GPU and warns below 10 GB of VRAM (§10.5). The support matrix is explicit (§3.3). A CPU backend (llama.cpp, GGUF ~3 GB) is future work, outside this plan (user decision) |
-| R3 | **Install fragility.** 13 GB download; antivirus, proxies, full disks, drivers too old for cu128; a legacy runtime that depends on an external uv Python | Medium | Medium | Resumable, idempotent steps (as today); hash-locked environment and pinned uv, ignoring PATH (§16.2); a new **free-space pre-check** (`shutil.disk_usage` ≥ 15 GB) and a **GPU/VRAM pre-check** (§10.5); *Open Log*; the legacy runtime is reused in place, with a background probe of its interpreter (§12.2). A driver too old for cu128, which passes the `nvidia-smi` check, is caught at load time: `auto` means CUDA only, so the server reports an error with a driver hint instead of silently loading on the CPU (§5.2) |
+| R3 | **Install fragility.** 13 GB download; antivirus, proxies, full disks, drivers too old for cu128; a located runtime that depends on an external uv Python | Medium | Medium | Resumable, idempotent steps; hash-locked environment and pinned uv, ignoring PATH (§16.2); a **free-space pre-check** (`shutil.disk_usage` ≥ 15 GB) and a **GPU/VRAM pre-check** (§10.5); *Open Log*; a background probe of the runtime's interpreter (§10.5). A driver too old for cu128, which passes the `nvidia-smi` check, is caught at load time: `auto` means CUDA only, so the server reports an error with a driver hint instead of silently loading on the CPU (§5.2) |
 | R4 | **Blender API drift** in 5.x: custom group nodes, interface API, Index Switch items, evaluation of undefined nodes | Medium | Medium | Interface, lookup, evaluator and `noaddon` suites on 4.5, 5.0 and 5.1 at every release (§18.3); `compat.py` switches (§11) |
 | R5 | **Table-object lifecycle bugs.** A table is lost on append or link, garbage collection removes a live table, or Blender stops evaluating objects linked to no collection, giving silently wrong outputs | High | Low | `entries` JSON is the source of truth, and derived data can be rebuilt from it without the CSV files (§14.1, §14.3). Garbage collection never removes a table whose uid is live. Copy, append, delete, save/reload, *Purge Unused Data* and rendering are tested on 4.5, 5.0 and 5.1 (§18). The excluded-collection fallback is a `tables.py`-only change (§8.5) |
 | R6 | **Static evaluator mismatch.** Python computes a word differently from Geometry Nodes, so the match chain finds no entry | Medium | Low | Every handler is checked against Geometry Nodes ground truth (§18), and unsupported nodes raise explicitly. On shared trees (two or more live contexts) a mismatch shows neutral fallback outputs, never another object's answer. On a single-context node it shows that context's own last answer (`k_default`, §8.2), which masks the mismatch but is never another object's data. The ground-truth tests are the real guard there. **Residual case without the add-on (G6):** no pass runs, so `k_default` keeps its saved value. If a tree saved with one live context is later used by a second object with different words in a Blender without OpenAct, that object shows the first object's last answers. The next pass with OpenAct installed resets it (two live contexts → 0) |
@@ -4157,13 +3890,13 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 | R11 | **Local server abuse** (CSRF, DNS rebinding, other local users) | Medium | Low | Token, `Origin` and `Host` checks, localhost binding, per-user token file (§16.1) |
 | R12 | **Supply chain drift.** The SemIf archive or the Hugging Face revision changes or disappears | Medium | Low | Recorded hashes and a hash-locked environment stop a bad install; existing installs are unaffected. SemIf comes from the pinned commit archive with a SHA-256 check (user decision); bundling may come later |
 | R13 | **Name conflict.** "OpenAct" is taken or trademarked | Medium | Unknown | User decision: keep "OpenAct" for now, with no trademark gate before release; the user may rebrand later. Before 1.0 a rename changes only constants (id, bl_idname prefix, inner prefix, runtime folder); after 1.0 it would need another migration like §12 |
-| R14 | **Threading bug.** `bpy` is touched off the main thread and Blender crashes | High | Low | Strict rule from the prototype: all `bpy` access on the main thread through `post()`/`pump()`. The worker holds only plain data. The fake-backend pipeline suite runs under load. Review checklist item |
+| R14 | **Threading bug.** `bpy` is touched off the main thread and Blender crashes | High | Low | Strict rule: all `bpy` access on the main thread through `post()`/`pump()`. The worker holds only plain data. The fake-backend pipeline suite runs under load. Review checklist item |
 | R15 | **GPU contention** with Cycles, EEVEE or other applications: slowdowns or out-of-memory | Medium | Medium | The worker pauses during render jobs (§5.5); *Stop Model* frees VRAM; a slow-server warning (§17.3); OOM surfaces as a server error with the log |
 | R16 | **Weaker tournaments** above 16 options: conservative confidence and occasional misses | Low | Medium | Unsure flags; README recommends 16 labels or fewer per question, or a two-level split; locks |
 | R17 | **Undo and file-size growth** from large `entries` JSON | Low | Low | The 2 MB soft cap bounds warm and cold entries. **Deliberate exception:** live and pinned entries are kept above 2 MB with a size note, bounded by the 16-live-word-set over-cap error, the 12-pin limit and the 4 MB per-entry hard cap (realistic worst case about 3 MB: 12 pins of a 4096-cell table). Prepare for Playback shows the projected size first. During fills the JSON is written at most every 2 s and once at completion (§14.7) |
 | R18 | **Scope creep towards agents** delays v1 | Medium | Medium | NG1. v1 ships only the hooks (§5.6), and the PR Plan contains no playback-time updates |
 | R19 | **Main-thread planning and graph-edit cost at the documented limits** (measured: RNA writes slow down as trees grow; planning 4096 cells takes about 120 ms, and a 64-setting Dials graph took 1.9 s to build, so Dials is limited to 32 settings, §8.4) | Medium | Medium | Per-element data in the table object (§8.4); bounded materialised entries (§8.1); plan cache and fingerprints (§5.3); the PR-08 contract spike; `--bench` and TIMING budgets as merge gates (§3.2, §8.7) |
-| R20 | **Mass re-asks** after an add-on upgrade (new templates), toggling a node's *Balance Option Order*, or a backend switch, silently changing saved scenes | High | Low (by design) | Words keys decide validity and ask keys only label rows (§5.4). A template bump, a toggle change and an upgrade each send 0 requests, asserted in `store_test`, `pipeline_blender` and `migrate_blender` |
+| R20 | **Mass re-asks** after an add-on upgrade (new templates), toggling a node's *Balance Option Order*, or a backend switch, silently changing saved scenes | High | Low (by design) | Words keys decide validity and ask keys only label rows (§5.4). A template bump and a toggle change each send 0 requests, asserted in `store_test` and `pipeline_blender` |
 | R21 | **Self-referential inputs**: a word source that reads the node's own output (evaluated geometry) re-asks or oscillates | Medium | Low (by design) | Attributes reads original data only and skips names the tree writes (§6.0). A test checks that the tree settles in one pass with one request |
 | R22 | **Exfiltration through an untrusted .blend**: OpenAct reads a private file named in a crafted file and stores its text in the saved file | High | Low | Trust rule: untrusted files may read only inside their own folder tree, and blocked text is never read or stored (§16.1). Pipeline test |
 | R23 | **CSV drift on another machine with the add-on**: different numeric CSV values on a farm or a colleague's machine re-bake silently, so renders differ from what the artist saw | Medium | Medium | In background mode (`bpy.app.background`) and during render jobs, OpenAct neither re-plans nor re-bakes from files. It keeps the saved values and prints "CSV <path> differs from the saved table (text/numbers); rendering the saved answers" (§7.8). Interactive sessions re-bake as usual and show the same note once in the status |
@@ -4189,10 +3922,6 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
     dist/
     README.md
   ```
-- **The prototype folder `X:\interzis\CHUMP_KIT\jev_nodes\` stays untouched.**
-  `tests/migrate_blender.py` builds v0.1.0 files from its 0.1.0 release, vendored as
-  `tests/fixtures/jev_nodes-0.1.0.zip` (§12.5), and it remains the fallback for Blender 4.2 users
-  (§11).
 - **One PR per PR Plan entry**, built by parallel worker subagents under an orchestrator (§20.6)
   and merged into `main` in dependency order. Each merge must pass its gates (§18.3). A build step
   turns any commit into `dist/openact-<version>.zip`.
@@ -4202,7 +3931,7 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 | Stage | Audience | What ships | Exit criteria |
 |---|---|---|---|
 | 0. Development | the orchestrator and its worker subagents on this machine (two RTX 3090, Blender 4.5 / 5.0 / 5.1; §20.6) | PRs merged wave by wave, in dependency order | Every gate green; §3.2 targets met on this machine |
-| 1. Internal alpha | the user | `dist/openact-1.0.0-alpha.N.zip`; the demo files; the user's existing Jev files upgraded | All demo acceptance checks (§18.4); no data lost on upgrade; the user signs off on the nodes and the sidebar |
+| 1. Internal alpha | the user | `dist/openact-1.0.0-alpha.N.zip`; the demo files | All demo acceptance checks (§18.4); the user signs off on the nodes and the sidebar |
 | 2. Private beta | 5–10 Geometry Nodes artists on **Windows 10/11** with NVIDIA GPUs of 10 GB or more (the v1 support matrix, §3.3); Linux testers welcome as best effort | A GitHub pre-release zip, README and known-issues list | No open crash or data-loss bugs; at least 90 % of testers install successfully; the Game of Life acceptance reproduces on their machines; feedback collected on `unsure_below` and on the CSV formats |
 | 3. Release 1.0 | the repository's audience (user decision) | A **GitHub release** in `nicolaiprodromov/openact`, plus the promo video. The repository is private for now, and making it public is the user's call at release time. A Blender Extensions submission is considered **after** 1.0 | All release gates (§18.3); release checklist (§20.5) |
 | 4. Future work (not in this plan) | — | A CPU backend (llama.cpp); a possible high-accuracy model (README note only); the separate agents design document | Separate plans |
@@ -4223,12 +3952,9 @@ There are no remote flags, because OpenAct makes no network calls after install.
 
 ### 20.4 Rollback
 
-- **Uninstall OpenAct.** Every file keeps evaluating on Blender 4.5+ from its stored answers
-  (§12.5). The runtime folder stays until the user deletes it.
-- **Back to v0.1.0.** Install `dist/jev_nodes-0.1.0.zip`. Files that were never upgraded work
-  exactly as before. Upgraded files show undefined nodes, which still evaluate on 4.5+.
-- **Upgrades are explicit and undoable.** They happen in one undo step, and Blender's `.blend1`
-  save versions keep the previous file on disk.
+- **Uninstall OpenAct.** Every file keeps evaluating on Blender 4.5+ from its stored answers,
+  as undefined nodes that run their saved inner groups (G6). The runtime folder stays until the
+  user deletes it.
 - **Bad template or model release.** Stored answers never depend on `PROMPT_VERSION` or model
   provenance (§5.4), so downgrading the add-on loses no answers.
 - **Server trouble.** *Stop Model*; answers stay, and rendering never needs the server.
@@ -4240,7 +3966,7 @@ There are no remote flags, because OpenAct makes no network calls after install.
 3. Run every suite on 4.5, 5.0 and 5.1 with `tests/run_all.ps1 -Model` (§18.3).
 4. Rebuild the demos with `--model`, then open and render each one **without** the add-on on 4.5.
 5. README covers:
-   - installation and the runtime (13 GB, reuse of `JevNodes`);
+   - installation and the runtime (13 GB);
    - the six nodes;
    - the CSV formats and templates;
    - the two ways to give a node its CSV: a typed path, or a plugged-in Import CSV node (§6.0);
@@ -4293,9 +4019,8 @@ agent, the orchestrator** (user decision).
 | Resource | Rule |
 |---|---|
 | GPUs: two RTX 3090 | At most **two concurrent real-model test runs**, one per GPU. Each gets a lease from the orchestrator (`--gpu 0` or `--gpu 1`) and its **own server port** (18765 on GPU 0, 18767 on GPU 1) |
-| Installed runtime at `%LOCALAPPDATA%\JevNodes` | Shared **read-only**. Workers never modify or reinstall it, and set `OPENACT_STATE_DIR` to a per-worker temporary folder for logs, probe cache and token files (§5.2). Installer tests use a temporary runtime folder with mocked downloads |
+| The installed model runtime | Shared **read-only**. Workers never modify or reinstall it, and set `OPENACT_STATE_DIR` to a per-worker temporary folder for logs, probe cache and token files (§5.2). Installer tests use a temporary runtime folder with mocked downloads |
 | Headless Blender processes | At most **4** concurrent, across all workers. The machine has 128 GB RAM |
-| Prototype folder `X:\interzis\CHUMP_KIT\jev_nodes\` | **Read-only**; `migrate_blender.py` uses its 0.1.0 release zip, vendored as `tests/fixtures/jev_nodes-0.1.0.zip` and extracted to a temporary folder |
 | GPUs shared with the user's other jobs | Tests must not assume exclusive GPU use. Before starting a server they check free VRAM (≥ 9 GB) and wait if it is short. Real-model timeouts are generous, and timing checks fail only above 2× target (§18.2), so slower runs pass |
 
 **Schedule: parallel waves.** The S/M/L/XL sizes remain relative effort (§PR Plan). A wave contains
@@ -4315,7 +4040,7 @@ every PR whose dependencies are in earlier waves:
 | W10 | PR-19 |
 | W11 | PR-21 |
 | W12 | PR-22 |
-| W13 | PR-23, PR-24 |
+| W13 | PR-23 |
 | W14 | PR-25 |
 | W15 | PR-26 |
 
@@ -4371,20 +4096,6 @@ decided (§4.e).
 
 ## 22. References
 
-**Prototype (read in full for this design; no git repository):**
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\__init__.py`: registration
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\prefs.py`: preferences, runtime paths, `runtime_installed()`
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\server.py`: lifecycle, installer, HTTP client, main-thread queue
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\engine.py`: static evaluator, contexts, specs, inner builder, passes
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\nodes.py`: `GeometryNodeJevAsk`, `GeometryNodeJevPick`, Add menu
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\ops.py`, `ui.py`: operators, sidebar, preferences UI
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\natsort.py`: `BLI_strcasecmp_natural` port
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\runtime\jev_server.py`: the local Jev-compatible server
-- `X:\interzis\CHUMP_KIT\jev_nodes\jev_nodes\blender_manifest.toml`: extension manifest
-- `X:\interzis\CHUMP_KIT\jev_nodes\tests\e2e_blender.py`, `tests\evaluator_blender.py`: existing tests
-- `X:\interzis\CHUMP_KIT\jev_nodes\README.md`, `dist\jev_nodes-0.1.0.zip`: docs and build
-- `%LOCALAPPDATA%\JevNodes`: the installed runtime (venv 4.4 GB, model 8.7 GB)
-
 **Measurements used** (from the task brief; RTX 3090, bf16, Blender 4.5.2 and 5.1.1, 2026-09):
 - model load 12–40 s and 8.4 GB of VRAM;
 - decision latencies and table-fill throughput;
@@ -4419,7 +4130,7 @@ decided (§4.e).
 
 | # | Decision | Rationale | Where |
 |---|---|---|---|
-| KD1 | The product is **OpenAct**: package and extension id `openact`, bl_idnames `GeometryNodeOpenAct*`, inner prefix `.OpenAct `. "Jev" appears only in credits and API-compatibility notes | "Jev" is TypeSafe's trademark, and SemIf renamed itself from "OpenJev" for the same reason. **User decision:** keep "OpenAct" for now, with no trademark gate before release; the user may rebrand later. Before 1.0 a rename changes only constants (id, bl_idname prefix, inner prefix, runtime folder) | §12.1, R13 |
+| KD1 | The product is **OpenAct**: package and extension id `openact`, bl_idnames `GeometryNodeOpenAct*`, inner prefix `.OpenAct `. "Jev" appears only in credits and API-compatibility notes | "Jev" is TypeSafe's trademark, and SemIf renamed itself from "OpenJev" for the same reason. **User decision:** keep "OpenAct" for now, with no trademark gate before release; the user may rebrand later. Before 1.0 a rename changes only constants (id, bl_idname prefix, inner prefix, runtime folder) | R13 |
 | KD2 | **Six nodes, one per verb**: Ask, Pick, Match, Classify, Rules, Dials. They share list sources, one answer-set format, the answer types and one confidence definition | Discoverable, and each node shows only its own sockets. Consistency comes from shared code (`specs/base.py`, `lists.py`, `csvfmt.py`), not from one mode-laden node | §6, §15.1 |
 | KD3 | **Decide per meaning, apply per element.** Decisions are table rows in the node's hidden inner group, looked up per element through an ID or factor fields. The model never runs during evaluation, playback or rendering | Geometry Nodes cannot run Python while it evaluates. Tables are bounded by meaning (at most 4096 cells), saved, deterministic and safe on a render farm | §4.b, §8, §15.2 |
 | KD4 | Every answer set is **"answer + when it applies"**. Exact facts are handled by code: `if` restrictions, and single-option cells decided without the model | Measured: descriptions raised confidence from 0.32 to 0.61, and "outcome + when" made four Game of Life rule sets exact. Offering only the applicable clauses fixed 3 wrong cells | §4.c, §4.d, §9.4 |
@@ -4431,11 +4142,11 @@ decided (§4.e).
 | KD10 | **Minimum Blender 4.5 LTS**; tested on 4.5, 5.0 and 5.1 | Import CSV, Import Text, `GeometrySet`, the input nodes, Integer Math and evaluation without the add-on all require 4.5. 4.2's LTS window has closed | §11 |
 | KD11 | **Keep the runtime split.** The model server runs in its own venv behind the Jev-compatible localhost API, with a backend interface (SemIf torch, fake), a per-question cache, `/v1/capabilities`, and a launch token plus `Origin`/`Host` checks | Blender stays pure Python and crash-safe. Backends are swappable, a hosted Jev stays possible, and CSRF and DNS rebinding are blocked | §5.2, §10.4, §15.4, §16 |
 | KD12 | **The cell is the unit of caching and batching.** Each table has one state; chunks hold at most 32 questions / 64 rows (one node's job, so one request carries that node's order-balancing setting); one request is in flight; priority classes P0/P1/P2; stale-while-refilling. Order balancing is a **per-node toggle, default on** (KD26) | Maximal `score_shared` batching, and interactive questions overtake long fills after at most one chunk. Partial tables never blank out | §5.3–§5.5, §10.3 |
-| KD13 | **Two key families.** Words keys (`wkey` per row, `words_key` per entry) cover only what the artist said, and decide whether a stored answer is valid. The ask key (templates, the node's *Balance Option Order* setting, backend) and the cell key (the exact text sent) only label rows and key the caches | Template upgrades, per-node order-balancing toggles, backend switches and upgrades of v0.1.0 files send 0 requests. After a words edit, only rows whose own words changed are asked again. Files keep the answers they were saved with | §5.4, §14.2 |
+| KD13 | **Two key families.** Words keys (`wkey` per row, `words_key` per entry) cover only what the artist said, and decide whether a stored answer is valid. The ask key (templates, the node's *Balance Option Order* setting, backend) and the cell key (the exact text sent) only label rows and key the caches | Template upgrades, per-node order-balancing toggles and backend switches send 0 requests. After a words edit, only rows whose own words changed are asked again. Files keep the answers they were saved with | §5.4, §14.2 |
 | KD14 | **Dynamic sockets** come from diffing the inner group's interface. The ID input uses `default_input = 'INDEX'`, not `ID_OR_INDEX` | Both behaviours are verified in 4.5.2 and 5.1.1. An ID means "entry number", and Distribute Points gives points large random ids that are not entry numbers | §6.0 |
-| KD15 | **Migration:** reuse the 13 GB `JevNodes` runtime in place; old nodes load as frozen legacy aliases; an explicit, undoable upgrade converts entries from schema 1 to schema 2 and keeps the answers | No re-download, no silent file rewrites, and upgraded files need no model to reopen | §12, §14.4 |
+| KD15 | **One runtime location.** The runtime lives in the *Runtime Folder* preference, else in `%LOCALAPPDATA%\OpenAct` (on Linux `$XDG_DATA_HOME/OpenAct`). *Locate Existing Runtime…* points OpenAct at a runtime installed elsewhere, after a probe | No hidden search paths: the folder the preferences show is the one in use | §10.5, §14.6 |
 | KD16 | **Supply chain:** pinned versions, SHA-256 checks for uv and SemIf, a hash-locked environment, a ≥ 15 GB free-space check, and `online_access` respected | A 13 GB install must be reproducible, and it must fail loudly rather than end up half-working | §16.2, R3 |
-| KD17 | Development happens in the user's GitHub repository **https://github.com/nicolaiprodromov/openact** (private), cloned to `X:\interzis\CHUMP_KIT\openact\`. PR-01 clones it, creates `main`, scaffolds, commits this design as `docs/DESIGN.md`, and pushes. The prototype folder stays untouched and read-only. 1.0 is released as a GitHub release there; making the repository public is the user's call at release time, and an Extensions submission is considered after 1.0 | User decisions. The migration tests build v0.1.0 files from the untouched prototype, which also remains the fallback for Blender 4.2 users | §20.1, §20.2, §20.5 |
+| KD17 | Development happens in the user's GitHub repository **https://github.com/nicolaiprodromov/openact** (private), cloned to `X:\interzis\CHUMP_KIT\openact\`. PR-01 clones it, creates `main`, scaffolds, commits this design as `docs/DESIGN.md`, and pushes. 1.0 is released as a GitHub release there; making the repository public is the user's call at release time, and an Extensions submission is considered after 1.0 | User decisions | §20.1, §20.2, §20.5 |
 | KD18 | **Only NVIDIA/CUDA is built** (user decision). A CPU backend (llama.cpp) is future work, outside this plan, and so is Apple Silicon. A high-accuracy 27B model is mentioned in the README only | Built and measured on RTX 3090s. Any future backend must pass the same acceptance suites before being offered | §3.3, NG9, §20.5 |
 | KD19 | **Agents are deferred.** v1 ships only hooks: `pipeline.submit(..., on_rows=…)`, table objects writable without rebuilds, and `geometry.read_attributes` | Keeps v1 focused (NG1) without precluding "think slow, act fast" | §5.6 |
 | KD20 | **Shape agreement across contexts.** All live contexts of a node must agree on the interface shape (list source, answer type, factors, settings, payload headers), **and on every value baked into the graph** (band edges and centres, category offsets and value maps, flag assignments). Anything else (texts, payload values, Dials ranges, Pick's picked material) is per-entry data selected by `k` | The interface exists once per node. A clear error is safer than a silent "first context wins", and per-entry values keep per-object variation possible | §6.0, §8.6 |
@@ -4445,7 +4156,7 @@ decided (§4.e).
 | KD24 | **Playback safety.** On a node used by exactly one live context, and not in a hint or error state, a no-match falls back to that context's last-shown entry. Shared trees fall back to neutral values. *Prepare for Playback* pins the entries animated words need | Passes stay paused during playback (NG1), yet a single-object sim must not break. On shared trees, one object must never silently show another's answers while OpenAct runs. Without the add-on, `k_default` stays as saved (R6) | §5.5, §8.1, §8.2 |
 | KD25 | **Import CSV hand-off** (user decision). A node gets its CSV from a typed path (String input) **or** from Blender's own Import CSV node plugged into the companion `<Input> CSV` Geometry socket. OpenAct traces the link (Reroutes, nested groups, Geometry selectors with static selectors) to the Import CSV node, reads its Path and Delimiter statically, and parses the file itself. A link wins over a typed path. Any other node, or a modifying node in between, is an error ("connect the Import CSV node directly") | Artists can wire CSVs the Blender way, while OpenAct keeps the text columns and always sees edits. The Import CSV geometry and path cache are never used. Limitation: the match chain can't see a traced path, so per-object files use route (a) or `Key` | §6.0, §7.7, §10.1 |
 | KD26 | **Per-node order balancing** (user decision). *Balance Option Order* (`balance_order`) is a node checkbox, default on, seeded from the global `debias` preference. It belongs to the ask key: toggling it discards nothing and sends 0 requests; new asks, and *Ask Again*, use the node's current setting | Some work doesn't need the double check, which costs 2× scored rows. Keeping it in the ask key preserves answers (KD13). Measuring accuracy with and without it is follow-up F2 | §6.0, §10.3, §14.2 |
-| KD27 | **Build orchestration** (user decision). The PR Plan is built locally by parallel worker subagents, one per PR, each in its own git worktree and branch, under an orchestrator that dispatches waves, reviews against *Tests to merge*, merges in dependency order, re-runs `tests/run_all.ps1`, and pushes `main`. Shared-resource rules: two GPU leases (one real-model run per RTX 3090, own port), a read-only runtime (`OPENACT_STATE_DIR` per worker), at most 4 headless Blenders, a read-only prototype, and tests tolerant of shared GPUs | Parallel waves shorten the build to about the critical path, while `origin/main` stays green and shared resources are never corrupted | §20.6 |
+| KD27 | **Build orchestration** (user decision). The PR Plan is built locally by parallel worker subagents, one per PR, each in its own git worktree and branch, under an orchestrator that dispatches waves, reviews against *Tests to merge*, merges in dependency order, re-runs `tests/run_all.ps1`, and pushes `main`. Shared-resource rules: two GPU leases (one real-model run per RTX 3090, own port), a read-only runtime (`OPENACT_STATE_DIR` per worker), at most 4 headless Blenders, and tests tolerant of shared GPUs | Parallel waves shorten the build to about the critical path, while `origin/main` stays green and shared resources are never corrupted | §20.6 |
 
 ## PR Plan
 
@@ -4460,7 +4171,6 @@ decided (§4.e).
     docs/DESIGN.md
     dist/
   ```
-  The prototype folder `X:\interzis\CHUMP_KIT\jev_nodes\` is never modified.
 - **Build orchestration (§20.6):** one worker subagent per PR, in its own worktree and branch.
   The orchestrator dispatches the waves listed in §20.6, reviews each PR against its *Tests to
   merge*, merges locally in dependency order, re-runs `tests/run_all.ps1` after each merge, and
@@ -4470,8 +4180,7 @@ decided (§4.e).
 - **Tests to merge** must pass on Blender 4.5 and 5.1, via `tests/run_all.ps1` from PR-02 on. They
   follow the gates in §18.3. No PR may break a suite that already passes.
 - **Real-model** tests run on this machine (two RTX 3090, at most one run per GPU under the
-  orchestrator's leases, §20.6) against the installed runtime, found through the legacy `JevNodes`
-  fallback (§12.2), which is read-only for workers.
+  orchestrator's leases, §20.6) against the installed runtime, which is read-only for workers.
 - Two suites complement §18.2: `tests/server_test.py` (PR-06) and `tests/installer_blender.py`
   (PR-07).
 
@@ -4479,10 +4188,10 @@ decided (§4.e).
 
 | Milestone | PRs | Result |
 |---|---|---|
-| M1 Foundation | PR-01 … PR-09 | The renamed prototype running on the new architecture (evaluator, store, server v1, installer, inner builder, specs, cell pipeline) |
+| M1 Foundation | PR-01 … PR-09 | The core on its architecture: evaluator, store, server v1, installer, inner builder, specs, cell pipeline |
 | M2 Tables and data | PR-10 … PR-15 | Decision worker, per-element lookup through table objects, list sources with path resolution and the trust rule, CSV watcher, answer sets |
 | M3 New nodes | PR-16 … PR-21 | Match, Classify, Rules I and II, Dials, Overrides |
-| M4 Product 1.0 | PR-22 … PR-26 | Sidebar and status, templates and diagnostics, migration, demos, **release 1.0.0** |
+| M4 Product 1.0 | PR-22 … PR-26 | Sidebar and status, templates and diagnostics, demos, **release 1.0.0** |
 
 **Future work (not in this plan):** a CPU backend (llama.cpp, GGUF Q4_K_M) and a possible
 high-accuracy 27B model. Both are noted in the README by PR-26. Apple Silicon is not planned.
@@ -4516,18 +4225,17 @@ it, with the same dependencies.
 | PR-20 | Dials node | M | PR-14, PR-15 | PR-16 … PR-19 | — |
 | PR-21 | Overrides CSV: locks and export (all six nodes) | M | PR-16, PR-17, PR-19, PR-20 | — | — |
 | PR-22 | Node status, sidebar inspection, Show Question | M | PR-07, PR-21 | — | — |
-| PR-23 | Templates, diagnostics, logs, alerts, playback prep, unpin, server sharing | XL | PR-22 | PR-24 | a: templates, diagnostics, JSONL log, alerts, server sharing · b: Prepare for Playback (read sets, channelbag F-curve path, NLA/driver fallback), pins, unpin |
-| PR-24 | Migration from jev_nodes | M | PR-22 | PR-23 | — |
+| PR-23 | Templates, diagnostics, logs, alerts, playback prep, unpin, server sharing | XL | PR-22 | — | a: templates, diagnostics, JSONL log, alerts, server sharing · b: Prepare for Playback (read sets, channelbag F-curve path, NLA/driver fallback), pins, unpin |
 | PR-25 | Demo scenes | L | PR-23 | — | a: `life` and `biome` · b: the other four demos, and the no-add-on render check |
-| PR-26 | **Release 1.0.0** | S | PR-07, PR-24, PR-25 | — | — |
+| PR-26 | **Release 1.0.0** | S | PR-07, PR-25 | — | — |
 
 **Schedule: parallel waves, not a calendar** (user decision; §20.6).
 - **W1** PR-01 · **W2** PR-02 · **W3** PR-03, PR-04, PR-05, PR-06 · **W4** PR-07, PR-08 · **W5**
   PR-09.
 - **W6** PR-10, PR-11 · **W7** PR-12, PR-13 · **W8** PR-14, PR-15 · **W9** PR-16, PR-17, PR-18,
   PR-20.
-- **W10** PR-19 · **W11** PR-21 · **W12** PR-22 · **W13** PR-23, PR-24 · **W14** PR-25 · **W15**
-  PR-26.
+- **W10** PR-19 · **W11** PR-21 · **W12** PR-22 · **W13** PR-23 · **W14** PR-25 · **W15** PR-26.
+- There is no PR-24: its number was retired with the section it planned (§12).
 
 The **critical path** is PR-01 → 02 → 05 → 08 → 09 → 11 → 13 → 15 (or 14) → 18 → 19 → 21 → 22 → 23
 → 25 → 26: about 24 of the 37 total effort units. The orchestrator dispatches each PR as soon as
@@ -4559,43 +4267,40 @@ flowchart LR
   PR19 --> PR21
   PR20 --> PR21
   PR21 --> PR22
-  PR22 --> PR23 & PR24
+  PR22 --> PR23
   PR23 --> PR25
   PR07 --> PR22
   PR07 --> PR26
-  PR24 --> PR26
   PR25 --> PR26
 ```
 
-### PR-01: Repository, rename and scaffold
+### PR-01: Repository and scaffold
 - **Files/components:**
   - **Clone** `https://github.com/nicolaiprodromov/openact` (private, empty, no default branch)
     into `X:\interzis\CHUMP_KIT\openact\` with `gh repo clone nicolaiprodromov/openact`. Then
     **create `main`**: the first commit is on `main`, which becomes the default branch.
   - `.gitignore` (`__pycache__/`, `*.pyc`, `dist/`, `*.blend1`) and a `README.md` skeleton.
   - **`docs/DESIGN.md`**: this design document, committed verbatim.
-  - `openact/openact/`, copied from `jev_nodes/jev_nodes/` and renamed: `__init__.py`,
-    `blender_manifest.toml`, `prefs.py`, `server.py`, `engine.py`, `nodes.py`, `ops.py`, `ui.py`,
-    `natsort.py`, `runtime/openact_server.py`.
-  - `tests/e2e_blender.py` and `tests/evaluator_blender.py`, copied and renamed.
+  - `openact/openact/`: `__init__.py`, `blender_manifest.toml`, `prefs.py`, `server.py`,
+    `engine.py`, `nodes.py`, `ops.py`, `ui.py`, `natsort.py`, `runtime/openact_server.py`.
+  - `tests/e2e_blender.py` and `tests/evaluator_blender.py`.
 - **Depends on:** none. **Parallel with:** none.
 - **Changes:**
-  - Apply the rename map (§12.1): package and manifest (§13.5); `bl_info` `(4, 5, 0)`; bl_idnames
+  - The OpenAct identity (G8): package and manifest (§13.5); `bl_info` `(4, 5, 0)`; bl_idnames
     `GeometryNodeOpenActAsk` / `GeometryNodeOpenActPick`; labels "Ask" and "Pick"; `INNER_PREFIX`
     `.OpenAct `; menu *Shift A > OpenAct*; tab "OpenAct"; `openact.*` operators;
     `OpenActPreferences`; `openact-*` thread names; `SERVER_ID` / `SERVER_NAME` `openact-semif`.
   - `register()` refuses to run on Blender below 4.5 (§11).
-  - `prefs.runtime_root()` gets the legacy fallback: explicit folder → `OpenAct` → `JevNodes`
-    (§12.2).
-  - The status reports an old `jev-nodes-semif` server on the port (§5.2).
-  - Otherwise the behaviour is identical to v0.1.0: two nodes, the same answers.
+  - `prefs.runtime_root()`: the explicit folder, else `OpenAct` (KD15).
+  - The status reports any other server on the port (§5.2).
+  - Two nodes, Ask and Pick, answered end to end.
   - **Push** `main` to origin (`git push -u origin main`). Every later PR branches from it (§20.6).
 - **Tests to merge:**
   - `origin/main` exists and contains `docs/DESIGN.md` (`gh repo view` shows `main` as the default
     branch).
   - `tests/evaluator_blender.py` on 4.5 and 5.1.
   - `tests/e2e_blender.py` phases `build`, `noaddon` and `reopen` on 4.5 and 5.1, with the real
-    model through the legacy runtime.
+    model.
   - `blender --command extension validate` passes.
 
 ### PR-02: Test harness and runner
@@ -4638,14 +4343,12 @@ flowchart LR
 ### PR-04: Node store, schema 2
 - **Files/components:**
   - `openact/store.py`;
-  - `tests/store_test.py`;
-  - `tests/fixtures/jev_v010_entries.json`, captured from the prototype's `set_entries` for Ask
-    Yes/No, Ask Amount, Pick from text and Pick from a collection.
+  - `tests/store_test.py`.
 - **Depends on:** PR-02. **Parallel with:** PR-03, PR-05, PR-06.
 - **Changes:**
   - `NodeStore` and its entry dataclasses, with columnar rows (§14.2), plus `load(node)` /
     `save(node, store, live_gns=None)`.
-  - Schema 1 → 2 conversion, including `gn` re-ordering, `legacy = true` and `pv = 0` (§14.4).
+  - The reading rules of §14.4.
   - The 2 MB soft cap (evicts least recently used **warm and cold** entries only; keeps live and
     pinned entries, even above 2 MB, with a size note) and the 4 MB per-entry hard cap (§14.7).
   - `save(node, store, live_gns=None)` (§13.3): live entries are identified by the `gn` tuples the
@@ -4740,7 +4443,7 @@ flowchart LR
   - `runtime_installed()` stays a cheap file-system check: the venv's Python, the `home`
     directory and the model shards.
   - The `import torch, semif_phase1` probe runs **on the executor thread**, with the status
-    "Checking the runtime…", and is cached in `<runtime>/probe.json` (§12.2).
+    "Checking the runtime…", and is cached in `<runtime>/probe.json` (§10.5).
   - `openact.locate_runtime` (moved here from PR-22 so it lives with the probe it runs): a folder
     picker that sets `runtime_dir` and runs the background probe.
   - SHA-256 checks: uv (`UV_SHA256[asset]`), and the SemIf archive downloaded at install time
@@ -4753,15 +4456,15 @@ flowchart LR
 - **Tests to merge:**
   - `tests/installer_blender.py`:
     - the dry run prints the expected cu128 commands, runs in a **temporary runtime folder with
-      mocked downloads**, and never touches the installed `JevNodes` runtime (§20.6);
+      mocked downloads**, and never touches the user's installed runtime (§20.6);
     - a hash mismatch aborts with a clear status;
     - too little disk space (mocked `disk_usage`) refuses before downloading;
     - with `online_access` off, the install refuses;
     - a mocked machine without `nvidia-smi` is refused before downloading, and a mocked 8 GB GPU
       gets the warning;
     - a `uv` on PATH is not used;
-    - the file-system check reports a legacy runtime whose venv `home` is missing, using a copied
-      `pyvenv.cfg` pointing at a non-existent path;
+    - the file-system check reports a runtime whose venv `home` is missing, using a `pyvenv.cfg`
+      pointing at a non-existent path;
     - the import probe runs off the main thread: `register()` returns in < 50 ms while a
       deliberately slow fake probe sleeps 5 s, and the second session reads `probe.json` without
       starting a subprocess.
@@ -4790,7 +4493,7 @@ flowchart LR
     budget is missed, adjust the budget or the design **before** PR-09. The numbers are recorded
     in the PR description.
   - All locations are written in one batched `tree.nodes.foreach_set("location", …)`.
-  - `entries` is stored as schema 2 through `store.py`; schema 1 is converted on read. The pass
+  - `entries` is stored as schema 2 through `store.py`. The pass
     calls `store.save(node, store, live_gns)` with the `gn` tuples of its current contexts, so
     eviction never removes a live entry (§13.3). It is the **only** caller that passes a live set.
     Operators that edit entries save with the default `live_gns=None`, which evicts nothing.
@@ -4841,7 +4544,7 @@ flowchart LR
   - `store_test`, including: a changed `PROMPT_VERSION` or `debias` changes the ask key but no
     words key;
   - `tests/rules_math_test.py` (confidence values for fixed distributions);
-  - every e2e phase, which must still meet the prototype's value checks;
+  - every e2e phase, which must still meet its value checks;
   - an e2e `reopen` run with a bumped `PROMPT_VERSION` (test switch) sends 0 requests.
 
 ### PR-10: Decision worker, priorities and chunking
@@ -4939,7 +4642,7 @@ flowchart LR
     - `--bench`: per-element lookup ≤ 5 ms above baseline at 1M points; `write_rows()` ≤ 5 ms;
       `inner.build()` within the §8.4 budget.
   - The interface suite.
-  - e2e: on the prototype scene, the Probability of the picked item equals its stored top
+  - e2e: on the ask_pick scene, the Probability of the picked item equals its stored top
     probability.
 
 ### PR-12: Table-object lifecycle: copies, append, garbage, save/reload
@@ -5257,8 +4960,7 @@ flowchart LR
 - **Changes:** §17.1–§17.3 and §7.10.
   - Icons: `CHECKMARK`, `SORTTIME`, `INFO`, `PAUSE`, `ERROR` (warnings) and `CANCEL` (errors).
   - ETA from `ms_per_row`.
-  - Banners for: model not installed, `jev_nodes` enabled, a port conflict, the Import CSV note, and
-    a hook for PR-24's legacy-node banner.
+  - Banners for: model not installed, a port conflict, and the Import CSV note.
   - The table page number lives in a `WindowManager` property.
 - **Tests to merge:**
   - **pipeline**, over a fake fill:
@@ -5290,7 +4992,7 @@ flowchart LR
   - `openact/ui.py` (the *Unpin* / *Unpin All* buttons);
   - `openact/blender_manifest.toml` (the `clipboard` permission, §13.5);
   - `tests/pipeline_blender.py`.
-- **Depends on:** PR-22. **Parallel with:** PR-24.
+- **Depends on:** PR-22. **Parallel with:** none.
 - **Changes:** §7.10, §16.3, §17.4–§17.6, plus the `clipboard` permission and Prepare for
   Playback (§5.5):
   - the F-curve path through `animation_data.action` + `action_slot` and
@@ -5331,38 +5033,6 @@ flowchart LR
     - a stalling fake script raises the stalled-fill alert, time-scaled in the test;
     - a fake `ms_per_row` raises the slow-server note.
 
-### PR-24: Migration from jev_nodes
-- **Files/components:**
-  - `openact/nodes.py`: legacy aliases `GeometryNodeJevAsk` / `GeometryNodeJevPick`, frozen, with
-    `poll()` False, registered only while no class holds those bl_idnames (a one-second timer
-    re-checks, §12.2);
-  - `openact/migrate.py` (new: `find_legacy()`, `upgrade_all()`, the `load_post` INFO report). It
-    saves converted entries with `live_gns=None` (no eviction, §13.3);
-  - `openact/ops.py` (`openact.upgrade_legacy`, one undo step, with a report);
-  - `openact/ui.py` (the legacy and `jev_nodes` banners; §12.2's Jev Nodes runtime line);
-  - `openact/engine.py` (frozen legacy nodes in `iter_nodes()`);
-  - `openact/prefs.py` (a one-time import of `jev_nodes` preferences, §12.1–§12.2);
-  - `openact/lists.py` (`parse_inline(mode="v0")` and the `items_parse_v0` node flag, §12.3);
-  - `tests/migrate_blender.py` (new), with `tests/fixtures/jev_nodes-0.1.0.zip`, the prototype's own
-    release.
-- **Depends on:** PR-22. **Parallel with:** PR-23.
-- **Changes:** §12.2–§12.4, including the six upgrade steps and keeping answers through the schema
-  1 → 2 conversion.
-  - The conversion computes v1 `words_key`s with fixed-length word tuples (§8.2, §14.4), so the
-    upgraded nodes' live plans reuse the converted entries.
-  - Pick keeps the prototype's precedence: a set Collection wins over the Items text, so an old
-    Pick with a collection becomes Source = Collection and its Items text is ignored, and old files
-    keep their answers (§12.3). Pick also keeps legacy item parsing for its old Items texts.
-- **Tests to merge:**
-  - `tests/migrate_blender.py` on 4.5 and 5.1: a v0.1.0 file built with the prototype's own 0.1.0
-    release is upgraded, then:
-    - outputs are identical;
-    - 0 requests are sent;
-    - inner groups are renamed and owned;
-    - links are kept;
-    - undo restores the old nodes.
-  - `store_test` and e2e `reopen`.
-
 ### PR-25: Demo scenes
 - **Files/components:**
   - `demos/build_demos.py`;
@@ -5375,8 +5045,7 @@ flowchart LR
   3. Clutter;
   4. Material families;
   5. Weather dials;
-  6. Ask and Pick, rebuilt directly with OpenAct nodes, so PR-25 does not depend on the migration
-     PR-24.
+  6. Ask and Pick, built directly with OpenAct nodes.
 
   `--model` fills the tables and runs each acceptance check. The saved files carry their answers.
 - **Tests to merge:**
@@ -5392,10 +5061,10 @@ flowchart LR
   - `README.md` (complete, with a changelog);
   - `openact/blender_manifest.toml` and `bl_info` (`1.0.0`);
   - `dist/openact-1.0.0.zip`.
-- **Depends on:** PR-07, PR-24, PR-25. **Parallel with:** none.
+- **Depends on:** PR-07, PR-25. **Parallel with:** none.
 - **Changes:** the §20.5 checklist.
   - **The README covers:**
-    - installation and the reuse of `JevNodes`;
+    - installation and the runtime;
     - the six nodes;
     - the CSV formats and templates, and both ways to give a node its CSV (a path, or a plugged-in
       Import CSV node);
@@ -5425,4 +5094,4 @@ flowchart LR
 
 None of these has a PR here (user decisions).
 
-**Total: 26 PRs.** PR-01 to PR-26 lead up to and include the v1.0.0 release.
+**Total: 25 PRs.** PR-01 to PR-26, without PR-24, lead up to and include the v1.0.0 release.
