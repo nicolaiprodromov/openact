@@ -153,6 +153,16 @@ def _interface_item(tree, identifier):
     return None
 
 
+def _implicit(sock):
+    """True for a group node input that Geometry Nodes gives an implicit field while unlinked (its interface item's
+    default_input), e.g. an OpenAct node's ID, which the node passes on while muted: the element's index, never the
+    socket's hidden value (§6.0). No String input has one, and words are Strings: they skip the search."""
+    if sock.type == 'STRING':
+        return False
+    tree = getattr(sock.node, "node_tree", None)
+    return tree is not None and getattr(_interface_item(tree, sock.identifier), "default_input", 'VALUE') != 'VALUE'
+
+
 def is_field(sock):
     """True when Blender's field inference gives the socket one value per element."""
     inferred = getattr(sock, "inferred_structure_type", None)  # 5.0+, where display_shape doesn't tell
@@ -185,6 +195,8 @@ def eval_input(sock, ctx, depth=0):
         if not links:
             if multi or not hasattr(sock, "default_value"):
                 return [] if multi else None
+            if _implicit(sock):
+                raise Unresolvable("fields can't be words")
             return _animated(sock, "default_value")
         if multi:  # Join Strings joins the most recently connected link first
             ordered = sorted(links, key=lambda link: -link.multi_input_sort_id)

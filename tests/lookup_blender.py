@@ -1195,7 +1195,7 @@ def set_words(users, idents, key, **words):
     users[key].update_tag()
 
 
-def table_read(obj):
+def table_read(obj, names=("prob", "sel", "idx")):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     depsgraph.update()
     evaluated = obj.evaluated_get(depsgraph)
@@ -1203,7 +1203,7 @@ def table_read(obj):
     try:
         return {name: None if name not in mesh.attributes else
                 [round(d.value, 6) if isinstance(d.value, float) else d.value for d in mesh.attributes[name].data]
-                for name in ("prob", "sel", "idx")}
+                for name in names}
     finally:
         evaluated.to_mesh_clear()
 
@@ -1466,18 +1466,25 @@ os._exit(0)
 """
 
 
-def no_addon_scene(name):
+def no_addon_scene(name, float_id=None):
     """An object of 5 points whose tree stores the per-element outputs of a Match, a Classify and a Pick over the same
-    4 items, each with its ID unlinked and built from one entry: (node, its store) of each."""
+    4 items, each built from one entry, with its ID unlinked, or linked from a Value node holding float_id: (node,
+    its store) of each."""
     tree_ = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree_.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     tree_.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
     geometry = tree_.nodes.new("NodeGroupInput").outputs["Geometry"]
+    value = None
+    if float_id is not None:
+        value = tree_.nodes.new("ShaderNodeValue")
+        value.outputs[0].default_value = float_id
     built = []
     for idname, words, v, single, outputs in NO_ADDON:
         node_ = tree_.nodes.new(idname)
-        for word, value in words.items():
-            node_.inputs[word].default_value = value
+        for word, text in words.items():
+            node_.inputs[word].default_value = text
+        if value is not None:
+            tree_.links.new(value.outputs[0], node_.inputs["ID"])
         for output, (attribute, data_type) in outputs.items():  # before build(): Pick reads Probability while linked
             geometry = store(tree_, geometry, node_.outputs[output], attribute, data_type)
         n = len(next(iter(v.values())))
@@ -1491,27 +1498,16 @@ def no_addon_scene(name):
     return built
 
 
-def no_addon_read(obj):
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    depsgraph.update()
-    evaluated = obj.evaluated_get(depsgraph)
-    mesh = evaluated.to_mesh()
-    try:
-        return {name: [round(d.value, 6) if isinstance(d.value, float) else d.value for d in mesh.attributes[name].data]
-                for name in NO_ADDON_READS}
-    finally:
-        evaluated.to_mesh_clear()
-
-
 def phase_no_addon():
     """G6 with an unlinked ID: without OpenAct its nodes are undefined, and an unlinked input passes its socket's value,
     not the element's index. Match, Classify and Pick with an unlinked ID, saved and opened in a Blender without the
     add-on (a second Blender this suite starts), read what they read with it: each element its own row. A group saved
-    before, its ID's value 0, reads row 0 everywhere there until its next pass, which rebuilds it."""
-    keys = ["NoAddon Passed", "NoAddon Old"]
+    before, its ID's value 0, reads row 0 everywhere there until its next pass, which rebuilds it. A float ID beyond
+    the Int range, which Blender converts to -2**31, reads the fallbacks in both."""
+    keys = ["NoAddon Passed", "NoAddon Old", "NoAddon Float"]
     passed, old = no_addon_scene(keys[0]), no_addon_scene(keys[1])
+    no_addon_scene(keys[2], float_id=1e10)
     for node_, _node_store in passed + old:  # as saved before: the ID's value 0, laid out under another LAYOUT
-        node_.node_tree.interface.items_tree["ID"].default_value = 0
         node_.inputs["ID"].default_value = 0
         node_.node_tree[inner.BUILT] = "an older layout"
     refused = []
@@ -1519,7 +1515,7 @@ def phase_no_addon():
         refused.append(not inner.update_values(node_, node_store))
         if refused[-1]:
             inner.build(node_, node_store)
-    mine = {key: no_addon_read(bpy.data.objects[key]) for key in keys}
+    mine = {key: table_read(bpy.data.objects[key], NO_ADDON_READS) for key in keys}
     folder = tempfile.mkdtemp(prefix="openact-noaddon-")
     try:
         path = os.path.join(folder, "noaddon.blend")
@@ -1537,17 +1533,43 @@ def phase_no_addon():
     theirs = json.loads(line[len("NOADDON "):]) if line else {}
     kinds = theirs.get("kinds", [])
     check("no add-on: with OpenAct, Match, Classify and Pick with an unlinked ID read each element's own row, and the "
-          "fallbacks past the rows, whatever the ID's hidden value", mine == dict.fromkeys(keys, NO_ADDON_READS), mine)
+          "fallbacks past the rows, whatever the ID's hidden value", mine[keys[0]] == mine[keys[1]] == NO_ADDON_READS,
+          mine)
     check("no add-on: saved and opened in a Blender without OpenAct, where they are undefined nodes, they read the same",
           "NodeUndefined" in kinds and not any(kind.startswith("GeometryNodeOpenAct") for kind in kinds)
           and theirs.get(keys[0]) == mine[keys[0]], theirs.get(keys[0], output[-3000:]))
+    row_0 = {name: values[:1] * len(values) for name, values in NO_ADDON_READS.items()}
     check("no add-on: a group saved before, its ID's value 0, reads row 0 everywhere there, and its next pass rebuilds "
-          "it (update_values() refuses it): the values above", refused == [True] * 3 and theirs.get(keys[1]) == {
-              name: values[:1] * len(values) for name, values in NO_ADDON_READS.items()}, (refused, theirs.get(keys[1])))
+          "it (update_values() refuses it): the values above", refused == [True] * 3 and theirs.get(keys[1]) == row_0,
+          (refused, theirs.get(keys[1])))
+    fallbacks = {name: values[-1:] * len(values) for name, values in NO_ADDON_READS.items()}  # the 5th point's
+    check("no add-on: an ID linked from a float beyond the Int range (1e10, which converts to -2**31) reads the "
+          "fallbacks everywhere, with and without OpenAct", mine[keys[2]] == theirs.get(keys[2]) == fallbacks,
+          (mine[keys[2]], theirs.get(keys[2])))
     for key in keys:  # the scene goes, and its tables now: phase_save_reload counts what garbage collection removes
         bpy.data.objects.remove(bpy.data.objects[key])
         bpy.data.node_groups.remove(bpy.data.node_groups[key])
     tables.collect_garbage(list(engine.iter_nodes()))
+
+
+def phase_factor_id():
+    """Only the ID of Match, Classify and Pick holds UNLINKED. A Rules factor may be named ID (§6.5), and build() keeps
+    the value typed on it, whatever its kind."""
+    group = bpy.data.node_groups.new("FactorID", 'GeometryNodeTree')
+    rules = group.nodes.new(RulesSpec.idname)
+    kept = {}
+    for kind, typed in (("category", 2), ("amount", 0.75), ("flag", True)):
+        inner.sync_interface(rules, engine.SPECS[RulesSpec.idname].interface(rules, [("ID", kind)], []))
+        rules.inputs["ID"].default_value = typed
+        try:
+            inner.build(rules, S.NodeStore())
+            kept[kind] = rules.inputs["ID"].default_value
+        except Exception as error:  # noqa: BLE001 - the check shows it
+            kept[kind] = f"{type(error).__name__}: {error}"
+    check("a Rules factor named ID keeps the value typed on it through build(), whatever its kind",
+          kept == {"category": 2, "amount": 0.75, "flag": True}, kept)
+    bpy.data.node_groups.remove(group)
+    tables.collect_garbage(list(engine.iter_nodes()))  # its table goes now: phase_save_reload counts what goes
 
 
 def phase_tables():
@@ -1702,6 +1724,7 @@ phase_materialised()
 phase_tables()
 phase_layout_version()
 phase_no_addon()
+phase_factor_id()
 if "--bench" in ARGS:
     chosen = os.environ.get("OPENACT_BENCH_SHAPE", "")
     phase_bench({chosen} if chosen in ("demo", "worst") else {"demo", "worst"})

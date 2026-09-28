@@ -261,6 +261,13 @@ S.save(answered, saved)
 inner.build(answered, saved)
 cases.append(("OpenAct Ask answer used as a word", answered.outputs["Answer"], 'FLOAT'))
 
+muted_pick = N.new(engine.PICK_ID)  # muted, it passes its ID on to Index (§12.3)
+three = N.new("FunctionNodeInputInt")
+three.integer = 3
+L.new(three.outputs[0], muted_pick.inputs["ID"])
+muted_pick.mute = True
+cases.append(("a muted Pick passes its linked ID on", muted_pick.outputs["Index"], 'INT'))
+
 field_ask = N.new(engine.ASK_ID)  # its Answer made a field, as a per-element output would be
 field_inner = field_ask.node_tree
 field_inner.links.new(field_inner.nodes.new("GeometryNodeInputIndex").outputs[0],
@@ -428,6 +435,11 @@ check("breadcrumb: an unsupported node", got == f"A ← {math_text.name} ← {ma
 got = reader_error(field_ask.outputs["Answer"])
 check("an OpenAct field output is rejected", got == f"A ← {field_ask.name}: '{field_ask.name}' output 'Answer' is a "
       "field; words must be single values", got)
+idle_pick = N.new(engine.PICK_ID)  # muted, its unlinked ID passes on the index: a field (§6.0)
+idle_pick.mute = True
+got = reader_error(idle_pick.outputs["Index"])
+check("a muted Pick passes its unlinked ID on: the index, a field, never the ID's hidden value",
+      got == f"A ← {idle_pick.name}: fields can't be words", got)
 unset = N.new("GeometryNodeMenuSwitch")
 unset.data_type = 'STRING'
 unset.enum_items.clear()  # leaves the Menu socket on no item
