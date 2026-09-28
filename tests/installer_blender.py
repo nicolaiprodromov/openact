@@ -47,6 +47,8 @@ import openact  # noqa: E402  (from this checkout, which _harness puts on sys.pa
 from openact import engine, server  # noqa: E402
 from openact import prefs as P  # noqa: E402
 
+engine.allow_background_passes(True)  # the suite ticks headlessly: passes run in background mode (§7.8)
+
 JEVNODES = os.path.join(os.path.dirname(P.default_runtime_root()), "JevNodes")  # the installed one: read only
 BASE = tempfile.mkdtemp(prefix="openact_installer_")
 os.environ["LOCALAPPDATA" if sys.platform == "win32" else "XDG_DATA_HOME"] = BASE

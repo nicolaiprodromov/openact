@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import time
 import traceback
 import uuid
@@ -27,7 +28,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy_extras import anim_utils
 
-from . import csvfmt, evaluator, inner, pipeline, server, store, trust
+from . import csvfmt, evaluator, inner, lists, pipeline, server, store, trust
 from . import prefs as P
 from . import tables
 from .csvfmt import ERROR, INFO, WARNING, Problem
@@ -55,6 +56,8 @@ ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": '
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
 P0_CELLS = 8
 PARTIAL = "openact_partial"  # ID property of the inner group: digest of the unstored partial tables its table holds
+DIFFERS = "CSV {} differs from the saved table ({})"  # a file edited since a table read from it was stored (R23)
+RENDERING = "; rendering the saved answers"  # ... printed where passes leave the saved tables as they are (§7.8)
 
 STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
@@ -65,6 +68,8 @@ DIRTY = set()  # uids of the nodes the next pass visits, when not all of them ar
 GENERATIONS = {}  # node uid -> its generation, bumped when its words change: its older queued chunks are dropped
 DUE = set()  # uids saved without their live set since their last pass (pins, Unpin): that pass saves with it (§13.3)
 NOTES = {}  # node uid -> what its last save evicted or kept above the soft cap (NodeStore.note), for its status
+DRIFT = {}  # node uid -> {path: note} of the CSVs that differed from its saved tables when the file loaded (R23)
+REPORTED = set()  # CSV paths whose "differs" line was printed since the file loaded (§7.8)
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -78,6 +83,8 @@ _pass_plans = None  # the PLANS keys the running pass planned, contexts only an 
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
 _quiet_since = time.monotonic()  # the stall clock: since a chunk was last answered, or cells were first asked
 _slow_since = None  # since when /health's ms_per_row has been above SLOW_MS, cells asked all along
+_background_passes = os.environ.get("OPENACT_BACKGROUND_PASSES") == "1"  # headless authoring runs passes (§7.8)
+_opened = True  # no pass has run since the file loaded: the next one compares its files with the saved tables
 
 
 @dataclass
@@ -122,10 +129,13 @@ def _openact_output(node, out, ctx, depth):
     if is_field(out):
         raise Unresolvable(f"'{node.name}' output '{out.name}' is a field; words must be single values")
     spec = SPECS[node.bl_idname]
+    outer, lists.HASHES = lists.HASHES, None  # its files are its own entries': not the reading node's
     try:
         job = _plan(spec, node, ctx)
     except Hint:
         return spec.fallback(out.name)
+    finally:
+        lists.HASHES = outer
     node_store = store.load(node)
     if node_store.schema > store.SCHEMA:  # its answers can't be read, so they never arrive
         raise Unresolvable(f"'{node.name}': {store.newer_message(node_store)}")
@@ -156,7 +166,7 @@ def _plan(spec, node, ctx):
         if cached is not None:  # new words: the chunks still queued for the node ask about the old ones
             _bump(node.uid)
         try:
-            planned = spec.locked(node, ctx, spec.plan(node, ctx))
+            planned = _planned(spec, node, ctx)
         except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
             planned = (type(error), str(error))
         cached = PLANS[key] = (fingerprint, planned)
@@ -165,6 +175,18 @@ def _plan(spec, node, ctx):
         kind, message = cached[1]
         raise kind(message)
     return cached[1]
+
+
+def _planned(spec, node, ctx):
+    """spec.plan() with the node's Overrides CSV applied, holding the hashes of the CSVs it read, which its entries
+    store (§14.2). Raises Hint, Pending or Unresolvable."""
+    outer, lists.HASHES = lists.HASHES, {}
+    try:
+        job = spec.locked(node, ctx, spec.plan(node, ctx))
+        job.csv = lists.HASHES
+        return job
+    finally:
+        lists.HASHES = outer
 
 
 def _bump(uid):
@@ -251,10 +273,29 @@ def schedule(immediate=False, node=None):
     _last_change = 0.0 if immediate else time.monotonic()
 
 
+def allow_background_passes(flag=True):
+    """Let passes run in background mode (blender -b) for headless authoring: test suites, demos/build_demos.py and
+    scripts that set words and save. Without it, or OPENACT_BACKGROUND_PASSES=1 set before Blender starts, a background
+    session renders the saved answers only (§7.8). Call it after enabling the add-on."""
+    global _background_passes
+    _background_passes = bool(flag)
+    schedule(immediate=True)
+
+
+def _saved_only():
+    """True while passes leave the saved answers and payload as they are: in a render job, and in background mode
+    unless headless authoring opted in (§7.8)."""
+    return _rendering() or (bpy.app.background and not _background_passes)
+
+
 def run_pass(everything=True):
-    """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. Main thread
-    only."""
-    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, passes
+    """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. While
+    _saved_only(), it only reports the CSVs that differ from the saved tables. Main thread only."""
+    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, passes, _opened
+    if _saved_only():  # a farm renders exactly the saved answers and payload (§7.8)
+        _dirty, _last_pass = False, time.monotonic()  # what else is due (DIRTY, WATCH) waits for a pass that writes
+        _report(iter_nodes())
+        return
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
@@ -279,6 +320,7 @@ def run_pass(everything=True):
         LIVE.clear()
         CONTEXTS.clear()
         NOTES.clear()
+        DRIFT.clear()
         DUE.clear()
         REBAKES.clear()
         WATCH.retain(())
@@ -307,6 +349,7 @@ def run_pass(everything=True):
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
         csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
         _pass_plans = None
+    _opened = False  # later edits are this session's own: no note
     if stored or _plans_made != plans_made:
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
     contexts = {node.uid: {ctx.key() for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]}
@@ -327,7 +370,7 @@ def run_pass(everything=True):
     for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
         pipeline.cancel(uid, below=math.inf)
     # nodes that disappeared: undo and deleting a node group call no node's free()
-    for cache in (LIVE, STATUS, NOTES, REBAKES):
+    for cache in (LIVE, STATUS, NOTES, DRIFT, REBAKES):
         for uid in [uid for uid in cache if uid not in contexts]:
             del cache[uid]
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
@@ -413,6 +456,8 @@ def _process(tree, node, contexts):
             if any(entry is found for entry in shown):
                 LAST_SHOWN[key] = found.words_key
             continue
+        if _opened and (drift := _differs(job, found)):  # edited elsewhere: re-baked as usual, with a note (R23)
+            DRIFT.setdefault(node.uid, {}).update((path, DIFFERS.format(path, kinds)) for path, kinds in drift)
         # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
         entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)
         if entry is not None and found is not None and entry is not found:
@@ -501,7 +546,7 @@ def _process(tree, node, contexts):
     STATUS[node.uid] = NodeStatus(
         state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings]
-        + [_problem(INFO, note) for note in (NOTES.get(node.uid),) if note],
+        + [_problem(INFO, note) for note in (NOTES.get(node.uid), *DRIFT.get(node.uid, {}).values()) if note],
         asking=frozenset(sent), pins=pins, **_counts(jobs, resolved, asked))
     return changed
 
@@ -531,6 +576,42 @@ def _scan(spec, node, contexts):
         except (Hint, Pending, Unresolvable) as error:
             planned.append((ctx, error))
     return planned
+
+
+def _differs(job, entry):
+    """(path, "text", "numbers" or "text/numbers") of each CSV the job read whose hashes differ from the ones the
+    entry was stored with (§14.2). A file the entry holds no hashes of (stored before they were kept) isn't
+    compared."""
+    found = []
+    for path, now in job.csv.items():
+        saved = entry.csv.get(path) if entry is not None else None
+        if not isinstance(saved, list) or len(saved) != 2:
+            continue
+        kinds = [kind for kind, new, old in zip(("text", "numbers"), now, saved) if new != old]
+        if kinds:
+            found.append((path, "/".join(kinds)))
+    return found
+
+
+def _report(nodes):
+    """Print once per file each CSV that differs from the one the stored table of its words was read from, for passes
+    that leave the saved tables as they are (§7.8). Each context is planned afresh; nothing is asked, stored or
+    built."""
+    uses = find_uses()
+    for tree, node in nodes:
+        entries = store.load(node).entries if tree.library is None else ()  # a library's answers are its own
+        if not entries:
+            continue
+        spec = SPECS[node.bl_idname]
+        for ctx in uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
+            try:
+                job = _planned(spec, node, ctx)
+            except (Hint, Pending, Unresolvable):
+                continue
+            for path, kinds in _differs(job, next((entry for entry in entries if entry.gn == job.gn), None)):
+                if path not in REPORTED:
+                    REPORTED.add(path)
+                    print(DIFFERS.format(path, kinds) + RENDERING, flush=True)
 
 
 def _submit(job, missing):
@@ -863,7 +944,7 @@ class Playback:
                     frame, ctx = self.origin[(node.uid, gn)]
                     evaluator.OVERRIDES = self.values[frame]  # the values its words read at that frame
                     try:
-                        job = spec.locked(node, ctx, spec.plan(node, ctx))
+                        job = _planned(spec, node, ctx)
                     except Hint:
                         continue  # nothing to ask at those frames
                     except (Pending, Unresolvable) as error:
@@ -1210,7 +1291,7 @@ def on_depsgraph_update(scene, depsgraph):
 
 @persistent
 def on_load_post(*_args):
-    global PLAYBACK, PLAYBACK_NOTE
+    global PLAYBACK, PLAYBACK_NOTE, _opened
     pipeline.cancel_all()  # asked for the file just closed; the chunk in flight still lands in MEMORY
     STATUS.clear()
     pipeline.FAILED.clear()
@@ -1219,10 +1300,21 @@ def on_load_post(*_args):
     LIVE.clear()
     CONTEXTS.clear()
     NOTES.clear()
+    DRIFT.clear()
+    REPORTED.clear()
     DUE.clear()
     REBAKES.clear()
     PLAYBACK, PLAYBACK_NOTE = None, ""  # the closed file's run
+    _opened = True
     schedule(immediate=True)
+
+
+@persistent
+def on_render_init(*_args):
+    # blender -b -f runs no timer, so no pass: a farm's render prints its "differs" lines here (§7.8). Only in
+    # background mode, where the render runs on the main thread
+    if bpy.app.background and _saved_only():
+        _report(iter_nodes())
 
 
 @persistent
@@ -1238,7 +1330,7 @@ def on_server_status():
 def _handlers():
     h = bpy.app.handlers
     return ((h.depsgraph_update_post, on_depsgraph_update), (h.load_post, on_load_post),
-            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo))
+            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo), (h.render_init, on_render_init))
 
 
 def register():

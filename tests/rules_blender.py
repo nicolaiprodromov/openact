@@ -4,14 +4,18 @@ the store (the cell index for every combination, interpolation, renormalisation 
 references), and a rebuild with the CSV files deleted must leave every output unchanged. A Factors CSV edit that
 keeps every row rebuilds the graph for the new factors, and a payload header of any length builds. Outcomes edits
 keep the table (§5.4), the status shows the plan's problems (§17.1), contexts must agree on the factors (§6.0), and
-only the pass writes the interface: not a draw, and again after an undo.
+only the pass writes the interface: not a draw, and again after an undo. In background mode without the opt-in, and
+during a render job, a pass neither plans again nor re-bakes from files and prints each changed CSV once (§7.8); a
+file reopened with a CSV edited meanwhile re-bakes, and its status notes the file (R23).
 
 With -- --model PORT GPU, the real model answers the Game of Life rule sets (18/18 exact, 0 unsure each).
 
 Run:  blender -b --factory-startup --python tests/rules_blender.py [-- --model 18769 0]
 """
 
+import contextlib
 import dataclasses
+import io
 import itertools
 import os
 import random
@@ -35,6 +39,7 @@ else:
 
     P._Defaults.auto_start = False  # nothing here may start a model server
     nodes.register()
+    engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 from openact import csvfmt, evaluator, inner, pipeline, tables  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
 from openact import store as S  # noqa: E402
@@ -910,6 +915,123 @@ def phase_writes():
     bpy.utils.unregister_class(_PollProbe)
 
 
+# --------------------------------------------------------------------------- background and render mode (§7.8)
+
+def edit(path, old, new):
+    """Replace text in a CSV of TMP, with a new stamp even within the clock tick of its last write."""
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    write(os.path.basename(path), text.replace(old, new))
+    status = os.stat(path)
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 2_000_000_000))
+    csvfmt.clear_cache()
+
+
+def phase_background():
+    """§7.8, R23: in background mode without the opt-in, and while a render job runs, a pass neither plans again nor
+    re-bakes from files: after a Factors text edit and an Outcomes numbers edit nothing is asked, stored or rebuilt,
+    the outputs keep the saved values, and each file's "differs" line is printed once over several passes; a
+    background render prints it too, as a farm runs no pass. With the opt-in the pass plans and re-bakes as before.
+    Reopened with a CSV edited meanwhile, the first pass re-bakes as usual and the status notes the file once. It
+    opens files, so it runs last."""
+    engine.register()  # its load_post and render_init handlers
+    bpy.ops.wm.read_homefile(use_empty=True)  # this node only: other phases' files differ from their tables too
+    try:
+        factors = shutil.copy(os.path.join(FIXTURES, "life_factors.csv"), os.path.join(TMP, "farm_factors.csv"))
+        outcomes = shutil.copy(os.path.join(FIXTURES, "life_outcomes.csv"), os.path.join(TMP, "farm_outcomes.csv"))
+        columns = {"in_state": ('BOOLEAN', [s for s, _n in CELLS]), "in_neighbours": ('INT', [n for _s, n in CELLS])}
+        tree, rules, obj, gi, go = scene("Farm", factors, outcomes, columns, question=GOL_QUESTION,
+                                         context="Life, saved and rendered on a farm.")  # not the other phases' cells
+        names = ["Birth", "Stays empty", "Survives", "Dies"]
+        reference = [outcome_name(s, n, {3}, {2, 3}) for s, n in CELLS]
+
+        def expect(birth):
+            """Each element's Outcome, and alive: Birth's payload where the cell is born, 1 where it survives."""
+            return {"Outcome": [names.index(name) for name in reference],
+                    "alive": [birth if name == "Birth" else int(name == "Survives") for name in reference]}
+
+        def notes():
+            return [(p.severity, p.message) for p in engine.STATUS[rules.uid].problems
+                    if "differs from the saved table" in p.message]
+
+        for job, _missing in passed(rules):
+            gol_answers(job, {3}, {2, 3}, names)
+        passed(rules)
+        wire(tree, rules, gi, go, ["Outcome", "alive"])
+        passed(rules)
+        saved, stored = read(obj, ["Outcome", "alive"]), rules.entries
+        check("background: with the opt-in, the table fills as the suites author it", saved == expect(1), saved)
+
+        engine.allow_background_passes(False)
+        edit(factors, "Exactly three live neighbours.", "Precisely three live neighbours.")  # text: 2 cells' facts
+        edit(outcomes, "comes to life.,state=dead,1", "comes to life.,state=dead,7")  # numbers: Birth's payload
+        plans, generations = dict(engine.PLANS), dict(engine.GENERATIONS)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            asked = [passed(rules) for _ in range(3)]
+        got = read(obj, ["Outcome", "alive"])
+        check('background without the opt-in: after a Factors text edit and an Outcomes numbers edit, each file\'s '
+              '"differs" line is printed once over 3 passes', out.getvalue().splitlines() == [
+                  f"CSV {factors} differs from the saved table (text); rendering the saved answers",
+                  f"CSV {outcomes} differs from the saved table (numbers); rendering the saved answers"],
+              out.getvalue())
+        check("background without the opt-in: nothing is planned again, asked or stored, and the outputs keep the "
+              "saved values", not any(asked) and engine.PLANS == plans and engine.GENERATIONS == generations
+              and rules.entries == stored and got == saved, (asked, got))
+
+        engine.allow_background_passes(True)
+        rendering, engine._rendering = engine._rendering, lambda: True  # stands in for is_job_running('RENDER')
+        try:
+            asked = [passed(rules) for _ in range(2)]
+        finally:
+            engine._rendering = rendering
+        got = read(obj, ["Outcome", "alive"])
+        check("render job: with the opt-in too, a pass while a render job runs plans nothing again and re-bakes "
+              "nothing", not any(asked) and engine.PLANS == plans and rules.entries == stored and got == saved,
+              (asked, got))
+
+        asked = passed(rules)
+        for job, _missing in asked:
+            gol_answers(job, {3}, {2, 3}, names)
+        passed(rules)
+        got = read(obj, ["Outcome", "alive"])
+        check("with the opt-in, the pass plans again and re-bakes as before: the 2 cells whose facts changed are "
+              "asked, and alive reads Birth's new payload", sum(len(missing) for _job, missing in asked) == 2
+              and got == expect(7), ([len(missing) for _job, missing in asked], got))
+
+        blend = os.path.join(TMP, "farm.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=blend)
+        edit(outcomes, "comes to life.,state=dead,7", "comes to life.,state=dead,9")  # on another machine
+        bpy.ops.wm.open_mainfile(filepath=blend)
+        tree, obj = bpy.data.node_groups["Farm"], bpy.data.objects["Farm"]
+        rules = next(node for node in tree.nodes if node.bl_idname == R.RulesSpec.idname)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            asked = passed(rules)
+        got = read(obj, ["Outcome", "alive"])
+        note = (csvfmt.INFO, f"CSV {outcomes} differs from the saved table (numbers)")
+        check("R23: reopened with the Outcomes CSV edited meanwhile, the first pass re-bakes as usual (0 requests), "
+              "prints nothing, and the status notes the file", not asked and got == expect(9)
+              and notes() == [note] and not out.getvalue(), (len(asked), got, notes(), out.getvalue()))
+        edit(factors, "Precisely three live neighbours.", "Exactly three live neighbours.")  # edited in this session
+        for job, _missing in passed(rules):
+            gol_answers(job, {3}, {2, 3}, names)
+        passed(rules)
+        check("R23: an edit made in this session adds no note, and the note shows once", notes() == [note], notes())
+
+        engine.allow_background_passes(False)
+        edit(outcomes, "comes to life.,state=dead,9", "comes to life.,state=dead,5")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            engine.on_render_init(bpy.context.scene)  # what blender -b -f runs, with no pass
+            passed(rules)
+        check('a farm: the render_init handler prints the "differs" line of the file loaded since, once, and the '
+              'outputs keep the saved values', engine.on_render_init in bpy.app.handlers.render_init
+              and out.getvalue().splitlines() == [
+                  f"CSV {outcomes} differs from the saved table (numbers); rendering the saved answers"]
+              and read(obj, ["Outcome", "alive"]) == expect(9), out.getvalue())
+    finally:
+        engine.allow_background_passes(True)
+        engine.unregister()
+
+
 # --------------------------------------------------------------------------- the real model
 
 def phase_model(port, gpu):
@@ -963,6 +1085,7 @@ try:
         phase_status()
         phase_agreement()
         phase_writes()
+        phase_background()
 except Exception:
     import traceback
 

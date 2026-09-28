@@ -38,6 +38,20 @@ on your GPU. Nothing leaves your computer.
      place, so nothing is downloaded.
 4. Add nodes with **Shift A > OpenAct**.
 
+## Render farms and headless scripts
+
+In background mode (`blender -b`, e.g. a render farm's `blender -b scene.blend -f 1`) and while a render job
+runs, OpenAct renders the answers and CSV payload saved in the file: it doesn't plan again or re-bake from the CSV
+files. If a CSV differs from the one a saved table was made from, it prints once per file, e.g.
+`CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. Opened
+interactively, the file re-bakes from its CSVs as usual, and the node's status notes each file that differed.
+
+A script that authors headlessly (sets words, fills tables, saves) opts back in, either way:
+- set the environment variable `OPENACT_BACKGROUND_PASSES=1` before starting Blender;
+- or call `openact.engine.allow_background_passes(True)` after enabling the add-on.
+
+The test suites use the second.
+
 ## Repository
 
 - `openact/`: the add-on (extension) package.

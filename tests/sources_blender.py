@@ -37,6 +37,7 @@ trust.register()
 watch.register()
 bpy.app.handlers.load_post.append(engine.on_load_post)  # the pass's caches start afresh with each file
 bpy.utils.register_class(ops.OPENACT_OT_allow_file)
+engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 real_open = builtins.open
 QUESTION = "What happens to this cell in the next generation?"
 

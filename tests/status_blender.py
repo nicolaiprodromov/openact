@@ -79,6 +79,7 @@ server.STATE.port = PORT  # before anything talks to a server
 for module in (ops, nodes, ui, trust, watch):
     module.register()
 engine.register()  # the server status listener; timers don't run under --python, so the test ticks
+engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 _popen = subprocess.Popen
 
 

@@ -134,8 +134,9 @@ class ClassifySpec(PerItemSpec):
         shape = dict(entry.shape, labels=list(job.options), payload=[list(column) for column in payload])
         columns = {header: [baked[label][j] if 0 <= label < len(baked) else (0 if kind == 'INT' else 0.0)
                             for label in entry.rows.v["label"]] for j, (header, kind) in enumerate(payload)}
-        if shape != entry.shape or columns != entry.rows.payload:
-            entry = dataclasses.replace(entry, shape=shape, rows=dataclasses.replace(entry.rows, payload=columns))
+        if shape != entry.shape or columns != entry.rows.payload:  # re-baked: the hashes are the files' it follows
+            entry = dataclasses.replace(entry, shape=shape, rows=dataclasses.replace(entry.rows, payload=columns),
+                                        csv=dict(job.csv))
         return entry, missing, failed
 
     def summary(self, entry):

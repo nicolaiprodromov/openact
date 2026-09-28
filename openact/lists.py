@@ -29,6 +29,7 @@ SOURCES = ("TEXT", "COLLECTION", "MATERIALS", "ATTRIBUTES")
 MAX_ITEMS = 255
 DECISION_PREFIXES = ("GeometryNodeOpenAct", "GeometryNodeJev")  # OpenAct nodes and their legacy aliases
 STORE = "GeometryNodeStoreNamedAttribute"
+HASHES = None  # while the engine plans a context: path as written -> [text_hash, num_hash] of each CSV it reads
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,8 @@ def load_csv(node, source: CsvSource, schema: str = "answer_set") -> csvfmt.CsvD
         raise Unresolvable(message)
     doc = csvfmt.load(path, source.delimiter, schema)
     WATCH.use(getattr(node, "uid", "") or node.name, doc, source.delimiter)
+    if HASHES is not None:  # by the path as written, which a farm or another machine shares (§14.2)
+        HASHES[source.path] = [doc.text_hash, doc.num_hash]
     return doc
 
 

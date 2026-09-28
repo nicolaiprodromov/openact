@@ -23,6 +23,7 @@ from openact import store as S  # noqa: E402  (store() is the harness's attribut
 TMP = tempfile.mkdtemp(prefix="openact_eval_")
 P._Defaults.auto_start = False  # the passes below must never start a model server
 nodes.register()  # OpenAct nodes: their outputs as words, and the linked-library check
+engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 
 
 tree = bpy.data.node_groups.new("Eval", 'GeometryNodeTree')

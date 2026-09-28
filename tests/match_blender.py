@@ -42,6 +42,7 @@ else:
     P._Defaults.auto_start = False  # nothing here may start a model server
     nodes.register()
     ops.register()
+    engine.allow_background_passes(True)  # the suite authors headlessly: passes run in background mode (§7.8)
 from openact import csvfmt, evaluator, inner, lists, pipeline, sources, tables  # noqa: E402
 from openact import store as S  # noqa: E402
 from openact.specs.classify import ClassifySpec  # noqa: E402

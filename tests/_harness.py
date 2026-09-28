@@ -42,6 +42,7 @@ def enable_addon():
     from openact import engine, server
     from openact import prefs as P
 
+    engine.allow_background_passes(True)  # the suites author headlessly: passes run in background mode (§7.8)
     return engine, server, P
 
 
