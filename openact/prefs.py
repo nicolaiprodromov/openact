@@ -165,7 +165,7 @@ class OpenActPreferences(bpy.types.AddonPreferences):
         name="Runtime Folder",
         subtype='DIR_PATH',
         default="",
-        description="Where the model runtime (Python environment and model weights, about 12 GB) lives. "
+        description="Where the model runtime (Python environment and model weights, about 13 GB) lives. "
                     "Leave empty for the default location",
     )
     port: bpy.props.IntProperty(
@@ -178,7 +178,6 @@ class OpenActPreferences(bpy.types.AddonPreferences):
             ('auto', "Auto", "Use the NVIDIA GPU. Without CUDA the model server reports an error instead of "
                              "using the CPU"),
             ('cuda', "GPU (CUDA)", "Use an NVIDIA GPU"),
-            ('cpu', "CPU", "Use the CPU (much slower)"),
         ),
         default='auto',
     )

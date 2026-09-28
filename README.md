@@ -11,7 +11,8 @@ plays and renders without the model, and without the add-on, on Blender 4.5 or n
 
 The model never generates text. It reads the probability of each allowed answer from one forward pass. That is the
 method of **SemIf** (formerly OpenJev, MIT), running **Qwen3.5-4B** (Apache-2.0) on your GPU. After the one-time
-install, OpenAct talks only to its model server on 127.0.0.1: nothing leaves your computer.
+install, OpenAct talks only to its model server on 127.0.0.1: nothing leaves your computer. A saved .blend holds its
+words, the item and outcome names, and the answers, so sharing the file shares them.
 
 ## Requirements
 
@@ -20,8 +21,7 @@ install, OpenAct talks only to its model server on 127.0.0.1: nothing leaves you
   NVIDIA GPU is best effort and untested.
 - 15 GB of free disk space for the one-time install of the model runtime, which takes about 13 GB.
 
-Only authoring needs the GPU and the runtime: a file that holds its answers renders wherever Blender 4.5 or newer
-runs, with or without OpenAct.
+Only authoring needs the GPU and the runtime.
 
 ## Install
 
@@ -39,45 +39,47 @@ onto the GPU in about 12-40 s. The sidebar's Model box shows its status, with *S
 Log*, and *Copy Diagnostics*, which copies a report for bug reports without your prompts, CSV text or paths. Another
 Blender on the same port uses the running server; there the button reads *Detach*.
 
-### The model runtime (13 GB)
+### The model runtime
 
 **Install Model** downloads about 12 GB once: uv, Python 3.12, PyTorch for CUDA 12.8, SemIf and the model. It
-installs them into `%LOCALAPPDATA%\OpenAct` (on Linux `$XDG_DATA_HOME/OpenAct`, or `~/.local/share/OpenAct`), where
-they take about 13 GB. It needs *Preferences > System > Network > Allow Online Access*, 15 GB of free disk space and
-an NVIDIA GPU. uv, SemIf and the Python packages are pinned and hash-checked, and the model is fetched at a fixed
-revision. The Model box shows the progress, and *Open Log* opens `install.log`.
+installs them into `%LOCALAPPDATA%\OpenAct` (on Linux `$XDG_DATA_HOME/OpenAct`, or `~/.local/share/OpenAct`). It needs
+*Preferences > System > Network > Allow Online Access*. uv, SemIf and the Python packages are pinned and hash-checked,
+and the model is fetched at a fixed revision. The Model box shows the progress, and *Open Log* opens `install.log`.
 
-**A Jev Nodes runtime is reused.** The runtime that Jev Nodes installed in `%LOCALAPPDATA%\JevNodes` is found and
-used in place, so nothing is downloaded, and the Model box reads *Using the Jev Nodes runtime at ...*. OpenAct never
-moves or changes that folder: its Python environment holds absolute paths. For a runtime in another folder, use
-*Locate Existing Runtime...* or the *Runtime Folder* preference. If Jev Nodes is enabled the first time OpenAct is,
-OpenAct takes over its settings once: runtime folder, port, device, GPU, *Start Automatically* and order balancing.
-
-**Removing it.** *Open Runtime Folder* shows the folder; deleting it uninstalls the model. Uninstalling OpenAct leaves
-it in place. Once OpenAct has its own runtime, you can delete `JevNodes`. A Jev Nodes runtime may use a Python from
-your global uv folder (the Model box names it: *Python from ...*), which other tools may share: remove that one only
-with `uv python uninstall`, and only if nothing else uses it.
+For a runtime in another folder, use *Locate Existing Runtime...* or the *Runtime Folder* preference. *Open Runtime
+Folder* shows the folder; deleting it uninstalls the model. Uninstalling OpenAct leaves it in place.
 
 ### Coming from Jev Nodes
 
-OpenAct grew from the Jev Nodes 0.1.0 prototype. With OpenAct installed, files made with Jev Nodes open with their
-old nodes frozen: they keep their saved answers and are never asked. The sidebar then offers **Upgrade**: in one
-undo step, every old Ask and Pick becomes its OpenAct node with its links, settings and answers, so the upgraded file
-asks nothing until its words change. A node that can't be upgraded stays frozen, and the report names it. On Blender
-4.2, keep using Jev Nodes 0.1.0.
+OpenAct grew from the Jev Nodes 0.1.0 prototype.
+
+- **Its runtime is reused.** The runtime that Jev Nodes installed in `%LOCALAPPDATA%\JevNodes` is found and used in
+  place, so nothing is downloaded, and the Model box reads *Using the Jev Nodes runtime at ...*. OpenAct never moves
+  that folder or changes its Python environment or model; it only writes its own logs, probe cache and token file
+  there. If Jev Nodes is enabled the first time OpenAct is, OpenAct takes over its settings once: runtime folder,
+  port, device, GPU, *Start Automatically* and order balancing.
+- **Its files upgrade.** With OpenAct installed, files made with Jev Nodes open with their old nodes frozen: they keep
+  their saved answers and are never asked. The sidebar then offers **Upgrade**: in one undo step, every old Ask and
+  Pick becomes its OpenAct node with its links, settings and answers, so the upgraded file asks nothing until its
+  words change. A node that can't be upgraded stays frozen, and the report names it.
+- Once OpenAct has its own runtime, you can delete `JevNodes`. A Jev Nodes runtime may use a Python from your global
+  uv folder (the Model box names it: *Python from ...*), which other tools may share: remove that one only with
+  `uv python uninstall`, and only if nothing else uses it.
+- On Blender 4.2, keep using Jev Nodes 0.1.0.
 
 ## The six nodes
 
 | Node | Judges | Answer | Words in | Outputs |
 |---|---|---|---|---|
 | **Ask** | the whole situation | Yes/No or Amount | Question, Context, Answers (optional) | **Answer** 0-1, **Yes**, **Confidence** |
-| **Pick** | the whole situation | one entry of a list | Prompt, Context, the list | **Index**, **Item**, **Confidence**; per element **Selection** and **Probability**; the picked **Instance** (Collection) or **Material** (Materials), or the Items CSV's payload |
+| **Pick** | the whole situation | one entry of a list | Prompt, Context, the list | **Index**, **Item**, **Confidence**; per element **Selection** and **Probability**; the picked **Instance** (Collection) or **Material** (Materials) |
 | **Dials** | the whole situation | per setting: Yes/No, Amount or One of | Prompt, Settings | one output per setting; **Confidence**, the lowest of theirs |
 | **Match** | each item of a list | Yes/No or Amount | Question, Context, the list, Answers (optional) | per element **Probability**, **Selection** (Probability ≥ *Threshold*), **Confidence** |
 | **Classify** | each item of a list | one of several labels | Question (optional), Context, the list, Labels | per element **Label** (its row), **Confidence**, the Labels CSV's payload |
 | **Rules** | each measured situation | One of, Yes/No or Amount | Question, Context, Factors, Outcomes, and one field input per factor | per element: One of gives **Outcome** (its row) and the Outcomes CSV's payload, Yes/No **Probability** and **Yes**, Amount **Amount**; and **Confidence** |
 
-Every node also has an **Overrides** input, a CSV that locks answers (below), and a hidden **Key**.
+Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV that locks answers (below), and
+**Key**. Ctrl H shows them.
 
 - **Words.** The text inputs are *words*: typed on the node, or linked from the modifier panel (Group Input), String,
   Join Strings, Menu Switch, Import Text, or another OpenAct node's single-value output. OpenAct reads them outside
@@ -95,24 +97,26 @@ Every node also has an **Overrides** input, a CSV that locks answers (below), an
   are flagged as unsure in the node's status, the sidebar's table and an exported Overrides CSV.
 - **Balance Option Order**, on each node and on by default, asks every question with its options in both orders,
   which removes the small model's bias toward early options, at twice the cost. Changing it keeps the answers given
-  so far. The preference of the same name sets it for new nodes.
+  so far. The *Balance Option Order for New Nodes* preference sets it for new nodes.
 - **Key.** Objects whose words are identical but whose Collection or Object differ can't be told apart: the node
-  says only one answer can show. Show the hidden **Key** input (Ctrl H), expose it on the modifier and give each
-  object its own value. The model never sees it.
+  says only one answer can show. Show **Key** (Ctrl H), expose it on the modifier and give each object its own
+  value. The model never sees it.
 - **Sidebar** (N > OpenAct): the Model box; for the active node, its status, a summary per object, the table of
   answers with confidence and source (*Show Question* shows exactly what a row asks the model), **Ask Again** and
   **Write Overrides CSV**; and the *Files* panel: each CSV the node reads, with its columns and problems, *Open File*
-  and *New CSV from Template*. The sidebar only inspects: every change goes through a socket or a file.
+  and *New CSV from Template*. The sidebar never edits answers: to change one, change its words, or lock it in the
+  Overrides CSV.
 - **Animated words.** OpenAct asks nothing during playback or rendering. When words change over the frame range (a
   keyframed dropdown, say), run **Prepare for Playback** in the sidebar first: it answers every set of words the
   frames show and pins those answers in the file. *Unpin* in the node's panel releases them.
 
 ## CSV files
 
-Answer sets, item lists, Rules factors, Dials settings and overrides can be typed inline or kept in CSV files next to
-the .blend. OpenAct parses every column itself. Text columns (names, `when` descriptions, `if` restrictions) go to
-the model. Numeric columns are *payload*: each becomes an output socket, and its values are baked into the node's
-table. The model never sees the numbers, and a saved file needs no CSV to render.
+Answer sets, item lists and Dials settings can be typed inline or kept in CSV files next to the .blend; Rules factors
+and overrides are always CSV files. OpenAct parses every column itself. Text columns (names, `when` descriptions, `if`
+restrictions) go to the model. The numeric columns of a Labels CSV (Classify) or a One-of Outcomes CSV (Rules) are
+*payload*: each becomes an output socket, and its values are baked into the node's table. The model never sees the
+numbers, and a saved file needs no CSV to render.
 
 ### Two ways to give a node its CSV
 
@@ -151,13 +155,14 @@ Classify).
 | Column | Meaning |
 |---|---|
 | `answer` (or `name`, `item`, `label`, `outcome`) | The option or item name: unique, at most 200 characters |
-| `when` (or `description`) | When this answer applies, or what the item is. Recommended: it makes the answers much more reliable |
+| `when` (or `description`) | When this answer applies, or what the item is (see Tips below) |
 | `if` | Rules Outcomes only: the cells that may choose this outcome (below) |
-| payload columns | Pick's Items, Classify's Labels and One-of Rules Outcomes: one output each, read at the chosen row; at most 16 |
+| payload columns | Classify's Labels and One-of Rules Outcomes: one output each, read at the chosen row; at most 16 |
 
 A payload column holds only integers (an Int output) or only numbers (a Float output), and its header becomes the
 output's name. An empty cell, a decimal comma, `inf` or `nan` makes it text, with a warning. Other text columns are
-ignored.
+ignored. In 1.0.0 an Items CSV's numeric columns give no outputs, though the *Files* panel lists them as payload
+columns.
 
 Row *r* is option *r*: Pick's Index, Classify's Label and Rules' Outcome give the row, which is also Import CSV's
 point *r*. A Yes/No set has exactly the rows `yes` and `no`; an Amount set has 2-16 levels, lowest first (by default
@@ -227,7 +232,8 @@ that row is never asked.
 *Write Overrides CSV* writes the node's answers with `lock` 0 and the columns `model_answer`, `confidence`, `unsure`
 and `source`, which are for reading only: set `lock` to 1 on the rows to keep. With an empty Overrides input it asks
 where to write the file, then fills the input. It merges into an existing file without losing a row. One file applies
-to every object that uses the node; for overrides per object, give each object its own file through the modifier.
+to every object that uses the node; for overrides per object, give each object its own file through the modifier
+(show the Overrides input with Ctrl H).
 
 ### Templates
 
@@ -239,8 +245,15 @@ its input when that input is empty and unlinked.
 |---|---|
 | Rules | `life_factors.csv` and `life_outcomes.csv`: Conway's Game of Life |
 | Classify | `items.csv`, and `labels.csv`: material families with roughness and metallic |
-| Pick, Match | `items.csv`: household objects with descriptions and a `scale` column |
+| Pick, Match | `items.csv`: household objects with descriptions |
 | Dials | `weather_dials.csv`: rain, wind speed, time of day, street lights and fog |
+
+### Tips
+
+- Give every option and item a `when`: when it applies, or what it is. Descriptions make the answers much more
+  reliable than bare names; the biome demo shows the difference.
+- Keep a question to 16 options or fewer. A longer list is asked as a tournament of smaller questions, which is less
+  reliable: split it into two levels instead, e.g. a group first, then an item within the group.
 
 ## Render farms and headless scripts
 
@@ -267,25 +280,21 @@ suites set the variable (`tests/_harness.py`).
 - **Blender's Import CSV cache affects your own Import CSV nodes.** Blender reads each Import CSV path once per
   session. If one of your own Import CSV nodes (not one plugged into an OpenAct node) reads a file that an OpenAct
   node also reads, it keeps the old rows after you edit the file, while OpenAct's outputs update. Use the OpenAct
-  node's payload outputs instead, or restart Blender. The sidebar notes each such node. OpenAct's own reading isn't
-  affected, whichever way it gets the file.
-- **Blender 4.5 or newer only.** On Blender 4.2, keep using Jev Nodes 0.1.0.
+  node's payload outputs instead, or restart Blender. The sidebar notes each such node.
+- **Blender 4.5 or newer only.** Older versions lack nodes OpenAct builds on.
 - **NVIDIA GPUs (CUDA) only.** The installer refuses to install without one, and there is no CPU backend yet (see
-  Future work). macOS is not supported for authoring. Files that hold their answers still render anywhere.
+  Future work). macOS is not supported for authoring.
 - **At most 16 sets of words per node.** A tree used by more than 16 objects with different words is an error on the
   node: split the tree.
-- **Blender 4.5 and 5.0 (Python 3.11):** Blender can crash when an operator runs under a context
-  override while one of OpenAct's background threads briefly runs Python (a Blender bug). OpenAct
-  makes no such call, but Blender does (the node editor's viewer shortcuts Ctrl+1…9 and 1…9, Quick
-  Effects), and so may other add-ons. It is rare. Blender 5.1 is not affected.
+- **Rare crash on Blender 4.5 and 5.0.** With OpenAct enabled, a Blender bug can crash Blender when the node editor's
+  viewer shortcuts (Ctrl+1…9 and 1…9), Quick Effects or some other add-ons' tools run. It is rare, and Blender 5.1 is
+  not affected.
 
 ## Future work
 
-Neither of these is built or scheduled; both were left out of 1.0 by the maintainer's decision.
+Neither of these is built or scheduled.
 
-- **A CPU backend** through llama.cpp (a GGUF Q4_K_M model of about 3 GB), for machines without an NVIDIA GPU. It
-  would plug in behind the same model server interface, and would be offered only once it passes the same acceptance
-  tests.
+- **A CPU backend** through llama.cpp (a GGUF Q4_K_M model of about 3 GB), for machines without an NVIDIA GPU.
 - **A high-accuracy model**: SemIf's 27B "bridge" (EXL3, 5 bits per weight). On SemIf's benchmark of 144 authored
   decisions its balanced accuracy is 0.958, against 0.813 for the 4B model OpenAct uses. It needs a 24 GB GPU.
 
@@ -350,8 +359,9 @@ blender -b --factory-startup --python demos/build_demos.py -- [<out folder>] --n
 With `--model` the add-on starts the model on PORT and GPU. Without them it uses the add-on's
 defaults, port 18765 and GPU 0. Give the port of a server no other Blender uses: the checks count
 that server's requests. Every table fills, and each demo's acceptance checks run (design §18.4).
-The files are saved with their answers, so they open, play and render without the model and without
-the add-on. Without `--model` the scenes are only laid out, and nothing is asked.
+The files are saved with their answers, and each has a camera framed on the demo and a sun, so they
+open, play and render as saved, without the model and without the add-on. Without `--model` the scenes
+are only laid out, and nothing is asked.
 
 The build also writes `evaluated.json` next to the files, which records what every demo object
 evaluates to. `--noaddon` opens all six demos in a Blender without OpenAct, with each dropdown item
@@ -375,9 +385,8 @@ The first release of OpenAct, which grew from the Jev Nodes 0.1.0 prototype and 
 - The sidebar shows each node's status, tables, questions and file problems, and offers starter templates and *Copy
   Diagnostics*; the *Log Requests* preference keeps a request log.
 - *Prepare for Playback* for animated words.
-- The model server batches questions, caches answers, checks a launch token, and can serve several Blender sessions.
-- The installer pins and hash-checks what it downloads, checks the disk and the GPU, reuses a Jev Nodes runtime in
-  place, and can locate an existing runtime.
+- Several Blender sessions can share one model server.
+- The installer checks the disk and the GPU, reuses a Jev Nodes runtime in place, and can locate an existing runtime.
 - Background renders use the saved answers; headless scripts can opt in to asking.
 - Jev Nodes 0.1.0 files upgrade in one step, keeping their answers.
 - Blender 4.5 or newer (the prototype supported 4.2).
@@ -385,14 +394,13 @@ The first release of OpenAct, which grew from the Jev Nodes 0.1.0 prototype and 
 
 ## Credits and licences
 
-- **OpenAct** is licensed under GPL-3.0-or-later.
+- **OpenAct** is licensed under GPL-3.0-or-later: see [LICENSE](LICENSE), which the extension zip carries too.
 - **SemIf** (formerly OpenJev) by TheoLeeCJ, MIT: <https://github.com/TheoLeeCJ/SemIf-OpenJev>. The installer
   installs it into the runtime; it is not bundled.
 - **Qwen3.5-4B** by the Qwen team (Alibaba), Apache-2.0: <https://huggingface.co/Qwen/Qwen3.5-4B>. The installer
   downloads it from Hugging Face; it is not redistributed.
 - **PyTorch** (BSD-3-Clause), **Hugging Face Transformers** and **huggingface_hub** (Apache-2.0) and **uv** (MIT or
   Apache-2.0) are installed into the runtime.
-- `tests/fixtures/jev_nodes-0.1.0.zip` is the release of the Jev Nodes prototype (same author, GPL-3.0-or-later).
 
 Not affiliated with TypeSafe or Jev. The model server is Jev-compatible only in the shape of its requests
 (`POST /v1/systemone`).

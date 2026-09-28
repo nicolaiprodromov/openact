@@ -295,9 +295,7 @@ def draw_preferences(prefs, context, layout):
     col.use_property_split = True
     col.prop(prefs, "auto_start")
     col.prop(prefs, "device")
-    sub = col.column()
-    sub.active = prefs.device != 'cpu'
-    sub.prop(prefs, "gpu")
+    col.prop(prefs, "gpu")
     col.prop(prefs, "debias")
     col.prop(prefs, "unsure_below")
     col.prop(prefs, "port")

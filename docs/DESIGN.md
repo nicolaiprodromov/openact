@@ -1339,6 +1339,9 @@ Property `list_source` (default `TEXT`). There is no `answer_type`: Pick is alwa
 | Material | output | Material | none | `list_source = MATERIALS`: the picked slot's material, via Index Switch of type `MATERIAL` (verified) |
 | *payload columns* | output | Int/Float, single | fallback | `list_source = TEXT` with a `.csv`: baked numeric columns, looked up at Index |
 
+**Not built in 1.0.0:** Pick's payload outputs. The Items CSV's numeric columns are parsed, and the
+sidebar lists them, but they give no sockets (README, *Formats*).
+
 **Behaviour.**
 - There is one `choice` question per context, with at most 255 options (a tournament above 16).
   The instruction is the prototype's: "Which item best fits: `<prompt>`?".

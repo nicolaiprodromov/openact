@@ -14,6 +14,7 @@ tests/_harness.py: PASS or FAIL per check, TIMING, and one RESULT line, with exi
 
 import collections
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import traceback
 import bmesh
 import bpy
 from bpy_extras import anim_utils
+from mathutils import Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tests"))
@@ -1216,6 +1218,35 @@ def new_file(name, csvs):
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, name + ".blend"))
 
 
+def stage():
+    """A camera framed on what the demo evaluates to at frame 1, from the front right and above, a sun, and Blender's
+    default grey world: the empty file has none of them, and the saved demo must render as it is (18.4)."""
+    scene = bpy.context.scene
+    scene.frame_set(1)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    corners = [instance.matrix_world @ Vector(corner) for instance in depsgraph.object_instances
+               if instance.object.type not in ('CAMERA', 'LIGHT') for corner in instance.object.bound_box]
+    lo = Vector([min(c[k] for c in corners) for k in range(3)]) if corners else Vector((-1.0, -1.0, -1.0))
+    hi = Vector([max(c[k] for c in corners) for k in range(3)]) if corners else Vector((1.0, 1.0, 1.0))
+    camera = bpy.data.objects.new("Camera", bpy.data.cameras.new("Camera"))
+    scene.collection.objects.link(camera)
+    scene.camera = camera
+    toward = Vector((0.9, -1.5, 1.0)).normalized()  # from the subject to the camera
+    camera.rotation_euler = (-toward).to_track_quat('-Z', 'Y').to_euler()
+    box = [value for corner in itertools.product(*zip(lo, hi)) for value in corner]
+    fitted, _scale = camera.camera_fit_coords(bpy.context.evaluated_depsgraph_get(), box)  # evaluates the new camera
+    center, fitted = (lo + hi) / 2, Vector(fitted)
+    camera.location = fitted + toward * 0.15 * (fitted - center).length  # a margin around the subject
+    camera.data.clip_end = max(camera.data.clip_end, 4 * (camera.location - center).length)
+    light = bpy.data.objects.new("Light", bpy.data.lights.new("Light", 'SUN'))
+    light.data.energy = 3.0
+    light.rotation_euler = (math.radians(40), math.radians(15), math.radians(30))
+    scene.collection.objects.link(light)
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("World")
+        scene.world.color = (0.05, 0.05, 0.05)
+
+
 def build():
     prefs = P.get_prefs()
     prefs.auto_start = MODEL is not None
@@ -1236,6 +1267,7 @@ def build():
                 builder()
                 if MODEL is not None:
                     whole(name)
+                stage()
                 bpy.ops.wm.save_mainfile()
                 results[name] = record(frames, menu)
             except Exception:
