@@ -1,5 +1,6 @@
 """The inner group built from a node's entries, with no server: the match chain, entry-level values,
-values-only updates and rebuilds, and single-value sampling from a table object. With --bench, also the
+values-only updates and rebuilds, single-value sampling from a table object, and per-element values with an
+unlinked ID in a second Blender, without the add-on (G6). With --bench, also the
 main-thread budgets of §8.4, as BENCH lines: inner.build() and update_values() for the Ask and Pick
 shapes and the contract spike's stand-ins for the demo and worst shapes of the nodes still to come; and,
 recorded without a gate, the planning cost of a 4096-cell context (§5.3). As §18.2 checks timings, a
@@ -15,6 +16,7 @@ import itertools
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -28,6 +30,7 @@ from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
 from openact.specs.base import Spec  # noqa: E402
+from openact.specs.classify import ClassifySpec  # noqa: E402
 from openact.specs.match import MatchSpec  # noqa: E402
 from openact.specs.rules import RulesSpec  # noqa: E402
 
@@ -1429,6 +1432,124 @@ def phase_layout_version():
           bumped is False and inner.update_values(ask, asks), bumped)
 
 
+NO_ADDON_ITEMS = "pan, sofa, kettle, lamp"
+NO_ADDON = (  # node type, typed words, its entry's rows and single values, {output: (attribute, data type)}
+    (MatchSpec.idname, {"Question": "Would you find it in a kitchen?", "Items": NO_ADDON_ITEMS},
+     {"p": [0.875, 0.125, 0.75, 0.25], "c": [0.75, 0.75, 0.5, 0.5]}, {},
+     {"Probability": ("m_p", 'FLOAT'), "Selection": ("m_sel", 'BOOLEAN'), "Confidence": ("m_c", 'FLOAT')}),
+    (ClassifySpec.idname, {"Items": NO_ADDON_ITEMS, "Labels": "kitchen; living room"},
+     {"label": [1, 0, 1, 0], "c": [0.625, 0.5, 0.375, 0.25]}, {},
+     {"Label": ("c_label", 'INT'), "Confidence": ("c_c", 'FLOAT')}),
+    (engine.PICK_ID, {"Prompt": "something to cook with", "Items": NO_ADDON_ITEMS},
+     {"prob": [0.125, 0.0625, 0.75, 0.0625]}, {"Index": 2, "Item": "kettle", "Confidence": 0.5},
+     {"Probability": ("p_prob", 'FLOAT'), "Selection": ("p_sel", 'BOOLEAN')}),
+)
+NO_ADDON_READS = {  # what 5 points read with their index as ID: their row, and past the 4 rows the fallbacks
+    "m_p": [0.875, 0.125, 0.75, 0.25, 0.0], "m_sel": [True, False, True, False, False],
+    "m_c": [0.75, 0.75, 0.5, 0.5, 0.0], "c_label": [1, 0, 1, 0, -1], "c_c": [0.625, 0.5, 0.375, 0.25, 0.0],
+    "p_prob": [0.125, 0.0625, 0.75, 0.0625, 0.0], "p_sel": [False, False, True, False, False]}
+# What the Blender without OpenAct runs on the saved file: the objects' attributes and their trees' node types
+NO_ADDON_READ = """\
+import json, os, sys
+import bpy
+keys, names = json.loads(sys.argv[sys.argv.index("--") + 1])
+depsgraph = bpy.context.evaluated_depsgraph_get()
+got = {"kinds": sorted({n.bl_idname for key in keys for n in bpy.data.objects[key].modifiers[0].node_group.nodes})}
+for key in keys:
+    evaluated = bpy.data.objects[key].evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    got[key] = {name: [round(d.value, 6) if isinstance(d.value, float) else d.value for d in mesh.attributes[name].data]
+                for name in names}
+    evaluated.to_mesh_clear()
+print("NOADDON " + json.dumps(got), flush=True)
+os._exit(0)
+"""
+
+
+def no_addon_scene(name):
+    """An object of 5 points whose tree stores the per-element outputs of a Match, a Classify and a Pick over the same
+    4 items, each with its ID unlinked and built from one entry: (node, its store) of each."""
+    tree_ = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    tree_.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    tree_.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    geometry = tree_.nodes.new("NodeGroupInput").outputs["Geometry"]
+    built = []
+    for idname, words, v, single, outputs in NO_ADDON:
+        node_ = tree_.nodes.new(idname)
+        for word, value in words.items():
+            node_.inputs[word].default_value = value
+        for output, (attribute, data_type) in outputs.items():  # before build(): Pick reads Probability while linked
+            geometry = store(tree_, geometry, node_.outputs[output], attribute, data_type)
+        n = len(next(iter(v.values())))
+        gn = tuple(words.get(word, "") for word in engine.SPECS[idname].WORDS)
+        node_store = S.NodeStore([S.Entry(words_key=idname, gn=gn, t=1.0, single=single, rows=S.Rows(
+            name=NO_ADDON_ITEMS.split(", "), wkey=[""] * n, ask=[0] * n, src="m" * n, v=v))])
+        inner.build(node_, node_store)
+        built.append((node_, node_store))
+    tree_.links.new(geometry, tree_.nodes.new("NodeGroupOutput").inputs[0])
+    user_of(tree_, name, points=5)
+    return built
+
+
+def no_addon_read(obj):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        return {name: [round(d.value, 6) if isinstance(d.value, float) else d.value for d in mesh.attributes[name].data]
+                for name in NO_ADDON_READS}
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def phase_no_addon():
+    """G6 with an unlinked ID: without OpenAct its nodes are undefined, and an unlinked input passes its socket's value,
+    not the element's index. Match, Classify and Pick with an unlinked ID, saved and opened in a Blender without the
+    add-on (a second Blender this suite starts), read what they read with it: each element its own row. A group saved
+    before, its ID's value 0, reads row 0 everywhere there until its next pass, which rebuilds it."""
+    keys = ["NoAddon Passed", "NoAddon Old"]
+    passed, old = no_addon_scene(keys[0]), no_addon_scene(keys[1])
+    for node_, _node_store in passed + old:  # as saved before: the ID's value 0, laid out under another LAYOUT
+        node_.node_tree.interface.items_tree["ID"].default_value = 0
+        node_.inputs["ID"].default_value = 0
+        node_.node_tree[inner.BUILT] = "an older layout"
+    refused = []
+    for node_, node_store in passed:  # the next pass: values only, else a rebuild (engine._process())
+        refused.append(not inner.update_values(node_, node_store))
+        if refused[-1]:
+            inner.build(node_, node_store)
+    mine = {key: no_addon_read(bpy.data.objects[key]) for key in keys}
+    folder = tempfile.mkdtemp(prefix="openact-noaddon-")
+    try:
+        path = os.path.join(folder, "noaddon.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+        result = subprocess.run([bpy.app.binary_path, "-b", "--factory-startup", "-t", "4", path, "--python-expr",
+                                 NO_ADDON_READ, "--", json.dumps([keys, list(NO_ADDON_READS)])], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=300, stdin=subprocess.DEVNULL,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        output = result.stdout + result.stderr
+    except subprocess.TimeoutExpired as error:  # run() killed it
+        output = f"the Blender without the add-on timed out: {error}"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    line = next((text for text in output.splitlines() if text.startswith("NOADDON ")), "")
+    theirs = json.loads(line[len("NOADDON "):]) if line else {}
+    kinds = theirs.get("kinds", [])
+    check("no add-on: with OpenAct, Match, Classify and Pick with an unlinked ID read each element's own row, and the "
+          "fallbacks past the rows, whatever the ID's hidden value", mine == dict.fromkeys(keys, NO_ADDON_READS), mine)
+    check("no add-on: saved and opened in a Blender without OpenAct, where they are undefined nodes, they read the same",
+          "NodeUndefined" in kinds and not any(kind.startswith("GeometryNodeOpenAct") for kind in kinds)
+          and theirs.get(keys[0]) == mine[keys[0]], theirs.get(keys[0], output[-3000:]))
+    check("no add-on: a group saved before, its ID's value 0, reads row 0 everywhere there, and its next pass rebuilds "
+          "it (update_values() refuses it): the values above", refused == [True] * 3 and theirs.get(keys[1]) == {
+              name: values[:1] * len(values) for name, values in NO_ADDON_READS.items()}, (refused, theirs.get(keys[1])))
+    for key in keys:  # the scene goes, and its tables now: phase_save_reload counts what garbage collection removes
+        bpy.data.objects.remove(bpy.data.objects[key])
+        bpy.data.node_groups.remove(bpy.data.node_groups[key])
+    tables.collect_garbage(list(engine.iter_nodes()))
+
+
 def phase_tables():
     """The per-element path on synthetic tables, through a stand-in Pick (PickV1) on a real Pick node."""
     saved = inner.SPECS[engine.PICK_ID]
@@ -1580,6 +1701,7 @@ phase_single_value_sample()
 phase_materialised()
 phase_tables()
 phase_layout_version()
+phase_no_addon()
 if "--bench" in ARGS:
     chosen = os.environ.get("OPENACT_BENCH_SHAPE", "")
     phase_bench({chosen} if chosen in ("demo", "worst") else {"demo", "worst"})

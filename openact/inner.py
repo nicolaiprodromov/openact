@@ -26,8 +26,9 @@ from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
 BUILT = "openact_built"  # ID property of the group: what build() laid out, for update_values()
-LAYOUT = 1  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
+LAYOUT = 2  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
 SEP = "\x1f"  # joins a word tuple into one key (§8.2)
+UNLINKED = -2**31  # the hidden value of an ID input, which the group reads as the element's index (_Builder.ident())
 MATERIALISED_MAX = 16  # entries in the graph and table object, pinned included (§8.1)
 WARM_TOTAL = 4  # warm entries are materialised only while the total is below this
 ROW_BUDGET = 16 * 4096  # flat rows warm entries may bring the table object to
@@ -93,6 +94,7 @@ class _Builder:
         self.table = None  # the node's table object, when it has one (build() sets it)
         self.index = None  # what per_element() reads at: None for the ID input; Rules sets its cell index
         self._info = None  # the group's one Object Info, table_geometry()
+        self._ident = None  # the ID as the lookups read it, ident()
 
     def new(self, idname, x, y):
         node = self.tree.nodes.new(idname)
@@ -185,6 +187,23 @@ class _Builder:
         self.link(b, both.inputs[1])
         return both.outputs[0]
 
+    def ident(self, gi):
+        """The ID as the lookups read it (§8.3), laid out once; None when the node has no ID input. Unlinked, an ID
+        is the element's index. OpenAct's default_input 'INDEX' gives it, but a file opened without OpenAct evaluates
+        the undefined node, whose unlinked input passes its socket's value instead: build() makes that UNLINKED, which
+        reads as the index here (G6)."""
+        if self._ident is None:
+            socket = next((s for s in gi.outputs if s.name == "ID"), None)
+            if socket is None:
+                return None
+            switch = self.new("GeometryNodeSwitch", -600, -800)
+            switch.input_type = 'INT'
+            self.link(self._compare('EQUAL', socket, UNLINKED, -750, -800), sock(switch.inputs, "Switch"))
+            self.link(socket, sock(switch.inputs, "False"))
+            self.link(self.new("GeometryNodeInputIndex", -750, -950).outputs[0], sock(switch.inputs, "True"))
+            self._ident = switch.outputs[0]
+        return self._ident
+
     def per_element(self, gi, go, entries, columns):
         """Per-element outputs (§8.3): each column sampled from the table object at flat = base + ID behind
         valid = 0 <= ID < count, else its fallback. base and count are Index Switches on k, so a no-match
@@ -196,7 +215,7 @@ class _Builder:
             return
         ident = self.index
         if ident is None:
-            ident = next((s for s in gi.outputs if s.name == "ID"), None)
+            ident = self.ident(gi)
         if ident is None:
             ident = self.new("GeometryNodeInputIndex", -900, -700).outputs[0]
         counts = [row_count(entry) for entry in entries]
@@ -295,7 +314,8 @@ def create_inner(node, store=None):
 
 
 def build(node, store, live=None, default=None):
-    """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept.
+    """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept, and an
+    ID input's hidden value made UNLINKED.
 
     live: the gn tuples of the node's live contexts, in context order (§8.1). None means unknown: every
     stored entry is laid out, in store order; only the pass knows the live set. default: the words_key of
@@ -325,7 +345,18 @@ def build(node, store, live=None, default=None):
         tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
     elif own:
         tables.write_rows(node, *own(node, entries))
+    _hold_unlinked(node)
     tree[BUILT] = _built(node, entries, columns, split)
+
+
+def _hold_unlinked(node):
+    """Give the node's ID input the value UNLINKED, and its interface item too, for sockets made later. The value is
+    hidden and OpenAct never reads it: only a file opened without OpenAct does (_Builder.ident())."""
+    item = next((i for i in node.node_tree.interface.items_tree
+                 if i.item_type == 'SOCKET' and i.in_out == 'INPUT' and i.name == "ID"), None)
+    if item is not None:
+        _set(item, "default_value", UNLINKED)
+        _set(sock(node.inputs, item.identifier), "default_value", UNLINKED)
 
 
 def update_values(node, store, live=None, default=None, rows=True):

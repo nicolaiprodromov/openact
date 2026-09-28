@@ -166,7 +166,7 @@ class PickSpec(Spec):
         picked = b.lookup(index, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
         b.lookup(index, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
         b.lookup(index, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
-        ident = next((s for s in gi.outputs if s.name == "ID"), None)
+        ident = b.ident(gi)
         if ident is not None and "Selection" in go.inputs:
             b.selection(ident, picked, go.inputs["Selection"])
         if "Material" in go.inputs:
