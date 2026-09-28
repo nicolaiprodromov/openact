@@ -75,6 +75,7 @@ if not NOADDON:
     try:
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # so the server's GPU index is the one nvidia-smi shows
         engine, server, P = enable_addon()
+        engine.allow_background_passes(True)  # headless authoring: fill and save the tables (7.8)
         from openact import natsort, pipeline  # noqa: E402
         from openact import store as S  # noqa: E402
         from openact.specs.base import complete  # noqa: E402
