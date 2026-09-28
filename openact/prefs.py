@@ -47,6 +47,12 @@ def get_prefs():
     return addon.preferences if addon else _Defaults()
 
 
+def device(prefs) -> str:
+    """The Device preference, or "auto" for a value the server doesn't take: Blender reads a profile saved with the
+    old CPU choice as "". Both values mean CUDA."""
+    return prefs.device if prefs.device in ("auto", "cuda") else "auto"
+
+
 def is_jev(module: str) -> bool:
     """True for jev_nodes' module name: a legacy install, or an extension (bl_ext.<repo>.jev_nodes)."""
     return module == "jev_nodes" or module.endswith(".jev_nodes")

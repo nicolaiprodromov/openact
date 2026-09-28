@@ -3854,7 +3854,7 @@ records which file was opened).
 2. **uv 0.8.17** is fetched from GitHub releases into `<runtime>/tools/`, and checked against a
    pinned SHA-256 per platform asset. That check is new. A `uv` on PATH is **ignored**: the
    prototype preferred `shutil.which("uv")`, and this machine has two, so "pinned" would not hold.
-3. **torch 2.10.0** comes from the official PyTorch index (`cu128` or `cpu`) over HTTPS.
+3. **torch 2.10.0** comes from the official PyTorch index (`cu128`) over HTTPS.
 4. **SemIf** is pinned to commit `23cf1f39…`. **Qwen3.5-4B** is pinned to revision `851bf6e8…`,
    whose Hugging Face snapshots are content-addressed by commit.
 5. **Hash-locked environment (new).** Today SemIf's transitive dependencies are not locked.
