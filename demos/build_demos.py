@@ -1,16 +1,18 @@
 """Builds the six demo scenes of the promo video (design §18.4) headlessly: one .blend each, next to its CSV files.
 
-  blender -b --factory-startup --python demos/build_demos.py -- <out folder> [--model [PORT GPU]]
-  blender -b --factory-startup --python demos/build_demos.py -- <out folder> --noaddon
+  blender -b --factory-startup --python demos/build_demos.py -- [<out folder>] [--model [PORT GPU]]
+  blender -b --factory-startup --python demos/build_demos.py -- [<out folder>] --noaddon
 
-The build copies each demo's CSV files from demos/ into the out folder and saves the demo there as <name>.blend. With
---model the add-on starts the local model (on PORT and GPU, else the preferences' own), every table fills, the demo's
-acceptance checks run, and the answers are saved in the file; without it nothing is asked. The build also writes
-evaluated.json: what every demo object evaluates to, attribute by attribute. --noaddon opens the saved demos in a
-Blender without OpenAct and checks that they evaluate to exactly that (G6). Lines as in tests/_harness.py: PASS or FAIL
-per check, TIMING, and one RESULT line.
+The out folder defaults to demos/. The build copies each demo's CSV files from demos/ into it and saves the demo there
+as <name>.blend. With --model the add-on starts the local model on PORT and GPU, by default on the add-on's own port
+18765 and GPU 0: give the port and GPU of a server no other Blender uses, since the checks count its requests. Every
+table fills, the demo's acceptance checks run, and the answers are saved in the file; without --model nothing is
+asked. The build also writes evaluated.json: what every demo object evaluates to, attribute by attribute. --noaddon
+opens the six saved demos in a Blender without OpenAct and checks that each evaluates to exactly that (G6). Lines as in
+tests/_harness.py: PASS or FAIL per check, TIMING, and one RESULT line, with exit code 1 when anything failed.
 """
 
+import collections
 import hashlib
 import json
 import math
@@ -18,6 +20,7 @@ import os
 import random
 import shutil
 import sys
+import tempfile
 import time
 import traceback
 
@@ -27,23 +30,58 @@ from bpy_extras import anim_utils
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tests"))
-from _harness import check, drive, enable_addon, finish  # noqa: E402
+from _harness import check, drive, enable_addon, finish, sock  # noqa: E402
 
-ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-OUT = os.path.abspath(ARGS[0]) if ARGS and not ARGS[0].startswith("--") else HERE
-NOADDON = "--noaddon" in ARGS
-MODEL = None  # with --model: (port, GPU), or () for the preferences' own
-if "--model" in ARGS:
-    MODEL = tuple(int(arg) for arg in ARGS[ARGS.index("--model") + 1:][:2] if arg.isdigit())
-EVALUATED = os.path.join(OUT, "evaluated.json")
+USAGE = ("usage: blender -b --factory-startup --python demos/build_demos.py -- [<out folder>] "
+         "[--model [PORT GPU] | --noaddon]")
 ASK, PICK, DIALS = "GeometryNodeOpenActAsk", "GeometryNodeOpenActPick", "GeometryNodeOpenActDials"
 MATCH, CLASSIFY, RULES = "GeometryNodeOpenActMatch", "GeometryNodeOpenActClassify", "GeometryNodeOpenActRules"
-if not NOADDON:  # --noaddon sees the nodes as a Blender without OpenAct does
-    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # so the server's GPU index is the one nvidia-smi shows
-    engine, server, P = enable_addon()
-    from openact import natsort, pipeline  # noqa: E402
-    from openact import store as S  # noqa: E402
-    from openact.specs.base import complete  # noqa: E402
+
+
+def arguments(args):
+    """(out folder, model, noaddon) from the arguments after "--". model: None without --model, () for the add-on's
+    default port and GPU, else (port, GPU). Raises ValueError for an argument it can't use."""
+    rest, out, model, noaddon = list(args), HERE, None, False
+    if rest and not rest[0].startswith("--"):
+        out = os.path.abspath(rest.pop(0))
+    while rest:
+        option = rest.pop(0)
+        if option == "--noaddon" and not noaddon:
+            noaddon = True
+        elif option == "--model" and model is None:
+            values = []
+            while rest and not rest[0].startswith("--"):
+                values.append(rest.pop(0))
+            if values and not (len(values) == 2 and all(value.isdigit() for value in values)
+                               and 1024 <= int(values[0]) <= 65535 and int(values[1]) <= 15):
+                raise ValueError(f"--model takes a PORT (1024-65535) and a GPU (0-15), or neither: got {values}")
+            model = tuple(int(value) for value in values)
+        else:
+            raise ValueError(f"can't use {option!r}")
+    if noaddon and model is not None:
+        raise ValueError("--noaddon runs without the add-on, so without --model")
+    return out, model, noaddon
+
+
+try:
+    OUT, MODEL, NOADDON = arguments(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
+except ValueError as error:
+    print(USAGE, flush=True)
+    check("arguments", False, error)
+    finish()
+EVALUATED = os.path.join(OUT, "evaluated.json")
+engine = None  # the add-on's engine, once it is enabled; --noaddon sees the nodes as a Blender without OpenAct does
+if not NOADDON:
+    try:
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # so the server's GPU index is the one nvidia-smi shows
+        engine, server, P = enable_addon()
+        from openact import natsort, pipeline  # noqa: E402
+        from openact import store as S  # noqa: E402
+        from openact.specs.base import complete  # noqa: E402
+    except Exception:
+        traceback.print_exc()
+        check("the add-on enables", False)
+        finish()
 
 
 # ------------------------------------------------------------------------------------------------ building blocks
@@ -59,10 +97,6 @@ def node(tree, idname, x, y, **settings):
 
 def enabled(sockets, name):
     return next(s for s in sockets if s.name == name and s.enabled)
-
-
-def sock(sockets, identifier):
-    return next(s for s in sockets if s.identifier == identifier)
 
 
 def feed(tree, socket, value):
@@ -137,12 +171,16 @@ def primitive(tree, idname, x, y, **inputs):
     return made.outputs["Mesh"]
 
 
-def row_of(tree, count, start, step, x, y):
-    """Mesh Line: count points from start, step apart."""
-    made = node(tree, "GeometryNodeMeshLine", x, y)
-    made.inputs["Count"].default_value = count
-    made.inputs["Start Location"].default_value, made.inputs["Offset"].default_value = start, step
-    return made.outputs["Mesh"]
+def dropdown(tree, gi, name, choices, x, y):
+    """The output of a String Menu Switch over choices ({item: text}), driven by the tree's menu input `name`."""
+    made = node(tree, "GeometryNodeMenuSwitch", x, y, data_type='STRING')
+    made.enum_items.clear()
+    for item in choices:
+        made.enum_items.new(item)
+    for slot, text in zip([s for s in made.inputs if s.identifier not in ("Menu", "__extend__")], choices.values()):
+        slot.default_value = text
+    tree.links.new(gi.outputs[name], made.inputs["Menu"])
+    return made.outputs[0]
 
 
 def placed(tree, points, instance, x, y, selection=None, index=None, rotation=None, scale=None):
@@ -230,12 +268,13 @@ def user(name, tree, mesh=None, location=(0.0, 0.0, 0.0), **inputs):
 
 
 def modify(obj, name, value):
-    """Set a modifier input, as the artist does, and schedule the pass that edit brings, without its 0.25 s debounce:
-    §3.2 times new answers from after it."""
+    """Set a modifier input, as the artist does. With the add-on, the pass that edit brings is scheduled without its
+    0.25 s debounce: §3.2 times new answers from after it."""
     modifier = obj.modifiers["OpenAct"]
     modifier[ident(modifier.node_group, name)] = value
     obj.update_tag()
-    engine.schedule(immediate=True)
+    if engine is not None:
+        engine.schedule(immediate=True)
 
 
 def menu_item(obj, name, item):
@@ -243,6 +282,11 @@ def menu_item(obj, name, item):
     modifier = obj.modifiers["OpenAct"]
     items = modifier.id_properties_ui(ident(modifier.node_group, name)).as_dict()["items"]
     return next(entry[-1] for entry in items if entry[1] == item)
+
+
+def choose(obj, name, item):
+    """Pick an item of the object's menu input, as in the modifier's dropdown."""
+    modify(obj, name, menu_item(obj, name, item))
 
 
 def material(name, color, emission=0.0, reads=(), ramp=""):
@@ -390,19 +434,43 @@ def digest(obj):
     return found
 
 
-def record(frames):
-    """digest() of each object with a Geometry Nodes modifier at these frames, set in order: {frame: {object: ...}}."""
+def record(frames, menu=None):
+    """digest() of each object with a Geometry Nodes modifier at these frames, set in order, once for each item of the
+    demo's menu input, picked as by hand (menu: (object, input, items)): {item: {frame: {object: digest}}}, with the
+    item "" when there's no menu."""
     scene = bpy.context.scene
     users = [obj for obj in scene.objects if any(modifier.type == 'NODES' for modifier in obj.modifiers)]
     found = {}
-    for frame in frames:
-        scene.frame_set(frame)
-        found[str(frame)] = {obj.name: digest(obj) for obj in users}
-    scene.frame_set(frames[0])
+    for item in menu[2] if menu else ("",):
+        if item:
+            choose(bpy.data.objects[menu[0]], menu[1], item)
+        found[item] = {}
+        for frame in frames:
+            scene.frame_set(frame)
+            found[item][frame] = {obj.name: digest(obj) for obj in users}
     return found
 
 
 # ------------------------------------------------------------------------------------------------ the passes
+
+def down():
+    """Why the model can't answer, or "" while it can: its server reports an error, or the runtime isn't installed."""
+    state, message = server.status()
+    return (message or state) if state in ("error", "not_installed") else ""
+
+
+def wait(done, timeout):
+    """Run the passes until done(), which it returns, or until the model can't answer (down()), or timeout."""
+    drive(engine, lambda: done() or bool(down()), timeout)
+    return done()
+
+
+def answering(name, done):
+    """done; else a FAIL that says why the demo's tables didn't fill, as its checks need them and are skipped."""
+    if not done:
+        check(f"{name}: the model answers", False, down() or "the tables didn't fill in time")
+    return done
+
 
 def answered():
     """Every OpenAct node shows whole tables for all its contexts and nothing is asked: each status is complete."""
@@ -419,14 +487,14 @@ def answered():
 
 
 def fill(what, timeout=180):
-    """Run the passes until answered(), timed: True once it is. Without --model one pass plans, and nothing is
-    asked."""
+    """Run the passes until answered(), timed: True once it is. It stops as soon as the model can't answer. Without
+    --model one pass plans, and nothing is asked."""
     engine.schedule(immediate=True)
     if MODEL is None:
         engine.run_pass()
         return False
     started = time.time()
-    done = drive(engine, answered, timeout)
+    done = wait(answered, timeout)
     print(f"TIMING {what}: {time.time() - started:.1f}s", flush=True)
     if not done:
         print(f"  model server: {server.status()}", flush=True)
@@ -562,37 +630,30 @@ def life_zone(tree, rules, gi, go):
 
 def build_life():
     tree, gi, go = new_tree("Life", ("Rule set", 'NodeSocketMenu'))
-    menu = node(tree, "GeometryNodeMenuSwitch", -1600, 300, data_type='STRING')
-    menu.enum_items.clear()
-    for name in RULE_SETS:
-        menu.enum_items.new(name)
-    for slot, (csv, _birth, _survive) in zip([s for s in menu.inputs if s.identifier not in ("Menu", "__extend__")],
-                                             RULE_SETS.values()):
-        slot.default_value = "//" + csv
-    tree.links.new(gi.outputs["Rule set"], menu.inputs["Menu"])
     rules = node(tree, RULES, -300, 300)
     for word, text in (("Question", GOL_QUESTION), ("Context", GOL_CONTEXT), ("Factors", "//life_factors.csv"),
                        ("Overrides", "//life_overrides.csv")):
         rules.inputs[word].default_value = text
-    tree.links.new(menu.outputs[0], rules.inputs["Outcomes"])
+    tree.links.new(dropdown(tree, gi, "Rule set", {name: "//" + csv for name, (csv, _birth, _survive)
+                                                   in RULE_SETS.items()}, -1600, 300), rules.inputs["Outcomes"])
     rng = random.Random(25)
     start = [int(rng.random() < 0.3) for _ in range(SIDE * SIDE)]
     mesh = bpy.data.meshes.new("Life")
     mesh.from_pydata([(i % SIDE * 0.1, i // SIDE * 0.1, 0.0) for i in range(SIDE * SIDE)], [], [])
     mesh.attributes.new("alive", 'INT', 'POINT').data.foreach_set("value", start)
     obj = user("Life", tree, mesh)
-    modify(obj, "Rule set", menu_item(obj, "Rule set", "Conway"))
+    choose(obj, "Rule set", "Conway")
     scene = bpy.context.scene
     scene.frame_start, scene.frame_end = 1, LAST
     engine.run_pass()  # plans: the factor inputs and the payload output 'alive' appear
     life_zone(tree, rules, gi, go)
     done = fill("life Conway table, the model starting", 600)
-    if MODEL is None:
+    if MODEL is None or not answering("life", done):
         return
 
     for name, (csv, birth, survive) in RULE_SETS.items():
         if name != "Conway":  # shown already
-            modify(obj, "Rule set", menu_item(obj, "Rule set", name))
+            choose(obj, "Rule set", name)
             done = fill(f"life {name} table")
         entry = next((e for e in S.load(rules).entries if e.gn[3] == "//" + csv), None)
         names = entry.shape.get("outcomes", []) if entry else []
@@ -607,9 +668,9 @@ def build_life():
               f"{exact}/18 exact, {unsure} unsure, lowest confidence {min(model, default=0.0):.2f}; wrong {wrong}")
 
     before = requests()
-    modify(obj, "Rule set", menu_item(obj, "Rule set", "Conway"))
+    choose(obj, "Rule set", "Conway")
     started = time.time()
-    done = drive(engine, lambda: answered() and engine.STATUS[rules.uid].uses[0][2].gn[3] == "//life_outcomes.csv", 30)
+    done = wait(lambda: answered() and engine.STATUS[rules.uid].uses[0][2].gn[3] == "//life_outcomes.csv", 30)
     sent = sent_since(before)
     check("life: switching back to Conway is instant, with 0 requests", done and sent == 0,
           f"{time.time() - started:.2f}s, {sent} requests")
@@ -620,10 +681,11 @@ def build_life():
     check("life: 32 frames in the Simulation Zone equal the Python B3/S23 reference (toroidal)", not wrong,
           f"wrong at frames {wrong[:5]}; {1000 * sum(seconds[1:]) / len(seconds[1:]):.1f} ms per frame")
 
-    # The dropdown keyframed through the four rule sets: Prepare for Playback pins their tables (§5.5)
+    # The continuous shot through the four rule sets (video beat 2): the dropdown keyframed, then Prepare for Playback
+    # pins their tables (§5.5)
     path = f'modifiers["OpenAct"]["{ident(tree, "Rule set")}"]'
     for frame, name in KEYS.items():
-        modify(obj, "Rule set", menu_item(obj, "Rule set", name))
+        choose(obj, "Rule set", name)
         obj.keyframe_insert(data_path=path, frame=frame)
     animation = obj.animation_data
     curve = anim_utils.action_get_channelbag_for_slot(animation.action, animation.action_slot).fcurves.find(path)
@@ -632,7 +694,7 @@ def build_life():
     scene.frame_set(1)
     before = requests()
     result = bpy.ops.openact.prepare_playback('EXEC_DEFAULT')
-    drive(engine, lambda: not pipeline.PENDING and not engine.pinning() and not engine._dirty, 60)
+    wait(lambda: not pipeline.PENDING and not engine.pinning() and not engine._dirty, 60)
     pins = sorted(entry.gn[3] for entry in S.load(rules).entries if entry.pinned)
     sent = sent_since(before)
     check("life: Prepare for Playback pins the four rule sets, with 0 requests", result == {'FINISHED'} and sent == 0
@@ -659,7 +721,30 @@ def build_life():
         print(f"WARN life playback takes {frame_ms:.1f} ms per frame, above {1000 / fps:.1f} ms", flush=True)
     check("life: playback keeps up with the frame rate (fails above twice the frame time)", frame_ms <= 2000 / fps,
           f"{frame_ms:.1f} ms per frame")
+
+    # Saved without the keys and the pins, so the dropdown stays where the artist switches it (the start of video beat
+    # 2): by hand, each rule set shows its stored table and plays exactly, with no model
+    action = obj.animation_data.action
+    obj.animation_data_clear()
+    bpy.data.actions.remove(action)
+    engine.unpin(rules.uid)
+    before, wrong, moved = requests(), {}, []
+    for name in RULE_SETS:
+        choose(obj, "Rule set", name)
+        wait(lambda: answered() and engine.STATUS[rules.uid].uses[0][2].gn[3] == "//" + RULE_SETS[name][0], 30)
+        frames, _seconds = generations(obj, 32)
+        want = reference(start, frames[0], 32, lambda frame: name)
+        wrong[name] = [frame for frame, (got, right) in enumerate(zip(frames, want), start=1) if got != right]
+        if obj.modifiers["OpenAct"][ident(tree, "Rule set")] != menu_item(obj, "Rule set", name):
+            moved.append(name)
+    sent = sent_since(before)
+    choose(obj, "Rule set", "Conway")
     scene.frame_set(1)
+    done = fill("life saved with a free dropdown", 30)
+    check("life: saved with no keys and no pins, the dropdown switched by hand stays put, and each rule set plays "
+          "exactly (32 frames), with 0 requests", done and not any(wrong.values()) and not moved and sent == 0
+          and obj.animation_data is None and not any(entry.pinned for entry in S.load(rules).entries),
+          f"{sent} requests; wrong frames {wrong}; moved back {moved}")
 
 
 # ------------------------------------------------------------------------------------------------ biome
@@ -675,19 +760,21 @@ PLANTS = (  # biome_outcomes.csv's rows, whose instance column counts in this or
 )
 LAND, SPAN, PEAK = 48, 24.0, 6.0  # terrain vertices per side, metres per side, metres at its top
 TEMPERATURE, RAIN = (-10.0, 35.0), (0.0, 3000.0)  # the terrain's °C and mm of rain a year: Map Range makes them 0-1
+OUTCOMES = {"Descriptions": "biome_outcomes.csv", "Bare names": "biome_outcomes_bare.csv"}  # the A/B dropdown
 
 
 def land(x, y):
-    """(height, temperature, rain) at (x, y): a mountain to the north-east and hills to the west; warm in the south,
-    cold in the north and colder uphill; dry in the west, wet in the east."""
-    height = PEAK * math.exp(-((x - 5) ** 2 + (y - 5) ** 2) / 30) + 2.0 * math.exp(-((x + 6) ** 2 + (y + 3) ** 2) / 20)
+    """(height, temperature, rain) at (x, y): a mountain to the north-east and hills to the north-west; warm in the
+    south, cold in the north and colder uphill; dry in the west, wet in the east. So every plant has ground, the
+    hills' cold and dry tops too."""
+    height = PEAK * math.exp(-((x - 5) ** 2 + (y - 5) ** 2) / 30) + 2.5 * math.exp(-((x + 6) ** 2 + (y - 7) ** 2) / 20)
     return height, 33.0 - 1.1 * (y + SPAN / 2) - 5.0 * height, 100.0 + 2800.0 * (x + SPAN / 2) / SPAN
 
 
 def build_biome():
     plants = hidden_collection("Plants", [(f"{i} {name}", solid(name, parts, color))  # sorted as the payload counts
                                           for i, (name, parts, color) in enumerate(PLANTS)])
-    tree, gi, go = new_tree("Biome")
+    tree, gi, go = new_tree("Biome", ("Plant descriptions", 'NodeSocketMenu'))
     position = node(tree, "ShaderNodeSeparateXYZ", -1600, -400)
     tree.links.new(node(tree, "GeometryNodeInputPosition", -1800, -400).outputs[0], position.inputs[0])
     factors = {"temperature": unit(tree, attribute(tree, "temperature", 'FLOAT', -1700, 0), *TEMPERATURE, -1400, 0),
@@ -698,7 +785,8 @@ def build_biome():
     snow.inputs["Question"].default_value = "How much snow covers the ground?"
     for rules in (kind, snow):
         rules.inputs["Factors"].default_value = "//biome_factors.csv"
-    kind.inputs["Outcomes"].default_value = "//biome_outcomes.csv"
+    tree.links.new(dropdown(tree, gi, "Plant descriptions", {item: "//" + csv for item, csv in OUTCOMES.items()},
+                            -1400, 700), kind.inputs["Outcomes"])
     kind.inputs["Dither"].default_value = 0.3
     coords, temperature, rain = [], [], []
     for j in range(LAND):
@@ -714,6 +802,7 @@ def build_biome():
     mesh.attributes.new("temperature", 'FLOAT', 'POINT').data.foreach_set("value", temperature)
     mesh.attributes.new("rain", 'FLOAT', 'POINT').data.foreach_set("value", rain)
     terrain = user("Terrain", tree, mesh)
+    choose(terrain, "Plant descriptions", "Descriptions")
     engine.run_pass()  # plans: the factor inputs, and the payload outputs 'instance' and 'scale', appear
     for rules in (kind, snow):
         for name, value in factors.items():
@@ -732,19 +821,33 @@ def build_biome():
                    index=kind.outputs["instance"], rotation=turn, scale=kind.outputs["scale"])
     tree.links.new(joined(tree, 400, 0, ground, trees), go.inputs["Geometry"])
     done = fill("biome tables")
-    if MODEL is None:
+    if MODEL is None or not answering("biome", done):
         return
 
-    table = next(iter(S.load(kind).entries), None)
-    confidences = table.rows.v["c"] if table else []
-    used = set(table.rows.v["outcome"]) if table else set()
-    mean = sum(confidences) / len(confidences) if confidences else 0.0
-    check("biome: mean confidence at least 0.55, with all 7 plants used", done and mean >= 0.55
-          and used == set(range(len(PLANTS))), f"mean {mean:.3f} over {len(confidences)} cells, used {sorted(used)}")
-    grown = {}
-    for name, _values in instances(terrain, ()):
-        grown[name] = grown.get(name, 0) + 1
-    print(f"  plants on the terrain: {grown}", flush=True)
+    def table(item):
+        """(mean confidence, the outcomes used) of the plants' table with that item's Outcomes CSV."""
+        entry = next((e for e in S.load(kind).entries if e.gn[3] == "//" + OUTCOMES[item]), None)
+        confidences = entry.rows.v["c"] if entry else []
+        return (sum(confidences) / len(confidences) if confidences else 0.0), set(entry.rows.v["outcome"] if entry
+                                                                                  else ())
+
+    mean, used = table("Descriptions")
+    check("biome: mean confidence at least 0.55, with all 7 plants used", mean >= 0.55
+          and used == set(range(len(PLANTS))), f"mean {mean:.3f}, used {sorted(used)}")
+    grown = collections.Counter(name for name, _values in instances(terrain, ()))
+    print(f"  plants on the terrain: {grown.most_common()}", flush=True)
+
+    # The A/B: the same plants by bare name, a table of its own, and back to the descriptions from the file
+    choose(terrain, "Plant descriptions", "Bare names")
+    done = fill("biome bare names table")
+    bare, bare_used = table("Bare names")
+    check("biome: bare plant names score below the descriptions (the A/B)", done and bare < mean,
+          f"bare names: mean {bare:.3f}, {len(bare_used)} plants used; descriptions: mean {mean:.3f}")
+    before = requests()
+    choose(terrain, "Plant descriptions", "Descriptions")
+    done = fill("biome back to the descriptions", 30)
+    sent = sent_since(before)
+    check("biome: back to the descriptions is instant, with 0 requests", done and sent == 0, f"{sent} requests")
 
     # A transect from hot lowland to cold summit, with moderate rain, through the same tree
     steps = [k / 32 for k in range(33)]
@@ -754,6 +857,7 @@ def build_biome():
         "value", [TEMPERATURE[1] - s * (TEMPERATURE[1] - TEMPERATURE[0]) for s in steps])
     line.attributes.new("rain", 'FLOAT', 'POINT').data.foreach_set("value", [sum(RAIN) / 2] * len(steps))
     transect = user("Transect", tree, line)
+    choose(transect, "Plant descriptions", "Descriptions")
     fill("biome transect", 60)
     amounts = values(transect, "snow")
     falls = [(k, round(a, 4), round(b, 4)) for k, (a, b) in enumerate(zip(amounts, amounts[1:])) if b < a - 1e-6]
@@ -828,7 +932,7 @@ def build_kitchen():
     house = user("House", tree, Kitchen_Only=False)
     kitchen_only = user("Kitchen", tree, location=(40.0, 0.0, 0.0), Kitchen_Only=True)
     done = fill("kitchen tables")
-    if MODEL is None:
+    if MODEL is None or not answering("kitchen", done):
         return
 
     got = dict(instances(house, ("kitchen", "weight", "room")))
@@ -885,44 +989,57 @@ def build_materials():
         faces = stored(tree, faces, value, name, data_type, -400 + 200 * x, 0, 'FACE')
     tree.links.new(faces, go.inputs["Geometry"])
     done = fill("materials tables")
-    if MODEL is None:
+    if MODEL is None or not answering("materials", done):
         return
 
     check("materials: the Labels CSV comes through the Import CSV node, with its payload outputs",
-          done and "roughness" in families.outputs and "metallic" in families.outputs,
-          [s.name for s in families.outputs])
+          "roughness" in families.outputs and "metallic" in families.outputs, [s.name for s in families.outputs])
     family, metal_yes = values(swatches, "family"), values(swatches, "metal")
     labels = next(iter(S.load(families).entries), None)
     labels = labels.shape.get("labels", []) if labels else []
     for k, (name, _color) in enumerate(SWATCHES):  # six faces each
         label = labels[family[6 * k]] if 0 <= family[6 * k] < len(labels) else family[6 * k]
         print(f"  {name}: {label}, metal {metal_yes[6 * k]:.2f}", flush=True)
-    path = os.path.join(OUT, "material_families.csv")
-    with open(path, encoding="utf-8", newline="") as handle:
-        text = handle.read()
-    lines = text.splitlines(keepends=True)
-    row = lines[1 + family[0]]  # the family the Steel faces (the first six) have
-    body = row.rstrip("\r\n")
-    head, roughness, payload_tail = body.rsplit(",", 2)
-    old, new = float(roughness), round(float(roughness) + 0.1, 2)
-    lines[1 + family[0]] = f"{head},{new},{payload_tail}{row[len(body):]}"
 
-    def saved(content, want):
-        """Save the CSV as the artist does: (whether the Steel faces show roughness want, seconds, requests)."""
-        before, stamp = requests(), os.stat(path).st_mtime_ns + 10 ** 9
-        with open(path, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-        os.utime(path, ns=(stamp, stamp))  # a later stamp, whatever the file system's clock resolution
-        started = time.time()
-        shown = drive(engine, lambda: abs(values(swatches, "roughness")[0] - want) < 1e-6, 15)
-        return shown, time.time() - started, sent_since(before)
+    # The edits go to a scratch copy of the demo and its CSV: the demo, and the CSV it ships with, never change
+    shipped = os.path.join(OUT, "material_families.csv")
+    with open(shipped, "rb") as handle:
+        original = handle.read()
+    bpy.ops.wm.save_mainfile()
+    real, scratch = bpy.data.filepath, tempfile.mkdtemp(prefix="openact_materials_")
+    try:
+        shutil.copyfile(real, os.path.join(scratch, "materials.blend"))
+        path = shutil.copyfile(shipped, os.path.join(scratch, "material_families.csv"))
+        bpy.ops.wm.open_mainfile(filepath=os.path.join(scratch, "materials.blend"))
+        swatches = bpy.data.objects["Swatches"]
+        fill("materials scratch copy", 60)
+        text = original.decode("utf-8")
+        lines = text.splitlines(keepends=True)
+        head, roughness, tail = lines[1 + family[0]].rsplit(",", 2)  # the family of the Steel faces, the first six
+        old, new = float(roughness), round(float(roughness) + 0.1, 2)
+        lines[1 + family[0]] = f"{head},{new},{tail}"
 
-    shown, seconds, sent = saved("".join(lines), new)
-    check("materials: a roughness edit in the CSV reaches the faces with 0 requests", done and shown and sent == 0,
-          f"{old} -> {new} after {seconds:.2f}s, {sent} requests")
-    shown, seconds, sent = saved(text, old)  # the demo keeps the CSV it ships with
-    check("materials: the CSV restored, the faces follow, again with 0 requests", shown and sent == 0,
-          f"after {seconds:.2f}s, {sent} requests")
+        def saved(content, want):
+            """Save the CSV as the artist does: (whether the Steel faces show roughness want, seconds, requests)."""
+            before, stamp = requests(), os.stat(path).st_mtime_ns + 10 ** 9
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+            os.utime(path, ns=(stamp, stamp))  # a later stamp, whatever the file system's clock resolution
+            started = time.time()
+            shown = wait(lambda: abs(values(swatches, "roughness")[0] - want) < 1e-6, 15)
+            return shown, time.time() - started, sent_since(before)
+
+        shown, seconds, sent = saved("".join(lines), new)
+        check("materials: a roughness edit in the CSV reaches the faces with 0 requests", shown and sent == 0,
+              f"{old} -> {new} after {seconds:.2f}s, {sent} requests")
+        shown, seconds, sent = saved(text, old)
+        check("materials: edited back, the faces follow, again with 0 requests", shown and sent == 0,
+              f"after {seconds:.2f}s, {sent} requests")
+    finally:
+        bpy.ops.wm.open_mainfile(filepath=real)
+        shutil.rmtree(scratch, ignore_errors=True)
+    with open(shipped, "rb") as handle:
+        check("materials: the CSV beside the demo is unchanged", handle.read() == original, shipped)
 
 
 # ------------------------------------------------------------------------------------------------ weather
@@ -954,7 +1071,8 @@ def build_weather():
     for x, (setting, name, data_type) in enumerate(DIALED):
         ground = stored(tree, ground, out[setting], name, data_type, -1000 + 180 * x, 900)
     sway = vector(tree, -900, 100, (number(tree, 'MULTIPLY', -1100, 100, out["Wind speed"], 0.015), 0.0, 0.0))
-    trees = placed(tree, row_of(tree, 6, (-7.5, 5.0, 1.25), (3.0, 0.0, 0.0), -900, 500),
+    trees = placed(tree, primitive(tree, "GeometryNodeMeshLine", -900, 500, Count=6, Start_Location=(-7.5, 5.0, 1.25),
+                                   Offset=(3.0, 0.0, 0.0)),
                    primitive(tree, "GeometryNodeMeshCone", -900, 300, Vertices=12, Radius_Bottom=0.6, Depth=2.5),
                    -600, 400, rotation=sway)
     lifted = node(tree, "GeometryNodeSetPosition", -700, -200)
@@ -974,8 +1092,9 @@ def build_weather():
                  -400, -800)
     bulb = painted(tree, primitive(tree, "GeometryNodeMeshIcoSphere", -700, -1300, Radius=0.25, Subdivisions=2),
                    material("Bulb", (1.0, 0.8, 0.4, 1.0), emission=20.0), -500, -1300)
-    lights = switch(tree, out["Street lights"], None, placed(tree, row_of(tree, 4, (-6.0, -3.0, 3.0), (4.0, 0.0, 0.0),
-                                                                          -700, -1200), bulb, -400, -1200), -200, -1200)
+    posts = primitive(tree, "GeometryNodeMeshLine", -700, -1200, Count=4, Start_Location=(-6.0, -3.0, 3.0),
+                      Offset=(4.0, 0.0, 0.0))
+    lights = switch(tree, out["Street lights"], None, placed(tree, posts, bulb, -400, -1200), -200, -1200)
     cube = node(tree, "GeometryNodeVolumeCube", -700, -1600)
     tree.links.new(out["Fog"], cube.inputs["Density"])
     cube.inputs["Min"].default_value, cube.inputs["Max"].default_value = (-10.0, -10.0, 0.0), (10.0, 10.0, 6.0)
@@ -984,7 +1103,7 @@ def build_weather():
     fog = painted(tree, cube.outputs[0], fog_material(), -400, -1600)
     tree.links.new(joined(tree, 400, 0, ground, trees, rain, sun, lights, fog), go.inputs["Geometry"])
     done = fill("weather dials")
-    if MODEL is None:
+    if MODEL is None or not answering("weather", done):
         return
 
     storm = dialed(village)
@@ -996,7 +1115,7 @@ def build_weather():
     before = requests()
     modify(village, "Prompt", CALM)
     started = time.time()
-    done = drive(engine, lambda: shown(CALM), 60)
+    done = wait(lambda: shown(CALM), 60)
     seconds, sent = time.time() - started, sent_since(before)
     print(f"  calm: {dialed(village)}", flush=True)
     print(f"TIMING weather new prompt: {seconds:.2f}s (budget 0.6 s)", flush=True)
@@ -1008,7 +1127,7 @@ def build_weather():
     before = requests()
     modify(village, "Prompt", STORM)
     started = time.time()
-    done = drive(engine, lambda: shown(STORM) and dialed(village) == storm, 10)
+    done = wait(lambda: shown(STORM) and dialed(village) == storm, 10)
     sent = sent_since(before)
     check("weather: switching back is instant (cached), with 0 requests", done and sent == 0,
           f"{time.time() - started:.2f}s, {sent} requests")
@@ -1061,7 +1180,7 @@ def build_ask_pick():
     users = {key: user(key, tree, plane(key, 1.0), location=(14.0 * i, 0.0, 0.0), Scene=scene, Pick_Prompt=prompt)
              for i, (key, (scene, prompt)) in enumerate(SCENES.items())}
     done = fill("ask_pick answers")
-    if MODEL is None:
+    if MODEL is None or not answering("ask_pick", done):
         return
 
     names = sorted((name for name, *_shape in FURNITURE), key=natsort.sort_key)  # Collection Info's order
@@ -1075,14 +1194,14 @@ def build_ask_pick():
 
 # ------------------------------------------------------------------------------------------------ main
 
-DEMOS = (  # name, builder, the CSV files beside it, the frames evaluated.json records
+DEMOS = (  # name, builder, the CSV files beside it, the frames evaluated.json records, the menu it records them for
     ("life", build_life, ("life_factors.csv", "life_outcomes.csv", "highlife_outcomes.csv", "seeds_outcomes.csv",
-                          "daynight_outcomes.csv", "life_overrides.csv"), range(1, LAST + 1)),
-    ("biome", build_biome, ("biome_factors.csv", "biome_outcomes.csv"), (1,)),
-    ("kitchen", build_kitchen, (), (1,)),
-    ("materials", build_materials, ("material_families.csv",), (1,)),
-    ("weather", build_weather, ("weather_dials.csv",), (1,)),
-    ("ask_pick", build_ask_pick, (), (1,)),
+                          "daynight_outcomes.csv", "life_overrides.csv"), range(1, 33), ("Life", "Rule set", RULE_SETS)),
+    ("biome", build_biome, ("biome_factors.csv", *OUTCOMES.values()), (1,), ("Terrain", "Plant descriptions", OUTCOMES)),
+    ("kitchen", build_kitchen, (), (1,), None),
+    ("materials", build_materials, ("material_families.csv",), (1,), None),
+    ("weather", build_weather, ("weather_dials.csv",), (1,), None),
+    ("ask_pick", build_ask_pick, (), (1,), None),
 )
 
 
@@ -1109,7 +1228,7 @@ def build():
         check("runtime detected", P.runtime_installed(P.runtime_root(prefs)), P.runtime_root(prefs))
     results, started = {}, time.time()
     try:
-        for name, builder, csvs, frames in DEMOS:
+        for name, builder, csvs, frames, menu in DEMOS:
             begun = time.time()
             try:
                 new_file(name, csvs)
@@ -1117,7 +1236,7 @@ def build():
                 if MODEL is not None:
                     whole(name)
                 bpy.ops.wm.save_mainfile()
-                results[name] = record(frames)
+                results[name] = record(frames, menu)
             except Exception:
                 traceback.print_exc()
                 check(f"{name}: built without an error", False)
@@ -1131,30 +1250,52 @@ def build():
 
 
 def noaddon():
-    """Open each demo the build saved, in a Blender without OpenAct: it evaluates to what it did with it (G6)."""
+    """Open each of the six demos the build saved, in a Blender without OpenAct: each evaluates to what it did with it
+    (G6), also with every item of its menu picked by hand. A demo the build didn't record or save fails."""
     print(f"BLENDER {bpy.app.version_string}: demos in {OUT}, without the add-on", flush=True)
-    with open(EVALUATED, encoding="utf-8") as handle:
-        expected = json.load(handle)
-    for name, frames in expected.items():
-        bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, name + ".blend"))
-        kinds = [n.bl_idname for tree in bpy.data.node_groups for n in tree.nodes]
-        check(f"noaddon: {name}: the OpenAct nodes are undefined nodes", "NodeUndefined" in kinds
-              and not any(kind.startswith("GeometryNodeOpenAct") for kind in kinds),
-              f"{kinds.count('NodeUndefined')} undefined")
-        scene, differ = bpy.context.scene, []
-        for frame, objects in sorted(frames.items(), key=lambda item: int(item[0])):
-            scene.frame_set(int(frame))
-            for obj_name, want in objects.items():
-                got = digest(bpy.data.objects[obj_name])
-                if got != want:
-                    differ.append((frame, obj_name, sorted(key for key in got.keys() | want.keys()
-                                                           if got.get(key) != want.get(key))))
-        check(f"noaddon: {name}: evaluates to the same attributes as with the add-on", not differ,
-              f"{len(frames)} frames; differences {differ[:3]}")
+    try:
+        with open(EVALUATED, encoding="utf-8") as handle:
+            expected = json.load(handle)
+    except (OSError, ValueError) as error:
+        print(f"  no record of the build: {error}", flush=True)
+        expected = {}
+    for name, _builder, _csvs, _frames, menu in DEMOS:
+        path = os.path.join(OUT, name + ".blend")
+        if name not in expected or not os.path.isfile(path):
+            check(f"noaddon: {name}: recorded by the build, and saved", False, f"{EVALUATED}, {path}")
+            continue
+        try:
+            bpy.ops.wm.open_mainfile(filepath=path)
+            kinds = [n.bl_idname for tree in bpy.data.node_groups for n in tree.nodes]
+            check(f"noaddon: {name}: the OpenAct nodes are undefined nodes", "NodeUndefined" in kinds
+                  and not any(kind.startswith("GeometryNodeOpenAct") for kind in kinds),
+                  f"{kinds.count('NodeUndefined')} undefined")
+            scene, differ, count = bpy.context.scene, [], 0
+            for item, frames in expected[name].items():
+                if item:
+                    choose(bpy.data.objects[menu[0]], menu[1], item)
+                for frame, objects in frames.items():
+                    scene.frame_set(int(frame))
+                    count += 1
+                    for obj_name, want in objects.items():
+                        obj = bpy.data.objects.get(obj_name)
+                        got = digest(obj) if obj is not None else {"missing": obj_name}
+                        if got != want:
+                            differ.append((item, frame, obj_name, sorted(key for key in got.keys() | want.keys()
+                                                                         if got.get(key) != want.get(key))))
+            check(f"noaddon: {name}: evaluates to the same attributes as with the add-on", count > 0 and not differ,
+                  f"{count} frames; differences {differ[:3]}")
+        except Exception:
+            traceback.print_exc()
+            check(f"noaddon: {name}: opens and evaluates", False)
 
 
-if NOADDON:
-    noaddon()
-else:
-    build()
+try:
+    if NOADDON:
+        noaddon()
+    else:
+        build()
+except Exception:
+    traceback.print_exc()
+    check("no exception", False)
 finish()
