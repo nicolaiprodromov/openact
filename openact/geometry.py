@@ -3,7 +3,7 @@
 attribute_names() feeds the Attributes list source. It reads the object's original data, never the evaluated
 geometry, which holds the modifier stack's output and so this node's own answer (design 6.0). int_values() reads the
 evaluated geometry for the geometry channel: Rules' stamp of the cells in use (design 5.8). read_attributes() is the
-agents hook (design 5.6); v1 itself doesn't use it.
+agents hook (design 5.6); OpenAct itself doesn't use it.
 """
 
 from __future__ import annotations

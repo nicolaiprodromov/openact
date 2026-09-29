@@ -14,7 +14,7 @@ engine.tick() between frames pumps the answers, runs its work between frames and
 - Rules' cells in use (§5.8): a triggered Rules node whose geometry passes through it asks, while the timeline plays,
   each cell as its points first reach it and no other, with no inner.build(), and the pass after stores them;
 - a simulation zone that adds an Ask's Answer to its state each frame, the Ask triggered from frame 3: the answer
-  written at frame 3 is seen at frame 4, and the simulation continues without resetting (REDESIGN 2.5);
+  written at frame 3 is seen at frame 4, and the simulation continues without resetting (§5.5);
 - stale questions: while the model is busy, a node whose words change every frame keeps only its newest question
   queued, dropping the older ones with a new generation, while a For Each Element zone keeps every element's question,
   those it still reports and each new one; once the model is free, only those are asked;
@@ -23,7 +23,7 @@ engine.tick() between frames pumps the answers, runs its work between frames and
 - the budget: the frame handler's cost with nothing new and with a new question (TIMING lines); a For Each Element
   zone that brings 40 new word sets at one frame gets what fits in FRAME_BUDGET planned there and the rest at the
   ticks, which ask them all;
-- renders never ask (§2.6): frames with new words, played while a render job runs or in a background session that
+- renders never ask (§5.5): frames with new words, played while a render job runs or in a background session that
   renders the saved answers, ask and write nothing;
 - the words a background render compares at the frame it renders (§7.8), read through the F-curves with no scene
   evaluation (engine.FrameWords): a keyframed Int modifier input's F-curve is found through the action slot's
@@ -754,7 +754,7 @@ def phase_budget():
 
 
 def phase_render():
-    """Renders never ask (§2.6): an Ask whose Question holds the frame, triggered, played while a render job runs, and
+    """Renders never ask (§5.5): an Ask whose Question holds the frame, triggered, played while a render job runs, and
     in a background session that renders the saved answers only (a farm's blender -b -a)."""
     scene = reset(1, 6)
     tree, gi, go = new_tree("Render")
