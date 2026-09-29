@@ -2,9 +2,10 @@
 
 Checks that itertools.product order equals a C-order ravel, the level and cell index references, the `if` allowed
 sets, cells decided by code, error rows, the 9.5 question text of the worked example, the 9.8 limits, the 9.6
-interpolation reference (hand-computed corners, renormalisation) and the 9.7 dithering probabilities against 100 000
-seeded samples, plus PR-09's three 4.e confidence formulas (specs.base.confidence). The Rules spec's pure part: rows
-carried across Outcomes edits (5.4), the problems a Job shows, and the ask key of code rows.
+interpolation reference (hand-computed corners, renormalisation), the 9.7 dithering probabilities against 100 000
+seeded samples and the 5.8 stamps naming each element's cells, plus PR-09's three 4.e confidence formulas
+(specs.base.confidence). The Rules spec's pure part: rows carried across Outcomes edits (5.4), the problems a Job
+shows, and the ask key of code rows.
 
 Run:  python tests/rules_math_test.py
       blender -b --factory-startup --python tests/rules_math_test.py
@@ -567,6 +568,39 @@ def test_dither():
     check("dither: an unknown category value gives no cell", invalid == ({}, -1), invalid)
 
 
+def test_stamp():
+    """5.8: the stamp each element leaves on the geometry names the cells it reads, One-of's its cell, Yes/No's and
+    Amount's every corner of weight > 0, so the node asks no more and no fewer cells than its elements read."""
+    life = factors_csv("life_factors.csv")
+    got = rc.stamped_cells(life, "ONE_OF", [1, 13, 0, 19, -4]), rc.stamp_limit("ONE_OF", 18)
+    check("stamp: a One-of stamp is 1 + the cell; 0, and a number beyond the table, name none", got == ({0, 12}, 18),
+          got)
+    biome = factors_csv("biome_factors.csv")
+    factors = [flag("lit"), biome[0], biome[1]]
+    stamp = rc.blend_stamp(factors, (True, 0.3, 0.75))
+    check("stamp: a Yes/No element names the 4 corners it blends, the hand-computed ones",
+          rc.stamped_cells(factors, "YES_NO", [stamp]) == {10, 11, 13, 14}, stamp)
+    four = amount("x", 4)
+    got = [rc.stamped_cells([four], "AMOUNT", [rc.blend_stamp([four], [x])]) for x in (0.05, 0.125, 0.5, 0.9, 1.5)]
+    check("stamp: an outer half-band, a band centre or a clamped value names the one corner it reads; between two "
+          "centres, both", got == [{0}, {0}, {1, 2}, {3}, {3}], got)
+    mixed = [amount("a", 3), category("c", (0, 5, 3)), amount("b", 4, (0, 0.1, 0.5, 0.8, 1)), flag("f"),
+             amount("d", 2), amount("e", 3)]
+    rng, wrong = random.Random(11), []
+    for _ in range(500):
+        values = [rng.uniform(-0.2, 1.2), rng.choice((0, 5, 3, 4)), rng.uniform(-0.2, 1.2), rng.random() < 0.5,
+                  rng.random(), rng.random()]
+        want = {cell for cell, weight in rc.corners(mixed, values) if weight > 0}
+        got = rc.stamped_cells(mixed, "YES_NO", [rc.blend_stamp(mixed, values)])
+        if got != want:
+            wrong.append((values, got, want))
+    check("stamp: 500 random elements over 3 interpolated factors, a 4th Amount factor at its band and an unknown "
+          "category value each name exactly their corners of weight > 0", not wrong, wrong[:2])
+    got = rc.stamped_cells(factors, "YES_NO", [0, -3, 1 + 3, 1 + 16, 1 + 64 * 18]), rc.stamp_limit("YES_NO", 18)
+    check("stamp: numbers no Yes/No stamp of these factors can be name no cell (no corner weighs, bits of a third "
+          "axis, a corner beyond the table)", got == (set(), 18 * 64), got)
+
+
 RULES = RulesSpec()
 GN = (GOL_QUESTION, GOL_CONTEXT, "life_factors.csv", "life_edit.csv", "", "")
 GOL_ROWS = {  # Outcomes rows by name, for the edits below
@@ -641,6 +675,42 @@ def test_outcome_edits():
     _moved, asked, wrong = life_edit(moved, [old], old.words_key)
     check("outcome edits: without the names its rows are never carried into another outcome order; the cells are "
           "asked again", asked == 18 and not wrong, (asked, wrong))
+
+
+def test_partial_table():
+    """5.4: a stored table so far that its context showed last resolves to itself while none of its missing cells has
+    an answer or has failed: the table and missing cells a full resolve gives, which for a Rules table of its cells
+    in use (5.8) costs most of an idle pass. An answer that lands, or a failure, resolves it again."""
+    from openact.specs import base
+
+    edited = answers("partial.csv", "answer,when,if,alive\n" + "\n".join(
+        GOL_ROWS[n] for n in ("Birth", "Stays empty", "Survives", "Dies")) + "\n")
+    job = RULES.job(("Where does this cell go?",) + GN[1:], factors_csv("life_factors.csv"), edited, "ONE_OF", True,
+                    ["f", edited.doc.text_hash], "u")
+    for row in job.rows[:4]:
+        pipeline.remember(row.cell.key, {"model": "m", "probabilities": [0.9, 0.1]})
+    stored = RULES.resolve(job, [], "", partial=True)[0]
+    again, missing, failed = RULES.resolve(job, [stored], stored.words_key, partial=True)
+    real, base._still_missing = base._still_missing, lambda _job, _entry: None
+    try:
+        full, full_missing, _failed = RULES.resolve(job, [stored], stored.words_key, partial=True)
+    finally:
+        base._still_missing = real
+    check("partial table: a stored table so far that its context showed last resolves to itself, missing the cells a "
+          "full resolve misses, and equal to the table it builds",
+          again is stored and stored.rows.src == "m" * 4 + "p" * 14 and not failed
+          and [cell.key for cell in missing] == [cell.key for cell in full_missing] == [
+              row.cell.key for row in job.rows[4:]] and dataclasses.replace(full, t=stored.t) == stored)
+    pipeline.remember(job.rows[5].cell.key, {"model": "m", "probabilities": [0.2, 0.8]})
+    landed, missing, _failed = RULES.resolve(job, [stored], stored.words_key, partial=True)
+    pipeline.FAILED[job.rows[6].cell.key] = "the model failed"
+    try:
+        failure = RULES.resolve(job, [landed], landed.words_key, partial=True)
+    finally:
+        del pipeline.FAILED[job.rows[6].cell.key]
+    check("partial table: an answer that lands resolves it again, and so does a failure",
+          landed is not stored and landed.rows.src == "m" * 4 + "pm" + "p" * 12 and len(missing) == 13
+          and failure[0] is not landed and failure[2] == ["the model failed"], (landed.rows.src, failure[2]))
 
 
 def test_problems():
@@ -751,7 +821,9 @@ test_limits()
 test_interpolation()
 test_renormalisation()
 test_dither()
+test_stamp()
 test_outcome_edits()
+test_partial_table()
 test_problems()
 test_code_asks()
 test_one_definition()

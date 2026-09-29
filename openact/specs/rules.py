@@ -1,6 +1,7 @@
 """Rules: each measured situation (§6.5, §9). One question per cell, a combination of factor levels; Geometry Nodes
 finds each element's cell from its factor sockets and reads that cell's row: the Outcome and its payload (One-of,
-optionally dithered), or Probability / Amount blended over up to 3 Amount factors (Yes/No, Amount).
+optionally dithered), or Probability / Amount blended over up to 3 Amount factors (Yes/No, Amount). It stamps the
+cells each element reads on the geometry passing through, so the pass asks only the cells in use (§5.8).
 
 The maths is rules_core's, which stays pure; this module turns it into Jobs, entries and the inner graph. Pure when
 imported: the methods that read a node import the evaluator, and with it bpy.
@@ -304,12 +305,38 @@ class RulesSpec(Spec):
         return {"Confidence": sum(row.values["c"] for row in rows) / len(rows) if rows else 0.0}
 
     def summary(self, entry):
+        """E.g. "18 cells · 0 unsure"; a table asked only where its elements read (§5.8) says how many are answered."""
         src, confidences, below = entry.rows.src, entry.rows.v.get("c", []), unsure_below()
         unsure = sum(1 for s, c in zip(src, confidences) if s == "m" and c < below)
-        text = f"{len(src)} cells · {unsure} unsure"
+        known = len(src) - src.count("p") - src.count("s")
+        text = f"{len(src)} cells" if known == len(src) else f"{known} of {len(src)} cells answered"
+        text += f" · {unsure} unsure"
         if "e" in src:
             text += f" · {src.count('e')} with no outcome"
         return text
+
+    def unanswered(self, job):
+        """The table so far of a job nothing of which is known yet, every row pending with neutral() values (§5.4).
+        The pass shows it while it reads the cells in use from the geometry (§5.8), so that the graph lays out the
+        job's factors and stamps their cells before any is asked."""
+        return self.entry(job, self.stale(job, list(job.rows), None))
+
+    # ------------------------------------------------------------------ the cells in use (§5.8)
+
+    def stamped(self, node, job, values):
+        """The rows of the job's cells that elements stamped with `values` read: values, an np.intc array, the stamp of
+        each evaluated element (build()). None when the graph that stamped them was laid out for another interface or
+        factor layout than the job's (inner.built_for()), as its numbers then name other cells."""
+        import numpy
+
+        from ..inner import built_for  # imports bpy
+
+        if not built_for(node, _layout(job.shape.factors)):
+            return None
+        limit = rules_core.stamp_limit(job.answer_type, len(job.rows))
+        values = values[(values > 0) & (values <= limit)]  # 0 names no cell, and nor does a number beyond the stamps
+        distinct = numpy.flatnonzero(numpy.bincount(values)).tolist()  # 9x faster than numpy.unique on 4.5, 100k
+        return rules_core.stamped_cells([factor_of(f) for f in job.shape.factors], job.answer_type, distinct)
 
     # ------------------------------------------------------------------ the table object
 
@@ -361,17 +388,22 @@ class RulesSpec(Spec):
     # ------------------------------------------------------------------ the graph
 
     def build(self, b, gi, go, entries):
+        """The graph of the reference layout, which also stamps each element's cells on the geometry passing through
+        (§5.8): One-of's stamp is 1 + the cell its outputs read, 0 for none; Yes/No's and Amount's name its corners
+        (_Graph.blend()). With no layout, every element's stamp is 0: the pass lays one out before it reads them."""
         mode = _mode(b.tree)
         reference = _reference(b.tree, entries, mode)
         if reference is None:
             if mode == 'ONE_OF':  # nothing answered for these factors: every element reads the fallbacks
                 b.index = _node(b, "FunctionNodeInputInt", -300, -700, integer=-1).outputs[0]
+            b.stamp(0)
             return
         graph = _Graph(b, gi, go, reference)
         if mode == 'ONE_OF':
             b.index = graph.one_of()
+            b.stamp(_int(b, 'ADD', 350, 1000, b.index, 1))
         else:
-            graph.blend(mode)
+            b.stamp(graph.blend(mode))
 
 
 # ---------------------------------------------------------------------- the interface and the reference entry
@@ -504,7 +536,8 @@ def _and(b, first, second, x, y):
 
 class _Graph:
     """The per-element graph of one reference shape: level indices (§9.2), the cell index (§9.3), dithering
-    (§9.7) and the corner blend (§9.6). rules_core holds the Python reference of each."""
+    (§9.7), the corner blend (§9.6) and the stamp of the cells each element reads (§5.8). rules_core holds the
+    Python reference of each."""
 
     def __init__(self, b, gi, go, reference):
         from ..inner import LEAD  # imports bpy
@@ -631,17 +664,23 @@ class _Graph:
     def blend(self, mode):
         """Yes/No and Amount (§9.6): the 2^Ka corner rows weighted by w * ok and renormalised; the fallbacks when
         a category value matches no level, no entry is found (its count reads 0), or the answered corners weigh
-        <= 1e-6. The entry's cell rows start at the row after its header row."""
+        <= 1e-6. The entry's cell rows start at the row after its header row. Returns each element's stamp (§5.8,
+        rules_core.blend_stamp()): 1 + its lower corner's cell * STAMP_CORNERS, plus two bits per interpolated factor
+        where one of its levels weighs nothing, or 0 where a category value matches no level. It reads no entry: it
+        names the cells an entry is to hold."""
         b, go = self.b, self.go
         interpolated = rules_core.interpolated_factors(self.factors)
-        valid, flat = _cmp(b, 'INT', 'GREATER_THAN', b.count(), 0, 300, 150), b.first()
+        valid, cell, known = _cmp(b, 'INT', 'GREATER_THAN', b.count(), 0, 300, 150), 0, None
         for j in range(len(self.factors)):
             if j not in interpolated:
                 level, ok = self.level(j)
-                flat = _int(b, 'MULTIPLY_ADD', 450, -300 * j, level, self.steps[j], flat)
+                cell = _int(b, 'MULTIPLY_ADD', 450, -300 * j, level, self.steps[j], cell)
                 valid = _and(b, valid, ok, 450, -300 * j - 100)
+                known = _and(b, known, ok, 450, -300 * j - 150)
+        flat = b.first() if isinstance(cell, int) else _int(b, 'ADD', 450, 150, b.first(), cell)
         corners = [(flat, None)]  # (flat row, weight; None = 1), s in itertools.product order
-        for j in interpolated:
+        lower, skips = cell, 1  # the stamp: the lower corner's cell, and 1 + the bits of the levels that weigh nothing
+        for a, j in enumerate(interpolated):
             b0, t = self.axis(j)
             b1 = b0 + 1 if isinstance(b0, int) else _int(b, 'ADD', 200, -300 * j, b0, 1)
             rest = _math(b, 'SUBTRACT', 200, -300 * j - 100, 1.0, t)
@@ -652,6 +691,10 @@ class _Graph:
                     grown.append((row, share if weight is None else _math(b, 'MULTIPLY', 750, -120 * len(grown),
                                                                          weight, share)))
             corners = grown
+            lower = _int(b, 'MULTIPLY_ADD', 1300, 900 + 150 * a, b0, self.steps[j], lower)
+            for bit, (operation, edge) in enumerate((('LESS_EQUAL', 0.0), ('GREATER_EQUAL', 1.0))):  # t = 0, t = 1
+                weightless = _cmp(b, 'FLOAT', operation, t, edge, 1300, 950 + 150 * a + 40 * bit)
+                skips = _int(b, 'MULTIPLY_ADD', 1450, 950 + 150 * a + 40 * bit, weightless, (1 + bit) << 2 * a, skips)
         geometry, value = b.table_geometry(), rules_core.value_column(mode)
         attributes = {name: b.attribute(name, 'FLOAT', 900, 400 - 100 * i) for i, name in enumerate((value, "c", "ok"))}
         total = numerator = confidence_sum = None
@@ -672,3 +715,5 @@ class _Graph:
                go.inputs["Confidence"])
         if mode == 'YES_NO':
             b.link(_cmp(b, 'FLOAT', 'GREATER_EQUAL', result, 0.5, 2050, 100), go.inputs["Yes"])
+        stamp = _int(b, 'MULTIPLY_ADD', 1600, 900, lower, rules_core.STAMP_CORNERS, skips)
+        return stamp if known is None else _switch(b, 'INT', known, 0, stamp, 1750, 900)

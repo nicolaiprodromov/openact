@@ -80,8 +80,9 @@ method of **SemIf** (formerly OpenJev, MIT), running **Qwen3.5-4B** (Apache-2.0)
 | **Classify** | each item of a list | one of several labels | Question (optional), Context, the list, Labels | per element **Label** (its row), **Confidence**, the Labels CSV's payload |
 | **Rules** | each measured situation | One of, Yes/No or Amount | Question, Context, Factors, Outcomes, and one field input per factor | per element: One of gives **Outcome** (its row) and the Outcomes CSV's payload, Yes/No **Probability** and **Yes**, Amount **Amount**; and **Confidence** |
 
-Every node starts with the same three sockets. **Geometry**, in and out, passes the geometry through unchanged, so a
-node can sit on the geometry's path. **Trigger**, a Boolean without a checkbox, decides when the node may ask the
+Every node starts with the same three sockets. **Geometry**, in and out, passes the geometry through, so a node can
+sit on the geometry's path; a Rules node that your geometry passes through asks only the cells your elements are in
+([below](#working-with-the-nodes)). **Trigger**, a Boolean without a checkbox, decides when the node may ask the
 model: when it is on ([below](#when-a-node-asks-the-trigger)). Unlinked, it is off, and the node never asks; it still
 outputs the answers it has. Any value converts: a number above 0, a vector that isn't zero or a colour lighter than
 black is on. Files saved by OpenAct 1.0 get these sockets when they open, with their links, and keep their answers;
@@ -115,6 +116,7 @@ sets of words the evaluation reported:
 | *Trigger off: 3 answers missing* | The Trigger is linked, but was off at the last evaluation. |
 | *Not evaluated: 3 answers missing* | No evaluation used the node: its outputs lead nowhere, its object is disabled in the viewport, or no modifier uses its tree. |
 | *Filling 12/50 · ~2 s* | Asking; the answers so far show, older ones meanwhile for rows being asked again. |
+| *4 of 8 cells answered · 0 unsure* | A Rules node your geometry passes through has the answers of every cell your elements are in; it asks another cell when an element first lands in it. |
 | *Its Question is read when the node evaluates* | The words come from nodes only Geometry Nodes can compute, and nothing evaluates the node yet. |
 
 ### Working with the nodes
@@ -130,6 +132,13 @@ sets of words the evaluation reported:
 - **One table per set of words.** A tree used by any number of objects, with words from each modifier, keeps one set
   of answers per object. The node also keeps the answers of up to 1024 sets of words no object uses now, within
   2 MB, so switching back to them is instant. A triggered node asks only for the rows whose words have no answer yet.
+- **Rules: pass your geometry through the node** to ask only the cells your elements are in. Link the geometry into
+  the node's Geometry input and its Geometry output on towards the modifier's result, as you would a Store Named
+  Attribute's. The node marks each element's cells on that geometry (a hidden attribute, `.openact_cell_` and the
+  node's id), and asks each cell when an element first lands in it: cells nothing is in are never asked. A new node
+  asks one evaluation after its Trigger turns on, once it has laid out its factors. Without the pass-through it asks
+  every cell. Put it after nodes that interpolate attributes, such as Subdivide, and realize instances before it,
+  since it doesn't look into instances.
 - **Lists** (Pick, Match, Classify) come from the node's dropdown: **Text or CSV** (inline items or a `.csv` path),
   **Collection** (its children, in the order Collection Info gives them with *Separate Children*), **Materials** (an
   object's material slots, so ID = material index) or **Attributes** (the attribute names of an object's own mesh,
@@ -262,7 +271,8 @@ wood,"planks, bark and furniture timber",0.6,0
 | `from`, `to` | `amount`, optional: the band's edges within 0-1; equal bands by default |
 
 A Rules node has 1-8 factors and at most 4096 cells, the product of their level counts. It asks one question per
-cell, and each element reads its cell through the factor inputs. An Outcomes `if` names the cells an outcome applies
+cell (only per cell your elements are in, when your geometry passes through it), and each element reads its cell
+through the factor inputs. An Outcomes `if` names the cells an outcome applies
 to: `factor=level` or `factor!=level` clauses, `|` between alternative levels and `;` between clauses that must all
 hold, e.g. `state=alive; neighbours=2|3`. A cell that allows one outcome gets it without asking, and a cell that
 allows none is an error. Yes/No and Amount blend between the band centres of up to 3 Amount factors; One of can mix

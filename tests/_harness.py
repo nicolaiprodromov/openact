@@ -59,8 +59,10 @@ def drive(engine, done, timeout):
 
 def trigger(node, on=True):
     """Link a Boolean node set to `on` into the node's Trigger, so it asks for what it misses (§6.0), and, when none of
-    the node's outputs is linked, pass its tree's geometry through it into the Group Output: an unused node is not
-    evaluated, so it reports nothing and never asks. Returns the Boolean node, whose `boolean` turns it off."""
+    the node's outputs is linked, put it on its tree's geometry path into the Group Output: an unused node is not
+    evaluated, so it reports nothing and never asks. The geometry passes through the node; a Rules node's Confidence
+    is stored on it instead, as its geometry passing through would make it ask only the cells its elements read
+    (§5.8). Returns the Boolean node, whose `boolean` turns it off."""
     tree = node.id_data
     switch = tree.nodes.new("FunctionNodeInputBool")
     switch.boolean = on
@@ -75,6 +77,10 @@ def trigger(node, on=True):
                 gi = next((n for n in tree.nodes if n.bl_idname == "NodeGroupInput"), None)
                 gi = gi or tree.nodes.new("NodeGroupInput")
                 source = next((s for s in gi.outputs if s.type == 'GEOMETRY'), None)
+            if node.bl_idname == "GeometryNodeOpenActRules":
+                geometry = source or tree.nodes.new("GeometryNodePoints").outputs[0]
+                tree.links.new(store(tree, geometry, node.outputs["Confidence"], "evaluated", 'FLOAT'), target)
+                return switch
             if source is not None:
                 tree.links.new(source, node.inputs["Geometry"])
             tree.links.new(node.outputs["Geometry"], target)

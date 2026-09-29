@@ -35,6 +35,10 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
   few milliseconds of Blender's time per frame at most. Meanwhile the node keeps showing what it showed last. The
   answers are stored once playback stops, or when the file is saved; simulations continue without resetting. Renders
   still never ask: bake simulations before final renders.
+- A Rules node that your geometry passes through asks only the cells your elements are in, each when an element
+  first lands in it, instead of its whole table: it marks each element's cells on the geometry as a hidden attribute.
+  Its status then says how many cells are answered, e.g. *4 of 8 cells answered · 0 unsure*. Without the geometry
+  passing through, it asks every cell as before. Groups laid out before are rebuilt on their first pass.
 
 ## 1.0.0
 

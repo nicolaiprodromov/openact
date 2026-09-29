@@ -250,9 +250,13 @@ def first(node):
 
 def passes(node):
     """True when the node's inner group feeds its Geometry output from its Geometry input, through the Warning's
-    gate (§5.7)."""
-    return any(name == "Geometry" and source.node.bl_idname == "NodeGroupInput" and source.name == "Geometry"
-               for name, source in inner._feeds(node.node_tree))
+    gate (§5.7) and, on Rules, the stamp of each element's cells (§5.8)."""
+    for name, source in inner._feeds(node.node_tree):
+        while source.node.bl_idname == "GeometryNodeStoreNamedAttribute" and source.node.inputs["Geometry"].is_linked:
+            source = source.node.inputs["Geometry"].links[0].from_socket
+        if name == "Geometry" and source.node.bl_idname == "NodeGroupInput" and source.name == "Geometry":
+            return True
+    return False
 
 
 def passing_tree(name):

@@ -7,9 +7,9 @@ of the node's live words by their hash, Hash Value of the key text, among the he
 Statistic, §8.2), reads its single values at that row (§8.6) and its per-element rows after it
 (§8.3), so one tree answers every context that uses it, with no Python at evaluation. A new entry
 is new rows, never a graph edit: the graph depends only on the layout (_built(), §8.8). Every group
-passes its Geometry input to its Geometry output unchanged (§6.0), and reports its uid, Trigger and
-live words through one Warning node (§5.7). The interface is never cleared: sync_interface() diffs
-it, so the links from the outer tree survive every rebuild.
+passes its Geometry input to its Geometry output (§6.0), Rules' stamping each element's cells on it
+(§5.8), and reports its uid, Trigger and live words through one Warning node (§5.7). The interface is
+never cleared: sync_interface() diffs it, so the links from the outer tree survive every rebuild.
 """
 
 from __future__ import annotations
@@ -27,11 +27,12 @@ from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
 BUILT = "openact_built"  # ID property of the group: the layout build() laid out (_built()), for update_values()
-LAYOUT = 4  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
+LAYOUT = 5  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
 UNLINKED = -2**31 + 1  # an unlinked ID's hidden value, read as the index (_Builder.ident()); no float converts to it
 GEOMETRY = "Geometry"  # the input and output every node passes its geometry through (§6.0)
 TRIGGER = "Trigger"  # the input whose state the Warning reports (§5.7)
 UID = "OpenAct uid"  # the String node holding the uid the Warning reports: update_values() rewrites it for a copy
+CELL = ".openact_cell_"  # + the uid: the hidden point attribute Rules stamps each element's cells in (§5.8)
 GATES = {'VALUE': 'FLOAT', 'INT': 'INT', 'BOOLEAN': 'BOOLEAN', 'STRING': 'STRING', 'GEOMETRY': 'GEOMETRY',
          'MATERIAL': 'MATERIAL'}  # output socket type -> the input_type of the Switch it is read through (gate())
 _PACK = {'FLOAT': 'd', 'INT': 'q', 'BOOLEAN': 'B'}  # array codes the rows are digested with (_digest())
@@ -101,6 +102,8 @@ class _Builder:
         self.node = None  # the OpenAct node (build() sets it), for a spec that reads its own sockets or outputs
         self.table = None  # the node's table object (build() sets it)
         self.index = None  # what per_element() reads at: None for the ID input; Rules sets its cell index
+        self.through = None  # (Group Input Geometry, Group Output Geometry) once pass_through() linked them
+        self.uid = None  # the String node UID's output, which warning() lays out
         self._info = None  # the group's one Object Info, table_geometry()
         self._ident = None  # the ID as the lookups read it, ident()
         self._first = None  # row + 1, the entry's first element row, first()
@@ -115,13 +118,38 @@ class _Builder:
         return self.tree.links.new(a, b)
 
     def pass_through(self, gi, go):
-        """Every node's Geometry input to its Geometry output, unchanged (§6.0). Found by name and type, as a CSV
-        companion is Geometry too; an interface without them (saved before them, until the pass adds them) passes
-        nothing."""
+        """Every node's Geometry input to its Geometry output (§6.0), kept as self.through for stamp(). Found by name
+        and type, as a CSV companion is Geometry too; an interface without them (saved before them, until the pass
+        adds them) passes nothing."""
         found = [next((s for s in sockets if s.name == GEOMETRY and s.type == 'GEOMETRY'), None)
                  for sockets in (gi.outputs, go.inputs)]
         if None not in found:
             self.link(*found)
+            self.through = tuple(found)
+
+    def stamp(self, value):
+        """Store `value`, an Int socket or a number, on each point of the geometry passing through, as the hidden
+        attribute CELL + uid (§5.8): Rules' cells of each element, which Python reads from the evaluated objects after
+        the evaluation (engine.in_use()). The name joins CELL and the String node UID, so a copy's group stamps its
+        own uid once update_values() rewrites it there. Nothing is stamped without Geometry sockets."""
+        if self.through is None:
+            return
+        source, target = self.through
+        prefix = self.new("FunctionNodeInputString", 200, 1150)
+        prefix.string, prefix.hide = CELL, True
+        name = self.new("GeometryNodeStringJoin", 350, 1100)
+        name.hide = True
+        for item in (self.uid, prefix.outputs[0]):  # Join Strings puts the most recently linked item first
+            self.link(item, name.inputs["Strings"])
+        stored = self.new("GeometryNodeStoreNamedAttribute", 500, 1100)
+        stored.data_type, stored.domain = 'INT', 'POINT'
+        self.link(source, stored.inputs["Geometry"])
+        self.link(name.outputs[0], stored.inputs["Name"])
+        if isinstance(value, int):
+            _enabled(stored.inputs, "Value").default_value = value
+        else:
+            self.link(value, _enabled(stored.inputs, "Value"))
+        self.link(stored.outputs["Geometry"], target)  # in place of the pass-through link: an input takes one
 
     def words(self, gi, names):
         """The Group Input sockets of the node's word tuple, in order, None where the interface has no such
@@ -160,10 +188,11 @@ class _Builder:
     def warning(self, gi, uid):
         """The Warning channel (§5.7): one INFO Warning whose message is words.message(uid, trigger, words),
         "OpenAct <uid> <0|1> <key text>", which the modifier lists after each evaluation that evaluates the node
-        (gate()). The uid is the String node UID; "1" comes from a String Switch on the Trigger, so Blender's
-        implicit conversion into its Bool socket decides what is on."""
+        (gate()). The uid is the String node UID, kept as self.uid for stamp(); "1" comes from a String Switch on
+        the Trigger, so Blender's implicit conversion into its Bool socket decides what is on."""
         mark, ident = self.new("FunctionNodeInputString", -250, 1000), self.new("FunctionNodeInputString", -250, 950)
         mark.string, ident.name, ident.string = words.MARK, UID, uid
+        self.uid = ident.outputs[0]
         switch = self.new("GeometryNodeSwitch", -250, 900)
         switch.input_type = 'STRING'
         sock(switch.inputs, "False").default_value, sock(switch.inputs, "True").default_value = "0", "1"
@@ -485,6 +514,13 @@ def append_entry(node, entry) -> bool:
     _blocks(block, [entry], _headers(node, [entry], singles, layout), singles, columns)
     tables.append_rows(node, block)
     return True
+
+
+def built_for(node, layout) -> bool:
+    """True when the group was laid out for the node as it is and for the spec layout `layout` (_built(), §8.8), so
+    what its evaluations compute follows them: Rules' stamp numbers the cells of that factor layout (§5.8)."""
+    tree = node.node_tree
+    return tree is not None and tree.get(BUILT) == _built(node, _columns(node), _singles(node), layout)
 
 
 def set_default(node, words_key, store=None):

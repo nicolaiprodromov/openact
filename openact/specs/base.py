@@ -159,6 +159,22 @@ def complete(entry) -> bool:
     return not {"p", "s"} & set(entry.rows.src)
 
 
+def _still_missing(job, entry):
+    """The cells of the job's pending and stale rows in a stored table so far of its words key, when none of them has
+    been answered or has failed since: Spec.resolve() would then build that same table again, which for a table of
+    thousands of rows costs most of an idle pass. None otherwise."""
+    if len(entry.rows.src) != len(job.rows):
+        return None
+    missing = []
+    for row, src in zip(job.rows, entry.rows.src):
+        if src not in "ps":
+            continue
+        if row.cell is None or row.cell.key in pipeline.MEMORY or row.cell.key in pipeline.FAILED:
+            return None
+        missing.append(row.cell)
+    return missing
+
+
 def table_of(job, entry=None) -> list[tuple[str, dict]]:
     """(source, values) of each row of a context's table, as the table view, Show Question and the Overrides CSV show
     it. From the entry it shows: row by row while the entry has the plan's words key, else from the entry's row with
@@ -263,6 +279,10 @@ class Spec:
         found = next((entry for entry in entries if entry.gn == job.gn), None)
         if found is not None and found.words_key == job.words_key and complete(found):
             return found, [], []
+        if partial and found is not None and found.words_key == job.words_key == last_shown:
+            waiting = _still_missing(job, found)
+            if waiting is not None:  # the table so far as stored, e.g. a Rules table of its cells in use (§5.8)
+                return found, waiting, []
         shown = next((entry for entry in entries if entry.words_key == last_shown), None) if last_shown else None
         sources = [entry for entry in (found, shown) if entry is not None]
         carried = {}

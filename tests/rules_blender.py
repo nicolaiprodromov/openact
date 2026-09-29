@@ -4,11 +4,13 @@ the store (the cell index for every combination, interpolation, renormalisation 
 references), and a rebuild with the CSV files deleted must leave every output unchanged. A Factors CSV edit that
 keeps every row rebuilds the graph for the new factors, and a payload header of any length builds. Outcomes edits
 keep the table (§5.4), the status shows the plan's problems (§17.1), contexts must agree on the factors (§6.0), and
-only the pass writes the interface: not a draw, and again after an undo. In background mode without the opt-in a
-pass neither plans again nor re-bakes from files and prints each changed CSV once under the path as written, also in
-a moved project, and so does a background render for each frame it renders (§7.8); a render job starts no pass, and
-Ask Again refuses while either holds the tables; a file reopened with a CSV edited meanwhile re-bakes, and its status
-notes the file (R23).
+only the pass writes the interface: not a draw, and again after an undo. A node whose geometry passes through asks
+only the cells its points read, stamped on that geometry (§5.8), whose reading and stamping costs are measured at
+10k and 100k points; the other phases' nodes ask every cell until they wire the geometry through. In background mode
+without the opt-in a pass neither plans again nor re-bakes from files and prints each changed CSV once under the path
+as written, also in a moved project, and so does a background render for each frame it renders (§7.8); a render job
+starts no pass, and Ask Again refuses while either holds the tables; a file reopened with a CSV edited meanwhile
+re-bakes, and its status notes the file (R23).
 
 With -- --model PORT GPU, the real model answers the Game of Life rule sets (18/18 exact, 0 unsure each).
 
@@ -27,6 +29,7 @@ import tempfile
 import time
 
 import bpy
+import numpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import ROOT, check, drive, enable_addon, finish, store, trigger  # noqa: E402
@@ -41,7 +44,7 @@ else:
 
     P._Defaults.auto_start = False  # nothing here may start a model server
     nodes.register()
-from openact import csvfmt, evaluator, inner, ops, pipeline, server, tables  # noqa: E402
+from openact import csvfmt, evaluator, geometry, inner, ops, pipeline, server, tables  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
 from openact import store as S  # noqa: E402
 from openact.specs import rules as R  # noqa: E402
@@ -70,8 +73,9 @@ def enabled(sockets, name):
 
 
 def scene(name, factors, outcomes, values, answer_type='ONE_OF', question="", context=""):
-    """A tree with a Rules node, used by an object whose points carry the factor values as in_<factor>. The geometry
-    passes through the node, whose Trigger is on, so it asks (§6.0)."""
+    """A tree with a Rules node, used by an object whose points carry the factor values as in_<factor>. Its Trigger is
+    on, so it asks (§6.0), and the geometry bypasses it (_harness.trigger()): it asks every cell it misses until wire()
+    passes the geometry through it, from when on it asks only the cells its points read (§5.8)."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -666,7 +670,8 @@ def phase_status():
 
 def shared_scene(name, words, values):
     """A tree whose Rules node takes these words from the modifier (word -> one text per object), used by one
-    object per item of values (its point attributes). The geometry passes through the node, whose Trigger is on."""
+    object per item of values (its point attributes). Its Trigger is on, and the geometry bypasses it, as in
+    scene()."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     for word in words:
@@ -911,8 +916,9 @@ def phase_writes():
     old_defs, old_entries = SPEC.interface(rules), rules.entries
     write("undo_factors.csv", TWO_FACTORS)
     csvfmt.clear_cache()
-    answer_cells(planned(rules), lambda name: 0 if name.startswith("cold") else 1)
-    wire_inputs(tree, rules)  # the new wind socket
+    planned(rules)  # the wind socket appears; the geometry passes through, so the graph lays out the factors first
+    wire_inputs(tree, rules)
+    answer_cells(planned(rules), lambda name: 0 if name.startswith("cold") else 1)  # the cells the points read (§5.8)
     planned(rules)
     two = (factor_names(rules), read(obj, ["Outcome"])["Outcome"])
     inner.sync_interface(rules, old_defs)  # what an undo restores; the plans are Python state and stay
@@ -923,6 +929,235 @@ def phase_writes():
     check("writes: after an undo the next pass gives the node its sockets back and the outputs return, 0 requests",
           two == (["heat", "wind"], [0, 1]) and not asked and got == two, (two, len(asked), got))
     bpy.utils.unregister_class(_PollProbe)
+
+
+# --------------------------------------------------------------------------- the cells in use (§5.8)
+
+IN_USE = ("factor,kind,level,value,when\nheat,amount,cold,,Cold.\nheat,amount,mild,,Mild.\nheat,amount,warm,,Warm.\n"
+          "heat,amount,hot,,Hot.\nlit,flag,dark,0,Dark.\nlit,flag,bright,1,Bright.\n")  # 8 cells: 2 * heat + lit
+
+
+def asked_of(asked):
+    """(row, Row) of each cell a pass asked: asked holds (Job, missing cells), as passed() gives them."""
+    for job, missing in asked:
+        keys = {cell.key for cell in missing}
+        yield from ((i, row) for i, row in enumerate(job.rows) if row.cell is not None and row.cell.key in keys)
+
+
+def asked_rows(asked):
+    return sorted(i for i, _row in asked_of(asked))
+
+
+def asked_names(asked):
+    return sorted(row.name for _i, row in asked_of(asked))
+
+
+def answer_asked(asked, value):
+    """Remember an answer for each cell the pass asked, and for no other: value(row name) is the row of the winning
+    One-of option."""
+    for _i, row in asked_of(asked):
+        pipeline.remember(row.cell.key, {"model": "fake", "probabilities": [
+            0.9 if int(key) == value(row.name) else 0.1 for key in row.cell.question["criteria"]]})
+
+
+def stamp_of(obj, rules):
+    """The node's stamp on each point of the evaluated object, None when it carries none (§5.8)."""
+    values = geometry.int_values(obj, inner.CELL + rules.uid, bpy.context.evaluated_depsgraph_get())
+    return None if values is None else values.tolist()
+
+
+def moved(obj, name, values):
+    """Give the points' attribute `name` new values, as an edit of the scene does."""
+    obj.data.attributes[name].data.foreach_set("value", values)
+    obj.data.update()
+    obj.update_tag()
+
+
+def phase_in_use():
+    """§5.8: a triggered Rules node whose geometry passes through to the modifier's output asks only the cells its
+    points read, which its group stamps on that geometry as a hidden attribute named after the node: none until its
+    graph lays out the factors, then the one cell of its unlinked factors, each cell a point moves into, the cells in
+    use again after Ask Again, and every missing cell once its geometry no longer reaches the output. The table
+    stays partial, and the status counts the cells answered. One-of with Dither asks the cells its points' outcomes
+    read, and a Yes/No node the corners its points blend."""
+    path = write("in_use_factors.csv", IN_USE)
+    points = {"in_heat": ('FLOAT', [0.1, 0.1, 0.6, 0.6]), "in_lit": ('BOOLEAN', [False, False, True, True])}
+    tree, rules, obj, gi, go = scene("InUse", path, "A: the first; B: the second", points, question="Which one?")
+    wire(tree, rules, gi, go, ["Outcome"])  # the geometry through the node, whose factor sockets aren't there yet
+
+    def outcome(name):  # A for the dark cells, B for the bright ones
+        return 0 if name.endswith("dark") else 1
+
+    asked = passed(rules)
+    entries = S.load(rules).entries
+    check("in use: the first pass asks nothing and stores the table with nothing answered, so the graph lays out the "
+          "factors, whose cells it stamps: 1 + cell 0 on each point, their factors unlinked",
+          not asked and [entry.rows.src for entry in entries] == ["p" * 8] and stamp_of(obj, rules) == [1] * 4,
+          (asked_names(asked), [entry.rows.src for entry in entries], stamp_of(obj, rules)))
+    asked = passed(rules)
+    check("in use: the next pass asks only the cell the points read, cold|dark", asked_names(asked) == ["cold|dark"],
+          asked_names(asked))
+    answer_asked(asked, outcome)
+    passed(rules)
+    status = engine.STATUS[rules.uid]
+    check("in use: its cell in use answered, the node is complete, and says how many of its cells are answered",
+          (status.icon, status.text, status.pending) == ('CHECKMARK', "1 of 8 cells answered · 0 unsure", 7),
+          (status.icon, status.text, status.pending))
+    name = inner.CELL + rules.uid
+    evaluated = [a.name for a in obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).data.attributes]
+    check("in use: the stamp is a hidden point attribute named after the node, on the evaluated geometry only, so "
+          "the Attributes list never shows it", name == f".openact_cell_{rules.uid}" and len(name.encode()) < 64
+          and name in evaluated and name not in obj.data.attributes and name not in geometry.attribute_names(obj),
+          (name, evaluated))
+
+    wire_inputs(tree, rules)  # the points' own heat and lit
+    asked = passed(rules)
+    answer_asked(asked, outcome)
+    passed(rules)
+    got = read(obj, ["Outcome"])["Outcome"]
+    check("in use: its factors linked to the points' attributes, the next pass asks just the cell that came into use, "
+          "warm|bright, and every point reads its answer",
+          asked_names(asked) == ["warm|bright"] and got == [0, 0, 1, 1], (asked_names(asked), got))
+    moved(obj, "in_heat", [0.1, 0.35, 0.6, 0.9])
+    asked = passed(rules)
+    answer_asked(asked, outcome)
+    passed(rules)
+    status = engine.STATUS[rules.uid]
+    check("in use: points moved into two new cells ask just those; 4 of the 8 cells are answered, and nothing more "
+          "is asked", asked_names(asked) == ["hot|bright", "mild|dark"] and read(obj, ["Outcome"])["Outcome"] == [
+              0, 0, 1, 1] and status.text == "4 of 8 cells answered · 0 unsure" and not passed(rules),
+          (asked_names(asked), status.text))
+
+    engine.reask(rules)
+    first, second = passed(rules), passed(rules)
+    check("in use: Ask Again asks the cells in use again, after the evaluation that lays out their factors: none, "
+          "then those 4", not first and asked_names(second) == ["cold|dark", "hot|bright", "mild|dark", "warm|bright"],
+          (asked_names(first), asked_names(second)))
+    answer_asked(second, outcome)
+    passed(rules)
+    tree.links.new(store(tree, gi.outputs["Geometry"], rules.outputs["Outcome"], "out_Outcome", 'INT'), go.inputs[0])
+    rules.inputs["Question"].default_value = "Which one, now?"
+    asked = passed(rules)
+    check("in use: once its geometry bypasses it, the node's new words ask every missing cell, as before: 8",
+          len(asked_rows(asked)) == 8 and stamp_of(obj, rules) is None, (asked_names(asked), stamp_of(obj, rules)))
+    bpy.data.objects.remove(obj)
+    bpy.data.node_groups.remove(tree)
+
+    path = write("in_use_dither.csv", DITHER_FACTORS)
+    factors, count, point = factors_of(path), 400, (0.3, True, 0.65)
+    columns = {"in_x": ('FLOAT', [point[0]] * count), "in_lit": ('BOOLEAN', [point[1]] * count),
+               "in_y": ('FLOAT', [point[2]] * count)}
+    tree, rules, obj, gi, go = scene("InUseDither", path, write("in_use_two.csv", TWO), columns, question="Which?")
+    synthetic(rules, obj, lambda i, row: {"outcome": i, "c": 1.0})  # each cell's Outcome is its own number
+    wire(tree, rules, gi, go, ["Outcome"])
+    rules.inputs["Dither"].default_value, rules.inputs["Seed"].default_value = 0.6, 3
+    read_cells = sorted(set(read(obj, ["Outcome"])["Outcome"]))
+    rules.inputs["Question"].default_value = "Which, now?"  # new words, none of whose cells is answered
+    asked = passed(rules)
+    possible = set(rc.dither_cells(factors, point, 0.6))
+    check("in use: One-of with Dither asks exactly the cells its points' outcomes read, several near a band edge",
+          asked_rows(asked) == read_cells and len(read_cells) > 1 and set(read_cells) <= possible,
+          (asked_rows(asked), read_cells, sorted(possible)))
+    bpy.data.objects.remove(obj)
+    bpy.data.node_groups.remove(tree)
+
+    path = write("in_use_shade.csv", MIXED_YES_NO)
+    factors, rng = factors_of(path), random.Random(19)
+    combos = random_values(factors, 12, rng)  # at most 48 corners of the 72 cells
+    columns = {f"in_{f.name}": ({'flag': 'BOOLEAN', 'category': 'INT', 'amount': 'FLOAT'}[f.kind],
+                                [combo[j] for combo in combos]) for j, f in enumerate(factors)}
+    tree, rules, obj, gi, go = scene("InUseShade", path, "", columns, answer_type='YES_NO', question="Shaded?")
+    synthetic(rules, obj, lambda i, row: {"p": 0.5, "c": 0.5, "ok": 1.0})
+    wire(tree, rules, gi, go, ["Probability"])
+    stored = [[numpy.float32(v).item() if isinstance(v, float) else v for v in combo] for combo in combos]  # as read
+    stamps = stamp_of(obj, rules)
+    rules.inputs["Question"].default_value = "Is this spot in the shade?"
+    asked = passed(rules)
+    corners = sorted({cell for combo in stored for cell, weight in rc.corners(factors, combo) if weight > 0})
+    check("in use: a Yes/No node stamps each point's lower corner and the levels that weigh nothing, as "
+          "rules_core.blend_stamp(), and asks exactly the corners its points blend with a weight",
+          stamps == [rc.blend_stamp(factors, combo) for combo in stored] and asked_rows(asked) == corners
+          and 1 < len(corners) < 72, (asked_rows(asked), corners, stamps))
+    bpy.data.objects.remove(obj)
+    bpy.data.node_groups.remove(tree)
+    engine.run_pass()
+
+
+def best(function, runs=20):
+    """(the fastest of `runs` calls in ms, its result)."""
+    times, result = [], None
+    for _ in range(runs):
+        started = time.perf_counter()
+        result = function()
+        times.append((time.perf_counter() - started) * 1000)
+    return min(times), result
+
+
+def evaluation_ms(obj):
+    """The fastest of 5 evaluations of the object, in ms."""
+    times = []
+    for _ in range(5):
+        obj.update_tag(refresh={'DATA'})
+        started = time.perf_counter()
+        bpy.context.evaluated_depsgraph_get()
+        times.append((time.perf_counter() - started) * 1000)
+    return min(times)
+
+
+def phase_in_use_cost():
+    """§5.8's costs at 10k and 100k points: reading the stamp from the evaluated object (budgets 1 and 3 ms, under the
+    §18.2 timing rule), and what stamping adds to an evaluation, against the same tree with the geometry bypassing
+    the node, for One-of with Dither and for Yes/No over 2 interpolated factors."""
+    for count, budget in ((10_000, 1.0), (100_000, 3.0)):
+        rng = random.Random(count)
+        columns = {"in_heat": ('FLOAT', [rng.random() for _ in range(count)]),
+                   "in_lit": ('BOOLEAN', [rng.random() < 0.5 for _ in range(count)])}
+        tree, rules, obj, gi, go = scene(f"Cost{count}", write("cost_factors.csv", IN_USE), write("cost_two.csv", TWO),
+                                         columns, question="Which?")
+        synthetic(rules, obj, lambda i, row: {"outcome": i % 2, "c": 1.0})
+        wire(tree, rules, gi, go, ["Outcome"])
+        rules.inputs["Dither"].default_value = 0.5
+        engine.run_pass()  # its report
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        reports = engine.REPORTS[rules.uid]
+        words = next(iter(next(iter(reports.values()))))
+        job = engine.plan_words(rules, context(rules, obj), words)
+        contexts = evaluator.find_uses()[tree.as_pointer()]
+        read_ms, values = best(lambda: geometry.int_values(obj, inner.CELL + rules.uid, depsgraph))
+        cells_ms, cells = best(lambda: engine.in_use(rules, job, words, reports, contexts, depsgraph))
+        stamped = evaluation_ms(obj)
+        bypass = store(tree, gi.outputs["Geometry"], rules.outputs["Outcome"], "out_Outcome", 'INT')
+        tree.links.new(bypass, go.inputs[0])
+        bypassed = evaluation_ms(obj)
+        print(f"BENCH rules in use, {count} points: the stamp read {read_ms:.3f} ms, the cells in use "
+              f"{cells_ms:.3f} ms (budget {budget:g} ms); an evaluation {stamped:.1f} ms stamped, {bypassed:.1f} ms "
+              f"bypassed (One-of, Dither 0.5)", flush=True)
+        if cells_ms > budget:
+            print(f"WARN rules in use at {count} points took {cells_ms:.3f} ms, above its {budget:g} ms budget",
+                  flush=True)
+        check(f"in use cost: the cells in use of {count} points, all 8 cells, within twice their {budget:g} ms budget",
+              len(values) == count and cells == {row.cell.key for row in job.rows} and cells_ms <= 2 * budget,
+              f"{cells_ms:.3f} ms")
+        bpy.data.objects.remove(obj)
+        bpy.data.node_groups.remove(tree)
+    count, rng = 100_000, random.Random(5)
+    path = write("cost_shade.csv", MIXED_YES_NO)
+    factors = factors_of(path)
+    combos = random_values(factors, count, rng)
+    columns = {f"in_{f.name}": ({'flag': 'BOOLEAN', 'category': 'INT', 'amount': 'FLOAT'}[f.kind],
+                                [combo[j] for combo in combos]) for j, f in enumerate(factors)}
+    tree, rules, obj, gi, go = scene("CostShade", path, "", columns, answer_type='YES_NO', question="Shaded?")
+    synthetic(rules, obj, lambda i, row: {"p": 0.5, "c": 0.5, "ok": 1.0})
+    wire(tree, rules, gi, go, ["Probability"])
+    stamped = evaluation_ms(obj)
+    tree.links.new(store(tree, gi.outputs["Geometry"], rules.outputs["Probability"], "out_Probability", 'FLOAT'),
+                   go.inputs[0])
+    bypassed = evaluation_ms(obj)
+    print(f"BENCH rules in use, {count} points: an evaluation {stamped:.1f} ms stamped, {bypassed:.1f} ms bypassed "
+          f"(Yes/No, 2 interpolated factors)", flush=True)
+    bpy.data.objects.remove(obj)
+    bpy.data.node_groups.remove(tree)
+    engine.run_pass()
 
 
 # --------------------------------------------------------------------------- background and render mode (§7.8)
@@ -1234,6 +1469,8 @@ try:
         phase_status()
         phase_agreement()
         phase_writes()
+        phase_in_use()
+        phase_in_use_cost()
         phase_background()
         phase_farm_frames()
 except Exception:

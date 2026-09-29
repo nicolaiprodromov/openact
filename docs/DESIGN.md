@@ -15,7 +15,7 @@
 2. [Background & Motivation](#2-background--motivation)
 3. [Goals & Non-Goals](#3-goals--non-goals)
 4. [Principles](#4-principles)
-5. [Architecture](#5-architecture): runtime split, request pipeline, per-context caching, threading, the Warning channel
+5. [Architecture](#5-architecture): runtime split, request pipeline, per-context caching, threading, the Warning channel, the geometry channel
 6. [The Six Nodes](#6-the-six-nodes): Ask, Pick, Match, Classify, Rules, Dials (sockets, behaviour, examples)
 7. [CSV Formats](#7-csv-formats): schemas, text/numeric split, overrides and locks, validation, change detection
 8. [Table Lookup in Geometry Nodes](#8-table-lookup-in-geometry-nodes): the table object, finding an entry by the hash of its words, node graphs
@@ -760,7 +760,8 @@ sequenceDiagram
      everything missing of a node *Ask Again* asked, once, whatever its Trigger (`ASK_ONCE`,
      consumed once its cells are pending). Nothing else is asked: a word set reported with the
      Trigger off, and every statically planned word set. Its missing cells still count as pending
-     rows, and the status says why nothing asks them (§17.1).
+     rows, and the status says why nothing asks them (§17.1). A Rules node whose geometry passes
+     through to the output misses only the cells its elements read (`engine.in_use()`, §5.8).
 6. **Entries** are updated in `store`: at most 1024 **warm or cold** stored entries per node
    (`MAX_ENTRIES`), within the 2 MB soft cap, least recently used evicted. Live entries are exempt from that limit and never
    evicted (§8.1). The entries the playback path answered since the node's last pass join them
@@ -874,6 +875,10 @@ rewrites the table, so it always holds the best answer known so far:
     shows stale values while it refills, not fallbacks.
 - If no previous value exists, the row gets the neutral fallback (§6.0) and is marked `pending`.
 - The status reads "Filling 12/50 · ~2 s". The sidebar shows stale and pending rows greyed out.
+- A Rules table asked only where its elements read stays partial (§5.8). A stored table so far that
+  its context showed last is resolved to itself while none of its pending or stale cells has an
+  answer or has failed (`base._still_missing()`): a full resolve would build it again as it is,
+  which for 4096 cells took 27 of an idle pass's 28 ms (10 ms with the shortcut, 4.5.2).
 
 ```mermaid
 stateDiagram-v2
@@ -964,7 +969,11 @@ a pass's work instead, values only, for the nodes whose Trigger is on:
   entries and this session's `MEMORY` (§5.4), and written at once, values only, when any row is
   known, as a table so far (stale-while-refilling). Its missing cells are submitted at **P0**, as
   the timeline shows them now, at the node's generation (`engine._ask()`, the one place that
-  chooses which of a job's missing cells playback submits).
+  chooses which of a job's missing cells playback submits). A Rules question submits only the
+  cells its elements read in the frame's evaluation (`in_use()`, §5.8), so it is planned after a
+  frame, never from a tick, which has no evaluation to read them from. Its table stays partial by
+  design, so once nothing it reads is missing, or its answers have landed, its words aren't held
+  (`HELD`): a later frame asks each cell as its elements first reach it.
 - **Answers landing** (`_play_tick()`, after `server.pump()` in `tick()`): each question whose cells
   landed is answered again and written, values only: a new entry is appended (`inner.append_entry()`),
   and one that grew, a table so far filling in, rewrites the rows (`inner.update_values()`, with the
@@ -1138,6 +1147,79 @@ each evaluation (`inner._Builder.warning()`).
   a reported word set fed by an Import Text whose Path lies outside the file's folder, or can't be
   read statically, is refused with the usual "Blocked reading" error, so its text is never stored.
 
+### 5.8 The geometry channel
+
+A Rules node asks only the cells its elements read, each on first encounter, instead of its whole
+table up front: its inner group stamps each element's cells on the geometry passing through its
+Geometry sockets (§6.0), and Python reads them from the evaluated objects after the evaluation. The
+other five nodes pass the geometry through unchanged.
+
+- **The stamp** (`_Builder.stamp()`, `RulesSpec.build()`) is a Store Named Attribute (Int, Point)
+  between the group's Geometry input and output; `gate()` still routes it last (§5.7). Its value is
+  evaluated on the passing geometry's points, as the factor inputs are, and it reads no entry: it
+  names the cells an entry is to hold, found or not.
+  - **One-of:** 1 + the cell its outputs read, dithered (§9.7); 0 where a category value matches no
+    level.
+  - **Yes/No and Amount** (`rules_core.blend_stamp()`): 1 + the lower corner's cell (each
+    interpolated factor at its b₀, §9.6) × 64, plus, for the *a*-th interpolated factor, 2^2a where
+    its upper level weighs nothing (t = 0) and 2^(2a+1) where its lower level weighs nothing
+    (t = 1); 0 where a category value matches no level. `rules_core.stamped_cells()` reads back
+    every corner whose weight is above 0, and no other: an element in an outer half-band or at a
+    band centre reads one level of that factor. One attribute per corner would cost up to 8 stores
+    and reads; the lower corner alone would also ask every neighbour of weight 0, e.g. 8 cells
+    instead of 1 for elements whose 3 Amount factors are clamped at 0.
+  - The 1 is added because an element that never passed through the node reads 0 once geometries
+    are joined (4.5.2, 5.1.1): such an element names no cell.
+  - Without a layout (no entry of the node's factors yet, §9) every element's stamp is 0.
+- **The name** is `inner.CELL` + the node's uid: `.openact_cell_<uid>`, 26 bytes (Blender 4.5
+  truncates names at 67). The leading `.` hides it from Blender's attribute lists and from the
+  Attributes list source (§6.0); the prefix keeps it clear of built-in names, which Blender refuses
+  with a warning ("Failed to write to attribute "position" …"). The name is joined from `CELL` and
+  the `OpenAct uid` String node, so a copy stamps its own uid once `update_values()` rewrites it
+  (§5.7, §8.8).
+- **The artist's part.** As with any attribute, the stamped geometry must reach the object's
+  evaluated result: the node's Geometry output leads on to the modifier's output, through the rest
+  of the stack. The reader looks at the evaluated mesh, point cloud and curves, not into instances
+  (realize them first, or the node asks every cell). A later node that interpolates attributes (a
+  subdivision, a resample) leaves numbers that name no cell or a neighbour's, so put the Rules node
+  after such nodes. A geometry that passes through the same node twice keeps the second stamp.
+  There is at least one evaluation of lag: an evaluation stamps, the pass after it reads.
+- **The reader.** `geometry.int_values(obj, name, depsgraph)` calls
+  `GeometrySet.from_evaluated_object()` and reads each component's attribute with `foreach_get`
+  into an `np.intc` buffer (an `np.int32` buffer takes a slow path on Windows, 10× slower).
+  `engine.in_use(node, job, words, reports, contexts, depsgraph)`, the one filter the pass and the
+  playback path share, gives the keys of the job's cells in use: the stamps of each object whose
+  modifier reported the words with the Trigger on, or of each that reported them when none did (Ask
+  Again); an object's modifiers share its geometry. `RulesSpec.stamped()` keeps the stamps from 1 to
+  `rules_core.stamp_limit()`, counts them with `np.bincount` (9× faster than `np.unique` at 100k
+  points with 4.5's numpy) and decodes them.
+  - **None**, so every missing cell is asked as before: an object that reported the words carries
+    no stamp (its geometry doesn't reach the output, or the Geometry input is unlinked); a
+    statically planned word set; any other node.
+  - **`LATER`**, an empty set, while the stamp comes from a graph laid out for another interface or
+    factor layout than the job's (`inner.built_for()`): nothing is asked, the pass lays out the
+    job's, and the next evaluation stamps its cells. While nothing of the job is known, the table
+    with nothing answered shows (`RulesSpec.unanswered()`, every row pending), so the graph reads
+    its layout: a new node asks one evaluation later, and never its whole table.
+- **Asking** (§5.3 step 5): only the missing cells in use. The others are neither asked nor missing
+  answers of an idle node (§17.1); they count as pending rows. The table stays partial: a table so
+  far shown in place of an entry whose words mean something else now (§5.4) replaces it once its
+  cells in use are answered. A cell that comes into use later is asked by the pass after that
+  evaluation. The status is complete once the cells in use are answered: "4 of 8 cells answered ·
+  0 unsure".
+- **Costs** (`tests/rules_blender.py`, `-t 4` on a shared machine; 4.5.2 and 5.1.1):
+
+  | Points | Reading the stamp | The cells in use | An evaluation, stamped / bypassed: One-of with Dither | Yes/No, 2 interpolated factors |
+  |---|---|---|---|---|
+  | 10k | 0.013 ms | 0.20 ms | 0.4 / 0.3 ms | |
+  | 100k | 0.04 ms | 0.37–0.39 ms | 0.6–0.8 / 0.4–0.6 ms | 1.9–2.7 / 1.2–1.7 ms |
+
+  Stamping evaluates the cell graph once more on the passing geometry, about what the node's own
+  per-element outputs cost. The pass reads the stamp only for word sets with missing cells.
+- **Known limits.** An object whose modifier reports several word sets of the node (a For Each
+  Element zone, a group used on several geometries that are joined) asks, for each of them, the
+  union of its elements' cells.
+
 ## 6. The Six Nodes
 
 ### 6.0 Conventions shared by all nodes
@@ -1161,6 +1243,7 @@ each evaluation (`inner._Builder.warning()`).
 **Node body.**
 - `draw_buttons` shows the dropdowns (`answer_type`, `list_source`) and one status line, e.g.:
   - `✓ 18 cells · 0 unsure · 2 locked`
+  - `✓ 4 of 8 cells answered · 0 unsure` (Rules asked only its cells in use, §5.8)
   - `⏳ Filling 12/50 · ~2 s`
   - `ⓘ Type a question`
   - `○ Trigger off: 3 answers missing`
@@ -1194,9 +1277,10 @@ default, seeded from the `debias` preference when the node is created.
 **Geometry and Trigger (every node).** Every node's interface starts with the same three sockets,
 whatever its spec, dropdowns and dynamic sockets (`specs/base.py`: `SHARED`, `shared_sockets()`):
 - **Geometry**, the first input, and **Geometry**, the first output. `inner.build()` links the one
-  to the other for every node, so the geometry passes through unchanged. They are optional to
-  link, like Capture Attribute's, and let a node sit on the geometry's path; nothing reads the
-  geometry yet.
+  to the other for every node, so the geometry passes through. They are optional to link, like
+  Capture Attribute's, and let a node sit on the geometry's path. Rules reads per-element data from
+  them: it stamps each element's cells on the geometry passing through, so that it asks only the
+  cells in use (§5.8). The other nodes pass it through unchanged.
 - **Trigger**, the second input: a Bool that decides when the node asks the model. When it is on
   at an evaluation, the node may ask for what it is missing; **unlinked, it is off, so the node
   never asks**, and it still outputs everything already stored. Its structure type is `SINGLE`
@@ -1648,6 +1732,15 @@ one input per factor declared in the Factors CSV, and a tail that exists only in
 - **One-of.** Uses the nearest band. With `Dither > 0`, each Amount coordinate is jittered by up
   to ±Dither/2 band widths using `Random Value` (seeded by *Seed* and the element's implicit ID),
   so outcomes mix near band edges instead of switching along a hard line.
+- **Only the cells in use are asked** when the node's geometry passes through to the modifier's
+  output (§5.8). The group stamps the cells each element reads on the geometry passing through its
+  Geometry sockets (One-of: the dithered cell; Yes/No and Amount: every corner of weight above 0),
+  and a triggered node asks only the missing ones among them, each at the pass after the evaluation
+  it first appears in. Cells no element reads are never asked and are no error: the table stays
+  partial, and the status says how many cells are answered once those in use are ("4 of 8 cells
+  answered · 0 unsure"). A new node's first triggered pass lays out its factors and asks nothing;
+  the next asks its cells in use. Without the pass-through (the geometry doesn't reach the output,
+  or the Geometry input is unlinked), the node asks every missing cell.
 - **Simulation and repeat zones.** Lookup works inside them because the inner group is a pure
   function of its field inputs (§8, tested in §18).
 
@@ -2230,12 +2323,13 @@ The sidebar lists every problem (at most 50 per file), each with *Open File*.
 
 ## 8. Table Lookup in Geometry Nodes
 
-Every inner group passes its Geometry input to its Geometry output (§6.0), holds the Warning
-channel (§5.7), and finds its answers in the node's table object by the hash of its live words.
-The table object holds every stored entry; the graph holds none of them, so a new entry is new
-rows and never a graph edit. `inner.LAYOUT` 4 marks groups laid out this way. The first pass
-rebuilds a group of an older LAYOUT (1.0's match chain, or 3, the Warning channel alone); without
-a pass, as in a background render, the saved graph evaluates as it was, which needs no add-on.
+Every inner group passes its Geometry input to its Geometry output (§6.0), Rules' stamping each
+element's cells on it (§5.8), holds the Warning channel (§5.7), and finds its answers in the node's
+table object by the hash of its live words. The table object holds every stored entry; the graph
+holds none of them, so a new entry is new rows and never a graph edit. `inner.LAYOUT` 5 marks
+groups laid out this way. The first pass rebuilds a group of an older LAYOUT (1.0's match chain, 3,
+the Warning channel alone, or 4, the hash lookup without Rules' stamp); without a pass, as in a
+background render, the saved graph evaluates as it was, which needs no add-on.
 
 ### 8.1 Table model
 
@@ -2628,7 +2722,7 @@ reference factor layout (§9), Dials' outputs, Pick's item names. Everything els
 | An answer lands during playback for words the table doesn't hold | **Values only.** `inner.append_entry()` appends its block, which the next evaluation finds; nothing else moves. It refuses (and the next pass writes) an entry whose key the table holds, one of another layout, or any change of the interface or columns |
 | An entry grows during playback (a table so far filling in) | **Values only.** `inner.update_values()` rewrites the rows from the entries the node's last pass wrote, the grown one in its place (§5.5); another layout waits for the pass after playback |
 | The default a miss shows changes (§8.2): a new last-shown entry, a change in the number of live contexts, or entering or leaving a hint or error state | **Values only.** Point 0 alone (`update_values()`; during playback `inner.set_default()`) |
-| A copy gets its own uid (`engine.ensure_owned()`) | **Values only.** `update_values()` rewrites the `OpenAct uid` String node the Warning reports (§5.7) |
+| A copy gets its own uid (`engine.ensure_owned()`) | **Values only.** `update_values()` rewrites the `OpenAct uid` String node the Warning reports (§5.7), whose uid also names Rules' stamp (§5.8) |
 | Row count of an entry changes (items added or removed) | **Values only.** The table object's vertex count changes; the graph does not |
 | A pass that changes nothing | **Nothing is written**: the digest is unchanged, and the default too |
 | Answer type, list source, factor layout, payload column set, Dials' settings or their order, Pick's Probability linked or unlinked, a new item name for Pick | **Rebuild**, after `inner.sync_interface()` when the interface changes |
@@ -3907,7 +4001,9 @@ is asked or filled for the node, its state is **idle**, and its line says why, w
 are missing: "Link a Trigger to ask" (the Trigger is unlinked), "Trigger off" (an evaluation reported
 the word sets with the Trigger off) or "Not evaluated" (no evaluation reported them: its outputs are
 unused, its object isn't evaluated, or no modifier uses its tree). Cells asked before, still pending
-in `pipeline.PENDING`, show as filling, and the stored answers keep showing.
+in `pipeline.PENDING`, show as filling, and the stored answers keep showing. A Rules cell that no
+evaluated element reads (§5.8) counts as a pending row too, but is no missing answer: once the cells
+in use are answered the node is complete, and its line says how many of its cells are answered.
 
 | State | Icon | Example line |
 |---|---|---|
@@ -3917,7 +4013,7 @@ in `pipeline.PENDING`, show as filling, and the stored answers keep showing.
 | starting | `SORTTIME` | "Starting the model…" / "Installing the model… 3/5 PyTorch" |
 | waiting | `SORTTIME` | "Waiting for another OpenAct node…" |
 | filling | `SORTTIME` | "Filling 12/50 · ~2 s" (stale rows show old values meanwhile, §5.4) |
-| complete | `CHECKMARK` | "18 cells · 0 unsure · 2 locked" |
+| complete | `CHECKMARK` | "18 cells · 0 unsure · 2 locked" / "4 of 8 cells answered · 0 unsure" (Rules, its cells in use answered, §5.8) |
 | warning | `ERROR` (triangle) | "18 cells · 1 warning: column 'scale' has an empty cell (line 7)" |
 | error | `CANCEL` | "life_outcomes.csv:4 'if' names unknown level 'alvie' of factor 'state'" |
 
@@ -4065,13 +4161,14 @@ A later run can diff these lines to spot performance regressions.
 |---|---|---|---|
 | `tests/csv_test.py` | CPython + Blender | none | `csvfmt` dialect (BOM, CRLF and CR, `;` and tab delimiters, quoting); INT/FLOAT/text classification; limits; every §7.9 message by fixture; the `parse_answer_set` / `parse_factors` / `parse_settings` / `parse_overrides` parsers; the `if` grammar; `lists.parse_inline` (newline, then `;`, then `,`); `text_hash` unchanged by numeric edits and `num_hash` unchanged by text edits |
 | **`tests/store_test.py`** | CPython + Blender | none | The reading rules of §14.4 (damaged entries skipped, anything but schema 2 read as empty, a newer schema left unread); a changed `PROMPT_VERSION` or `debias` changes the ask key but no words key; save/load round trip with the documented field order; 2 MB soft-cap eviction removes only warm and cold entries, a pinned one of OpenAct 1.0 among them, and **keeps live entries**, even when they alone exceed 2 MB (with the size note) |
-| `tests/rules_math_test.py` | CPython + Blender | none | The 4.e confidence formulas: uniform answers give exactly 0 for L = 2…16, point masses give 1, near-uniform answers stay below 0.30, and the documented examples (0.65; the bimodal split gives 0). `itertools.product` order equals `ravel`; allowed sets and code-decided cells; the reference interpolation (corners, weights, renormalisation); dithering probabilities, analytic versus 100 000 samples within ±1 % |
+| `tests/rules_math_test.py` | CPython + Blender | none | The 4.e confidence formulas: uniform answers give exactly 0 for L = 2…16, point masses give 1, near-uniform answers stay below 0.30, and the documented examples (0.65; the bimodal split gives 0). `itertools.product` order equals `ravel`; allowed sets and code-decided cells; the reference interpolation (corners, weights, renormalisation); dithering probabilities, analytic versus 100 000 samples within ±1 %; **the stamps (§5.8)**: a One-of stamp names its cell, and a Yes/No stamp exactly the corners of weight above 0 of 500 random elements (outer half-bands, band centres, clamped values, a 4th Amount factor, an unknown category), while numbers no stamp can be name none; a stored table so far resolves to itself, as a full resolve builds it, until an answer lands or a cell fails (§5.4) |
+| `tests/rules_blender.py` | Blender | none | The Rules node with synthetic answers: the cell index of every combination, interpolation and dithering against `rules_core`; the Game of Life in a Simulation Zone against a Python B3/S23 reference; layout and Outcomes edits, shape agreement, the status's problems, writes only from the pass; background mode and farm renders (§7.8). **The cells in use (§5.8):** with its geometry passing through, a triggered node's first pass asks nothing and lays out its factors, the next asks the cell its points read, a cell a point moves into is asked at the next pass, Ask Again asks the cells in use again, and without the pass-through every missing cell is asked; One-of with Dither asks the cells its outcomes read, and Yes/No the corners its points blend, its stamp as `rules_core.blend_stamp()`; the stamp is a hidden point attribute named after the node, on the evaluated geometry only; the status says how many cells are answered. BENCH lines: reading the stamp and the cells in use at 10k and 100k points (1 and 3 ms budgets), and an evaluation stamped against bypassed |
 | **`tests/evaluator_blender.py`** (extended) | Blender | none | Every existing case, plus **Menu Switch**: a value typed on the socket and a value coming from a modifier's Group Input menu, for String, Int and Float, covering both storage forms (§10.1). Also Special Characters, String Length, OpenAct single-value outputs used as words, field outputs rejected with the breadcrumb message, a muted Pick that passes a linked ID on (and its unlinked ID, the index, rejected as a field, §6.0), and the per-pass memo returning identical values. All are checked against Geometry Nodes ground truth with Compare nodes, the existing technique. **`trace_csv_source()`** (added by PR-13): a direct link; a Path exposed on the modifier; Reroute, nested-group and Geometry Menu Switch pass-through; the Import CSV Path/Delimiter socket identifiers pinned on 4.5, 5.0 and 5.1; both error messages |
 | `tests/csv_probe_blender.py` | Blender | none | **Import CSV parity** per fixture: point count equals `csvfmt` data rows; kept attributes equal `csvfmt` numeric columns with the same INT/FLOAT types and values. It records Blender's behaviour for blank lines, quoted line breaks, BOM and `;` in `tests/fixtures/import_csv_behaviour.json`. It re-asserts the path-cache fact (an edited file still returns old rows), so a future Blender change is noticed |
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
 | `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: the hash lookup on all six nodes (each context finds its entry by the key of its words; invalid IDs and a miss give fallbacks, or the default a miss shows); 3 contexts through the table object's header rows; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **No cap:** 20 objects with different words on one node each show their own answer; a new word set is new rows with the same nodes and layout, `append_entry()` and `set_default()` show at the next evaluation with no graph edit, and a second pass writes nothing. **Collisions:** words whose keys collide ('aZ' and 'b5') leave the later entry out and show the error naming both; a live entry wins its key over a warm one. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Key text (§8.2):** each word at its position, an absent one read as `""` (a Collection-source Pick finds its stored entry); word tuples that join to the same text have different keys. **Single values (§8.6):** Pick's Index feeds a single-value socket (Grid *Vertices X*). **A miss (§8.2):** with one live context, words with no entry show that context's own last answers; with two contexts, A's show neutral values, never B's answers; a cleared Question (a hint) shows neutral values; each change of the default is values only. **Layout (§8.8):** a group of another `LAYOUT`, or 1.0's, is rebuilt; the table keeps its digest through save and reload, so the reopened file's first update writes nothing. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: `inner.build()`, `update_values()` (unchanged, and one entry changed) and `append_entry()` on the demo and worst shapes, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
-| `tests/reports_blender.py` | Blender + fake server | fake | **The Warning channel's reader (§5.3, §5.7):** words the static evaluator can't read (Scene Time's frame through Value to String, a Repeat zone's count, a simulation's step) are planned from the report and answered; a For Each Element zone's word sets each become an entry; a Collection list source reads its collection statically while its Prompt comes from the report; group paths sharing a modifier split its report; words built from an unanswered node's fallback wait for it; a tree no modifier uses and an unused node are planned statically, an unreadable word there is a hint; a modifier that doesn't evaluate reports nothing (disabled in viewports or in the viewport), an object hidden with the eye still does; a copy's shared uid is ignored; `plan_words()` shares the plan cache; no pass loop; in an untrusted file an Import Text outside the folder is refused. **The Trigger (§6.0):** unlinked, a node asks nothing and says so; linked to True it asks; turned off, new words ask nothing and the stored answer keeps showing, while a cell asked before still fills; a Float −1 is off and 0.3 on, and an Int, a Vector and a Color convert as Blender does; a triggered node whose outputs are unused asks nothing; Ask Again asks once without a Trigger, a statically planned word set too; a file saved by 1.0 keeps its answers and asks nothing; the sidebar's live activity. Every suite that expects asking links a Trigger (`_harness.trigger()`) |
+| `tests/reports_blender.py` | Blender + fake server | fake | **The Warning channel's reader (§5.3, §5.7):** words the static evaluator can't read (Scene Time's frame through Value to String, a Repeat zone's count, a simulation's step) are planned from the report and answered; a For Each Element zone's word sets each become an entry; a Collection list source reads its collection statically while its Prompt comes from the report; group paths sharing a modifier split its report; words built from an unanswered node's fallback wait for it; a tree no modifier uses and an unused node are planned statically, an unreadable word there is a hint; a modifier that doesn't evaluate reports nothing (disabled in viewports or in the viewport), an object hidden with the eye still does; a copy's shared uid is ignored; `plan_words()` shares the plan cache; no pass loop; in an untrusted file an Import Text outside the folder is refused. **The Trigger (§6.0):** unlinked, a node asks nothing and says so; linked to True it asks; turned off, new words ask nothing and the stored answer keeps showing, while a cell asked before still fills; a Float −1 is off and 0.3 on, and an Int, a Vector and a Color convert as Blender does; a triggered node whose outputs are unused asks nothing; Ask Again asks once without a Trigger, a statically planned word set too; a file saved by 1.0 keeps its answers and asks nothing; the sidebar's live activity. Every suite that expects asking links a Trigger (`_harness.trigger()`, which keeps a Rules node's geometry off the path, so it asks every cell, §5.8) |
 | `tests/playback_blender.py` | Blender + fake server | fake | **Playback (§5.5)**, with `engine._animation_playing()` returning True, `scene.frame_set()` for the frames and `engine.tick()` between them: a keyframed Menu Switch cycles through three rule sets, two of them answered while the scene was stopped: they show and ask and write nothing; the third is asked at its first frame, in one request, while the node shows the rules it showed last (its table so far, stale), and its answer is written values only as it lands and shows from then on; no `inner.build()` and no pass during playback; the pass after playback stores it; played again, nothing is asked or written. An untriggered Ask asks nothing and its table is never written; a triggered one whose Question holds the frame asks at each new frame, showing its last answer (the default a miss shows) until the frame's own lands. A simulation zone sees an answer written at frame N at N + 1 and continues without resetting. Stale questions: with the model busy, a node whose words change every frame keeps only its newest one queued, a For Each Element zone keeps all of its elements'. Storing: nothing during playback, then evicted as any save evicts (`MAX_ENTRIES` at 3); a save right after playback, before any pass, holds its answers, and so does the file reopened. The budget: TIMING lines for the frame handler with nothing new and with a new question, and 40 new word sets at one frame planned partly there and the rest at the ticks. Renders never ask (§2.6): played while a render job runs, or in a background session that renders the saved answers, new words ask and write nothing. **Words at other frames (§7.8):** the F-curves are found through the action slot's channelbag on 4.5 and 5.1, give the words the scene has at every frame with no scene evaluation, and clamp to the hard range; a background render (`on_render_pre`) compares the words of its frame through them, and a driven input, an NLA strip and Time Stretching as the file holds them. OpenAct's code calls no `temp_override` (§5.5) |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
 | `tests/startup_blender.py` | Blender | none | On 4.5 and newer: `runtime_root()` follows the Runtime Folder preference, else the default folder; a server of another program on the port gives the port error and launches nothing until it has gone and *Start Model* runs. On older Blender, enabling the add-on fails before anything is registered (§11) |

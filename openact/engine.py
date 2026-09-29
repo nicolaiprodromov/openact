@@ -35,10 +35,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 import bpy
+import numpy as np
 from bpy.app.handlers import persistent
 from bpy_extras import anim_utils
 
-from . import channel, csvfmt, evaluator, inner, lists, pipeline, server, store, trust
+from . import channel, csvfmt, evaluator, geometry, inner, lists, pipeline, server, store, trust
 from . import prefs as P
 from . import tables
 from .csvfmt import ERROR, INFO, WARNING, Problem
@@ -91,6 +92,7 @@ RENDERED = set()  # (node uid, words) a background render compared since the fil
 TABLES = {}  # node uid -> Table: its table object as its last pass wrote it, which the playback path extends (§5.5)
 QUESTIONS = {}  # (uid, words) -> Question: the word sets the playback path plans or waits for, oldest first (§5.5)
 HELD = set()  # (uid, words) the playback path leaves to the next pass: nothing to ask, or a new layout to lay out
+_frame = None  # (depsgraph, reports, uses) of the frame _play_frame() handles: where Rules' cells in use are read
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -101,6 +103,7 @@ _has_nodes = False
 _group_count = -1  # number of node groups at the last pass that found no OpenAct nodes
 _plans_made = 0  # a pass that plans changes what nodes reading another's answers as words may read
 _pass_plans = None  # the PLANS keys the running pass planned, contexts only an evaluator read reaches included
+_pass_depsgraph = None  # the evaluated depsgraph whose reports and stamps the running pass reads (§5.7, §5.8)
 passes = 0  # passes run this session: what the sidebar works out once per pass is keyed by it
 _quiet_since = time.monotonic()  # the stall clock: since a chunk was last answered, or cells were first asked
 _slow_since = None  # since when /health's ms_per_row has been above SLOW_MS, cells asked all along
@@ -414,7 +417,7 @@ def run_pass(everything=True):
     """Bring the OpenAct nodes up to date: every node, or with everything=False only the dirty ones. While
     _saved_only(), it only reports the CSVs that differ from the saved tables. Main thread only, and never during a
     render job (tick())."""
-    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, passes, _opened
+    global _dirty, _dirty_all, _has_nodes, _last_pass, _group_count, _pass_plans, _pass_depsgraph, passes, _opened
     if _saved_only():  # a farm renders exactly the saved answers and payload (§7.8)
         _dirty, _last_pass = False, time.monotonic()  # what else is due (DIRTY, WATCH) waits for a pass that writes
         _report()
@@ -467,6 +470,7 @@ def run_pass(everything=True):
     csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
     planned = _pass_plans = set()
     visited = set()
+    _pass_depsgraph = depsgraph  # the nodes' stamps are read from the evaluation their reports come from (§5.8)
     try:
         trust.PASS = trust.is_trusted()
         for tree, node in nodes:
@@ -481,7 +485,7 @@ def run_pass(everything=True):
     finally:
         evaluator.MEMO = None  # keyed by pointers: after the pass, nodes and data may be freed or edited
         csvfmt.IDENTITIES = trust.PASS = None  # files, the .blend and the trusted lists change between passes
-        _pass_plans = None
+        _pass_plans = _pass_depsgraph = None
     _opened = False  # later edits are this session's own: no note
     if stored or _plans_made != plans_made:
         schedule(immediate=True)  # a node that reads another's answers as words may read new ones
@@ -540,6 +544,7 @@ def _process(tree, node, contexts):
     uses, resolved, asked = [], {}, set()  # (label, Job) per planned word set; words -> entry shown; cells asked
     sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
     idle = set()  # missing cells nothing asks: of word sets not reported with the Trigger on (§6.0)
+    unused = set()  # missing cells no evaluated element reads, which nothing asks either (§5.8)
     upstream = waiting = unasked = False  # unasked: an idle word set was reported, with the Trigger off
     changed = _stored(node.uid, entries)  # what playback answered since the last pass: this pass stores it (§5.5)
     reports = REPORTS.get(node.uid) or {}
@@ -610,6 +615,15 @@ def _process(tree, node, contexts):
             continue
         # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
         entry, missing, errors = spec.resolve(job, entries, last_shown.get(key, ""), partial=True)
+        # Rules asks only the cells its elements read, stamped on the evaluated geometry, and its table is whole once
+        # they are answered (§5.8). While none is known yet, the table with nothing answered shows, so the graph lays
+        # out the job's factors and stamps their cells
+        cells = in_use(node, job, words, reports, contexts, _pass_depsgraph) if missing else None
+        if entry is None and cells is not None:
+            entry = found if found is not None and found.words_key == job.words_key else spec.unanswered(job)
+        if missing and cells is not None and cells is not LATER:
+            unused.update(cell.key for cell in missing if cell.key not in cells)
+            missing = [cell for cell in missing if cell.key in cells]
         if entry is not None and found is not None and entry is not found and dataclasses.replace(
                 entry, t=found.t) == found:
             entry = found  # the partial table as stored already
@@ -640,8 +654,10 @@ def _process(tree, node, contexts):
         if missing and (words in on or once):  # reported with its Trigger on, by any modifier, or Ask Again (§6.0)
             waiting = True
             asked.update(cell.key for cell in missing)
-            if _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
-                                           generation=GENERATIONS.get(node.uid, 0)), missing):
+            # LATER: the graph laid out now stamps the cells in use at the next evaluation, and the pass after it asks
+            # them; meanwhile they count as asked, so Ask Again waits for them too
+            if cells is not LATER and _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
+                                                                  generation=GENERATIONS.get(node.uid, 0)), missing):
                 sent.update(cell.key for cell in missing)
         elif missing:  # nothing asks it; cells asked before are still filled, and the node shows it
             pending = {cell.key for cell in missing if cell.key in pipeline.PENDING}
@@ -698,7 +714,7 @@ def _process(tree, node, contexts):
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings]
         + [_problem(INFO, note) for note in (NOTES.get(node.uid), *DRIFT.get(node.uid, {}).values()) if note],
         asking=frozenset(sent), trigger=trigger, reported=len({words for sets in reports.values() for words in sets}),
-        **_counts(spec, jobs, resolved, asked | idle))
+        **_counts(spec, jobs, resolved, asked | idle | unused))
     return changed
 
 
@@ -798,6 +814,46 @@ def _scan(spec, node, sets):
                 error = Hint(READ_LATER.format(error.socket))
             planned.append((ctx, words, error))
     return planned
+
+
+class _Later(frozenset):
+    """LATER's type: no cell, told apart from "no cell in use"."""
+
+
+LATER = _Later()  # in_use(): the cells in use are known after the next evaluation; none is asked meanwhile
+
+
+def in_use(node, job, words, reports, contexts, depsgraph):
+    """The keys of the job's cells (pipeline.Cell.key) that the elements of its word set read in the evaluation of
+    `depsgraph` (§5.8), so a Rules node asks only the missing ones among them: the cells its group stamped on the
+    evaluated geometry of each object whose modifier reported `words` with the Trigger on, or of each that reported
+    them when none did (Ask Again, and an idle node's count of missing answers). For the pass and the playback path;
+    main thread, after the evaluation.
+
+    None, so that every missing cell is asked, when that can't be known: another node type, a statically planned word
+    set (words None), or such an object whose geometry doesn't carry the stamp (it doesn't reach the modifier's
+    output, or the node's Geometry input is unlinked). LATER, which holds no cell, while the stamp comes from a graph
+    laid out for another interface or factor layout than the job's: the pass lays out the job's, and the evaluation
+    after it stamps their cells. reports: {(object pointer, modifier name): {words: triggered}}, the node's REPORTS;
+    contexts: the Ctx of each use of the node's tree (evaluator.find_uses())."""
+    stamped = getattr(SPECS[node.bl_idname], "stamped", None)
+    if stamped is None or words is None or depsgraph is None:
+        return None
+    at = [key for key, sets in reports.items() if words in sets]
+    at = [key for key in at if reports[key][words]] or at
+    objects = {ctx.obj.as_pointer(): ctx.obj for ctx in contexts if ctx.obj is not None}
+    found = []
+    for pointer in dict.fromkeys(pointer for pointer, _mod in at):  # an object's modifiers share its geometry
+        values = geometry.int_values(objects[pointer], inner.CELL + node.uid, depsgraph) if pointer in objects else None
+        if values is None:
+            return None
+        found.append(values)
+    if not found:
+        return None
+    rows = stamped(node, job, np.concatenate(found))
+    if rows is None:
+        return LATER
+    return frozenset(job.rows[i].cell.key for i in rows if job.rows[i].cell is not None)
 
 
 def _differs(job, entry):
@@ -1087,11 +1143,21 @@ def _play_frame(depsgraph):
     reported that its table holds no whole entry for becomes a question, which is planned, answered from the node's
     stored entries and this session's answers, written values only, and asked at P0 for what it misses. This frame's
     questions come first; what the budget leaves waits, oldest first, for the next frame or tick."""
+    global _frame
     started = time.perf_counter()
     nodes = list(iter_nodes())
     uses = find_uses()
     trees = dict.fromkeys(tree.as_pointer() for tree, _node in nodes)
     reports = channel.read(nodes, [ctx for key in trees for ctx in uses.get(key, ())], depsgraph)
+    _frame = (depsgraph, reports, uses)  # what _in_use_now() reads the cells in use from (§5.8)
+    try:
+        _frame_questions(nodes, uses, reports, started)
+    finally:
+        _frame = None
+
+
+def _frame_questions(nodes, uses, reports, started):
+    """_play_frame()'s questions: the new ones of this frame first, then those the budget left, oldest first."""
     asked = {}  # uid -> the words of its questions
     for uid, words in QUESTIONS:
         asked.setdefault(uid, set()).add(words)
@@ -1174,14 +1240,34 @@ def _plan_one(key, question, node):
     if node is None or record is None:  # deleted, or its table was never written by a pass
         del QUESTIONS[key]
         return
+    stamped = hasattr(SPECS[node.bl_idname], "stamped")
+    if stamped and _frame is None:  # a tick has no evaluation to read its cells in use from: the next frame plans it
+        return
     try:
         job = plan_words(node, question.ctx, key[1])
     except (Hint, Pending, Unresolvable):
         _done(key, record)
         return
     missing = _answer(node, record, question, job)
+    if missing and stamped:
+        missing = _in_use_now(node, key[1], job, missing)
+        if missing == []:  # every cell its elements read is answered: a later frame's may bring new ones (§5.8)
+            del QUESTIONS[key]
+            return
     if not (missing and _ask(node, question, job, missing)):
         _done(key, record)
+
+
+def _in_use_now(node, words, job, missing):
+    """The missing cells of a Rules question that this frame's elements read (in_use(), §5.8): all of them when that
+    can't be known, None while the stamp comes from another layout (LATER), which the pass after playback lays out."""
+    depsgraph, reports, uses = _frame
+    cells = in_use(node, job, words, reports.get(node.uid) or {}, uses.get(node.id_data.as_pointer(), ()), depsgraph)
+    if cells is None:
+        return missing
+    if cells is LATER:
+        return None
+    return [cell for cell in missing if cell.key in cells]
 
 
 def _answer(node, record, question, job):
@@ -1214,6 +1300,15 @@ def _done(key, record):
     entry = record.found.get(key[1])
     if entry is None or not complete(entry):
         HELD.add(key)
+
+
+def _finished(key, record, node):
+    """A question whose asked cells all landed goes (_done()). A Rules node's table stays partial by design, its cells
+    no element reads never asked (§5.8), so its words aren't held: a later frame asks the cells its elements reach."""
+    if hasattr(SPECS[node.bl_idname], "stamped") and key[1] in record.found:
+        del QUESTIONS[key]
+    else:
+        _done(key, record)
 
 
 def _write(node, record, entry, shown=None):
@@ -1287,7 +1382,7 @@ def _play_tick(playing):
             missing = _answer(node, record, question, question.job)
             question.asked = frozenset(cell.key for cell in missing or ()) & asked
             if not question.asked:
-                _done(key, record)
+                _finished(key, record, node)
         elif not _ask(node, question, question.job,
                       [row.cell for row in question.job.rows if row.cell is not None and row.cell.key in asked]):
             _done(key, record)

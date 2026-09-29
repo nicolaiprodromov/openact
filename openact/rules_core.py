@@ -1,5 +1,6 @@
 """The Rules engine in pure Python (design 6.5 and 9): cells, `if` restrictions, the question for one cell, the limits,
-and the references for interpolation and dithering that the inner graph must match within 1e-5.
+the references for interpolation and dithering that the inner graph must match within 1e-5, and the stamp that names
+each element's cells on the geometry (5.8).
 
 Only the standard library, csvfmt and pipeline are imported, so the unit tests also run under plain CPython.
 specs/rules.py builds the Rules Spec on it. Model rows take their confidence from specs/base.py's confidence() (4.e);
@@ -32,6 +33,7 @@ MAX_SCORED_ROWS = 8192  # per context, before any request (5.4)
 MAX_INTERPOLATED = 3  # Amount factors that Yes/No and Amount interpolate over; later ones use the nearest band
 BLEND_EPSILON = 1e-6  # a blend whose answered corners weigh no more than this gives the fallbacks
 DITHER_SEED_STEP = 7919  # factor j's Random Value uses Seed + 7919 * j (j in factor order)
+STAMP_CORNERS = 64  # a Yes/No or Amount stamp: 1 + its lower corner * 64 + 2 bits per interpolated factor (5.8)
 
 
 class RulesError(ValueError):
@@ -404,6 +406,58 @@ def blend(factors, values, table) -> tuple[float, float, bool]:
     if total <= BLEND_EPSILON:
         return 0.0, 0.0, False
     return value / total, confidence / total, True
+
+
+# ------------------------------------------------------------------------ the stamp on the geometry (5.8)
+
+
+def blend_stamp(factors, values) -> int:
+    """The stamp of one Yes/No or Amount element: 1 + its lower corner (each interpolated factor at its b0, the others
+    at their level) * STAMP_CORNERS, plus, for the a-th interpolated factor, 1 << 2a when its upper level weighs
+    nothing (t = 0) and 2 << 2a when its lower one weighs nothing (t = 1). So it names every corner of weight > 0
+    (corners()). 0 when a category value matches no level. One-of's stamp is simply 1 + its cell, 0 for none."""
+    interpolate = interpolated_factors(factors)
+    steps = strides(level_counts(factors))
+    lower, skips = 0, 0
+    for j, (factor, value) in enumerate(zip(factors, values)):
+        if j in interpolate:
+            b0, t = axis(factor, value)
+            a = interpolate.index(j)
+            lower += b0 * steps[j]
+            skips += (1 << 2 * a if t <= 0 else 0) + (2 << 2 * a if t >= 1 else 0)
+            continue
+        b = level_index(factor, value)
+        if b is None:
+            return 0
+        lower += b * steps[j]
+    return 1 + lower * STAMP_CORNERS + skips
+
+
+def stamp_limit(answer_type: str, cells: int) -> int:
+    """The largest stamp of a table of `cells` cells: a larger number names no cell."""
+    return cells if answer_type == "ONE_OF" else cells * STAMP_CORNERS
+
+
+def stamped_cells(factors, answer_type: str, stamps) -> set[int]:
+    """The cells that elements with these stamps read: a One-of stamp names its cell, a Yes/No or Amount one
+    (blend_stamp()) each corner of weight > 0. 0 names none, and so does a number that is no stamp of these factors,
+    such as a node after the Rules node that interpolates attributes (a subdivision) may leave."""
+    counts = level_counts(factors)
+    total = math.prod(counts)
+    if answer_type == "ONE_OF":
+        return {stamp - 1 for stamp in stamps if 0 < stamp <= total}
+    interpolate, steps = interpolated_factors(factors), strides(counts)
+    cells = set()
+    for stamp in stamps:
+        lower, skips = divmod(stamp - 1, STAMP_CORNERS)
+        if stamp <= 0 or skips >> 2 * len(interpolate):
+            continue
+        corners = [lower]
+        for a, j in enumerate(interpolate):
+            levels = {0: (0, 1), 1: (0,), 2: (1,)}.get(skips >> 2 * a & 3, ())  # 3 would weigh nothing: no stamp
+            corners = [cell + level * steps[j] for cell in corners for level in levels]
+        cells.update(cell for cell in corners if 0 <= cell < total)
+    return cells
 
 
 # ------------------------------------------------------------------------ dithering (9.7, One-of only)

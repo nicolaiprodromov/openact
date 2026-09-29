@@ -11,6 +11,8 @@ engine.tick() between frames pumps the answers, runs its work between frames and
 - the Trigger: an Ask whose Question holds the frame (Value to String) asks at each new frame, shows its last answer
   (the default a miss shows, §8.2) until the frame's own lands and then that one, while an untriggered Ask beside it
   asks nothing and its table is never written; nothing is stored during playback, and all of it once it stops;
+- Rules' cells in use (§5.8): a triggered Rules node whose geometry passes through it asks, while the timeline plays,
+  each cell as its points first reach it and no other, with no inner.build(), and the pass after stores them;
 - a simulation zone that adds an Ask's Answer to its state each frame, the Ask triggered from frame 3: the answer
   written at frame 3 is seen at frame 4, and the simulation continues without resetting (REDESIGN 2.5);
 - stale questions: while the model is busy, a node whose words change every frame keeps only its newest question
@@ -561,6 +563,53 @@ def phase_trigger():
     timing("with a new question at each frame (planned and asked)", new_costs, engine.FRAME_BUDGET)
 
 
+HEAT = ("factor,kind,level,value,when\nheat,amount,cold,,Cold.\nheat,amount,mild,,Mild.\nheat,amount,warm,,Warm.\n"
+        "heat,amount,hot,,Hot.\nlit,flag,dark,0,Dark.\nlit,flag,bright,1,Bright.\n")  # 8 cells: heat * lit
+
+
+def phase_rules_in_use():
+    """A Rules node whose geometry passes through it to the modifier's output, its heat the frame / 10 (Scene Time)
+    and its lit flag unlinked (dark), triggered: its points move from cold to hot while the timeline plays."""
+    scene = reset(1, 9)
+    path = os.path.join(TMP, "heat_factors.csv")
+    pathlib.Path(path).write_text(HEAT, encoding="utf-8")
+    tree, gi, go = new_tree("Heat")
+    rules = tree.nodes.new(RULES.idname)
+    rules.inputs["Question"].default_value = "Which one?"
+    rules.inputs["Factors"].default_value = path
+    rules.inputs["Outcomes"].default_value = "A: the first; B: the second"
+    tree.links.new(gi.outputs["Geometry"], rules.inputs["Geometry"])
+    tree.links.new(store(tree, rules.outputs["Geometry"], rules.outputs["Outcome"], "out", 'INT'), go.inputs["Geometry"])
+    switch = tree.nodes.new("FunctionNodeInputBool")  # its Trigger, on
+    switch.boolean = True
+    tree.links.new(switch.outputs[0], rules.inputs["Trigger"])
+    obj = user("Heat", tree)
+    settle()  # the pass gives the node its factor sockets from the Factors CSV
+    tenth = tree.nodes.new("ShaderNodeMath")
+    tenth.operation = 'DIVIDE'
+    tree.links.new(tree.nodes.new("GeometryNodeInputSceneTime").outputs["Frame"], tenth.inputs[0])
+    tenth.inputs[1].default_value = 10.0
+    tree.links.new(tenth.outputs[0], rules.inputs["heat"])
+    obj.update_tag()
+    settle()  # stopped at frame 1: the pass lays out the factors, then asks the one cell in use, cold|dark
+    names, stopped = S.load(rules).entries[0].rows.name, S.load(rules).entries[0].rows.src  # rows in cell order
+    start, builds = len(ASKED), len(BUILDS)
+    with playing():
+        for frame in range(1, 10):
+            scene.frame_set(frame)
+            landed()
+    during = (len(asked_by(rules, start)), len(BUILDS) - builds)
+    settle()
+    src = S.load(rules).entries[0].rows.src
+    answered = sorted(name for name, letter in zip(names, src) if letter == "m")
+    check("rules in use: stopped at frame 1, the node asks only the cell its points read, cold|dark",
+          sorted(name for name, letter in zip(names, stopped) if letter == "m") == ["cold|dark"], (names, stopped))
+    check("rules in use: during playback it asks each cell as its points first reach it, mild, warm then hot, 3 cells "
+          "in all, never a bright one, and builds nothing", during == (3, 0), during)
+    check("rules in use: once playback stops, the pass stores the 4 dark cells answered, the bright ones never asked",
+          answered == ["cold|dark", "hot|dark", "mild|dark", "warm|dark"], (answered, src))
+
+
 def phase_simulation():
     """A simulation zone that counts its steps and adds an Ask's Answer to a sum at each step; the Ask's Trigger is on
     after frame 2 (Scene Time)."""
@@ -941,6 +990,7 @@ def main():
                                                                                             60), server.status())
         phase_playback()
         phase_trigger()
+        phase_rules_in_use()
         phase_simulation()
         phase_stale()
         phase_budget()
