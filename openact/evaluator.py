@@ -7,11 +7,16 @@ Join Strings, Value to String, Replace String, Slice String, String Length, Spec
 Switch, Index Switch, Menu Switch; Import Text, Reroute, muted nodes and links; and the single-value
 outputs of OpenAct nodes, through the handler the engine registers.
 
-Anything that needs geometry or fields raises Unresolvable, with a breadcrumb from the socket that
+Anything that needs geometry or fields raises Unreadable, with a breadcrumb from the socket that
 was read to the node that failed: "Context ← Join Strings ← Named Attribute: fields can't be words".
 The one geometry link followed is a CSV socket's, by trace_csv_source(), and only to read the Path
 and Delimiter of the Import CSV node at its end. Import CSV and Import Text Paths resolve as Geometry
 Nodes resolves them (import_path()), and Import Text obeys the file trust rule (trust.py).
+
+The words of a context an evaluation reported come from the Warning channel instead (§5.7): while the
+engine plans one reported word tuple, WORDS gives the planned node's String word sockets the reported
+values, so the same plan() reads them, and everything else (ID inputs, the Import CSV hand-off)
+statically.
 
 For the words at other frames (engine.FrameWords), which a background render compares with the saved
 tables (§7.8), the values animation can change (modifier inputs, socket defaults, the Integer and
@@ -32,6 +37,7 @@ MAX_DEPTH = 64
 MEMO = None  # (output socket pointer, Ctx.key()) -> (value, depth read at) during engine.run_pass(); else None
 READS = None  # while words are read at other frames: (ID pointer, data path) -> (struct, name, custom, value) read
 OVERRIDES = None  # while words are read at another frame: (ID pointer, data path) -> the value read instead
+WORDS = None  # while a reported word set is planned: (node pointer, socket identifier) -> the reported value (§5.7)
 
 
 class Unresolvable(Exception):
@@ -50,6 +56,11 @@ class Unresolvable(Exception):
         if len(names) > 3:
             names = [names[0], "…", *names[-2:]]
         return f"{' ← '.join(names)}: {message}"
+
+
+class Unreadable(Unresolvable):
+    """A value only Geometry Nodes can compute: a field, a node the evaluator doesn't know (Scene Time, a simulation's
+    state), a chain too deep. A word of it is no error where an evaluation reports the node's words (§5.7)."""
 
 
 class FileError(Unresolvable):
@@ -184,9 +195,13 @@ def _animated(struct, name, custom=False):
 
 
 def eval_input(sock, ctx, depth=0):
-    """Value of an input socket in the given context."""
+    """Value of an input socket in the given context: the reported value for a word socket of the node WORDS plans."""
     if depth > MAX_DEPTH:
-        raise Unresolvable("the connection chain is too deep")
+        raise Unreadable("the connection chain is too deep")
+    if WORDS is not None and depth == 0:  # a node reads its own words at depth 0, and never through a link
+        reported = WORDS.get((sock.node.as_pointer(), sock.identifier))
+        if reported is not None:
+            return reported
     try:
         links = [link for link in sock.links if not link.is_muted]
         if any(not link.is_valid for link in links):
@@ -196,7 +211,7 @@ def eval_input(sock, ctx, depth=0):
             if multi or not hasattr(sock, "default_value"):
                 return [] if multi else None
             if _implicit(sock):
-                raise Unresolvable("fields can't be words")
+                raise Unreadable("fields can't be words")
             return _animated(sock, "default_value")
         if multi:  # Join Strings joins the most recently connected link first
             ordered = sorted(links, key=lambda link: -link.multi_input_sort_id)
@@ -247,8 +262,8 @@ def _eval_output(node, out, ctx, depth):
     handler = HANDLERS.get(kind)
     if handler is None:
         if is_field(out):
-            raise Unresolvable("fields can't be words")
-        raise Unresolvable(f"{node.bl_label} isn't supported as an OpenAct input")
+            raise Unreadable("fields can't be words")
+        raise Unreadable(f"{node.bl_label} isn't supported as an OpenAct input")
     return handler(node, out, ctx, depth + 1)
 
 
@@ -267,7 +282,7 @@ def _group_input(identifier, ctx, depth):
     item = _interface_item(ctx.root, identifier)
     if ctx.mod is not None:
         if ctx.mod.get(identifier + "_use_attribute"):
-            raise Unresolvable("a modifier input is set to use an attribute")
+            raise Unreadable("a modifier input is set to use an attribute")
         try:
             value = _animated(ctx.mod, identifier, custom=True)
         except KeyError:

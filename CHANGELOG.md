@@ -18,6 +18,11 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
   their table. The error "... the limit is 16: split the tree" is gone; two sets of words whose hashes collide, which
   is rare, get an error asking for another Key. Files saved by 1.0 are rebuilt on their first pass.
 - A node keeps up to 1024 stored sets of answers besides the ones in use (was 16), still within 2 MB per node.
+- Words can come from any nodes that make a single String, such as the frame through Value to String, a Repeat zone
+  or a simulation: OpenAct reads the words each evaluation reports. A For Each Element zone gives each element its
+  own words and answers. A node no evaluation uses reads its words as before, and words only Geometry Nodes computes
+  wait for its first evaluation. In a file that isn't trusted, words an Import Text node reads from outside the
+  file's folder are blocked, as before.
 
 ## 1.0.0
 

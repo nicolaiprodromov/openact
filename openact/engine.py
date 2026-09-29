@@ -3,9 +3,10 @@
 Geometry Nodes cannot run Python while it evaluates (Blender has no script node), so an OpenAct
 node is answered outside evaluation:
 
-1. After a change, each OpenAct node's words are read by the static evaluator (evaluator.py) and
-   planned into a Job per context (specs/, pipeline.py). A Job is planned again only when the
-   fingerprint of what it was planned from changes.
+1. After a change, each OpenAct node's words are read from what the evaluation reported through
+   the Warning channel (channel.py), or by the static evaluator (evaluator.py) for a context no
+   evaluation reported, and planned into a Job per word set (specs/, pipeline.py). A Job is
+   planned again only when the fingerprint of what it was planned from changes.
 2. Its rows are answered by the validity rule: the node's stored answers while the words mean the
    same, then this session's answers, then the local model, asked in the background (server.py).
 3. The answers are written into the node's table object, which its hidden node group reads, keyed
@@ -16,23 +17,25 @@ node is answered outside evaluation:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import os
 import time
 import traceback
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 
 import bpy
 from bpy.app.handlers import persistent
 from bpy_extras import anim_utils
 
-from . import csvfmt, evaluator, inner, lists, pipeline, server, store, trust
+from . import channel, csvfmt, evaluator, inner, lists, pipeline, server, store, trust
 from . import prefs as P
 from . import tables
 from .csvfmt import ERROR, INFO, WARNING, Problem
-from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
+from .evaluator import Ctx, Hint, Pending, Unreadable, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
@@ -58,12 +61,15 @@ INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is
 P0_CELLS = 8
 DIFFERS = "CSV {} differs from the saved table ({})"  # a file edited since a table read from it was stored (R23)
 RENDERING = "; rendering the saved answers"  # ... printed where passes leave the saved tables as they are (§7.8)
+READ_LATER = "Its {} is read when the node evaluates"  # a word only Geometry Nodes computes, of an unreported context
 
 STATUS = {}  # node uid -> NodeStatus
-PLANS = {}  # (node uid, ctx key) -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
-LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last
+PLANS = {}  # _key() of a word set -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
+LAST_SHOWN = {}  # (node uid, ctx key) -> words key of the entry that context showed last, while it has one word set
 LIVE = {}  # node uid -> words keys of the entries its contexts showed at its last pass
 CONTEXTS = {}  # node uid -> the ctx keys of its contexts at the last pass: tells the pass when one goes away
+REPORTS = {}  # node uid -> {(object pointer, modifier name): {words: triggered}}: the pass's channel.read() (§5.7)
+SETS = {}  # node uid -> the _key()s of the word sets its last visit planned: tells a visit when a context's changed
 DIRTY = set()  # uids of the nodes the next pass visits, when not all of them are dirty
 GENERATIONS = {}  # node uid -> its generation, bumped when its words change: its older queued chunks are dropped
 NOTES = {}  # node uid -> what its last save evicted or kept above the soft cap (NodeStore.note), for its status
@@ -123,9 +129,9 @@ def _error(text):
 
 
 def _openact_output(node, out, ctx, depth):
-    """Evaluator handler: the answer an OpenAct node shows for the words it gets in this context."""
+    """Evaluator handler: the answer an OpenAct node shows for the words the static evaluator reads in this context."""
     if is_field(out):
-        raise Unresolvable(f"'{node.name}' output '{out.name}' is a field; words must be single values")
+        raise Unreadable(f"'{node.name}' output '{out.name}' is a field; words must be single values")
     spec = SPECS[node.bl_idname]
     outer, lists.HASHES = lists.HASHES, None  # its files are its own entries': not the reading node's
     try:
@@ -143,36 +149,124 @@ def _openact_output(node, out, ctx, depth):
     try:
         return spec.output(entry, out.name)
     except KeyError:
-        raise Unresolvable(f"'{node.name}' output '{out.name}' can't be a word") from None
+        raise Unreadable(f"'{node.name}' output '{out.name}' can't be a word") from None
 
 
 evaluator.HANDLERS.update(dict.fromkeys(OPENACT_TYPES, _openact_output))
 
 
-def _plan(spec, node, ctx):
+def _plan(spec, node, ctx, words=None):
     """The node's Job in ctx with its Overrides CSV applied, planned again only when its fingerprint changed (§5.3).
-    Raises Hint, Pending or Unresolvable."""
+    words: a word tuple an evaluation reported for the node (§5.7), which its String word sockets read instead of
+    the static evaluator's; None plans its static words. Raises Hint, Pending or Unresolvable."""
     global _plans_made
-    if evaluator.READS is not None or evaluator.OVERRIDES is not None:  # words read at another frame (FrameWords)
-        return spec.locked(node, ctx, spec.plan(node, ctx))  # the plan cache and generations are the live words'
-    key = (node.uid, ctx.key())
-    if _pass_plans is not None:
-        _pass_plans.add(key)
-    fingerprint = spec.fingerprint(node, ctx)
-    cached = PLANS.get(key)
-    if cached is None or cached[0] != fingerprint:
-        if cached is not None:  # new words: the chunks still queued for the node ask about the old ones
-            _bump(node.uid)
-        try:
-            planned = _planned(spec, node, ctx)
-        except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
-            planned = (type(error), str(error))
-        cached = PLANS[key] = (fingerprint, planned)
-        _plans_made += 1
+    if words is not None:
+        _checked(spec, node, ctx)
+    with reading(spec, node, words):
+        if evaluator.READS is not None or evaluator.OVERRIDES is not None:  # words read at another frame (FrameWords)
+            return spec.locked(node, ctx, spec.plan(node, ctx))  # the plan cache and generations are the live words'
+        key = _key(node.uid, ctx, words)
+        if _pass_plans is not None:
+            _pass_plans.add(key)
+        fingerprint = spec.fingerprint(node, ctx)
+        cached = PLANS.get(key)
+        if cached is None or cached[0] != fingerprint:
+            if cached is not None:  # new words: the chunks still queued for the node ask about the old ones
+                _bump(node.uid)
+            try:
+                planned = _planned(spec, node, ctx)
+            except (Hint, Unresolvable) as error:  # kept as a message: the evaluator adds its hops to a raised error
+                planned = (type(error), str(error))
+            cached = PLANS[key] = (fingerprint, planned)
+            _plans_made += 1
     if isinstance(cached[1], tuple):
         kind, message = cached[1]
         raise kind(message)
     return cached[1]
+
+
+def _key(uid, ctx, words=None):
+    """The plan cache's key of a word set: its node and context, and the words when an evaluation reported them."""
+    return (uid, ctx.key()) if words is None else (uid, ctx.key(), words)
+
+
+@contextlib.contextmanager
+def reading(spec, node, words):
+    """Within it, the node's String word sockets read the reported word tuple `words` (evaluator.WORDS, §5.7), in
+    spec.words() order, whatever is linked to them; None: the static evaluator reads them."""
+    found = None
+    if words is not None:
+        found = {}
+        for name, word in zip(spec.words(node), words):
+            socket = next((s for s in node.inputs if s.name == name and s.type == 'STRING'), None)
+            if socket is not None:  # e.g. Items under a Collection source: reported as ""
+                found[(node.as_pointer(), socket.identifier)] = word
+    outer, evaluator.WORDS = evaluator.WORDS, found
+    try:
+        yield
+    finally:
+        evaluator.WORDS = outer
+
+
+def _checked(spec, node, ctx):
+    """Check the words an evaluation reported for the node in ctx before they are planned (§5.7). The static evaluator
+    reads them too, as 1.0 did: when they wait for another OpenAct node's answer it raises Pending, and when it meets
+    an error (another node's blocked or broken file, a missing text file, an invalid link) it raises that
+    Unresolvable, as Geometry Nodes then built the reported words from fallbacks, which a pass never asks about (§5.3,
+    chaining). Words only Geometry Nodes computes (Unreadable) are its report's. In a file that isn't trusted, raises
+    Unresolvable when an Import Text node may have read them from outside its folder (_outside(), §16.1)."""
+    if not trust.is_trusted() and (blocked := _outside(spec, node, ctx)):
+        raise Unresolvable(blocked)
+    try:
+        with reading(spec, node, None):
+            spec.gn(node, ctx)
+    except (Hint, Unreadable):  # only Geometry Nodes computes them: its report is all there is
+        pass
+
+
+def _outside(spec, node, ctx):
+    """In a file that isn't trusted, why the node's reported words in ctx may hold a file outside its folder, else "":
+    the blocked read of an Import Text node that feeds its String words (trust.blocked()), or one whose Path the static
+    evaluator can't read. Geometry Nodes reads such a file itself, but OpenAct never stores its text (§16.1). Text never
+    travels through geometry (no attribute holds a string), so Geometry sockets are not followed."""
+    stack = [(socket, ctx) for socket in node.inputs if socket.name in spec.words(node) and socket.type == 'STRING']
+    seen = set()
+    while stack:
+        socket, at = stack.pop()
+        if (socket.as_pointer(), at.key()) in seen:
+            continue
+        seen.add((socket.as_pointer(), at.key()))
+        if len(seen) > 4096:
+            return f"{trust.BLOCKED} the words of '{node.name}': too many nodes feed them to check their files"
+        for link in socket.links:
+            if link.is_muted or socket.type == 'GEOMETRY':
+                continue
+            up, out = link.from_node, link.from_socket
+            if up.bl_idname == "GeometryNodeImportText" and not up.mute:
+                try:
+                    path = evaluator.as_text(evaluator.eval_input(evaluator._in(up, "Path"), at))
+                    message = path and trust.blocked(evaluator.import_path(path, up))
+                except (Hint, Pending, Unresolvable):
+                    message = f"{trust.BLOCKED} the text file of '{up.name}': its Path can't be checked"
+                if message:
+                    return message
+            elif up.bl_idname == "NodeGroupInput":
+                if at.path:
+                    stack += [(s, at.pop()) for s in at.path[-1].inputs if s.identifier == out.identifier]
+            elif up.bl_idname == "GeometryNodeGroup" and up.node_tree is not None:
+                stack += [(s, at.push(up)) for n in up.node_tree.nodes if n.bl_idname == "NodeGroupOutput"
+                          and n.is_active_output for s in n.inputs if s.identifier == out.identifier]
+            else:
+                stack += [(s, at) for s in up.inputs]
+    return ""
+
+
+def plan_words(node, ctx, words):
+    """The Job of a word tuple an evaluation reported for the node in ctx (§5.7), with the node's Overrides CSV
+    applied: for the playback path, through the pass's plan cache, so a word set is planned once for both, and a
+    changed fingerprint bumps the node's generation as in a pass (GENERATIONS; submit at GENERATIONS[uid]). Raises
+    Hint, Pending or Unresolvable. Main thread, outside evaluation."""
+    return _plan(SPECS[node.bl_idname], node, ctx, tuple(words))
 
 
 def _planned(spec, node, ctx):
@@ -194,10 +288,13 @@ def _bump(uid):
 
 
 def _jobs(node):
-    """(ctx, Job) for each use of the node that has a question."""
-    tree = node.id_data
-    uses = find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
-    return [(ctx, job) for ctx, job in _scan(SPECS[node.bl_idname], node, uses) if not isinstance(job, Exception)]
+    """(ctx, Job) for each word set of the node that has a question, as a pass would plan them now: the words its
+    evaluations report (§5.7), else its static words."""
+    spec, tree = SPECS[node.bl_idname], node.id_data
+    contexts = find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
+    found = channel.read(list(iter_nodes()), contexts, channel.evaluated()).get(node.uid)
+    return [(ctx, job) for ctx, _words, job in _scan(spec, node, _sets(spec, node, contexts, found))
+            if not isinstance(job, Exception)]
 
 
 # ------------------------------------------------------------------------ inner trees
@@ -305,6 +402,9 @@ def run_pass(everything=True):
         _dirty, _last_pass = False, time.monotonic()  # what else is due (DIRTY, WATCH) waits for a pass that writes
         _report()
         return
+    # The evaluation the reports describe (§5.7): it evaluates any change since, whose depsgraph update then schedules
+    # nothing more, as this pass covers it
+    depsgraph = channel.evaluated()
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
@@ -328,23 +428,30 @@ def run_pass(everything=True):
         LAST_SHOWN.clear()
         LIVE.clear()
         CONTEXTS.clear()
+        REPORTS.clear()
+        SETS.clear()
         NOTES.clear()
         DRIFT.clear()
         WATCH.retain(())
         tables.collect_garbage(nodes)
         return
+    uses = find_uses()
+    trees = dict.fromkeys(tree.as_pointer() for tree, _node in nodes)  # the trees that hold OpenAct nodes
+    REPORTS.clear()  # before ensure_owned(): read() tells a copy's reports from its original's by the groups they share
+    REPORTS.update(channel.read(nodes, [ctx for key in trees for ctx in uses.get(key, ())], depsgraph))
     ensure_owned(nodes)
     tables.collect_garbage(nodes)  # after ensure_owned(), which gives copies their own table objects
-    uses = find_uses()
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
     csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
     planned = _pass_plans = set()
+    visited = set()
     try:
         trust.PASS = trust.is_trusted()
         for tree, node in nodes:
             if not (visit_all or node.uid in dirty):
                 continue
+            visited.add(node.uid)
             try:
                 stored |= _process(tree, node, uses.get(tree.as_pointer()))
             except Exception as error:
@@ -365,9 +472,11 @@ def run_pass(everything=True):
     CONTEXTS.clear()
     CONTEXTS.update(contexts)
     # Contexts that disappeared, and nodes that did, but never one this pass planned: an evaluator read also reaches
-    # contexts find_uses() lacks (through a group node in a tree no modifier uses), planned again every pass if dropped
+    # contexts find_uses() lacks (through a group node in a tree no modifier uses), planned again every pass if dropped.
+    # A reported word set a visited node no longer plans goes too: its context's words changed
     for cache in (PLANS, LAST_SHOWN):
-        for key in [key for key in cache if key not in planned and key[1] not in contexts.get(key[0], ())]:
+        for key in [key for key in cache if key not in planned and (
+                key[1] not in contexts.get(key[0], ()) or len(key) > 2 and key[0] in visited)]:
             del cache[key]
     for uid in lost:
         _bump(uid)
@@ -375,7 +484,7 @@ def run_pass(everything=True):
     for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
         pipeline.cancel(uid, below=math.inf)
     # nodes that disappeared: undo and deleting a node group call no node's free()
-    for cache in (LIVE, STATUS, NOTES, DRIFT):
+    for cache in (LIVE, STATUS, SETS, NOTES, DRIFT):
         for uid in [uid for uid in cache if uid not in contexts]:
             del cache[uid]
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
@@ -383,8 +492,8 @@ def run_pass(everything=True):
 
 
 def _process(tree, node, contexts):
-    """Plan and answer the node's contexts, store new answers, rebuild its group and set its status. True if it stored
-    any."""
+    """Plan and answer the node's word sets, store new answers, rebuild its group and set its status. True if it stored
+    any. A context plans each word tuple its evaluation reported (REPORTS, §5.7), else its static words (§5.3)."""
     if tree.library is not None:  # read-only: the library file holds this node's answers
         STATUS[node.uid] = NodeStatus("linked", f"Linked from {tree.library.name}: answers come from that file")
         return False
@@ -403,34 +512,41 @@ def _process(tree, node, contexts):
     hidden = {}  # their (gn, words key) -> the partial table shown in their place, or None while nothing is known
     instead = {}  # (uid, ctx key) -> the words key of the partial table that context shows in a hidden entry's place
     problems, warnings, failed = [], [], []
-    uses, resolved, asked = [], {}, set()  # (label, Job) per planned context; words -> entry shown; cells missing
+    uses, resolved, asked = [], {}, set()  # (label, Job) per planned word set; words -> entry shown; cells missing
     sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
     upstream = waiting = changed = False
-    planned = _scan(spec, node, contexts)
+    generation = GENERATIONS.get(node.uid, 0)
+    planned = _scan(spec, node, _sets(spec, node, contexts, REPORTS.get(node.uid)))
+    _moved(node.uid, contexts, planned, generation)
+    counts = Counter(ctx.key() for ctx, _words, _job in planned)  # several word sets in a context: a zone's (§5.7)
     # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
     # good table stays. A context without a job (Pending; Unresolvable: a CSV with errors, too many items...; or a Hint
     # whose words still name a stored entry: an Import CSV node without a Path, an empty collection) still shows its
     # last table, whose shape is unknown. While there is one, agree() keeps the sockets, and jobs that don't fit them
     # wait (None) until that context plans again or goes away; jobs that fit them are answered
     gns = {entry.gn for entry in entries}
-    hinted = {ctx.key(): gn for ctx, job in planned if isinstance(job, Hint) and (gn := _gn(spec, node, ctx)) in gns}
-    hints = [str(job) for ctx, job in planned if ctx.key() in hinted]  # first: they are the hints that hold the node
-    unknown = bool(hinted) or any(isinstance(job, (Pending, Unresolvable)) for _ctx, job in planned)
-    conflict = spec.agree(node, [(ctx, job) for ctx, job in planned if not isinstance(job, Exception)], unknown,
-                          entries) if hasattr(spec, "agree") else ""
+    hinted = {(ctx.key(), words): gn for ctx, words, job in planned
+              if isinstance(job, Hint) and (gn := _gn(spec, node, ctx, words)) in gns}
+    hints = [str(job) for ctx, words, job in planned if (ctx.key(), words) in hinted]  # first: they hold the node
+    unknown = bool(hinted) or any(isinstance(job, (Pending, Unresolvable)) for _ctx, _words, job in planned)
+    conflict = spec.agree(node, [(ctx, job) for ctx, _words, job in planned if not isinstance(job, Exception)],
+                          unknown, entries) if hasattr(spec, "agree") else ""
     held = conflict is None
     if conflict:
         problems.append(conflict)
-    for ctx, job in planned:
+    for ctx, words, job in planned:
         key = (node.uid, ctx.key())
+        # A context with several word sets (a zone, §5.7) keeps no last-shown entry: they have no identity from one
+        # evaluation to the next, so one word set would show another's rows while refilling
+        last_shown = LAST_SHOWN if counts[ctx.key()] == 1 else {}
         if isinstance(job, Pending):  # its words wait for another node's answer: the entry it showed last stays live
             upstream = True
-            last = next((entry for entry in entries if entry.words_key == LAST_SHOWN.get(key)), None)
+            last = next((entry for entry in entries if entry.words_key == last_shown.get(key)), None)
             if last is not None and last.gn not in live:
                 live.append(last.gn)
             continue
         if isinstance(job, Hint):
-            gn = hinted.get(ctx.key())
+            gn = hinted.get((ctx.key(), words))
             if gn is None:
                 hints.append(str(job))
             elif gn not in live:  # the stored entry its words name still shows: kept, as for an error
@@ -438,16 +554,16 @@ def _process(tree, node, contexts):
             continue
         if isinstance(job, Unresolvable):  # e.g. a CSV with errors: its words stay live, so the last good table shows
             problems.append(str(job))
-            _live(live, spec, node, ctx)
+            _live(live, spec, node, ctx, words)
             continue
-        uses.append((ctx.label(), job))
+        uses.append((_label(ctx, words, counts[ctx.key()]), job))
         warnings += job.problems
         problems += job.errors  # rows in error in a table that still shows, e.g. cells no outcome applies to
         if job.gn not in live:
             live.append(job.gn)
         if conflict or held:  # nothing is answered: the sidebar shows the stored entry resolve() keeps, if any
             found = next((entry for entry in entries if entry.gn == job.gn), None)
-            kept = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)[0] if found is not None else None
+            kept = spec.resolve(job, entries, last_shown.get(key, ""), partial=True)[0] if found is not None else None
             if kept is not None and kept.words_key == found.words_key:  # it, its table so far or a refreshed copy
                 resolved[job.gn] = found
             continue
@@ -457,13 +573,13 @@ def _process(tree, node, contexts):
             continue
         found = next((entry for entry in entries if entry.gn == job.gn), None)
         if found is not None:  # after a load, a context shows its stored entry
-            LAST_SHOWN.setdefault(key, found.words_key)
+            last_shown.setdefault(key, found.words_key)
         if other[0] is not job:  # the same words and meaning as an earlier context: the graph shows it that entry
             if any(entry is found for entry in shown):
-                LAST_SHOWN[key] = found.words_key
+                last_shown[key] = found.words_key
             continue
         # While cells are missing, the table so far shows: stale-while-refilling (§5.4)
-        entry, missing, errors = spec.resolve(job, entries, LAST_SHOWN.get(key, ""), partial=True)
+        entry, missing, errors = spec.resolve(job, entries, last_shown.get(key, ""), partial=True)
         if entry is not None and found is not None and entry is not found and dataclasses.replace(
                 entry, t=found.t) == found:
             entry = found  # the partial table as stored already
@@ -483,7 +599,7 @@ def _process(tree, node, contexts):
             if entry is not None:
                 instead[key] = entry.words_key
         elif entry is not None:
-            LAST_SHOWN[key] = entry.words_key
+            last_shown[key] = entry.words_key
             if entry is not found:
                 if found is not None:  # in place: the graph keeps its entry order, so values only (§8.8)
                     entries[entries.index(found)] = entry
@@ -523,7 +639,7 @@ def _process(tree, node, contexts):
         graph = store.NodeStore([entry for entry in (hidden.get((stored.gn, stored.words_key), stored)
                                                      for stored in node_store.entries) if entry is not None])
     problems += [COLLIDE.format(_named(kept), _named(other)) for kept, other in inner.collisions(graph.entries, live)]
-    keys = [(node.uid, ctx.key()) for ctx in contexts]
+    keys = [(node.uid, ctx.key()) for ctx, _words, _job in planned]  # one per word set: a zone's several show none
     last = [instead.get(key, LAST_SHOWN.get(key)) for key in keys]  # a miss shows what the table showed last
     default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
     # The table object is written only when its rows change: a write re-evaluates every modifier that reads it, whose
@@ -541,15 +657,18 @@ def _process(tree, node, contexts):
     return changed
 
 
-def _live(live, spec, node, ctx):
-    """Add the words ctx has now to the live gns, when they can be read."""
-    gn = _gn(spec, node, ctx)
+def _live(live, spec, node, ctx, words=None):
+    """Add the words of a word set to the live gns, when they can be read."""
+    gn = _gn(spec, node, ctx, words)
     if gn is not None and gn not in live:
         live.append(gn)
 
 
-def _gn(spec, node, ctx):
-    """The words ctx has now, or None when they can't be read."""
+def _gn(spec, node, ctx, words=None):
+    """The words of a word set: the reported ones, else the ones the static evaluator reads in ctx now, or None when
+    it can't."""
+    if words is not None:
+        return words
     try:
         return spec.gn(node, ctx)
     except (Hint, Pending, Unresolvable):
@@ -561,15 +680,60 @@ def _named(gn):
     return " · ".join(word if len(word) <= 40 else word[:39] + "…" for word in gn if word)
 
 
-def _scan(spec, node, contexts):
-    """(ctx, its Job, or the Hint, Pending or Unresolvable that planning raised) of each context: a visit plans each
-    context once, for agree() and for answering."""
-    planned = []
+def _sets(spec, node, contexts, found):
+    """(ctx, words) of each word set the node plans (§5.3): each word tuple the context's modifier reported for the
+    node (found: its REPORTS, §5.7), sorted, else (ctx, None), its static words, for a context no evaluation reported
+    (a tree no modifier uses, an unused or muted node, an object the viewport doesn't evaluate). Group paths that share
+    a modifier share its report: a tuple goes to the first path whose static words equal it, else to the first path,
+    so a path whose words merged into another's plans none. A tuple of another length (a group laid out for other
+    words) is left out."""
+    size, paths, owned = len(spec.words(node)), {}, {}
     for ctx in contexts:
+        paths.setdefault(ctx.key()[:2], []).append(ctx)
+    reported = {at: sorted(words for words in (found or {}).get(at, ()) if len(words) == size) for at in paths}
+    for at, shared in paths.items():
+        statics = [_gn(spec, node, ctx) for ctx in shared] if len(shared) > 1 and reported[at] else []
+        for words in reported[at]:
+            owner = next((ctx for ctx, gn in zip(shared, statics) if gn == words), shared[0])
+            owned.setdefault(owner.key(), []).append(words)
+    return [(ctx, words) for ctx in contexts
+            for words in (owned.get(ctx.key(), ()) if reported[ctx.key()[:2]] else (None,))]
+
+
+def _moved(uid, contexts, planned, generation):
+    """Bump the node's generation when a context it still has lost a word set its last visit planned: its words
+    changed, so its queued chunks ask about old words (§5.5). Once a visit: _plan() bumps for a changed fingerprint of
+    the same word set, and a pass for a context that went away."""
+    now = {_key(uid, ctx, words) for ctx, words, _job in planned}
+    present = {ctx.key() for ctx in contexts}
+    gone = any(key[1] in present and key not in now for key in SETS.get(uid, ()))
+    SETS[uid] = now
+    if gone and GENERATIONS.get(uid, 0) == generation:
+        _bump(uid)
+
+
+def _label(ctx, words, count):
+    """A word set's label in the sidebar: its context's, followed by its first word when the context has several (a
+    zone's, §5.7)."""
+    if count < 2 or not words:
+        return ctx.label()
+    word = next((word.strip() for word in words if word.strip()), "")
+    return f"{ctx.label()}: {word if len(word) <= 32 else word[:31] + '…'}"
+
+
+def _scan(spec, node, sets):
+    """(ctx, words, its Job, or the Hint, Pending or Unresolvable that planning raised) of each word set: a visit plans
+    each once, for agree() and for answering. A word of an unreported context that only Geometry Nodes computes
+    (Unreadable: Scene Time, a simulation's state...) is no error: its first evaluation reports it (§5.7), so it shows
+    a hint."""
+    planned = []
+    for ctx, words in sets:
         try:
-            planned.append((ctx, _plan(spec, node, ctx)))
+            planned.append((ctx, words, _plan(spec, node, ctx, words)))
         except (Hint, Pending, Unresolvable) as error:
-            planned.append((ctx, error))
+            if words is None and isinstance(error, Unreadable) and error.socket in spec.words(node):
+                error = Hint(READ_LATER.format(error.socket))
+            planned.append((ctx, words, error))
     return planned
 
 
@@ -994,6 +1158,14 @@ def on_depsgraph_update(scene, depsgraph):
 
 
 @persistent
+def on_frame_change(*_args):
+    # A new frame may give nodes new words (§5.7), and sends no depsgraph update: a pass reads them, once the timeline
+    # stops (tick())
+    if _has_nodes:
+        schedule()
+
+
+@persistent
 def on_load_post(*_args):
     global _opened
     pipeline.cancel_all()  # asked for the file just closed; the chunk in flight still lands in MEMORY
@@ -1003,6 +1175,8 @@ def on_load_post(*_args):
     LAST_SHOWN.clear()
     LIVE.clear()
     CONTEXTS.clear()
+    REPORTS.clear()
+    SETS.clear()
     NOTES.clear()
     DRIFT.clear()
     REPORTED.clear()
@@ -1031,8 +1205,9 @@ def on_server_status():
 
 def _handlers():
     h = bpy.app.handlers
-    return ((h.depsgraph_update_post, on_depsgraph_update), (h.load_post, on_load_post),
-            (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo), (h.render_pre, on_render_pre))
+    return ((h.depsgraph_update_post, on_depsgraph_update), (h.frame_change_post, on_frame_change),
+            (h.load_post, on_load_post), (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo),
+            (h.render_pre, on_render_pre))
 
 
 def register():

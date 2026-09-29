@@ -325,7 +325,9 @@ reading of evaluated geometry through `GeometrySet`.
 ### 3.4 Hard constraints (verified facts the design must respect)
 
 - Geometry Nodes cannot run Python during evaluation, and Python cannot read socket values
-  inside a tree during evaluation. Words come from **static evaluation** of the node tree only.
+  inside a tree during evaluation. Words therefore come from what each evaluation **reported**
+  through the Warning channel, read afterwards (§5.7), so they need not be computable in Python;
+  the static evaluator reads only what no evaluation reported (§10.1).
 - In a custom node's `copy()`, never reassign `node_tree`. In 4.2 the pointer is not user-counted
   and the original's group is dropped on save. `copy()` clears `uid`, and the next pass
   (`ensure_owned`) gives the copy its own inner group and table object.
@@ -509,7 +511,8 @@ Package `openact/`, in a flat style: one module per concern.
 | `prefs.py` | `OpenActPreferences`. Runtime root resolution: the explicit `runtime_dir`, else `…/OpenAct`. Backend enum, `unsure_below` | `get_prefs()`, `runtime_root()`, `runtime_installed()` |
 | `nodes.py` | The six node classes on an `_OpenActNode` mixin; Add menu | `GeometryNodeOpenAct*` |
 | `engine.py` | Passes, handlers, timer, file watcher, per-node status, ownership fix-up | `run_pass()`, `tick()`, `schedule()`, `ensure_owned()` |
-| `evaluator.py` | Static evaluator and contexts, including tracing a plugged-in Import CSV node to its Path and Delimiter (§6.0) | `eval_input()`, `find_uses()`, `trace_csv_source()`, `Ctx`, `Unresolvable`, `Pending`, `Hint` |
+| `evaluator.py` | Static evaluator and contexts, including tracing a plugged-in Import CSV node to its Path and Delimiter (§6.0) | `eval_input()`, `find_uses()`, `trace_csv_source()`, `Ctx`, `Unresolvable`, `Unreadable`, `Pending`, `Hint`, `WORDS` |
+| `channel.py` | The Warning channel's reader: what each evaluation reported, per node and modifier (§5.7) | `read()`, `evaluated()` |
 | `lists.py` | The four list sources → `ItemList([Item(name, when, row)])` | `resolve_items(node, ctx)`, `parse_inline()` |
 | `csvfmt.py` | Pure-Python CSV reader (no `bpy`): header conventions, numeric/text split mirroring Import CSV, validation, `text_hash` | `read_csv(path) -> CsvDoc` |
 | `specs/base.py`, `specs/{ask,pick,match,classify,rules,dials}.py` | Per node: wanted interface, `plan()` → `Job`, answers → rows, output spec for the builder | `Spec.interface()`, `Spec.plan()`, `Spec.rows()` |
@@ -694,8 +697,14 @@ sequenceDiagram
 1. `iter_nodes()` yields every `GeometryNodeOpenAct*` node in all non-inner Geometry Node trees.
 2. `ensure_owned()` gives every node a unique `uid` and its own inner group, and its own table
    object when the node uses one (§8).
-3. `find_uses()` maps every tree to its `Ctx` list. The limit stays at 64 contexts per tree.
-4. For each context, the words are evaluated statically (§10) and hashed into a **fingerprint**:
+3. `find_uses()` maps every tree to its `Ctx` list. The limit stays at 64 contexts per tree. Before
+   `ensure_owned()`, `channel.read()` reads what the last evaluation reported for every node
+   (`REPORTS`, §5.7).
+4. Each context plans its **word sets** (`engine._sets()`): each word tuple its modifier reported for
+   the node, or, for a context no evaluation reported (a tree no modifier uses, a node whose outputs
+   are unused, a muted node, an object the viewport doesn't evaluate), its static words (§10.1).
+   A For Each Element zone reports one tuple per element, so one context can have several word
+   sets. Each word set is hashed into a **fingerprint**:
    - the raw word strings;
    - `answer_type` and `list_source`;
    - `(path, delimiter, st_mtime_ns, st_size)` of every referenced CSV, whether typed as a path or
@@ -705,15 +714,19 @@ sequenceDiagram
    - the file trust state (§16.1), which decides the files `plan()` may read. A pass works it out
      once at its start, and resolves each file's `realpath` once, not per fingerprint.
 
-   `engine.PLANS[(uid, ctx key)]` holds `(fingerprint, job)`. An unchanged fingerprint reuses the
-   cached Job, so the cost is the evaluator plus one hash. Only a changed fingerprint runs
-   `spec.plan(node, ctx)`, which resolves the list, answer set and CSV documents and builds the
-   Job. Nodes are marked dirty by socket updates, the file watcher and depsgraph updates.
+   `engine.PLANS[(uid, ctx key)]`, or `PLANS[(uid, ctx key, words)]` for a reported word set, holds
+   `(fingerprint, job)`. An unchanged fingerprint reuses the cached Job, so the cost is the evaluator
+   plus one hash. Only a changed fingerprint runs `spec.plan(node, ctx)`, which resolves the list,
+   answer set and CSV documents and builds the Job; for a reported word set the node's String word
+   sockets read the reported words (`evaluator.WORDS`), and everything else statically. Nodes are
+   marked dirty by socket updates, the file watcher, depsgraph updates and frame changes.
    `SAFETY_PASS` only recomputes fingerprints (§10.6). Budget: ≤ 5 ms per unchanged node and ≤ 50 ms
    per idle pass (§3.2). A changed 4096-cell context costs about 120 ms of planning, once: two
    sha1-over-JSON keys per cell (its `wkey` and its cell key), measured by the PR-08 spike.
    Evaluation or planning can stop with one of:
-   - `Hint`: shows a hint, as today.
+   - `Hint`: shows a hint, as today. A word of an unreported context that only Geometry Nodes
+     computes (`evaluator.Unreadable`: a field, Scene Time, a zone's or simulation's value) gives
+     the hint "Its *Question* is read when the node evaluates", not an error.
    - `Pending`: another OpenAct node upstream has no answer yet.
    - `Unresolvable`: shows an error naming the socket.
 5. **Rows are resolved** by the validity rule (§5.4):
@@ -740,7 +753,12 @@ sequenceDiagram
 
 **Chaining.** The single-value outputs of Ask, Pick and Dials can feed another node's words. The
 evaluator reads them from `MEMORY` or the stored entry, or raises `Pending`. Field outputs (Probability, Label, Outcome and so on) can never be words. The
-evaluator raises `Unresolvable("… is a field; words must be single values")`.
+evaluator raises `Unreadable("… is a field; words must be single values")`. A reported word set
+waits the same way: while the static evaluator finds its words waiting for another node's answer,
+it raises `Pending` (`engine._checked()`), because Geometry Nodes built the reported words from
+that node's fallback, a question nobody means. An error it meets there (another node's blocked or
+broken file, a missing text file, an invalid link) is the word set's error, as in 1.0; only an
+`Unreadable` word is left to the report.
 
 ### 5.4 Per-context caching and versioning
 
@@ -988,8 +1006,45 @@ each evaluation (`inner._Builder.warning()`).
   long messages (a 100 KB word).
 - **Only the viewport depsgraph logs warnings**, so renders never report: they use the stored
   answers (§7.8).
-- The messages show as info markers on the node and the modifier, which is accepted. Nothing reads
-  them yet: the engine's reader, which plans the reported words, comes with the change to asking.
+- The messages show as info markers on the node and the modifier, which is accepted.
+
+**The reader** (`channel.py`). Each pass reads the channel once, before `ensure_owned()`
+(`engine.REPORTS`, §5.3):
+- `channel.evaluated()` calls `bpy.context.evaluated_depsgraph_get()`, which evaluates whatever
+  changed since the last evaluation, so a timer or a headless script reads the current lists. The
+  pass calls it before it clears its dirty flag, so that evaluation's depsgraph update schedules no
+  further pass. A frame change sends no depsgraph update, so `frame_change_post` schedules a pass,
+  which runs once the timeline stops.
+- `channel.read(nodes, contexts, depsgraph)` reads `mod.node_warnings` of each Geometry Nodes
+  modifier whose tree holds an OpenAct node, and keeps what `words.parse()` accepts: node uid →
+  (object pointer, modifier name) → {word tuple: triggered}. The same words reported with the
+  Trigger on and off count as triggered.
+- **A modifier that didn't evaluate reports nothing**, whatever list its last evaluation left: one
+  disabled in the viewport (or in edit mode) or whose object isn't evaluated
+  (`evaluated_get(depsgraph).is_evaluated`: disabled in viewports, in an excluded or hidden
+  collection, in no scene). An object hidden with the eye still evaluates, as does one only
+  another object's Object Info reads, so both report (measured on 4.5.2).
+- **A uid more than one group may report is left out**: a copy shares its original's group until
+  `ensure_owned()` gives it its own, whose `OpenAct uid` node holds the original's uid until the
+  pass rewrites it. Only a uid that exactly one node's group holds, that node's own, is read.
+- **Planning a report.** `evaluator.WORDS` maps the planned node's String word sockets to the
+  reported words while `engine._plan()` plans a reported word set, so the unchanged `spec.plan()`,
+  `Spec.gn()`, `fingerprint()`, `lists` and `sources` plan them; ID inputs (Collection, Object) and
+  the Import CSV hand-off of the `<name> CSV` sockets stay static (§10.1). Group paths that share a
+  modifier share its report: a tuple goes to the first path whose static words equal it, else to
+  the first path, so a path whose words merged into another's plans nothing.
+- **A context with several word sets** (a For Each Element zone) keeps no `LAST_SHOWN` entry: its
+  word sets have no identity from one evaluation to the next, so one would show another's rows
+  while refilling, and none is the default a miss shows (§8.2). The sidebar labels each with its first word.
+- **Generations.** A context that loses a word set it planned at the node's last visit bumps the
+  node's generation before anything is submitted (`engine._moved()`, §5.5), as a changed
+  fingerprint does.
+- **For the playback path**, `engine.plan_words(node, ctx, words)` plans one reported word set
+  outside a pass, through the same plan cache and generations; `engine._sets()` gives the word sets
+  of a node's contexts from a report.
+- **Files** (§16.1): Geometry Nodes' own Import Text reads any file. In a file that isn't trusted,
+  a reported word set fed by an Import Text whose Path lies outside the file's folder, or can't be
+  read statically, is refused with the usual "Blocked reading" error, so its text is never stored.
 
 ## 6. The Six Nodes
 
@@ -1038,7 +1093,7 @@ default, seeded from the `debias` preference when the node is created.
 
 | Kind | Read by | Examples |
 |---|---|---|
-| **word** | the static evaluator (§10). May be typed, or linked from Group Input (modifier panel), String, Join Strings, Menu Switch, Import Text, another OpenAct node's single-value output… | Question, Prompt, Context, Items, Collection, Object, Answers, Labels, Outcomes, Factors, Settings, Overrides, and `Key` (hidden by default; compared, never sent to the model, §6.0) |
+| **word** | the Warning channel: what each evaluation reported (§5.7); the static evaluator (§10.1) reads the Collection and Object words, and the words of a context no evaluation reported. May be typed, or linked from any single-value String: Group Input (modifier panel), Join Strings, Menu Switch, Import Text, Scene Time through Value to String, a zone's or simulation's value, another OpenAct node's single-value output… | Question, Prompt, Context, Items, Collection, Object, Answers, Labels, Outcomes, Factors, Settings, Overrides, and `Key` (hidden by default; compared, never sent to the model, §6.0) |
 | **field** | Geometry Nodes only, per element; never statically evaluated | ID, Rules factor sockets |
 | **single** | Geometry Nodes, one value per evaluation (`SINGLE` on every version); the Warning channel reports it (§5.7) | Trigger |
 | **GN value** | Geometry Nodes only; single value or field; Python ignores it | Threshold (Match), Dither and Seed (Rules) |
@@ -1168,8 +1223,9 @@ interface and never clears it:
   - Threshold, Dither and Seed stay `AUTO`.
 - **Blender does not flag a string field linked into a `SINGLE` String input.** On all three
   versions such a link stays `is_valid = True`; only a float field into a `SINGLE` Float input is
-  flagged, on 5.1. The evaluator's `Unresolvable("… is a field; words must be single values")` is
-  therefore the **real guard** against fields linked into words (§10.1).
+  flagged, on 5.1. An evaluated context reports the single value Geometry Nodes gives such a word
+  (§5.7); for a context no evaluation reported, the evaluator's `Unreadable("fields can't be
+  words")` makes it a hint (§5.3, §10.1).
 - **Verified** in 4.5.2 and 5.1.1: custom group nodes follow inner-interface edits immediately,
   and existing links stay valid. A regression test in §18 guards this on 4.5, 5.0 and 5.1.
 
@@ -2734,7 +2790,7 @@ The evaluator moves out of `engine.py` **without behaviour changes**:
 
 | Change | Why | Detail |
 |---|---|---|
-| `_openact_output` | The six node types | **Single-value** outputs resolve from `MEMORY` or the stored entry via `spec.output(entry, out.identifier)`, else raise `Pending`. They are: Ask Answer/Yes/Confidence; Pick Index/Item/Confidence/payload; each Dials setting and its Confidence. **Field** outputs raise `Unresolvable("'Match' output 'Probability' is a field; words must be single values")`. Geometry and Material outputs raise `Unresolvable`, as today |
+| `_openact_output` | The six node types | **Single-value** outputs resolve from `MEMORY` or the stored entry via `spec.output(entry, out.identifier)`, else raise `Pending`. They are: Ask Answer/Yes/Confidence; Pick Index/Item/Confidence/payload; each Dials setting and its Confidence. **Field** outputs raise `Unreadable("'Match' output 'Probability' is a field; words must be single values")`. Geometry and Material outputs raise `Unreadable` |
 | New handler: Menu Switch (`GeometryNodeMenuSwitch`) | Modifier dropdowns choose rule sets and presets (§7.7) | Algorithm, from the review's measured storage (4.2–5.1). `NodeEnumItem` exposes only `name` and `description`. 1) **A socket value is matched by name**: a Menu socket's `default_value` is the item name. 2) **A modifier value is an int identifier** (for a Menu reaching the modifier through Group Input). It is mapped to a name through `mod.id_properties_ui(key).as_dict()["items"]`, whose tuples end with the int, e.g. `('A','A','',0,0)`. The int is **never** used as a position in `enum_items`, because identifiers stay fixed when items are removed or reordered. 3) **`-1`** (a fresh modifier; the UI default is −1 on 4.4+ and 0 on 4.2/4.3) means the group interface socket's default item; the evaluator test verifies this. 4) The name is matched against `node.enum_items`, and that item's input socket is evaluated. 5) An unknown name or value raises `Unresolvable` naming the menu. The evaluator test pins each step against Geometry Nodes ground truth on 4.5, 5.0 and 5.1, including deleted and reordered items and a Menu inside a nested group |
 | New handler: Special Characters (`FunctionNodeInputSpecialCharacters`) | Multi-line Items or Labels built with Join Strings | "Line Break" → `"\n"`, "Tab" → `"\t"` |
 | New handler: String Length (`FunctionNodeStringLength`) | Int words, e.g. an Index Switch index | `len(text)` in code points; parity checked by the evaluator test |
@@ -2752,8 +2808,9 @@ The evaluator moves out of `engine.py` **without behaviour changes**:
 - Import Text, Reroute, and muted nodes and links.
 - The single-value outputs of OpenAct nodes.
 
-Anything that needs geometry or fields (Named Attribute, Sample Index, Import CSV, …) raises
-`Unresolvable` naming the node. So does an unlinked group node
+Anything that needs geometry or fields (Named Attribute, Sample Index, Import CSV, …), and any
+other node it doesn't know (Scene Time, a zone's or simulation's output), raises `Unreadable`, an
+`Unresolvable`, naming the node; so does a chain deeper than 64 links. So does an unlinked group node
 input that Geometry Nodes gives an implicit field (its interface's `default_input` isn't `VALUE`),
 such as the ID a muted OpenAct node passes on: its hidden socket value is never read (§6.0). The
 one intentional data-derived word source is the **Attributes** list source (§6.0). It reads
@@ -2763,6 +2820,19 @@ node's own output, and it stays outside the evaluator.
 
 The Import Text handler obeys the file trust rule (§7.7, §16.1): in an untrusted file it reads
 only inside the .blend's folder tree.
+
+**Its role beside the Warning channel.** The String words of every evaluated context come from
+what the evaluation reported (§5.7): Geometry Nodes computes them, so they need not be word
+sources above. While the engine plans a reported word set, `evaluator.WORDS` holds
+`{(node pointer, socket identifier): value}` for the planned node's own String word sockets, and
+`eval_input()` returns those values at depth 0. The evaluator still reads:
+- the ID inputs (Collection, Object) and the Import CSV hand-off (`trace_csv_source()`), which
+  Geometry Nodes can't report;
+- the words of a context no evaluation reported, for its status only; an `Unreadable` word there
+  is a hint, not an error (§5.3);
+- chained reads for those, and whether a reported word set waits for another node's answer
+  (`engine._checked()`, §5.3);
+- the words of the background render's CSV report (`engine._report()`, §7.8).
 
 ### 10.2 Specs and prompt templates (`specs/`)
 
@@ -3011,7 +3081,7 @@ The pipeline adapts to each backend through `/v1/capabilities`: `slots`, `batch_
 
 The engine's rhythm:
 - the 0.1 s `tick()` timer and the 0.25 s debounce;
-- the depsgraph / `load_post` / undo / redo handlers;
+- the depsgraph / frame change / `load_post` / undo / redo handlers;
 - `SAFETY_PASS` (2 s), which now only **recomputes fingerprints** and re-plans nothing unless a
   fingerprint changed (§5.3 step 4);
 - pausing during playback and render jobs;
@@ -3021,7 +3091,9 @@ And its work:
 - `iter_nodes()` covers the six node types.
 - The file watcher runs in `tick()` (§7.8).
 - `run_pass()` follows §5.3, including the plan cache (`PLANS`), per-node dirty flags and the
-  table writes (§8.8).
+  table writes (§8.8). It evaluates the depsgraph and reads the Warning channel once, at its start
+  (`channel.py`, §5.7), and plans every word set a context reported; a pass whose writes
+  re-evaluate the tree reads the same reports again and writes nothing, so it doesn't loop.
 - The file trust state is worked out once per pass (§5.3); `load_post` records which file was
   opened (§16.1).
 - `ensure_owned()` handles table objects (§8.5), and garbage collection of orphaned table objects
@@ -3172,6 +3244,13 @@ def csv_source(node, input_name: str, ctx) -> CsvSource | None: ...   # the link
 
 # evaluator.py
 def trace_csv_source(node, csv_socket, ctx) -> CsvSource: ...   # follows geometry links to an Import CSV node (§10.1)
+WORDS: dict | None      # {(node pointer, socket identifier): value} while a reported word set is planned (§5.7)
+
+# channel.py
+def read(nodes, contexts, depsgraph) -> dict: ...  # uid -> {(object pointer, modifier name): {words: triggered}} (§5.7)
+
+# engine.py
+def plan_words(node, ctx, words) -> Job: ...    # one reported word set, through PLANS and GENERATIONS (§5.7)
 
 # pipeline.py
 def submit(job: Job, missing: list[Cell], priority: int, on_rows=None) -> None: ...
@@ -3408,8 +3487,9 @@ Reading is pure Python. `tests/store_test.py` covers these rules under CPython a
 |---|---|---|
 | `MEMORY` (cell answers, LRU 100 000), `PENDING`, `FAILED` | `pipeline.py` | Blender restart. `load_post` clears `FAILED`, as today; *Ask Again* clears a node's keys |
 | `STATUS` (per-node icon, text, counts, ETA) | `engine.py` | `load_post` |
-| `PLANS[(uid, ctx key)] → (fingerprint, job)`, the plan cache (§5.3) | `engine.py` | a changed fingerprint; a context that disappears, unless the pass planned it (an evaluator read also reaches contexts `find_uses()` doesn't list, through a group node in a tree no modifier uses); `load_post` |
-| `LAST_SHOWN[(uid, ctx key)] → words_key` of the entry that context showed last (stale-while-refilling, carry-over, and the default a miss shows on single-context nodes, §5.3–§5.4, §8.2). **Seeded on the first pass after load** from the stored entry whose `gn` equals that context's words, so rows re-asked after a CSV edit made while Blender was closed show stale values, not fallbacks | `engine.py` | `load_post` (then re-seeded); a context that disappears |
+| `PLANS[(uid, ctx key)]`, or `PLANS[(uid, ctx key, words)]` for a reported word set, `→ (fingerprint, job)`: the plan cache (§5.3) | `engine.py` | a changed fingerprint; a context that disappears, unless the pass planned it (an evaluator read also reaches contexts `find_uses()` doesn't list, through a group node in a tree no modifier uses); a reported word set its node's pass no longer plans; `load_post` |
+| `LAST_SHOWN[(uid, ctx key)] → words_key` of the entry that context showed last (stale-while-refilling, carry-over, and the default a miss shows on single-context nodes, §5.3–§5.4, §8.2); a context with several word sets keeps none (§5.7). **Seeded on the first pass after load** from the stored entry whose `gn` equals that context's words, so rows re-asked after a CSV edit made while Blender was closed show stale values, not fallbacks | `engine.py` | `load_post` (then re-seeded); a context that disappears |
+| `REPORTS` (what the last evaluation reported, §5.7) and `SETS` (the word sets each node's last visit planned) | `engine.py` | every pass (`REPORTS`); `load_post` |
 | `TRUST`: which file was opened; `PASS`: whether the open file is trusted, worked out once per pass (§16.1) | `trust.py` | `load_post` and enabling OpenAct (`TRUST`); every pass (`PASS`) |
 | `WATCH` (file stamps and `CsvDoc` cache), the evaluator memo and the file identities (`csvfmt.IDENTITIES`) | `engine.py`, `evaluator.py`, `csvfmt.py` | `load_post` (watch); every pass (memos) |
 | Worker queue, server `STATE` | `server.py` | add-on unregister (`shutdown_owned`) |
@@ -3620,6 +3700,10 @@ records which file was opened).
   - Stored answers keep evaluating as usual; Geometry Nodes needs no Python.
   - A blocked read makes the node show the blocked path, and the sidebar shows the banner with
     *Allow this file* and *Trust this folder*.
+  - Geometry Nodes' own Import Text reads any file, and the Warning channel reports what it read
+    (§5.7). So a reported word set fed by an Import Text whose Path lies outside the folder tree,
+    or can't be read statically, is refused as a blocked read (`engine._outside()`): its text is
+    never planned, asked or stored.
 - **Residual risk: appended and linked node groups.** They run under the *host* file's trust, as
   with Blender's own auto-run. A trusted file that appends a crafted group from elsewhere therefore
   lets that group's word paths read outside the host's folder. The sidebar's *Files* panel still
@@ -3862,6 +3946,7 @@ A later run can diff these lines to spot performance regressions.
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
 | `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: the hash lookup on all six nodes (each context finds its entry by the key of its words; invalid IDs and a miss give fallbacks, or the default a miss shows); 3 contexts through the table object's header rows; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **No cap:** 20 objects with different words on one node each show their own answer; a new word set is new rows with the same nodes and layout, `append_entry()` and `set_default()` show at the next evaluation with no graph edit, and a second pass writes nothing. **Collisions:** words whose keys collide ('aZ' and 'b5') leave the later entry out and show the error naming both; a live entry wins its key over a warm one. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Key text (§8.2):** each word at its position, an absent one read as `""` (a Collection-source Pick finds its stored entry); word tuples that join to the same text have different keys. **Single values (§8.6):** Pick's Index feeds a single-value socket (Grid *Vertices X*). **A miss (§8.2):** with one live context, words with no entry show that context's own last answers; with two contexts, A's show neutral values, never B's answers; a cleared Question (a hint) shows neutral values; each change of the default is values only. **Layout (§8.8):** a group of another `LAYOUT`, or 1.0's, is rebuilt; the table keeps its digest through save and reload, so the reopened file's first update writes nothing. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: `inner.build()`, `update_values()` (unchanged, and one entry changed) and `append_entry()` on the demo and worst shapes, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
+| `tests/reports_blender.py` | Blender + fake server | fake | **The Warning channel's reader (§5.3, §5.7):** words the static evaluator can't read (Scene Time's frame through Value to String, a Repeat zone's count, a simulation's step) are planned from the report and answered; a For Each Element zone's word sets each become an entry; a Collection list source reads its collection statically while its Prompt comes from the report; group paths sharing a modifier split its report; words built from an unanswered node's fallback wait for it; a tree no modifier uses and an unused node are planned statically, an unreadable word there is a hint; a modifier that doesn't evaluate reports nothing (disabled in viewports or in the viewport), an object hidden with the eye still does; a copy's shared uid is ignored; `plan_words()` shares the plan cache; no pass loop; in an untrusted file an Import Text outside the folder is refused |
 | `tests/playback_blender.py` | Blender + fake server | fake | **Playback (§5.5):** a keyframed Menu Switch cycles through three rule sets, two of them answered while the scene was stopped; playing sends 0 requests and writes no table, each answered rule set shows its table and the one never answered the object's last rules (the default a miss shows, §8.2), never a fallback, and the pass after playback asks for it. **Words at other frames (§7.8):** the F-curves are found through the action slot's channelbag on 4.5 and 5.1, give the words the scene has at every frame with no scene evaluation, and clamp to the hard range; a background render (`on_render_pre`) compares the words of its frame through them, and a driven input, an NLA strip and Time Stretching as the file holds them. OpenAct's code calls no `temp_override` (§5.5) |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
 | `tests/startup_blender.py` | Blender | none | On 4.5 and newer: `runtime_root()` follows the Runtime Folder preference, else the default folder; a server of another program on the port gives the port error and launches nothing until it has gone and *Start Model* runs. On older Blender, enabling the add-on fails before anything is registered (§11) |
@@ -3931,7 +4016,7 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 | R3 | **Install fragility.** 13 GB download; antivirus, proxies, full disks, drivers too old for cu128; a located runtime that depends on an external uv Python | Medium | Medium | Resumable, idempotent steps; hash-locked environment and pinned uv, ignoring PATH (§16.2); a **free-space pre-check** (`shutil.disk_usage` ≥ 15 GB) and a **GPU/VRAM pre-check** (§10.5); *Open Log*; a background probe of the runtime's interpreter (§10.5). A driver too old for cu128, which passes the `nvidia-smi` check, is caught at load time: `auto` means CUDA only, so the server reports an error with a driver hint instead of silently loading on the CPU (§5.2) |
 | R4 | **Blender API drift** in 5.x: custom group nodes, interface API, Index Switch items, evaluation of undefined nodes | Medium | Medium | Interface, lookup, evaluator and `noaddon` suites on 4.5, 5.0 and 5.1 at every release (§18.3); `compat.py` switches (§11) |
 | R5 | **Table-object lifecycle bugs.** A table is lost on append or link, garbage collection removes a live table, or Blender stops evaluating objects linked to no collection, giving silently wrong outputs | High | Low | `entries` JSON is the source of truth, and derived data can be rebuilt from it without the CSV files (§14.1, §14.3). Garbage collection never removes a table whose uid is live. Copy, append, delete, save/reload, *Purge Unused Data* and rendering are tested on 4.5, 5.0 and 5.1 (§18). The excluded-collection fallback is a `tables.py`-only change (§8.5) |
-| R6 | **Static evaluator mismatch.** Python computes a word differently from Geometry Nodes, so its key finds no entry | Medium | Low | Every handler is checked against Geometry Nodes ground truth (§18), and unsupported nodes raise explicitly. On shared trees (two or more live contexts) a mismatch shows neutral fallback outputs, never another object's answer. On a single-context node it shows that context's own last answer (the default a miss shows, §8.2), which masks the mismatch but is never another object's data. The ground-truth tests are the real guard there. **Residual case without the add-on (G6):** no pass runs, so the default keeps its saved value. If a tree saved with one live context is later used by a second object with different words in a Blender without OpenAct, that object shows the first object's last answers. The next pass with OpenAct installed resets it (two live contexts → none) |
+| R6 | **Static evaluator mismatch.** Python computes a word differently from Geometry Nodes, so its key finds no entry | Medium | Low | The words of every evaluated context are the ones Geometry Nodes reported (§5.7), so only an unreported context's static words can differ. Every handler is checked against Geometry Nodes ground truth (§18), and unsupported nodes raise explicitly. On shared trees (two or more live contexts) a mismatch shows neutral fallback outputs, never another object's answer. On a single-context node it shows that context's own last answer (the default a miss shows, §8.2), which masks the mismatch but is never another object's data. The ground-truth tests are the real guard there. **Residual case without the add-on (G6):** no pass runs, so the default keeps its saved value. If a tree saved with one live context is later used by a second object with different words in a Blender without OpenAct, that object shows the first object's last answers. The next pass with OpenAct installed resets it (two live contexts → none) |
 | R7 | **Performance on the main thread.** Graph edits get slower as a tree grows (measured, §8.4), and planning repeats on every pass | Medium | Medium | Per-element data lives in the table object, so value updates are `foreach_set` and never graph edits (§8.4). Materialised entries are bounded (§8.1). Rebuilds happen only on shape changes, at most once per pass. Plan cache and fingerprints (§5.3). Batched `foreach_set` locations. `--bench` budgets for `build()`, `update_values()`, `write_rows()` and pass time are merge gates (§3.2, §8.7) |
 | R8 | **Perceived hangs.** Large tables take minutes and users think Blender froze | Low | Medium | ETA, partial tables written after every chunk, priority classes, and size limits with clear messages (§5.4, §17) |
 | R9 | **Template regressions.** A prompt change breaks the exact tables | Medium | Medium | Template PRs must pass the real-model e2e acceptance (§18.3). `PROMPT_VERSION` never invalidates stored answers (§5.4) |

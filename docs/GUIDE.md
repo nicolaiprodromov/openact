@@ -58,9 +58,10 @@ Folder* shows the folder; deleting it uninstalls the model. Uninstalling OpenAct
 ## The six nodes
 
 OpenAct adds six Geometry Nodes that make judgements. A question, a prompt, a list of items or a table of rules goes
-in; numbers, selections, picks and labels come out. The nodes read their words (typed on the node, set on the
-modifier panel, or kept in CSV files) outside evaluation, ask a model on your GPU in the background, and store its
-answers in the node as a table that Geometry Nodes looks up, per element where needed. The model runs only when the
+in; numbers, selections, picks and labels come out. Each node reports its words (typed on the node, set on the
+modifier panel, built by other nodes, or kept in CSV files) as the tree evaluates; OpenAct reads them afterwards,
+asks a model on your GPU in the background, and stores its answers in the node as a table that Geometry Nodes looks
+up, per element where needed. The model runs only when the
 words change, never during evaluation, playback or rendering. The answers are saved in the .blend, so a file opens,
 plays and renders without the model, and without the add-on, on Blender 4.5 or newer.
 
@@ -87,9 +88,14 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
 
 ### Working with the nodes
 
-- **Words.** The text inputs are *words*: typed on the node, or linked from the modifier panel (Group Input), String,
-  Join Strings, Menu Switch, Import Text, or another OpenAct node's single-value output. OpenAct reads them outside
-  evaluation, so they must be single values: a field linked into a word is an error on the node.
+- **Words.** The text inputs are *words*: typed on the node, set on the modifier panel (Group Input), or built by any
+  nodes that make a single String: Join Strings, Menu Switch, Import Text, the frame (Scene Time) through Value to
+  String, a Repeat zone's or a simulation's value, another OpenAct node's single-value output. Each evaluation reports
+  the words it used (the info marker below), and OpenAct reads them afterwards. In a For Each Element zone each
+  element reports its own words, and gets its own answers. A node no evaluation uses (its outputs unused, its object
+  disabled in the viewport, a tree no modifier uses) has its words read without Geometry Nodes, which understands
+  only typed words, the modifier panel and simple String nodes; words only Geometry Nodes computes then wait for the
+  node's first evaluation, which the node's status says.
 - **One table per set of words.** A tree used by any number of objects, with words from each modifier, keeps one set
   of answers per object. The node also keeps the answers of up to 1024 sets of words no object uses now, within
   2 MB, so switching back to them is instant. The model is asked only when words change, and only for the rows whose

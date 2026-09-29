@@ -363,17 +363,22 @@ class OPENACT_OT_table_view(bpy.types.Operator):
 # ----------------------------------------------------------------------------- the Overrides CSV (§7.6)
 
 def export_uses(node):
-    """(ctx, Job) of each context of the node that plans, as the pass plans it, then of each context whose Overrides
-    CSV alone can't be applied (missing, with errors or blocked), with its Job without that file, so the export can
-    create it, or refuse it with its own error. The first ones are the contexts the sidebar lists, in its order."""
+    """(ctx, Job) of each word set of the node that plans, as the last pass planned it (the words its evaluations
+    reported, else its static words: engine._sets()), then of each whose Overrides CSV alone can't be applied
+    (missing, with errors or blocked), with its Job without that file, so the export can create it, or refuse it with
+    its own error. The first ones are the word sets the sidebar lists, in its order."""
     spec, tree = engine.SPECS[node.bl_idname], node.id_data
+    contexts = find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
     uses, unlocked = [], []
-    for ctx in find_uses().get(tree.as_pointer()) or [Ctx(None, None, (), tree)]:
+    for ctx, words in engine._sets(spec, node, contexts, engine.REPORTS.get(node.uid)):
         try:
-            uses.append((ctx, engine._plan(spec, node, ctx)))
+            uses.append((ctx, engine._plan(spec, node, ctx, words)))
         except (Hint, Unresolvable):  # perhaps its Overrides CSV alone
             try:
-                unlocked.append((ctx, spec.plan(node, ctx)))
+                if words is not None:  # words a blocked file gave, or waiting for another node, stay out too
+                    engine._checked(spec, node, ctx)
+                with engine.reading(spec, node, words):
+                    unlocked.append((ctx, spec.plan(node, ctx)))
             except (Hint, Pending, Unresolvable):
                 continue
         except Pending:
