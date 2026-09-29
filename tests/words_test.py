@@ -39,7 +39,8 @@ def phase_hash():
     check("hash: the replica gives Blender's Hash Value for every measured text and seed", not got, got)
     check("hash: results are signed 32-bit Ints", all(-2**31 <= words.blender_hash(text, seed) < 2**31
                                                        for text, seed, _ in MEASURED))
-    check("hash: a NUL ends the text, as in Blender's C loop", words.blender_hash("ab\x00cd") == words.blender_hash("ab"))
+    check("hash: a NUL ends the text, as in Blender's C loop",
+          words.blender_hash("ab\x00cd") == words.blender_hash("ab"))
     check("hash: seeds re-mix the same pre-hash, so 'aZ' and 'b5' share a hash under every seed",
           all(words.blender_hash("aZ", seed) == words.blender_hash("b5", seed) for seed in (0, 1, 2, -1, 12345)))
 
@@ -49,7 +50,8 @@ def phase_key_text():
              ("\x1f", "line\nbreak", "tab\t"), (LONG, "")]
     check("key text: each word as its length, a colon and the word",
           words.key_text(("Is it night?", "", "caf\u00e9")) == "12:Is it night?0:4:caf\u00e9")
-    check("key text: lengths count code points, as String Length does", words.key_text(("\U0001f327",)) == "1:\U0001f327")
+    check("key text: lengths count code points, as String Length does",
+          words.key_text(("\U0001f327",)) == "1:\U0001f327")
     check("key text: split() gives back every word tuple, whatever the words hold",
           all(words.split(words.key_text(gn)) == gn for gn in cases),
           [gn for gn in cases if words.split(words.key_text(gn)) != gn])

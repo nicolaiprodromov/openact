@@ -1091,14 +1091,14 @@ def table_scene():
     tree_.links.new(geometry, go.inputs[0])
     idents = {i.name: i.identifier for i in tree_.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
     users = {}
-    for key, words in TABLE_WORDS.items():
+    for key in TABLE_WORDS:
         mesh = bpy.data.meshes.new(key)
         mesh.from_pydata([(i, 0, 0) for i in range(POINTS)], [], [])
         users[key] = bpy.data.objects.new(key, mesh)
         bpy.context.scene.collection.objects.link(users[key])
         users[key].modifiers.new("Table", 'NODES').node_group = tree_
-    for key, words in TABLE_WORDS.items():
-        set_words(users, idents, key, **words)
+    for key, typed in TABLE_WORDS.items():
+        set_words(users, idents, key, **typed)
     return tree_, picker, users, idents
 
 
@@ -1421,16 +1421,16 @@ def no_addon_scene(name, float_id=None):
         value = tree_.nodes.new("ShaderNodeValue")
         value.outputs[0].default_value = float_id
     built = []
-    for idname, words, v, single, outputs in NO_ADDON:
+    for idname, typed, v, single, outputs in NO_ADDON:
         node_ = tree_.nodes.new(idname)
-        for word, text in words.items():
+        for word, text in typed.items():
             node_.inputs[word].default_value = text
         if value is not None:
             tree_.links.new(value.outputs[0], node_.inputs["ID"])
         for output, (attribute, data_type) in outputs.items():  # before build(): Pick reads Probability while linked
             geometry = store(tree_, geometry, node_.outputs[output], attribute, data_type)
         n = len(next(iter(v.values())))
-        gn = tuple(words.get(word, "") for word in engine.SPECS[idname].WORDS)
+        gn = tuple(typed.get(word, "") for word in engine.SPECS[idname].WORDS)
         node_store = S.NodeStore([S.Entry(words_key=idname, gn=gn, t=1.0, single=single, rows=S.Rows(
             name=NO_ADDON_ITEMS.split(", "), wkey=[""] * n, ask=[0] * n, src="m" * n, v=v))])
         inner.build(node_, node_store)
