@@ -253,7 +253,7 @@ becomes `items 2.csv`), and puts each copy's path in its input when that input i
 ### Tips
 
 - Give every option and item a `when`: when it applies, or what it is. Descriptions make the answers much more
-  reliable than bare names; the biome demo shows the difference.
+  reliable than bare names.
 - Keep a question to 16 options or fewer. A longer list is asked as a tournament of smaller questions, which is less
   reliable: split it into two levels instead, e.g. a group first, then an item within the group.
 

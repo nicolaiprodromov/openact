@@ -2,6 +2,10 @@
 
 All notable changes to OpenAct. Versions follow the extension manifest (`openact/blender_manifest.toml`).
 
+## Unreleased
+
+- The demos are removed.
+
 ## 1.0.0
 
 The first release of OpenAct.

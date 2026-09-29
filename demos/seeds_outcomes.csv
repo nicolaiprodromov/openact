@@ -1,4 +1,0 @@
-answer,when,if,alive
-Birth,A dead cell with exactly two live neighbours comes to life.,state=dead,1
-Stays empty,A dead cell with any other number of live neighbours stays empty.,state=dead,0
-Dies,Every live cell dies in the next generation.,state=alive,0

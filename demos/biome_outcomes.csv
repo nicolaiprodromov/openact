@@ -1,8 +1,0 @@
-answer,when,instance,scale
-Pine,"high altitude with moderate or wet moisture, at any temperature: mountain forests",0,1.2
-Birch,"cold, with moderate or wet moisture, at low or mid altitude: northern woods, bogs and riversides",1,1.0
-Oak,"mild, with moderate or wet moisture, at low or mid altitude: temperate woodland",2,1.4
-Palm,"hot, with moderate or wet moisture, at low or mid altitude: tropical coasts and rainforest",3,1.5
-Cactus,"hot and dry, at any altitude: deserts",4,0.7
-Olive,"mild and dry, at any altitude: sunny Mediterranean groves and slopes",5,0.9
-Heather,"cold and dry, at any altitude: moors, heaths and bare rocky ground",6,0.5

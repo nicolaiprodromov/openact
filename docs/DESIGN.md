@@ -257,7 +257,7 @@ name OpenAct.
 
 **G9. Tested and demoable.** Automated suites cover the evaluator, CSV parsing, table lookup
 (including main-thread cost budgets), simulation-zone use, a fake-model pipeline and real-model
-end to end, on Blender 4.5, 5.0 and 5.1. Demo scenes for the promo video are built by script (§18).
+end to end, on Blender 4.5, 5.0 and 5.1. Demo scenes for the promo video ship answered and saved (§18).
 
 **G10. Don't preclude agents.** v1 ships a job queue with priorities and cancellation,
 per-element tables that can be rewritten without rebuilding node graphs (table objects), and
@@ -976,7 +976,7 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
 **Headless and tests.** With `bpy.app.background` set, as in a render farm's `blender -b -f`,
 OpenAct renders the saved answers and does not re-plan or re-bake from files (§7.8, R23). Headless
 **authoring** opts back in, through `OPENACT_BACKGROUND_PASSES=1` or in process through
-`openact.engine.allow_background_passes(True)`; `demos/build_demos.py` uses the latter. The test
+`openact.engine.allow_background_passes(True)`; a script that builds scenes uses the latter. The test
 suites then drive `engine.tick()` in a loop, as `tests/e2e_blender.py::drive()` does today.
 
 ### 5.6 Hooks kept open for the agents design (NG1)
@@ -1975,11 +1975,11 @@ The watcher (`engine.WATCH: {path_id: (stamp, CsvDoc)}`) behaves as follows:
   A background render compares the words of each frame it renders, read through the F-curves; a
   context whose words only a frame change reveals (a driver, NLA, or another fallback case of
   §5.5) is compared as the file holds it, and the render shows the saved answers either way.
-  - **Headless authoring opts back in.** This covers the test suites, `demos/build_demos.py`, and
-    any script that sets prompts headlessly and saves. There are two ways:
+  - **Headless authoring opts back in.** This covers the test suites and any script that sets
+    prompts headlessly and saves, as the 1.0 demo build did. There are two ways:
     - the environment variable `OPENACT_BACKGROUND_PASSES=1`, set before Blender starts;
     - **in process**, `openact.engine.allow_background_passes(True)`, a public Python function
-      that a script calls after enabling the add-on. `build_demos.py` calls it.
+      that a script calls after enabling the add-on.
   - The README documents both. Without either, a headless session renders saved answers only.
 
 ### 7.9 Validation and error reporting
@@ -3835,19 +3835,21 @@ of Life tables and the biome thresholds) are hard failures.
 | PRs that touch `server.py`, `pipeline.py` or `openact_server.py` | Also `tests/pipeline_blender.py` (fake backend) |
 | PRs that touch specs, templates or scoring | Also `tests/e2e_blender.py` with the real model, on the RTX 3090 machine |
 | PRs that touch storage | Also `tests/store_test.py` |
-| Release | Every suite on 4.5, 5.0 and 5.1; e2e on 4.5 and 5.1; demo scenes rebuilt and rendered **without** the add-on |
+| Release | Every suite on 4.5, 5.0 and 5.1; e2e on 4.5 and 5.1; demo scenes opened and rendered **without** the add-on |
 
 ### 18.4 Demo scenes (for the promo video)
 
-`demos/build_demos.py` builds every demo headlessly:
-- `blender -b --factory-startup --python demos/build_demos.py -- <out folder> [--model]`. The
-  script enables the add-on, then calls `openact.engine.allow_background_passes(True)` (§7.8), so
-  passes run headlessly and the tables fill.
-- It writes `demos/<name>.blend` next to that demo's CSV files, which are copied from
-  `tests/fixtures/` and `openact/templates/`.
-- With `--model` it fills every table with the real model and checks the acceptance criteria below.
-  The saved files then carry their answers, so they open, play and render **without the model and
-  without the add-on** on Blender 4.5+ (G6).
+The demos ship as saved `.blend` files in `demos/`, one folder per demo, beside the CSV files they
+read through `//` paths. A demo folder moves as a whole: its entries store each CSV by the path as
+written, with the hashes of what it held (§14.2), so the files find their CSVs and ask nothing.
+- The six demos below were built by a script for 1.0 (PR-25), with every table filled by the real
+  model and the acceptance checks below passed. The saved files carry their answers, so they open,
+  play and render **without the model and without the add-on** on Blender 4.5+ (G6). The script was
+  retired once the files existed: a demo is now edited in Blender and saved with its answers.
+- Two larger demos come from projects built on OpenAct, for Blender 5.1: `char_react/`, two
+  reactive characters (a Classify, two Rules and a Dials node per character), and `alchemy/`, a
+  falling-sand tank in three layouts (Classify, Match, Pick, Dials and two Rules nodes). Their build
+  and authoring scripts stay in those projects.
 
 | Demo | Nodes | What it shows | Acceptance |
 |---|---|---|---|
@@ -3943,7 +3945,7 @@ There are no remote flags, because OpenAct makes no network calls after install.
 | Switch | Kind | Purpose |
 |---|---|---|
 | `OPENACT_BACKEND=fake`, `OPENACT_SERVER_PYTHON=<python>` | environment | Tests and CI without a GPU or the runtime (§18.1) |
-| `OPENACT_BACKGROUND_PASSES=1`, or in process `openact.engine.allow_background_passes(True)` | environment / Python API | Lets headless authoring (test suites, `demos/build_demos.py`, user scripts) run passes. Without either, background mode renders only the saved answers (§7.8) |
+| `OPENACT_BACKGROUND_PASSES=1`, or in process `openact.engine.allow_background_passes(True)` | environment / Python API | Lets headless authoring (test suites, scene-building scripts, user scripts) run passes. Without either, background mode renders only the saved answers (§7.8) |
 | `OPENACT_BENCH_SHAPE=demo\|worst` | environment | Selects the shape that `tests/lookup_blender.py --bench` builds for the main-thread budgets (§8.4) |
 | `debias` (the default for new nodes), `auto_start`, `unsure_below` (0.30), `log_requests` | preferences | Behaviour and diagnostics (§13.4) |
 | `balance_order` | node property | Per-node order balancing (§10.3) |

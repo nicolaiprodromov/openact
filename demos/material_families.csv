@@ -1,5 +1,0 @@
-answer,when,roughness,metallic
-metal,"steel, iron, copper, brass or aluminium surfaces",0.35,1
-wood,"planks, bark and furniture timber",0.6,0
-stone,"rock, brick, concrete or marble",0.8,0
-fabric,"cloth, carpet and upholstery",0.9,0

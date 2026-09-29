@@ -366,11 +366,12 @@ def logo_files(t: Type) -> dict[str, Doc]:
 # ---------------------------------------------------------------------------------------------------------- banner
 #
 # The README header shows what the nodes do to a scene: one Rules node, asked "Which plant grows here?", plants a
-# whole terrain. It follows the biome demo (demos/build_demos.py): its land and climate, the factor bands of
-# demos/biome_factors.csv, and the seven plants of demos/biome_outcomes.csv with their scale payload, each where its
-# one-line description says it grows, blended at the band edges by the demo's Dither of 0.3; the snow is the demo's
-# second Rules node, an Amount. The image holds no page text, so one file suits GitHub's light and dark themes: the
-# name and the tagline are text in the README, and the only words here are the node's, on the node editor's panel.
+# whole terrain. It follows the biome demo (demos/biome/): its land and climate, as the 1.0 script that built the
+# demo made them, the factor bands of biome_factors.csv, and the seven plants of biome_outcomes.csv with their scale
+# payload, each where its one-line description says it grows, blended at the band edges by the demo's Dither of 0.3;
+# the snow is the demo's second Rules node, an Amount. The image holds no page text, so one file suits GitHub's light
+# and dark themes: the name and the tagline are text in the README, and the only words here are the node's, on the
+# node editor's panel.
 
 BIOME = (  # biome_outcomes.csv's rows: the answer, its scale payload, and the ground it grows on
     ("Pine", 1.2, "#4F7C57"), ("Birch", 1.0, "#6E9867"), ("Oak", 1.4, "#78A453"), ("Palm", 1.5, "#56A35C"),
