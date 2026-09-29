@@ -61,23 +61,26 @@ for the one-time model install. Linux is best effort. Opening, playing and rende
 this, not even the add-on.
 
 1. **Download** `openact-1.0.0.zip` from the [latest release](https://github.com/nicolaiprodromov/openact/releases/latest),
-   or [build it from source](CONTRIBUTING.md#set-up-a-checkout).
+   or [build it from source](CONTRIBUTING.md#set-up-a-checkout) for what this page describes: the Trigger, live
+   playback and the rest of the [unreleased changes](CHANGELOG.md#unreleased).
 2. **Install** it in Blender: *Edit › Preferences › Get Extensions › Install from Disk…*
 3. **Get the model.** In a Geometry Node editor, press <kbd>N</kbd>, open the **OpenAct** tab and click
    **Install Model**. It downloads about 12 GB once, pinned and hash-checked.
-4. **Add a node** with <kbd>Shift</kbd> <kbd>A</kbd> › **OpenAct** and type a question. The model loads on first
-   use, in 12 to 40 seconds; after that, a new answer takes well under a second.
+4. **Add a node** with <kbd>Shift</kbd> <kbd>A</kbd> › **OpenAct**, type a question, and link a Boolean node set to
+   True into its **Trigger**. The model loads on first use, in 12 to 40 seconds; after that, a new answer takes well
+   under a second.
 
 ## The six nodes
 
 **Ask**, **Pick** and **Dials** judge the whole situation. **Match** and **Classify** judge each item of a list.
-**Rules** judges each measured situation. Add them with <kbd>Shift</kbd> <kbd>A</kbd> › **OpenAct**. On the cards,
-a round socket carries one value and a diamond carries a value per element; the chips show what the example words
-produce.
+**Rules** judges each measured situation. Add them with <kbd>Shift</kbd> <kbd>A</kbd> › **OpenAct**. Every node
+starts with a **Geometry** input and output, which pass your geometry through, and a **Trigger** input: link it,
+and the node asks the model for what it is missing. On the cards, a round socket carries one value and a diamond
+carries a value per element; the chips show what the example words produce.
 
 <table>
   <tr>
-    <td width="440"><img src="docs/assets/nodes/ask.svg" width="440" alt="The Ask node, asked 'Is it night?' about a snowy village at night: Answer 0.97, Yes True, Confidence 0.94."></td>
+    <td width="440"><img src="docs/assets/nodes/ask.svg" width="440" alt="The Ask node, its Trigger linked, asked 'Is it night?' about a snowy village at night: Answer 0.97, Yes True, Confidence 0.94."></td>
     <td valign="middle">
       <h3>Ask</h3>
       <p>One question about the whole scene, answered <b>yes / no</b> or as an <b>amount</b> from 0 to 1.
@@ -86,7 +89,7 @@ produce.
     </td>
   </tr>
   <tr>
-    <td width="440"><img src="docs/assets/nodes/pick.svg" width="440" alt="The Pick node, prompted 'something to sit on' over a Furniture collection: Index 0, Item Armchair, the Armchair as an instance."></td>
+    <td width="440"><img src="docs/assets/nodes/pick.svg" width="440" alt="The Pick node, its Trigger linked, prompted 'something to sit on' over a Furniture collection: Index 0, Item Armchair, the Armchair as an instance."></td>
     <td valign="middle">
       <h3>Pick</h3>
       <p>Chooses the one entry of a list that best fits a prompt. The list is typed, read from a CSV, or taken
@@ -96,7 +99,7 @@ produce.
     </td>
   </tr>
   <tr>
-    <td width="440"><img src="docs/assets/nodes/dials.svg" width="440" alt="The Dials node, prompted 'A stormy night in a fishing village': Rain True, Wind speed 24.6, Time of day night, Street lights True, Fog 0.35."></td>
+    <td width="440"><img src="docs/assets/nodes/dials.svg" width="440" alt="The Dials node, its Trigger linked, prompted 'A stormy night in a fishing village': Rain True, Wind speed 24.6, Time of day night, Street lights True, Fog 0.35."></td>
     <td valign="middle">
       <h3>Dials</h3>
       <p>One prompt sets many named settings at once: switches, amounts in any range, or one of several options.
@@ -106,7 +109,7 @@ produce.
     </td>
   </tr>
   <tr>
-    <td width="440"><img src="docs/assets/nodes/match.svg" width="440" alt="The Match node, asking 'Would you find it in a kitchen?' about every prop of a collection: a probability, a selection and a confidence per element."></td>
+    <td width="440"><img src="docs/assets/nodes/match.svg" width="440" alt="The Match node, its Trigger linked, asking 'Would you find it in a kitchen?' about every prop of a collection: a probability, a selection and a confidence per element."></td>
     <td valign="middle">
       <h3>Match</h3>
       <p>Asks the same question about every item of a list. Each element reads its item's probability, and
@@ -116,7 +119,7 @@ produce.
     </td>
   </tr>
   <tr>
-    <td width="440"><img src="docs/assets/nodes/classify.svg" width="440" alt="The Classify node, labelling an object's material slots from a Labels CSV plugged in through Import CSV: a label, a confidence, and the roughness and metallic of each label, per element."></td>
+    <td width="440"><img src="docs/assets/nodes/classify.svg" width="440" alt="The Classify node, its Trigger linked, labelling an object's material slots from a Labels CSV plugged in through Import CSV: a label, a confidence, and the roughness and metallic of each label, per element."></td>
     <td valign="middle">
       <h3>Classify</h3>
       <p>Gives every item one of several labels. The numeric columns of the Labels CSV, like roughness or metallic,
@@ -126,11 +129,12 @@ produce.
     </td>
   </tr>
   <tr>
-    <td width="440"><img src="docs/assets/nodes/rules.svg" width="440" alt="The Rules node, running Conway's Game of Life from life_factors.csv and life_outcomes.csv: each cell's outcome, confidence and alive flag, read through the state and neighbours inputs."></td>
+    <td width="440"><img src="docs/assets/nodes/rules.svg" width="440" alt="The Rules node, its Trigger linked and a grid of points passing through, running Conway's Game of Life from life_factors.csv and life_outcomes.csv: each cell's outcome, confidence and alive flag, read through the state and neighbours inputs."></td>
     <td valign="middle">
       <h3>Rules</h3>
       <p>Decides a table of situations. Factors such as amount bands, categories and flags span a grid of cells.
-      The model decides each cell once, and every element reads its own cell through the factor inputs.</p>
+      The model decides each cell once, and every element reads its own cell through the factor inputs. Pass your
+      geometry through the node, and it asks only the cells your elements are in.</p>
       <p><sub>EXAMPLE</sub><br>Conway's Game of Life, written as four outcomes, each with a sentence that says when
       it happens.</p>
     </td>
@@ -141,20 +145,25 @@ The [user guide](docs/GUIDE.md#the-six-nodes) covers every input, output and opt
 
 ## How it works
 
-1. **You write words.** Type them on the node, expose them on the modifier panel, build them with other nodes, or
-   keep them in CSV files. Each node reports the words it evaluated.
-2. **OpenAct asks outside evaluation.** For a node whose Trigger is on, it sends only the new questions to its model
-   server on `127.0.0.1`. There, [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) scores each allowed answer with
-   [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) in a single forward pass. No text is generated.
-3. **The answers become a table inside the node.** Geometry Nodes looks them up per element, through an ID or the
-   Rules factor inputs, as fast as any other lookup.
-4. **The table is saved with the file.** Anyone can open, play and render it on Blender 4.5 or newer, with or
+1. **You write words.** Type them on the node, expose them on the modifier panel, keep them in CSV files, or build
+   them with any nodes that make a String, even from the frame or a simulation's state.
+2. **Each node reports its words as the tree evaluates,** and whether its Trigger is on. OpenAct reads the reports
+   afterwards: nothing runs inside the evaluation.
+3. **OpenAct asks only what's new.** For a node whose Trigger is on, it sends the questions it has no answer for to
+   its model server on `127.0.0.1`, also while the timeline plays. There,
+   [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) scores each allowed answer with
+   [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) in a single forward pass. No text is generated. A Rules node
+   that your geometry passes through asks only the cells your elements are in.
+4. **The answers become a table inside the node,** with rows for every set of words, found by their hash: one node
+   serves any number of objects, and a new answer is new rows, even mid-playback. Geometry Nodes looks them up per
+   element, through an ID or the Rules factor inputs, as fast as any other lookup.
+5. **The table is saved with the file.** Anyone can open, play and render it on Blender 4.5 or newer, with or
    without OpenAct.
 
 ## Roadmap
 
 <p align="center">
-  <img src="docs/assets/roadmap.svg" width="100%" alt="Roadmap. Shipped in 1.0: six judgement nodes; rules, labels and payloads from CSV; answers saved in the .blend. Next: lists read from geometry inside the node tree; the Blender Extensions platform. Later: a CPU backend, so no NVIDIA GPU is needed; a high-accuracy mode with SemIf's 27B model. Exploring: agents whose decisions arrive during playback; Apple Silicon.">
+  <img src="docs/assets/roadmap.svg" width="100%" alt="Roadmap. Shipped in 1.0: six judgement nodes; rules, labels and payloads from CSV; answers saved in the .blend. Built and unreleased: nodes ask when their Trigger is on; words from any String nodes; decisions during playback; Rules asks only the cells in use. Next: lists read from geometry inside the node tree; the Blender Extensions platform. Later: a CPU backend, so no NVIDIA GPU is needed; a high-accuracy mode with SemIf's 27B model. Exploring: agents that think slow and act fast; Apple Silicon.">
 </p>
 
 Ideas and requests are welcome: [open an issue](https://github.com/nicolaiprodromov/openact/issues).

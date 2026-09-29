@@ -366,12 +366,13 @@ def logo_files(t: Type) -> dict[str, Doc]:
 # ---------------------------------------------------------------------------------------------------------- banner
 #
 # The README header shows what the nodes do to a scene: one Rules node, asked "Which plant grows here?", plants a
-# whole terrain. It follows the biome demo (demos/biome/): its land and climate, as the 1.0 script that built the
-# demo made them, the factor bands of biome_factors.csv, and the seven plants of biome_outcomes.csv with their scale
-# payload, each where its one-line description says it grows, blended at the band edges by the demo's Dither of 0.3;
-# the snow is the demo's second Rules node, an Amount. The image holds no page text, so one file suits GitHub's light
-# and dark themes: the name and the tagline are text in the README, and the only words here are the node's, on the
-# node editor's panel.
+# whole terrain. It follows 1.0's biome demo scene, removed since (design 18.4): its land and climate, as the script
+# that built the demo made them, the factor bands of biome_factors.csv, and the seven plants of biome_outcomes.csv
+# with their scale payload (both in tests/fixtures/), each where its one-line description says it grows, blended at
+# the band edges by the demo's Dither of 0.3; the snow is the demo's second Rules node, an Amount. The terrain passes
+# through the node, which asks only the cells its points read, and its Trigger is linked. The image holds no page
+# text, so one file suits GitHub's light and dark themes: the name and the tagline are text in the README, and the
+# only words here are the node's, on the node editor's panel.
 
 BIOME = (  # biome_outcomes.csv's rows: the answer, its scale payload, and the ground it grows on
     ("Pine", 1.2, "#4F7C57"), ("Birch", 1.0, "#6E9867"), ("Oak", 1.4, "#78A453"), ("Palm", 1.5, "#56A35C"),
@@ -403,15 +404,20 @@ def _band(value: float, edges) -> int:
     return sum(value >= edge for edge in edges[1:-1])
 
 
-def biome_plant(factors, jitter) -> int:
-    """The plant of a point: the cell of its factors (temperature, moisture, altitude), each jittered by (r - 0.5)
-    Dither widths of its band as the node dithers (jitter: an r 0-1 per factor), and that cell's outcome as the model
-    reads biome_outcomes.csv: dry ground by temperature, then high ground, then the rest by temperature."""
+def biome_cell(factors, jitter) -> tuple[int, int, int]:
+    """The cell a point reads: the band of each of its factors (temperature, moisture, altitude), jittered by
+    (r - 0.5) Dither widths of its band as the node dithers (jitter: an r 0-1 per factor)."""
     bands = []
     for value, edges, r in zip(factors, (T_BANDS, THIRDS, THIRDS), jitter):
         b = _band(value, edges)
         bands.append(_band(_clamp01(value + (r - 0.5) * DITHER * (edges[b + 1] - edges[b])), edges))
-    t, m, a = bands
+    return tuple(bands)
+
+
+def biome_plant(factors, jitter) -> int:
+    """The plant of a point: its cell's outcome (biome_cell()) as the model reads biome_outcomes.csv: dry ground by
+    temperature, then high ground, then the rest by temperature."""
+    t, m, a = biome_cell(factors, jitter)
     if m == 0:
         return (6, 5, 4)[t]  # dry: heather on cold moors, olives on mild slopes, cacti in hot deserts
     return 0 if a == 2 else (1, 2, 3)[t]  # moderate or wet: pines up high, else birch, oak or palm by temperature
@@ -546,9 +552,11 @@ def banner(t: Type) -> Doc:
         doc.define(f'<g id="{plants[-1]}">{art}</g>')
     doc.add(rect(0, 0, W, H, 20, fill=EDITOR), f'<g clip-path="url(#{clip})">', rect(0, 0, W, H, fill=f"url(#{dots})"))
 
-    # --- the node's layout: Rules as the node cards draw it, scaled up, with the sockets that are linked
-    s, nx0, ny0 = 1.38, 56, 66
-    rows = (("out", "instance", "int"), ("out", "scale", "float"), ("status", "27 cells · 0 unsure"),
+    # --- the node's layout: Rules as the node cards draw it, scaled up, with the sockets that are linked: the
+    # terrain passes through its Geometry, so it asks only the cells its points read, and its Trigger is on
+    s, nx0, ny0 = 1.25, 56, 40
+    rows = (("out", "Geometry", "geometry"), ("out", "instance", "int"), ("out", "scale", "float"), ("status", ""),
+            ("input", "Geometry", "geometry"), ("input", "Trigger", "bool"),
             ("word", "Question", "Which plant grows here?"), ("word", "Factors", "//biome_factors.csv"),
             ("word", "Outcomes", "//biome_outcomes.csv"), ("field", "temperature"), ("field", "moisture"),
             ("field", "altitude"))
@@ -580,13 +588,15 @@ def banner(t: Type) -> Doc:
     light = (-0.62, -0.28, 1.0)
     light = tuple(c / math.sqrt(sum(v * v for v in light)) for c in light)
     rng = random.Random(7)
+    in_use = set()  # the cells the terrain's points read: all the node asks, as the terrain passes through it
 
     def soil(x, y):
         """The ground of the cell around (x, y): its plant's, dithered as the node dithers, rock above the treeline
         and the snow of the summit."""
         height, temperature, moisture, altitude = biome_land(x, y)
-        colour = _rgb(BIOME[biome_plant((temperature, moisture, altitude), (rng.random(), rng.random(),
-                                                                               rng.random()))][2])
+        jitter = (rng.random(), rng.random(), rng.random())
+        in_use.add(biome_cell((temperature, moisture, altitude), jitter))
+        colour = _rgb(BIOME[biome_plant((temperature, moisture, altitude), jitter)][2])
         colour = _mix(colour, _rgb(ROCK), 0.85 * _clamp01((height - 5.2) / 0.5))
         return _mix(colour, _rgb(SNOW), biome_snow(height, temperature))
 
@@ -627,6 +637,7 @@ def banner(t: Type) -> Doc:
         return -half <= east <= half and point[1] >= cy - (east + half) * ky - height_at(east, half) * kz
 
     way_out, exposed = [], []  # exposed: the points of the ways in that show, which no plant may cover
+    dashes = {"geometry": None}  # a field's link is dashed; the Geometry's, one value, is solid
     for index, (row, cy_) in enumerate(outs):
         along = half - SPAN * (index + 1) / (len(outs) + 1)  # the first output furthest along, so no two cross
         (x1, y1), (x2, y2) = at(NW, cy_), iso(along, half, plug)
@@ -634,7 +645,8 @@ def banner(t: Type) -> Doc:
         curve = ((x1, y1), (x1 + (x2 - x1) * 0.5, y1), (x2 - south[0] * reach * 0.45, y2 - south[1] * reach * 0.45),
                  (x2, y2))
         doc.add(path(f"M{num(x1)} {num(y1)}C" + " ".join(f"{num(x)} {num(y)}" for x, y in curve[1:]), fill="none",
-                     stroke=SOCKET[row[2]], stroke_width=2.2 * s, stroke_dasharray=dash, stroke_linecap="round"))
+                     stroke=SOCKET[row[2]], stroke_width=2.2 * s, stroke_dasharray=dashes.get(row[2], dash),
+                     stroke_linecap="round"))
         for step_ in range(241):
             point = _cubic(*curve, step_ / 240)
             if behind(point):
@@ -680,8 +692,9 @@ def banner(t: Type) -> Doc:
             x = -half + (i + 0.5 + scatter.uniform(-0.38, 0.38)) * step
             y = -half + (j + 0.5 + scatter.uniform(-0.38, 0.38)) * step
             height, temperature, moisture, altitude = biome_land(x, y)
-            kind = biome_plant((temperature, moisture, altitude), (scatter.random(), scatter.random(),
-                                                                   scatter.random()))
+            jitter = (scatter.random(), scatter.random(), scatter.random())
+            in_use.add(biome_cell((temperature, moisture, altitude), jitter))
+            kind = biome_plant((temperature, moisture, altitude), jitter)
             size = BIOME[kind][1] * scatter.uniform(0.85, 1.15)
             if height > 5.4:
                 continue  # nothing grows on the rock and snow above the treeline
@@ -706,20 +719,30 @@ def banner(t: Type) -> Doc:
         x2, y2 = W + 4, level + offset
         doc.add(path(f"M{num(x1)} {num(y1)}C{num(x1 + south[0] * 56)} {num(y1 + south[1] * 56)} "
                      f"{num((x1 + south[0] * 56 + x2) / 2)} {num(y2)} {num(x2)} {num(y2)}", fill="none",
-                     stroke=f"url(#{fade})", stroke_width=2.2 * s, stroke_dasharray=dash, stroke_linecap="round"))
-        east, up = (kx / k * 9, -ky / k * 9), (0.0, -9.0)  # the node's field socket, lying on the front
+                     stroke=f"url(#{fade})", stroke_width=2.2 * s, stroke_dasharray=dashes.get(row[2], dash),
+                     stroke_linecap="round"))
+        east, up = (kx / k * 9, -ky / k * 9), (0.0, -9.0)  # the node's socket, lying on the front
+        if row[2] == "geometry":  # a single value's round socket, seen at the front's slant
+            ring = [(x1 + 0.8 * (east[0] * math.cos(a) + up[0] * math.sin(a)),
+                     y1 + 0.8 * (east[1] * math.cos(a) + up[1] * math.sin(a))) for a in
+                    (math.tau * i / 20 for i in range(20))]
+            doc.add(_poly(ring, colour, stroke=OUTLINE, stroke_width=2.2, stroke_linejoin="round"))
+            continue
         doc.add(_poly([(x1 + east[0], y1 + east[1]), (x1 + up[0], y1 + up[1]), (x1 - east[0], y1 - east[1]),
                        (x1 - up[0], y1 - up[1])], colour, stroke=OUTLINE, stroke_width=2.2, stroke_linejoin="round"))
 
-    # --- the node, over everything, and the factors that arrive at it from the left, as on the node cards
+    # --- the node, over everything, and the inputs that arrive at it from the left, as on the node cards
     for row, cy_ in zip(rows, centres):
-        if row[0] == "field":
+        if row[0] in ("field", "input"):
+            colour = SOCKET["float" if row[0] == "field" else row[2]]
             fade = doc.uid("fade")
             end = at(0, cy_)
-            doc.define(linear(fade, ((0, SOCKET["float"], 0), (1, SOCKET["float"], 0.9)), "0", "0", num(end[0]), "0",
-                              user=True))
+            doc.define(linear(fade, ((0, colour, 0), (1, colour, 0.9)), "0", "0", num(end[0]), "0", user=True))
             doc.add(line(0, end[1], end[0], end[1], stroke=f"url(#{fade})", stroke_width=2.2 * s,
-                         stroke_dasharray=f"{num(4 * s)} {num(3.5 * s)}"))
+                         stroke_dasharray=f"{num(4 * s)} {num(3.5 * s)}" if row[0] == "field" else None))
+    cells = 27  # the biome's: 3 temperature x 3 moisture x 3 altitude bands
+    status = (f"{len(in_use)} of {cells} cells answered · 0 unsure" if len(in_use) < cells
+              else f"{cells} cells · 0 unsure")
     doc.add(f'<g transform="translate({num(nx0)} {num(ny0)}) scale({s})">')
     doc.add(f'<g filter="url(#{shadow})">', rect(0, 0, NW, node_h, 9, fill=NODE, stroke=NODE_EDGE), "</g>")
     doc.add(rect(0, 0, NW, HEAD, 9, fill=HEADER), rect(0, HEAD - 10, NW, 10, fill=HEADER),
@@ -734,10 +757,13 @@ def banner(t: Type) -> Doc:
     for row, cy_ in zip(rows, centres):
         if row[0] == "out":
             doc.text(NW - 16, cy_ + 4.5, row[1], 13, 400, fill=TEXT, anchor="end")
-            socket(doc, NW, cy_, SOCKET[row[2]], "field")
+            socket(doc, NW, cy_, SOCKET[row[2]], "one" if row[2] == "geometry" else "field")
         elif row[0] == "status":
             check_icon(doc, 16, cy_, "#D3D6DB")
-            doc.text(36, cy_ + 4.5, row[1], 13, 400, fill="#D3D6DB")
+            doc.text(36, cy_ + 4.5, status, 13, 400, fill="#D3D6DB")
+        elif row[0] == "input":
+            socket(doc, 0, cy_, SOCKET[row[2]])
+            doc.text(left, cy_ + 4.5, row[1], 13, 400, fill=TEXT)
         elif row[0] == "word":
             socket(doc, 0, cy_, SOCKET["string"])
             doc.text(left, cy_ + 4.5, row[1], 13, 400, fill=TEXT)
@@ -770,22 +796,36 @@ PITCH = 8  # the step of a per-element chip's marks
 LABEL_W = 80  # the label column of a word's field
 
 # rows: ("out", label, socket, shape, chip) · ("seg", options, active) · ("menu", text) · ("check", label)
-#       ("status", text) · ("word", label, value) · ("csv", label, linked) · ("block", label, socket, name)
-#       ("field", label, socket, linked) · ("slider", label, value) · ("number", label, value)
+#       ("status", text) · ("input", label, socket, linked) · ("word", label, value) · ("csv", label, linked)
+#       ("block", label, socket, name) · ("field", label, socket, linked) · ("slider", label, value)
+#       ("number", label, value)
 # chips: ("text", value[, aside]) · ("bars", values) · ("cells", flags) · ("labels", indices) · ("grid", rows)
+# Every node starts with the same sockets (specs/base.py SHARED): the Geometry output first, and the Geometry and
+# Trigger inputs first. The cards pass the example's geometry through and link the Trigger, as a node asks only then.
 BALANCE = ("check", "Balance Option Order")
+SHARED_IN = (("input", "Geometry", "geometry", True), ("input", "Trigger", "bool", True))
+
+
+def geometry_out(what: str) -> tuple:
+    """The Geometry output's row: the geometry that passes through the node, e.g. "Points"."""
+    return ("out", "Geometry", "geometry", "one", ("text", what))
+
+
 CARDS = {
     "ask": ("Ask", "whole", (
+        geometry_out("Mesh"),
         ("out", "Answer", "float", "one", ("text", "0.97")),
         ("out", "Yes", "bool", "one", ("text", "True")),
         ("out", "Confidence", "float", "one", ("text", "0.94")),
         ("seg", ("Yes / No", "Amount"), 0), BALANCE, ("status", "Yes  (97% yes)"),
+        *SHARED_IN,
         ("word", "Question", "Is it night?"),
         ("word", "Context", "A snowy mountain village at night, warm windows glowing."),
         ("word", "Answers", ""),
         ("csv", "Answers CSV", False),
     )),
     "pick": ("Pick", "whole", (
+        geometry_out("Points"),
         ("out", "Index", "int", "one", ("text", "0")),
         ("out", "Item", "string", "one", ("text", "Armchair")),
         ("out", "Confidence", "float", "one", ("text", "0.83")),  # the winner minus the runner-up
@@ -793,12 +833,14 @@ CARDS = {
         ("out", "Probability", "float", "field", ("bars", (0.88, 0.03, 0.02, 0.05, 0.02))),
         ("out", "Instance", "geometry", "one", ("text", "1 instance")),
         ("menu", "Collection"), BALANCE, ("status", "Armchair  (88%)"),
+        *SHARED_IN,
         ("word", "Prompt", "something to sit on"),
         ("word", "Context", ""),
         ("block", "Collection", "collection", "Furniture"),
         ("field", "ID", "int", False),
     )),
     "dials": ("Dials", "whole", (
+        geometry_out("Mesh"),
         ("out", "Rain", "bool", "one", ("text", "True")),
         ("out", "Wind speed", "float", "one", ("text", "24.6")),
         ("out", "Time of day", "int", "one", ("text", "3", "night")),
@@ -806,16 +848,19 @@ CARDS = {
         ("out", "Fog", "float", "one", ("text", "0.35")),
         ("out", "Confidence", "float", "one", ("text", "0.71")),
         BALANCE, ("status", "5 settings · lowest confidence 0.71"),
+        *SHARED_IN,
         ("word", "Prompt", "A stormy night in a fishing village"),
         ("word", "Settings", "//weather_dials.csv"),
         ("csv", "Settings CSV", False),
     )),
     "match": ("Match", "item", (
+        geometry_out("Instances"),
         ("out", "Probability", "float", "field", ("bars", (0.97, 0.94, 0.06, 0.91, 0.12, 0.03, 0.88, 0.09))),
         ("out", "Selection", "bool", "field", ("cells", (1, 1, 0, 1, 0, 0, 1, 0))),
         ("out", "Confidence", "float", "field", ("bars", (0.94, 0.88, 0.88, 0.82, 0.76, 0.94, 0.76, 0.82))),
         ("seg", ("Yes / No", "Amount"), 0), ("menu", "Collection"), BALANCE,
         ("status", "10 of 40 yes · 0 unsure"),
+        *SHARED_IN,
         ("word", "Question", "Would you find it in a kitchen?"),
         ("word", "Context", ""),
         ("block", "Collection", "collection", "Props"),
@@ -825,11 +870,13 @@ CARDS = {
         ("slider", "Threshold", 0.5),
     )),
     "classify": ("Classify", "item", (
+        geometry_out("Mesh"),
         ("out", "Label", "int", "field", ("labels", (0, 1, 2, 3, 0, 2, 1, 3))),
         ("out", "Confidence", "float", "field", ("bars", (0.92, 0.84, 0.9, 0.71, 0.88, 0.79, 0.86, 0.66))),
         ("out", "roughness", "float", "field", ("bars", (0.35, 0.6, 0.8, 0.9, 0.35, 0.8, 0.6, 0.9))),
         ("out", "metallic", "int", "field", ("cells", (1, 0, 0, 0, 1, 0, 0, 0))),
         ("menu", "Materials"), BALANCE, ("status", "8 items · 4 labels used · 0 unsure"),
+        *SHARED_IN,
         ("word", "Question", ""),
         ("word", "Context", ""),
         ("block", "Object", "object", "Swatches"),
@@ -838,10 +885,12 @@ CARDS = {
         ("field", "ID", "int", True),
     )),
     "rules": ("Rules", "cell", (
+        geometry_out("Points"),
         ("out", "Outcome", "int", "field", ("labels", (0, 1, 2, 3, 1, 2, 1, 3))),
         ("out", "Confidence", "float", "field", ("bars", (0.97, 0.99, 0.95, 0.93, 0.99, 0.96, 0.99, 0.9))),
         ("out", "alive", "int", "field", ("grid", ("01000010", "00100010", "11100010"))),
         ("seg", ("One of", "Yes / No", "Amount"), 0), BALANCE, ("status", "18 cells · 0 unsure"),
+        *SHARED_IN,
         ("word", "Question", "What happens to this cell in the next generation?"),
         ("word", "Context", "A cellular automaton on a square grid; every cell has eight neighbours."),
         ("word", "Factors", "//life_factors.csv"),
@@ -957,7 +1006,7 @@ def node_card(t: Type, key: str) -> Doc:
         centres.append(y + h / 2)
         y += h
     for row, cy in zip(rows, centres):
-        if row[0] in ("csv", "field") and row[-1] is True:
+        if row[0] in ("csv", "input", "field") and row[-1] is True:
             colour = SOCKET["geometry" if row[0] == "csv" else row[2]]
             fade = doc.uid("fade")
             doc.define(linear(fade, ((0, colour, 0), (1, colour, 0.9)), "4", "0", num(X0), "0", user=True))
@@ -1015,8 +1064,8 @@ def node_card(t: Type, key: str) -> Doc:
             field_box(doc, fx, cy - 11, right - fx)
             if value:
                 doc.text(fx + 8, cy + 4.5, doc.fit(value, 12.5, right - fx - 16), 12.5, 400, fill="#ECEDEF")
-        elif kind == "csv":
-            socket(doc, X0, cy, SOCKET["geometry"])
+        elif kind in ("csv", "input"):  # a socket and its label, no value: a CSV companion, Geometry, the Trigger
+            socket(doc, X0, cy, SOCKET["geometry" if kind == "csv" else row[2]])
             doc.text(left, cy + 4.5, row[1], 13, 400, fill=TEXT)
         elif kind == "block":
             _, label, sock, name = row
@@ -1063,27 +1112,28 @@ def node_card(t: Type, key: str) -> Doc:
 
 # --------------------------------------------------------------------------------------------------------- roadmap
 
-ROADMAP = (  # (stage, tag, state, items)
+ROADMAP = (  # (stage, tag, state, items): done is released, built is merged and unreleased (CHANGELOG.md)
     ("Shipped", "1.0", "done", ("Six judgement nodes", "Rules, labels and payloads from CSV",
                                 "Answers saved in the .blend")),
+    ("Unreleased", None, "built", ("Nodes ask when their Trigger is on", "Words from any String nodes",
+                                   "Decisions during playback", "Rules asks only cells in use")),
     ("Next", None, "next", ("Lists from geometry inside the tree", "On the Blender Extensions platform")),
     ("Later", None, "later", ("A CPU backend, no NVIDIA GPU needed", "High-accuracy mode with SemIf's 27B model")),
-    ("Exploring", None, "explore", ("Agents: decisions during playback", "Apple Silicon")),
+    ("Exploring", None, "explore", ("Agents that think slow and act fast", "Apple Silicon")),
 )
-STAGE_COLOURS = {"done": CYAN, "next": CYAN, "later": "#7A8194", "explore": "#5E6577"}  # cyan: done or next
+STAGE_COLOURS = {"done": CYAN, "built": CYAN, "next": CYAN, "later": "#7A8194", "explore": "#5E6577"}
 
 
 def roadmap(t: Type) -> Doc:
-    W, margin = 960, 32  # drawn to be shown at about 880 px, nearly 1:1
+    W, margin = 1200, 32  # as wide as the banner, drawn to be shown at about 900 px
     col = (W - 2 * margin) / len(ROADMAP)
     probe = Doc(t, W, 10, "")
     size, lead, width = 15, 21, col - 24
     wrapped = [[probe.wrap(item, size, width) for item in items] for *_rest, items in ROADMAP]
     bottom = max(146 + sum(len(lines) * lead + 12 for lines in column) for column in wrapped)
     H = round(bottom + 26)
-    doc = Doc(t, W, H, "OpenAct roadmap",
-              "Shipped in 1.0: " + "; ".join(ROADMAP[0][3]) + ". Next: " + "; ".join(ROADMAP[1][3]) + ". Later: "
-              + "; ".join(ROADMAP[2][3]) + ". Exploring: " + "; ".join(ROADMAP[3][3]) + ".")
+    doc = Doc(t, W, H, "OpenAct roadmap", " ".join(f"{stage}{f' in {tag}' if tag else ''}: {'; '.join(items)}."
+                                                    for stage, tag, _state, items in ROADMAP))
     clip, dots = doc.uid("clip"), doc.uid("dots")
     doc.define(  # the node editor's panel, as on the node cards
         f'<clipPath id="{clip}">{rect(0, 0, W, H, 20)}</clipPath>',
@@ -1095,8 +1145,9 @@ def roadmap(t: Type) -> Doc:
             rect(0.5, 0.5, W - 1, H - 1, 19.5, fill="none", stroke=EDITOR_EDGE))
     ty = 58
     xs = [margin + i * col + 22 for i in range(len(ROADMAP))]
-    doc.add(line(xs[0], ty, xs[1], ty, stroke=CYAN, stroke_width=3, stroke_linecap="round"))
-    for a, b in zip(xs[1:], xs[2:] + [W - margin + 30]):
+    reached = next(i for i, stage in enumerate(ROADMAP) if stage[2] == "next")  # solid up to the next stage
+    doc.add(line(xs[0], ty, xs[reached], ty, stroke=CYAN, stroke_width=3, stroke_linecap="round"))
+    for a, b in zip(xs[reached:], xs[reached + 1:] + [W - margin + 30]):
         doc.add(line(a, ty, b, ty, stroke="#4A5061", stroke_width=2.5, stroke_dasharray="2 7",
                      stroke_linecap="round"))
     for i, ((stage, tag, state, _items), lines_per_item) in enumerate(zip(ROADMAP, wrapped)):
@@ -1104,6 +1155,9 @@ def roadmap(t: Type) -> Doc:
         if state == "done":
             doc.add(circle(x, ty, 12, fill=colour, stroke=OUTLINE, stroke_width=3))
             check_icon(doc, x - 5.2, ty + 0.3, OUTLINE, 2.4)
+        elif state == "built":  # done, not yet released: the check in a ring
+            doc.add(circle(x, ty, 11, fill=EDITOR, stroke=colour, stroke_width=3))
+            check_icon(doc, x - 5.2, ty + 0.3, colour, 2.4)
         elif state == "next":
             doc.add(circle(x, ty, 11, fill=EDITOR, stroke=colour, stroke_width=3), circle(x, ty, 4.5, fill=colour))
         else:
