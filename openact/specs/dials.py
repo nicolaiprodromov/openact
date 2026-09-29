@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import csvfmt, pipeline
-from .base import KEY, Spec, confidence, named, number_text, overrides_inputs, warnings, yes_no_text
+from .base import KEY, Spec, confidence, named, number_text, overrides_inputs, shared_sockets, warnings, yes_no_text
 
 SOCKETS = {"yes_no": 'NodeSocketBool', "amount": 'NodeSocketFloat', "one_of": 'NodeSocketInt'}
 KINDS = {socket: kind for kind, socket in SOCKETS.items()}
@@ -75,6 +75,7 @@ class DialsSpec(Spec):
 
         outputs = self.outputs(node) if outputs is None else outputs
         return [
+            *shared_sockets(),
             SocketDef('INPUT', "Prompt", 'NodeSocketString',
                       "The situation every setting is judged against, e.g. 'A stormy night in a fishing village'",
                       "word"),

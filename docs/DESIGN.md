@@ -996,7 +996,31 @@ default, seeded from the `debias` preference when the node is created.
 |---|---|---|
 | **word** | the static evaluator (§10). May be typed, or linked from Group Input (modifier panel), String, Join Strings, Menu Switch, Import Text, another OpenAct node's single-value output… | Question, Prompt, Context, Items, Collection, Object, Answers, Labels, Outcomes, Factors, Settings, Overrides, and `Key` (hidden by default; compared, never sent to the model, §6.0) |
 | **field** | Geometry Nodes only, per element; never statically evaluated | ID, Rules factor sockets |
+| **single** | Geometry Nodes only, one value per evaluation (`SINGLE` on every version) | Trigger |
 | **GN value** | Geometry Nodes only; single value or field; Python ignores it | Threshold (Match), Dither and Seed (Rules) |
+
+**Geometry and Trigger (every node).** Every node's interface starts with the same three sockets,
+whatever its spec, dropdowns and dynamic sockets (`specs/base.py`: `SHARED`, `shared_sockets()`):
+- **Geometry**, the first input, and **Geometry**, the first output. `inner.build()` links the one
+  to the other for every node, so the geometry passes through unchanged. They are optional to
+  link, like Capture Attribute's, and let a node sit on the geometry's path; nothing reads the
+  geometry yet.
+- **Trigger**, the second input: a Bool that decides when the node asks the model. When it is on
+  at an evaluation, the node may ask for what it is missing; **unlinked, it is off, so the node
+  never asks**, and it still outputs everything already stored. Its structure type is `SINGLE`
+  on every version (kind `single`, `compat.structure_type()`), and `hide_value` removes its
+  checkbox. On is Blender's implicit conversion into a Bool socket: a Float or Int above 0, a
+  Vector with any non-zero component, a Color whose grayscale is above 0 (alpha ignored).
+  *The asking rule arrives with the engine's change to asking; until then the pass asks as 1.0
+  does, whatever the Trigger.*
+- **Files saved by 1.0** lack the three sockets. The first pass adds them in their places
+  (`inner.lacks()`, then `sync_interface()`), keeping every other socket's identifier and links,
+  and rebuilds the group, whose interface changed.
+- **Reserved names.** No Rules factor may be called `Geometry` or `Trigger`
+  (`csvfmt.RULES_INPUTS`, which also keeps the Trigger, a Bool input, from being taken for a flag
+  factor), and no payload column or Dials setting `Geometry` (§7.3–§7.5).
+- A muted node passes its Geometry input to its Geometry output. Its Trigger reaches its Bool, Int
+  and Float outputs that have no input of a closer type, as the ID does below.
 
 **ID input.**
 - An `Int` input with `default_input = 'INDEX'` and `hide_value = True`. Unlinked, it means
@@ -1094,6 +1118,7 @@ interface and never clears it:
   So `sync_interface()` does this, with the version switch in `compat.py` (§11):
   - Word inputs, all String, are `SINGLE` on every version. It is harmless, and draws the right
     shape.
+  - The Trigger (kind `single`) is `SINGLE` on every version.
   - ID and factor inputs are `FIELD` on 5.0+ and `AUTO` on 4.5.
   - Threshold, Dither and Seed stay `AUTO`.
 - **Blender does not flag a string field linked into a `SINGLE` String input.** On all three
@@ -1686,8 +1711,9 @@ CSV source):
 - **Reserved in this schema** (case-insensitive, never payload): the names above, plus the
   Overrides columns `lock`, `unsure`, `confidence`, `model_answer` and `source`.
 - **Payload limits.** At most 16 payload columns. A payload header that equals a fixed output of
-  the node, ignoring case (`Index`, `Item`, `Confidence`, `Selection`, `Probability`, `Instance`,
-  `Material`, `Label`, `Outcome`, `Yes`, `Amount`), is an error: "rename column 'Outcome'".
+  the node, ignoring case (`Geometry`, `Index`, `Item`, `Confidence`, `Selection`, `Probability`,
+  `Instance`, `Material`, `Label`, `Outcome`, `Yes`, `Amount`), is an error: "rename column
+  'Outcome'".
 - **Rows by answer type:**
   - Yes/No sets have exactly the rows `yes` and `no`, in any order.
   - Amount sets have 2–16 rows, lowest level first.
@@ -1710,7 +1736,7 @@ blanks freely.
 
 | Column | Required | Meaning |
 |---|---|---|
-| `factor` | yes | Factor name, which becomes the input socket name. At most 63 characters and unique. It must not equal a fixed socket (`Question`, `Context`, `Factors`, `Outcomes`, `Overrides`, `Dither`, `Seed`), nor an Overrides CSV column (`answer`, `lock`, `model_answer`, `confidence`, `unsure`, `source`): factor names are the Overrides CSV's key columns (§7.6) |
+| `factor` | yes | Factor name, which becomes the input socket name. At most 63 characters and unique. It must not equal a fixed socket (`Geometry`, `Trigger`, `Question`, `Context`, `Factors`, `Outcomes`, `Overrides`, `Dither`, `Seed`), nor an Overrides CSV column (`answer`, `lock`, `model_answer`, `confidence`, `unsure`, `source`): factor names are the Overrides CSV's key columns (§7.6) |
 | `kind` | on the factor's first row; later rows empty or equal | `amount`, `category` or `flag` |
 | `level` | yes | Level name shown to the model; unique within the factor, ignoring case |
 | `when` (synonym `description`) | recommended | What the level means: "freezing to chilly: snow is common" |
@@ -1749,7 +1775,7 @@ altitude,amount,high,"mountains and high slopes",,
 
 | Column | Required | Meaning |
 |---|---|---|
-| `setting` | yes | Output socket name; unique ignoring case, at most 63 characters. It must not be `Confidence` |
+| `setting` | yes | Output socket name; unique ignoring case, at most 63 characters. It must not be `Confidence` or `Geometry` |
 | `type` | yes | `yes/no` (synonyms `yes_no`, `bool`), `amount`, or `one-of` (synonyms `one_of`, `choice`) |
 | `question` | yes | The instruction for this setting |
 | `answers` | yes for `one-of`, optional otherwise | Inline answer set (§6.0): `;`-separated `name: when` entries. One-of: 2–255 options (a tournament above 16). Amount: 2–16 ordered levels. Yes/No: `yes`/`no` whens |
@@ -2996,11 +3022,16 @@ Full socket tables are in §6. This table is the summary:
 **Every node also has the hidden input `Key`** (String, word; compared by the match chain, never
 sent to the model, §6.0). It is part of the 1.x interface.
 
+**Every node now starts with Geometry and Trigger inputs and a Geometry output** (§6.0): Geometry
+passes through unchanged, and an unlinked Trigger never asks. A file saved by 1.0 gains them on
+its first pass, with its links.
+
 **Stability promise from 1.0:**
 - Socket **names** and **types** in these tables, `Key` included, do not change within 1.x,
   because links depend on them.
 - Dynamic sockets (factors, settings, payload) take their names from the CSV (§6.0).
-- New optional inputs may be appended.
+- New optional sockets may be added, anywhere: links follow socket identifiers, which
+  `sync_interface()` keeps (§6.0).
 
 ### 13.2 HTTP API (Blender ↔ model server)
 

@@ -339,8 +339,9 @@ def phase_pass_classify():
             engine.run_pass()
         outputs = [(s.name, s.bl_idname) for s in node.outputs]
         check("pass: the Labels CSV's numeric columns become payload outputs as soon as the node plans",
-              outputs == [("Label", 'NodeSocketInt'), ("Confidence", 'NodeSocketFloat'),
-                          ("roughness", 'NodeSocketFloat'), ("metallic", 'NodeSocketInt')], outputs)
+              outputs == [("Geometry", 'NodeSocketGeometry'), ("Label", 'NodeSocketInt'),
+                          ("Confidence", 'NodeSocketFloat'), ("roughness", 'NodeSocketFloat'),
+                          ("metallic", 'NodeSocketInt')], outputs)
         store_outputs(tree, node, {"Label": 'INT', "Confidence": 'FLOAT', "roughness": 'FLOAT', "metallic": 'INT'})
         job = CLASSIFY.plan(node, evaluator.find_uses()[tree.as_pointer()][0])
         check("pass: one choice question per item over the 4 labels, all 4 missing cells asked in one job",
@@ -422,9 +423,10 @@ def phase_draw_classify():
               got[0] == "ok" and face(node) == before, (got[0], face(node)[0]))
         with Capture():
             engine.run_pass()
+        payload = face(node)[0][3:]  # after Geometry, Label and Confidence
         check("draw: the next pass plans and adds the payload outputs",
-              face(node)[0][2:] == [("roughness", 'NodeSocketFloat', "The Labels CSV's 'roughness' of the chosen label"),
-                                    ("metallic", 'NodeSocketInt', "The Labels CSV's 'metallic' of the chosen label")],
+              payload == [("roughness", 'NodeSocketFloat', "The Labels CSV's 'roughness' of the chosen label"),
+                          ("metallic", 'NodeSocketInt', "The Labels CSV's 'metallic' of the chosen label")],
               face(node)[0])
         store_outputs(tree, node, {"Label": 'INT', "roughness": 'FLOAT', "metallic": 'INT'})
         for row in CLASSIFY.plan(node, evaluator.find_uses()[tree.as_pointer()][0]).rows:
@@ -446,7 +448,7 @@ def phase_draw_classify():
         rewire(tree, node, {"Label": 'INT', "roughness": 'FLOAT', "metalness": 'INT'})
         got = read(obj, ("Label", "roughness", "metalness"))
         check("draw: the next pass renames the payload output, with its tooltip, and asks nothing",
-              [s.name for s in node.outputs] == ["Label", "Confidence", "roughness", "metalness"]
+              [s.name for s in node.outputs] == ["Geometry", "Label", "Confidence", "roughness", "metalness"]
               and tips.get("metalness") == "The Labels CSV's 'metalness' of the chosen label"
               and got == {"Label": [0, 1, 2, 3, -1, -1], "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0],
                           "metalness": [1, 0, 0, 0, 0, 0]} and not capture.keys(node), (tips, got))
@@ -461,7 +463,7 @@ def phase_draw_classify():
             engine.run_pass()
         got = read(obj, ("Label", "roughness"))
         check("draw: the next pass drops the payload output and rebuilds the group: each element reads its own label",
-              [s.name for s in node.outputs] == ["Label", "Confidence", "roughness"]
+              [s.name for s in node.outputs] == ["Geometry", "Label", "Confidence", "roughness"]
               and got == {"Label": [0, 1, 2, 3, -1, -1], "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0]}
               and not capture.keys(node), got)
 
@@ -472,7 +474,7 @@ def phase_draw_classify():
             engine.run_pass()
         got = read(obj, ("Label", "roughness"))
         check("draw: after an undo that keeps the plans, the next pass syncs the payload outputs to the file again",
-              [s.name for s in node.outputs] == ["Label", "Confidence", "roughness"]
+              [s.name for s in node.outputs] == ["Geometry", "Label", "Confidence", "roughness"]
               and got == {"Label": [0, 1, 2, 3, -1, -1], "roughness": [0.35, 0.6, 0.8, 0.9, 0.0, 0.0]},
               ([s.name for s in node.outputs], got))
     finally:
@@ -623,7 +625,7 @@ def phase_agree_classify():
         check("agreement: the same payload columns in another order agree: each object reads its own payload, the "
               "outputs follow the first context's order and keep their links, 0 requests",
               got[0] == ('CHECKMARK', summary) and got[1] == 0 and got[3] == before and face(node)[1] == shown[1]
-              and [s.name for s in node.outputs] == ["Label", "Confidence", "metallic", "roughness"],
+              and [s.name for s in node.outputs] == ["Geometry", "Label", "Confidence", "metallic", "roughness"],
               (got, [s.name for s in node.outputs]))
 
         # A context whose Labels come through an Import CSV node without a Path, or whose collection is empty, shows a

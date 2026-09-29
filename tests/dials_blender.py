@@ -42,8 +42,8 @@ DIALS = dials.DialsSpec.idname
 WEATHER = os.path.join(ROOT, "tests", "fixtures", "weather_dials.csv")
 STORM, CALM = "A stormy night in a fishing village", "A calm summer morning"
 TMP = tempfile.mkdtemp(prefix="openact_dials_")
-OUTPUTS = [("Rain", 'BOOLEAN'), ("Wind speed", 'VALUE'), ("Time of day", 'INT'), ("Street lights", 'BOOLEAN'),
-           ("Fog", 'VALUE'), ("Confidence", 'VALUE')]
+OUTPUTS = [("Geometry", 'GEOMETRY'), ("Rain", 'BOOLEAN'), ("Wind speed", 'VALUE'), ("Time of day", 'INT'),
+           ("Street lights", 'BOOLEAN'), ("Fog", 'VALUE'), ("Confidence", 'VALUE')]  # every node's Geometry first
 STORED = {'BOOLEAN': 'BOOLEAN', 'VALUE': 'FLOAT', 'INT': 'INT'}  # socket type -> Store Named Attribute type
 FAKE = {  # instructions -> what the fake model answers, parsed as pipeline.parse() gives it
     "Is it raining?": {"p": 0.9},
@@ -119,11 +119,11 @@ def words(obj, **values):
 
 
 def wire(tree, node):
-    """Store every Dials output on the points, named after it, for read()."""
+    """Store every Dials output but Geometry on the points, named after it, for read()."""
     gi = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
     go = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
     geometry = gi.outputs["Geometry"]
-    for x, socket in enumerate(node.outputs):
+    for x, socket in enumerate(s for s in node.outputs if s.type in STORED):
         geometry = store(tree, geometry, socket, socket.name, STORED[socket.type], 300 + 200 * x)
     tree.links.new(geometry, go.inputs["Geometry"])
 
@@ -357,7 +357,7 @@ def phase_inline():
         settle()
     names = [s.name for s in node.outputs]
     check("inline rename: the outputs follow the settings, and the node warns",
-          names == ["Rain", "Mist", "Confidence"] and len(S.load(node).entries) == 2 and not calls
+          names == ["Geometry", "Rain", "Mist", "Confidence"] and len(S.load(node).entries) == 2 and not calls
           and dials.WARNINGS.get(node.uid) == "Setting 'Fog' renamed or retyped: reconnect its output",
           (names, dials.WARNINGS.get(node.uid), len(calls)))
     orphan = next(n for n in tree.nodes if n.bl_idname == "GeometryNodeStoreNamedAttribute"
@@ -372,7 +372,7 @@ def phase_inline():
         settle()
     names = [s.name for s in node.outputs]
     check("inline rename back: the stored entry's outputs return, with 0 requests, and the linked Mist warns",
-          names == ["Rain", "Fog", "Confidence"] and not calls
+          names == ["Geometry", "Rain", "Fog", "Confidence"] and not calls
           and dials.WARNINGS.get(node.uid) == "Setting 'Mist' renamed or retyped: reconnect its output",
           (names, len(calls), dials.WARNINGS.get(node.uid)))
     words(users["I"], Settings=inline.format("Mist"))  # typed back: a new socket, without the link undo brings back
@@ -465,7 +465,8 @@ def phase_new_setting():
     got = [(s.name, s.type, s.is_linked) for s in node.outputs]
     check("new setting: its output comes before its answer, and the other outputs keep their links",
           asked == {"Is it snowing in the harbour?"}
-          and got == [("Fog", 'VALUE', True), ("Snow", 'BOOLEAN', False), ("Confidence", 'VALUE', True)], (asked, got))
+          and got == [("Geometry", 'GEOMETRY', False), ("Fog", 'VALUE', True), ("Snow", 'BOOLEAN', False),
+                      ("Confidence", 'VALUE', True)], (asked, got))
     phase_reorder()
 
 
@@ -490,8 +491,8 @@ def phase_reorder():
         names, got = [s.name for s in node.outputs], read(users["R"])
         asked = [job for job, _missing in calls if job.uid == node.uid]  # the new setting's Snow is still unanswered
         check(f"reorder ({label}): each output keeps its own setting's value, with 0 requests and one rebuild",
-              got == EXPECTED and names == [row.split(",")[0] for row in order] + ["Confidence"] and not asked
-              and len(rebuilt) == 1, (got, names, len(asked), rebuilt))
+              got == EXPECTED and names == ["Geometry", *(row.split(",")[0] for row in order), "Confidence"]
+              and not asked and len(rebuilt) == 1, (got, names, len(asked), rebuilt))
     phase_chained_hint()
 
 

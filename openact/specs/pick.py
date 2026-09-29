@@ -5,7 +5,8 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, named, option_text, overrides_inputs, state_text, unsure_below, warnings
+from .base import (KEY, Spec, confidence, named, option_text, overrides_inputs, shared_sockets, state_text,
+                   unsure_below, warnings)
 
 PICK_STATE = "Choose one of the listed items."
 
@@ -51,8 +52,9 @@ class PickSpec(Spec):
 
         source = getattr(node, "list_source", 'TEXT')
         extra = (self.EXTRA[source],) if source in self.EXTRA else ()
-        return [*(SocketDef(*args) for args in self.INPUTS), *list_inputs(source), SocketDef(*self.ID),
-                *(SocketDef(*args) for args in (*self.OUTPUTS, *extra)), *overrides_inputs(), SocketDef(*KEY)]
+        return [*shared_sockets(), *(SocketDef(*args) for args in self.INPUTS), *list_inputs(source),
+                SocketDef(*self.ID), *(SocketDef(*args) for args in (*self.OUTPUTS, *extra)), *overrides_inputs(),
+                SocketDef(*KEY)]
 
     def items(self, node, ctx):
         from ..lists import resolve_items  # imports bpy

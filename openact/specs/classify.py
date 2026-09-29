@@ -6,7 +6,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline
-from .base import KEY, confidence, named, overrides_inputs, warnings
+from .base import KEY, confidence, named, overrides_inputs, shared_sockets, warnings
 from .match import PerItemSpec
 
 
@@ -32,13 +32,15 @@ class ClassifySpec(PerItemSpec):
         return "one_of"
 
     def payload_outputs(self, node) -> list:
-        """(header, type) of the node's payload outputs. They follow the Labels CSVs of its live contexts (agree())."""
+        """(header, type) of the node's payload outputs: its Int and Float outputs besides Label and Confidence. They
+        follow the Labels CSVs of its live contexts (agree())."""
         tree = node.node_tree
         if tree is None:
             return []
-        return [(item.name, 'INT' if item.socket_type == 'NodeSocketInt' else 'FLOAT')
-                for item in tree.interface.items_tree
-                if item.item_type == 'SOCKET' and item.in_out == 'OUTPUT' and item.name not in self.FIXED]
+        types = {'NodeSocketInt': 'INT', 'NodeSocketFloat': 'FLOAT'}
+        return [(item.name, types[item.socket_type]) for item in tree.interface.items_tree
+                if item.item_type == 'SOCKET' and item.in_out == 'OUTPUT' and item.socket_type in types
+                and item.name not in self.FIXED]
 
     def interface(self, node, payload=None):
         from ..inner import SocketDef  # imports bpy
@@ -46,6 +48,7 @@ class ClassifySpec(PerItemSpec):
         if payload is None:  # keep the payload outputs the node has
             payload = self.payload_outputs(node)
         return [
+            *shared_sockets(),
             *self.head(node, "Optional instruction. Empty: 'Which label fits this item best?'",
                        "The labels (required): 'metal: steel, iron; wood: planks, bark', or a .csv path with "
                        "answer, when and numeric payload columns"),

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, state_text, warnings
+from .base import (KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, shared_sockets, state_text,
+                   warnings)
 
 ANSWERS = ("Optional answer set. Yes / No: 'yes: <when>; no: <when>'. Amount: 2-16 levels, lowest first, e.g. "
            "'none; dusting; patchy; thick; buried'. Or a .csv path. Empty: Yes / No, or Not at all ... Extremely")
@@ -29,8 +30,8 @@ class AskSpec(Spec):
         from ..inner import SocketDef  # imports bpy
         from ..sources import csv_inputs
 
-        return [*(SocketDef(*args) for args in self.SOCKETS), *csv_inputs("Answers", ANSWERS), *overrides_inputs(),
-                SocketDef(*KEY)]
+        return [*shared_sockets(), *(SocketDef(*args) for args in self.SOCKETS), *csv_inputs("Answers", ANSWERS),
+                *overrides_inputs(), SocketDef(*KEY)]
 
     def answers(self, node, ctx):
         from .. import sources  # imports bpy

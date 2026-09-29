@@ -393,6 +393,9 @@ def _process(tree, node, contexts):
         STATUS[node.uid] = _error(store.newer_message(node_store))
         return False
     spec = SPECS[node.bl_idname]
+    wanted = spec.interface(node)
+    if inner.lacks(node, wanted):  # saved before the node gained sockets, e.g. Geometry and Trigger (§6.0)
+        inner.sync_interface(node, wanted)
     entries = node_store.entries
     contexts = contexts or [Ctx(None, None, (), tree)]
     jobs, shown, live = {}, [], []  # words -> (Job, ctx), one per distinct words; the entries shown; live gns

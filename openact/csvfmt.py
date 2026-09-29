@@ -45,17 +45,19 @@ OVERRIDE_COLUMNS = ("answer", "lock", "model_answer", "confidence", "unsure", "s
 # Never payload in an answer set (design 7.3); every other numeric column is.
 ANSWER_COLUMNS = frozenset(NAME_COLUMNS + WHEN_COLUMNS + ("if",) + OVERRIDE_COLUMNS)
 # Where an answer set's numeric columns become output sockets: (node, kind) -> the node's fixed output names, which
-# those sockets must not take.
+# those sockets must not take. Every node has a Geometry output.
 PAYLOAD_OUTPUTS = {
-    ("pick", "items"): frozenset(("index", "item", "confidence", "selection", "probability")),
-    ("classify", "one_of"): frozenset(("label", "confidence")),
-    ("rules", "one_of"): frozenset(("outcome", "probability", "yes", "amount", "confidence")),
+    ("pick", "items"): frozenset(("geometry", "index", "item", "confidence", "selection", "probability")),
+    ("classify", "one_of"): frozenset(("geometry", "label", "confidence")),
+    ("rules", "one_of"): frozenset(("geometry", "outcome", "probability", "yes", "amount", "confidence")),
 }
-# Factor names become input sockets of the Rules node, next to these.
+# Factor names become input sockets of the Rules node, next to these. The node also tells its factor sockets from its
+# own Int, Float and Bool inputs (the Trigger) by this set.
 RULES_INPUTS = frozenset(
-    ("question", "context", "factors", "outcomes", "overrides", "dither", "seed", "key")
+    ("geometry", "trigger", "question", "context", "factors", "outcomes", "overrides", "dither", "seed", "key")
     + ("factors csv", "outcomes csv", "overrides csv")
 )
+DIALS_OUTPUTS = frozenset(("geometry", "confidence"))  # the Dials node's fixed outputs, which no setting may name
 FACTOR_LEVELS = {"amount": (2, 16), "category": (2, 64), "flag": (2, 2)}
 SETTING_TYPES = {
     **{"yes/no": "yes_no", "yes_no": "yes_no", "bool": "yes_no", "amount": "amount"},
@@ -686,7 +688,7 @@ def _setting_name_problem(name, seen):
         problem = "the setting name is empty"
     elif size > MAX_NAME:
         problem = f"the setting name has {size} bytes in UTF-8 (limit {MAX_NAME})"
-    elif name.casefold() == "confidence":
+    elif name.casefold() in DIALS_OUTPUTS:
         problem = f"rename setting '{name}': it clashes with a node output"
     elif name.casefold() in seen:
         problem = f"'{name}' appears twice"

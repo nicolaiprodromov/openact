@@ -5,8 +5,8 @@ stored entries (store.py) at any time. Only the materialised entries (§8.1) are
 Nodes selects the entry whose words equal the node's live inputs (the joined-key match chain, §8.2),
 reads that entry's single values from Index Switches, and its per-element rows from the table object
 at base + ID (§8.3), so one tree answers every context that uses it, with no Python at evaluation.
-The interface is never cleared: sync_interface() diffs it, so the links from the outer tree survive
-every rebuild.
+Every group passes its Geometry input to its Geometry output unchanged (§6.0). The interface is never
+cleared: sync_interface() diffs it, so the links from the outer tree survive every rebuild.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ WARM_TOTAL = 4  # warm entries are materialised only while the total is below th
 ROW_BUDGET = 16 * 4096  # flat rows warm entries may bring the table object to
 K_DEFAULT = "OpenAct k_default"  # the chain's innermost Switch: its False value is what a no-match shows
 BASE, COUNT = "OpenAct base", "OpenAct count"  # Index Switches: each entry's first flat row, its row count
+GEOMETRY = "Geometry"  # the input and output every node passes its geometry through (§6.0)
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,7 @@ class SocketDef:
     name: str
     socket_type: str  # e.g. 'NodeSocketString'
     description: str = ""  # the tooltip
-    kind: str = ""  # inputs: "word" (read by the evaluator), "field" (per element), "" (a Geometry Nodes value)
+    kind: str = ""  # inputs: "word" (read by the evaluator), "field" (per element), "single" (one value), "" (any)
     hidden: bool = False  # hidden on the node when the socket is created; Ctrl H reveals it
     default_input: str = 'VALUE'  # 'INDEX': unlinked, the input is the element's index
     hide_value: bool = False
@@ -103,6 +104,15 @@ class _Builder:
 
     def link(self, a, b):
         return self.tree.links.new(a, b)
+
+    def pass_through(self, gi, go):
+        """Every node's Geometry input to its Geometry output, unchanged (§6.0). Found by name and type, as a CSV
+        companion is Geometry too; an interface without them (saved before them, until the pass adds them) passes
+        nothing."""
+        found = [next((s for s in sockets if s.name == GEOMETRY and s.type == 'GEOMETRY'), None)
+                 for sockets in (gi.outputs, go.inputs)]
+        if None not in found:
+            self.link(*found)
 
     def words(self, gi, names):
         """The Group Input sockets of the node's word tuple, in order, None where the interface has no such
@@ -318,8 +328,8 @@ def create_inner(node, store=None):
 
 
 def build(node, store, live=None, default=None):
-    """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept, and the
-    ID's hidden value set (_Builder.ident()).
+    """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept, the
+    geometry passed through (§6.0) and the ID's hidden value set (_Builder.ident()).
 
     live: the gn tuples of the node's live contexts, in context order (§8.1). None means unknown: every
     stored entry is laid out, in store order; only the pass knows the live set. default: the words_key of
@@ -339,6 +349,7 @@ def build(node, store, live=None, default=None):
     builder.node, builder.table = node, table
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
+    builder.pass_through(group_in, group_out)
     if table is not None:  # the table's only user, and how find() sees it, even while nothing samples it yet
         builder.table_geometry()
     SPECS[node.bl_idname].build(builder, group_in, group_out, entries)
@@ -535,6 +546,13 @@ def sync_interface(node, wanted):
     for d, identifier in created:
         if d.hidden:
             sock(node.inputs if d.in_out == 'INPUT' else node.outputs, identifier).hide = True
+
+
+def lacks(node, wanted) -> bool:
+    """True when the inner group's interface lacks a socket of `wanted`, as a file saved before the node had it does:
+    sync_interface() adds it, and keeps the others with their links."""
+    have = {(i.in_out, i.name, i.socket_type) for i in node.node_tree.interface.items_tree if i.item_type == 'SOCKET'}
+    return any((d.in_out, d.name, d.socket_type) not in have for d in wanted)
 
 
 def _set(item, name, value):

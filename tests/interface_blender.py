@@ -8,6 +8,9 @@
   Switch MATERIAL works; a string field (5.1+) linked into a SINGLE word stays valid, so the evaluator is
   the guard.
 - copy() plus ensure_owned() gives every copy its own inner group, also when the whole tree is duplicated.
+- Every node's first sockets (§6.0): Geometry and Trigger inputs, a Geometry output, through dropdowns and
+  dynamic sockets; the Trigger a SINGLE Bool with no checkbox; the geometry passes through all six nodes. A
+  node saved by 1.0, without them, gains them on the next pass, its other sockets and links kept.
 
 Run:  blender -b --factory-startup --python tests/interface_blender.py
 """
@@ -23,11 +26,18 @@ from openact import compat, engine, evaluator, inner, nodes  # noqa: E402  (bpy 
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
+from openact.specs.base import SHARED  # noqa: E402
+from openact.specs.classify import ClassifySpec  # noqa: E402
+from openact.specs.dials import DialsSpec  # noqa: E402
+from openact.specs.rules import RulesSpec  # noqa: E402
 
 P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 FIELDS = bpy.app.version >= (5, 0, 0)
 STRING_FIELDS = bpy.app.version >= (5, 1, 0)  # before 5.1 a per-element condition can't drive a String Switch
+RULES, CLASSIFY, DIALS = RulesSpec.idname, ClassifySpec.idname, DialsSpec.idname
+FIRST = [("Geometry", 'GEOMETRY'), ("Trigger", 'BOOLEAN'), ("Geometry", 'GEOMETRY')]  # every node's first sockets
+SHARED_KEYS = {(in_out, name, socket_type) for in_out, name, socket_type, *_rest in SHARED}
 
 tree = bpy.data.node_groups.new("Interface", 'GeometryNodeTree')
 tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
@@ -75,22 +85,22 @@ def items(node):
 
 
 def phase_sync():
-    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # Question, Context, outputs, Answers, Overrides (+CSV), Key
-    by = {d.name: d for d in spec}
-    kept = {s.name: s.identifier for s in (*ask.inputs, *ask.outputs)}
+    spec = engine.SPECS[engine.ASK_ID].interface(ask)  # shared, Question, Context, outputs, Answers, Overrides, Key
+    shared, by = spec[:3], {d.name: d for d in spec[3:]}  # Geometry in, Trigger, Geometry out (§6.0)
+    kept = [(s.is_output, s.name, s.identifier) for s in (*ask.inputs, *ask.outputs)]
     tag = SocketDef('INPUT', "Tag", 'NodeSocketString', "Compared, never sent to the model", kind="word", hidden=True)
     extra = SocketDef('OUTPUT', "Extra", 'NodeSocketInt', "An extra output")
-    wanted = [by["Context"], by["Question"], by["Answers"], by["Answers CSV"], by["Overrides"], by["Overrides CSV"], tag,
-              by["Key"], by["Confidence"], by["Answer"], by["Yes"], extra]  # Context first, Confidence first
-    inputs = ("Question", "Context", "Answers", "Answers CSV", "Overrides", "Overrides CSV", "Key")
+    wanted = [*shared, by["Context"], by["Question"], by["Answers"], by["Answers CSV"], by["Overrides"],
+              by["Overrides CSV"], tag, by["Key"], by["Confidence"], by["Answer"], by["Yes"], extra]  # Context first
     inner.sync_interface(ask, wanted)
     check("sync: new sockets reach the node, in the wanted order",
-          names(ask.inputs) == ["Context", "Question", "Answers", "Answers CSV", "Overrides", "Overrides CSV", "Tag",
-                                "Key"]
-          and names(ask.outputs) == ["Confidence", "Answer", "Yes", "Extra"], (names(ask.inputs), names(ask.outputs)))
+          names(ask.inputs) == ["Geometry", "Trigger", "Context", "Question", "Answers", "Answers CSV", "Overrides",
+                                "Overrides CSV", "Tag", "Key"]
+          and names(ask.outputs) == ["Geometry", "Confidence", "Answer", "Yes", "Extra"],
+          (names(ask.inputs), names(ask.outputs)))
     check("sync: matched sockets keep their identifiers (the interface is never cleared)",
-          all(sock(ask.inputs if name in inputs else ask.outputs, identifier).name == name
-              for name, identifier in kept.items()), kept)
+          all(sock(ask.outputs if output else ask.inputs, identifier).name == name
+              for output, name, identifier in kept), kept)
     check("sync: links to the node survive", question_link.is_valid and question_link.to_socket == ask.inputs["Question"]
           and all(link.is_valid for link in L), [(link.to_socket.name, link.is_valid) for link in L if not link.is_valid])
     check("sync: the node still evaluates through its links", read(host, "answer") == [0.75] * 4, read(host, "answer"))
@@ -117,10 +127,12 @@ def phase_sync():
 
     inner.sync_interface(ask, spec)
     check("sync: obsolete sockets are removed and the order restored",
-          names(ask.inputs) == ["Question", "Context", "Answers", "Answers CSV", "Overrides", "Overrides CSV", "Key"]
-          and names(ask.outputs) == ["Answer", "Yes", "Confidence"], (names(ask.inputs), names(ask.outputs)))
+          names(ask.inputs) == ["Geometry", "Trigger", "Question", "Context", "Answers", "Answers CSV", "Overrides",
+                                "Overrides CSV", "Key"]
+          and names(ask.outputs) == ["Geometry", "Answer", "Yes", "Confidence"],
+          (names(ask.inputs), names(ask.outputs)))
     check("sync: kept sockets and links are untouched by the removals",
-          all(sock((*ask.inputs, *ask.outputs), identifier).name == name for name, identifier in kept.items())
+          all(sock(ask.outputs if output else ask.inputs, identifier).name == name for output, name, identifier in kept)
           and question_link.is_valid and read(host, "answer") == [0.75] * 4)
 
 
@@ -129,12 +141,14 @@ def phase_structure_types():
         'INPUT', "Factor", 'NodeSocketFloat', kind="field")
     value, collection = SocketDef('INPUT', "Threshold", 'NodeSocketFloat'), SocketDef(
         'INPUT', "Collection", 'NodeSocketCollection', kind="word")
+    single = SocketDef('INPUT', "Trigger", 'NodeSocketBool', kind="single", hide_value=True)
     stand = N.new(engine.ASK_ID)
-    inner.sync_interface(stand, [word, field, value, collection])
+    inner.sync_interface(stand, [word, field, value, collection, single])
     got = {name: item.structure_type for (_in_out, name), item in items(stand).items()}
-    check("structure types: SINGLE for String words, FIELD for fields only on 5.0+, AUTO otherwise",
-          got == {"Word": 'SINGLE', "Factor": 'FIELD' if FIELDS else 'AUTO', "Threshold": 'AUTO', "Collection": 'AUTO'},
-          got)
+    check("structure types: SINGLE for String words and single-value inputs (the Trigger) on every version, FIELD "
+          "for fields only on 5.0+, AUTO otherwise",
+          got == {"Word": 'SINGLE', "Factor": 'FIELD' if FIELDS else 'AUTO', "Threshold": 'AUTO', "Collection": 'AUTO',
+                  "Trigger": 'SINGLE'}, got)
     check("structure types: sync never asks for FIELD on a String socket",
           compat.structure_type('NodeSocketString', "field") == 'AUTO')
     string = stand.node_tree.interface.new_socket("Probe", in_out='INPUT', socket_type='NodeSocketString')
@@ -229,9 +243,124 @@ def phase_copies():
           [copy.node_tree for copy in copies] == groups and ask.node_tree.as_pointer() == original[2])
 
 
+def first(node):
+    """(name, type) of the node's first two inputs and its first output."""
+    return [(s.name, s.type) for s in (node.inputs[0], node.inputs[1], node.outputs[0])]
+
+
+def passes(node):
+    """True when the node's inner group links its Geometry input to its Geometry output."""
+    return any(link.from_node.bl_idname == "NodeGroupInput" and link.from_socket.name == "Geometry"
+               and link.to_node.bl_idname == "NodeGroupOutput" and link.to_socket.name == "Geometry"
+               for link in node.node_tree.links)
+
+
+def passing_tree(name):
+    """A tree whose modifier geometry, a copy of the host's 4 points, enters as Geometry and leaves as Geometry."""
+    group = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    obj = bpy.data.objects.new(name, mesh.copy())
+    bpy.context.scene.collection.objects.link(obj)
+    obj.modifiers.new(name, 'NODES').node_group = group
+    return group, group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput"), obj
+
+
+def phase_shared():
+    """§6.0: every node starts with a Geometry and a Trigger input and a Geometry output, whatever its dropdowns and
+    dynamic sockets, and its inner group passes the geometry through unchanged."""
+    group, gi, go, obj = passing_tree("Shared")
+    geometry = store(group, gi.outputs["Geometry"], group.nodes.new("GeometryNodeInputIndex").outputs[0], "tag", 'INT')
+    made = {}
+    for idname in engine.SPECS:  # the six nodes in a row, each passing on what the one before passed
+        node = made[idname] = group.nodes.new(idname)
+        group.links.new(geometry, node.inputs["Geometry"])
+        geometry = node.outputs["Geometry"]
+    group.links.new(geometry, go.inputs["Geometry"])
+    check("shared: Geometry and Trigger are the first inputs, Geometry the first output, on all six nodes",
+          all(first(node) == FIRST for node in made.values()), {node.bl_label: first(node) for node in made.values()})
+    trigger = {node.bl_label: items(node)[('INPUT', "Trigger")] for node in made.values()}
+    check("shared: the Trigger is a single value on every version, with no checkbox, and off while unlinked",
+          all((i.structure_type, i.hide_value, i.default_value) == ('SINGLE', True, False) for i in trigger.values())
+          and not any(node.inputs["Trigger"].default_value for node in made.values()),
+          {label: (i.structure_type, i.hide_value, i.default_value) for label, i in trigger.items()})
+    check("shared: their tooltips",
+          all(items(node)[(in_out, name)].description == text for node in made.values()
+              for in_out, name, _type, text, *_rest in SHARED))
+    check("shared: every inner group links its Geometry input to its Geometry output",
+          all(passes(node) for node in made.values()), [node.bl_label for node in made.values() if not passes(node)])
+    check("shared: the six nodes pass the geometry through unchanged, attributes included",
+          read(obj, "tag") == [0, 1, 2, 3], read(obj, "tag"))
+
+    rules, classify, dials = made[RULES], made[CLASSIFY], made[DIALS]
+    rules.answer_type = 'YES_NO'  # dropdowns swap sockets at once (nodes._interface_changed)
+    made[engine.PICK_ID].list_source = 'COLLECTION'  # Instance: another Geometry output
+    inner.sync_interface(rules, engine.SPECS[RULES].interface(rules, [("heat", "amount"), ("wet", "flag")], []))
+    inner.sync_interface(classify, engine.SPECS[CLASSIFY].interface(classify, [("roughness", 'FLOAT')]))
+    inner.sync_interface(dials, engine.SPECS[DIALS].interface(dials, [("Rain", "yes_no"), ("Wind", "amount")]))
+    check("shared: they stay first through dropdowns, factors, payload and settings",
+          all(first(node) == FIRST for node in made.values()), {node.bl_label: first(node) for node in made.values()})
+    got = ([d.name for d in engine.SPECS[RULES].interface(rules) if d.kind == "field"],
+           engine.SPECS[CLASSIFY].payload_outputs(classify), engine.SPECS[DIALS].outputs(dials))
+    check("shared: the Trigger is no flag factor, and the Geometry output no payload or setting",
+          got == (["heat", "wet"], [("roughness", 'FLOAT')], [("Rain", "yes_no"), ("Wind", "amount")]), got)
+    check("shared: the geometry still passes through", read(obj, "tag") == [0, 1, 2, 3], read(obj, "tag"))
+
+
+def phase_saved_before():
+    """A node saved by OpenAct 1.0 lacks the shared sockets: the next pass adds them in their places and rebuilds the
+    group, which passes the geometry through; every other socket keeps its identifier and its links, the factor,
+    payload and setting sockets included; a second pass changes nothing."""
+    group, gi, go, _obj = passing_tree("Before")
+    olds = [group.nodes.new(idname) for idname in (engine.ASK_ID, RULES, CLASSIFY, DIALS)]
+    asker, rules, classify, dials = olds
+    for node, wanted in ((asker, engine.SPECS[engine.ASK_ID].interface(asker)),
+                         (rules, engine.SPECS[RULES].interface(rules, [("heat", "amount")], [])),
+                         (classify, engine.SPECS[CLASSIFY].interface(classify, [("roughness", 'FLOAT')])),
+                         (dials, engine.SPECS[DIALS].interface(dials, [("Rain", "yes_no")]))):
+        inner.sync_interface(node, [d for d in wanted if (d.in_out, d.name, d.socket_type) not in SHARED_KEYS])
+        inner.build(node, S.load(node))
+    words, heat = group.nodes.new("FunctionNodeInputString"), group.nodes.new("ShaderNodeValue")
+    words.string = "Is it night?"
+    group.links.new(words.outputs[0], asker.inputs["Question"])
+    group.links.new(heat.outputs[0], rules.inputs["heat"])
+    geometry = gi.outputs["Geometry"]
+    for node, output, data_type in ((asker, "Answer", 'FLOAT'), (rules, "Outcome", 'INT'),
+                                    (classify, "roughness", 'FLOAT'), (dials, "Rain", 'BOOLEAN')):
+        geometry = store(group, geometry, node.outputs[output], output, data_type)
+    group.links.new(geometry, go.inputs["Geometry"])
+
+    def faces():
+        return {node.name: [(s.is_output, s.name, s.identifier) for s in (*node.inputs, *node.outputs)]
+                for node in olds}
+
+    def linked():
+        return sorted((link.from_node.name, link.from_socket.identifier, link.to_node.name, link.to_socket.identifier,
+                       link.is_valid) for link in group.links if link.from_node in olds or link.to_node in olds)
+
+    before, links = faces(), linked()
+    check("saved before: the 1.0 nodes lack the shared sockets, and their groups pass nothing",
+          all(first(node) != FIRST and not passes(node) for node in olds), {n.name: first(n) for n in olds})
+    engine.run_pass()
+    check("saved before: the next pass gives each node Geometry and Trigger first, and Geometry first among outputs",
+          all(first(node) == FIRST for node in olds), {node.name: first(node) for node in olds})
+    after = {name: [face for face in sockets if (face[0], face[1]) not in (
+        (False, "Geometry"), (False, "Trigger"), (True, "Geometry"))] for name, sockets in faces().items()}
+    check("saved before: every other socket keeps its identifier and its order, factor, payload and setting included",
+          after == before, (before, after))
+    check("saved before: every link to and from the nodes survives", linked() == links, (links, linked()))
+    check("saved before: the pass rebuilt each group, which now passes the geometry through",
+          all(passes(node) for node in olds), [node.name for node in olds if not passes(node)])
+    settled = faces()
+    engine.run_pass()
+    check("saved before: a second pass changes nothing", faces() == settled and linked() == links)
+
+
 phase_sync()
 phase_structure_types()
 phase_index_default()
 phase_material_switch()
 phase_copies()
+phase_shared()
+phase_saved_before()
 finish()

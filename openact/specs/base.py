@@ -18,6 +18,12 @@ NO_CONTEXT = "No additional context."
 KEY = ('INPUT', "Key", 'NodeSocketString',
        "Tells apart objects that share every other word, e.g. typed per object on the modifier. Compared, never "
        "sent to the model", "word", True)  # the last word of every node (§6.0), hidden until Ctrl H
+SHARED = (  # the first sockets of every node (§6.0), whatever its spec: SocketDef arguments
+    ('INPUT', "Geometry", 'NodeSocketGeometry', "Passed to the Geometry output unchanged"),
+    ('INPUT', "Trigger", 'NodeSocketBool', "Asks the model for what this node is missing whenever it is on at an "
+     "evaluation. Unlinked: never asks", "single", False, 'VALUE', True),  # one value, no checkbox: unlinked is off
+    ('OUTPUT', "Geometry", 'NodeSocketGeometry', "The Geometry input, passed through"),
+)
 SOURCES = {"lock": "l", "code": "c", "model": "m", "pending": "p", "stale": "s", "error": "e"}  # Row.source -> src
 KINDS = {src: source for source, src in SOURCES.items()}  # src -> Row.source
 OVERRIDES = ("Optional Overrides CSV (.csv path). Rows with lock = 1 replace the model's answer and are never asked. "
@@ -85,6 +91,14 @@ def overrides_inputs() -> list:
     from ..sources import csv_inputs  # imports bpy
 
     return csv_inputs("Overrides", OVERRIDES, hidden=True)
+
+
+def shared_sockets() -> list:
+    """The SocketDefs every interface() starts with (SHARED), so they come first on the node: Geometry in and out,
+    which inner.build() links, and the Trigger (§6.0)."""
+    from ..inner import SocketDef  # imports bpy
+
+    return [SocketDef(*args) for args in SHARED]
 
 
 def named(answer: str, names) -> int | None:

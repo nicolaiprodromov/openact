@@ -12,7 +12,8 @@ import dataclasses
 import itertools
 
 from .. import csvfmt, pipeline, rules_core
-from .base import KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, unsure_below, warnings
+from .base import (KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, shared_sockets,
+                   unsure_below, warnings)
 
 FACTORS_HINT = "Set a Factors CSV (sidebar: New CSV from Template)"
 OUTCOMES_HINT = "Add outcomes"
@@ -79,6 +80,7 @@ class RulesSpec(Spec):
             payload = _payload_outputs(tree) if tree is not None else []
         mode = node.answer_type
         defs = [
+            *shared_sockets(),
             SocketDef('INPUT', "Question", 'NodeSocketString',
                       "What to decide for each cell, e.g. 'What happens to this cell in the next generation?'",
                       kind="word"),

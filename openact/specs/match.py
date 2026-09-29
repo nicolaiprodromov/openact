@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .. import pipeline
 from ..csvfmt import _n
-from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings
+from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, shared_sockets, warnings
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
 
@@ -95,6 +95,7 @@ class MatchSpec(PerItemSpec):
         from ..inner import SocketDef  # imports bpy
 
         return [
+            *shared_sockets(),
             *self.head(node, "Asked about every item, e.g. 'Would you find it in a kitchen?' (Amount: 'How heavy "
                              "is it?')",
                        "Optional, as on Ask: 'yes: ...; no: ...', Amount levels lowest first, or a .csv path"),

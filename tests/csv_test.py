@@ -584,6 +584,16 @@ def test_answer_sets():
         only(problems, "error", 0, message),
         summary(problems),
     )
+    for node in ("classify", "rules"):
+        problems = raised(
+            csvfmt.parse_answer_set, read("geometry_payload.csv", "answer,Geometry\na,1\nb,2\n"), "one_of", node=node
+        )
+        message = "Rename column 'Geometry': it clashes with a node output"
+        check(
+            f"answers: payload may not take the Geometry output every node has ({node})",
+            only(problems, "error", 0, message),
+            summary(problems),
+        )
     long_name = "p" * 64
     problems = raised(
         csvfmt.parse_answer_set, read("payload_long.csv", f"answer,{long_name}\na,1\n"), "one_of", node="classify"
@@ -715,6 +725,8 @@ def test_factors():
         ("wide_name", flag("\u4e00" * 22), 2, "Line 2: the factor name has 66 bytes in UTF-8 (limit 63)"),
         ("clash", flag("Seed"), 2, "Line 2: rename factor 'Seed': it clashes with a node input"),
         ("clash_key", flag("key"), 2, "Line 2: rename factor 'key': it clashes with a node input"),
+        ("clash_trigger", flag("Trigger"), 2, "Line 2: rename factor 'Trigger': it clashes with a node input"),
+        ("clash_geometry", flag("geometry"), 2, "Line 2: rename factor 'geometry': it clashes with a node input"),
         ("clash_source", flag("source"), 2, "Line 2: rename factor 'source': it clashes with an Overrides CSV column"),
         ("clash_lock", flag("Lock"), 2, "Line 2: rename factor 'Lock': it clashes with an Overrides CSV column"),
         ("empty_name", ",flag,x,0\n" + flag("a"), 2, "Line 2: the factor name is empty"),
@@ -870,6 +882,7 @@ def test_settings():
             2,
             "Line 2: rename setting 'Confidence': it clashes with a node output",
         ),
+        ("geometry", "geometry,amount,q?,,,\n", 2, "Line 2: rename setting 'geometry': it clashes with a node output"),
         ("long_name", "s" * 64 + ",yes/no,q?,,,\n", 2, "Line 2: the setting name has 64 bytes in UTF-8 (limit 63)"),
         (
             "wide_name",
@@ -913,6 +926,7 @@ def test_inline_settings():
         ("Rain (yes/no):  ", "Entry 1: the question is empty"),
         ("Rain (yes/no): q?; rain (amount): q?", "Entry 2: 'rain' appears twice"),
         ("Confidence (amount): q?", "Entry 1: rename setting 'Confidence': it clashes with a node output"),
+        ("Geometry (yes/no): q?", "Entry 1: rename setting 'Geometry': it clashes with a node output"),
         ("s" * 64 + " (yes/no): q?", "Entry 1: the setting name has 64 bytes in UTF-8 (limit 63)"),
         (" ; ", "No settings"),
     ):

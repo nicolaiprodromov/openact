@@ -76,6 +76,12 @@ method of **SemIf** (formerly OpenJev, MIT), running **Qwen3.5-4B** (Apache-2.0)
 | **Classify** | each item of a list | one of several labels | Question (optional), Context, the list, Labels | per element **Label** (its row), **Confidence**, the Labels CSV's payload |
 | **Rules** | each measured situation | One of, Yes/No or Amount | Question, Context, Factors, Outcomes, and one field input per factor | per element: One of gives **Outcome** (its row) and the Outcomes CSV's payload, Yes/No **Probability** and **Yes**, Amount **Amount**; and **Confidence** |
 
+Every node starts with the same three sockets. **Geometry**, in and out, passes the geometry through unchanged, so a
+node can sit on the geometry's path. **Trigger**, a Boolean without a checkbox, decides when the node may ask the
+model: when it is on. Unlinked, it is off, and the node never asks; it still outputs the answers it has. Any value
+converts: a number above 0, a vector that isn't zero or a colour lighter than black is on. Files saved by OpenAct 1.0
+get these sockets when they open, with their links.
+
 Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV that locks answers
 ([below](#overrides)), and **Key**. Ctrl H shows them.
 

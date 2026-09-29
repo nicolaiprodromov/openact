@@ -8,6 +8,9 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
 - *Prepare for Playback* is removed, with its pins, *Unpin* and *Unpin All*. An entry that 1.0 pinned is kept in the
   file, but may now be dropped like any other stored answer to keep the file small.
 - Fix: a Pick whose answer is below *Unsure Below* counts as unsure in its status.
+- Every node starts with a **Geometry** input and output, which pass the geometry through unchanged, and a
+  **Trigger** input. Files saved by 1.0 gain them on their first pass, keeping their links. Rules factors can't be
+  called Geometry or Trigger, and payload columns and Dials settings can't be called Geometry.
 
 ## 1.0.0
 
