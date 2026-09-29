@@ -126,6 +126,7 @@ def phase_other_server(engine, server, P, root):
     ask = tree.nodes.new(engine.ASK_ID)
     ask.inputs["Question"].default_value = "Is it night?"
 
+    engine.reask(ask)  # nothing evaluates the node, so Ask Again asks it (§6.0)
     engine.run_pass()  # the node needs an answer, so auto-start meets the other server
     check("other server: the status names the port", server.status() == taken, server.status())
     status = engine.STATUS.get(ask.uid)

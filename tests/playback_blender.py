@@ -36,7 +36,7 @@ import bpy  # noqa: E402
 from bpy_extras import anim_utils  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import FAILURES, ROOT, check, drive, finish, store  # noqa: E402
+from _harness import FAILURES, ROOT, check, drive, finish, store, trigger  # noqa: E402
 from openact import engine, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402
@@ -170,7 +170,8 @@ def menu_value(obj, name, item):
 
 def question_tree(name, count, *extra):
     """A tree whose Ask asks 'Question <Level>?' of `count` questions, Level being the modifier's Int input; extra:
-    more (name, socket type) inputs. Returns (tree, Ask node, Group Input)."""
+    more (name, socket type) inputs. The geometry passes through the Ask, whose Trigger is on (§6.0). Returns (tree,
+    Ask node, Group Input)."""
     tree, gi, go = new_tree(name, ("Level", 'NodeSocketInt'), *extra)
     switch = tree.nodes.new("GeometryNodeIndexSwitch")
     switch.data_type = 'STRING'
@@ -182,6 +183,7 @@ def question_tree(name, count, *extra):
     ask = tree.nodes.new(ASK.idname)
     tree.links.new(switch.outputs[0], ask.inputs["Question"])
     tree.links.new(gi.outputs["Geometry"], go.inputs["Geometry"])
+    trigger(ask)
     return tree, ask, gi
 
 
@@ -255,6 +257,7 @@ def life_scene():
     mesh.attributes.new("in_neighbours", 'INT', 'POINT').data.foreach_set("value", [i % 9 for i in range(18)])
     obj = user("Life", tree, mesh)
     obj.modifiers["OpenAct"][ident(tree, "Rule set")] = menu_value(obj, "Rule set", "Life")
+    trigger(rules)  # the geometry passes through it until wire_life() stores its Outcome
     return tree, rules, obj, gi, go
 
 

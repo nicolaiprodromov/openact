@@ -32,7 +32,7 @@ import traceback
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import check, finish, store  # noqa: E402
+from _harness import check, finish, store, trigger  # noqa: E402
 from openact import csvfmt, engine, evaluator, nodes, ops, pipeline, trust  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import rules_core as rc  # noqa: E402
@@ -117,6 +117,8 @@ def new_tree(name):
 
 
 def user(name, tree, attributes=None):
+    """An object of POINTS points using the tree. Every OpenAct node of the tree gets a Trigger that is on, so it
+    asks (§6.0), and is put on the geometry's path if nothing reads it (_harness.trigger())."""
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([(i, 0, 0) for i in range(POINTS)], [], [])
     for attribute, values in (attributes or {}).items():
@@ -124,6 +126,8 @@ def user(name, tree, attributes=None):
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
     obj.modifiers.new("OpenAct", 'NODES').node_group = tree
+    for node in [n for n in tree.nodes if n.bl_idname in engine.OPENACT_TYPES and not n.inputs["Trigger"].is_linked]:
+        trigger(node)
     return obj
 
 
@@ -317,6 +321,7 @@ def phase_nodes():
                         "Rain,yes/no,Is it raining?,,,\nTime,one-of,What time is it?,dawn: early; dusk: late,,\n")
     dial.inputs["Overrides"].default_value = write("dials.csv", "setting,answer,lock\nWind,25,1\nRain,yes,1\n"
                                                                "Time,Dusk,1\n")
+    user("LockedUser", tree)  # evaluated and triggered: only its locks keep it from asking
     with Capture() as capture:
         engine.run_pass()
         engine.run_pass()
@@ -571,11 +576,16 @@ def phase_contexts():
     question, overrides = (tree.interface.items_tree[name].identifier for name in ("Question", "Overrides"))
     moon_file = write("moon_overrides.csv", "question,answer,lock\nIs the moon up?,yes,1\n")
     sun, moon = user("Sun", tree), user("Moon", tree)
+    # A modifier input set from Python re-evaluates nothing until the object is tagged, so the evaluation that reports
+    # the node's words (§5.7) would keep the old ones: update_tag(), as Blender's UI does
     sun.modifiers["OpenAct"][question] = "Is the sun up?"
     moon.modifiers["OpenAct"][question], moon.modifiers["OpenAct"][overrides] = "Is the moon up?", moon_file
+    sun.update_tag()
+    moon.update_tag()
     answer(ask, {"Is the sun up?": {"p": 0.7}})  # the moon's question is locked
     sun_file = os.path.join(TMP, "sun_overrides.csv")
     sun.modifiers["OpenAct"][overrides] = sun_file  # per object, through Group Input (§7.6 Scope)
+    sun.update_tag()
     engine.run_pass()
     before = bytes_of(moon_file)
     got = export(ask, [ctx.obj for ctx, _job in ops.export_uses(ask)].index(sun))
@@ -585,6 +595,7 @@ def phase_contexts():
               [["question", *HEADER[1:]], ["Is the sun up?", "0.7", "0", "0.7", "0.40", "0", "model"]]).encode()
           and bytes_of(moon_file) == before, (got, os.path.isfile(sun_file) and rows_of(sun_file)))
     moon.modifiers["OpenAct"][overrides] = os.path.join(TMP, "moon_later.csv")  # Moon's context comes first
+    moon.update_tag()
     engine.run_pass()
     got = ([label for label, _job, _entry in engine.answers_for(ask)],
            [ctx.label() for ctx, _job in ops.export_uses(ask)], ops.export_context(ask, 0)[1].obj == sun)
@@ -592,6 +603,7 @@ def phase_contexts():
           "the context it shows; one whose Overrides CSV is missing follows",
           got == (["Sun > OpenAct"], ["Sun > OpenAct", "Moon > OpenAct"], True), got)
     moon.modifiers["OpenAct"][overrides] = moon_file
+    moon.update_tag()
     engine.run_pass()
 
 

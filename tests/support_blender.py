@@ -66,7 +66,7 @@ TMP = os.path.dirname(STATE_DIR)
 import bpy  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import FAILURES, ROOT, check, drive, finish  # noqa: E402
+from _harness import FAILURES, ROOT, check, drive, finish, trigger  # noqa: E402
 from openact import csvfmt, engine, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact.specs.rules import FACTORS_HINT  # noqa: E402
@@ -114,7 +114,8 @@ def new_tree(name):
 
 
 def used(name, idname, **words):
-    """A node of this type, with these String inputs typed, in a new tree that an object's modifier uses."""
+    """A node of this type, with these String inputs typed, in a new tree that an object's modifier uses. The geometry
+    passes through the node, whose Trigger is on, so it asks (§6.0)."""
     tree = new_tree(name)
     node = tree.nodes.new(idname)
     for word, value in words.items():
@@ -122,6 +123,7 @@ def used(name, idname, **words):
     obj = bpy.data.objects.new(name, bpy.data.meshes.new(name))
     bpy.context.scene.collection.objects.link(obj)
     obj.modifiers.new("OpenAct", 'NODES').node_group = tree
+    trigger(node)
     return node
 
 

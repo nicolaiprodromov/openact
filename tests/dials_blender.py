@@ -31,7 +31,7 @@ import time
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import ROOT, check, drive, finish, store  # noqa: E402
+from _harness import ROOT, check, drive, finish, store, trigger  # noqa: E402
 from openact import engine, inner, nodes, ops, pipeline, server, tables, ui  # noqa: E402  (bpy must be imported first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
@@ -85,7 +85,8 @@ def rewrite(path, lines):
 
 
 def scene(name, users):
-    """A tree whose Prompt and Settings come from the modifier, used by one object per (name, prompt, settings)."""
+    """A tree whose Prompt and Settings come from the modifier, used by one object per (name, prompt, settings). The
+    geometry passes through the node, whose Trigger is on, so it asks (§6.0)."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     for socket, kind in (("Geometry", 'NodeSocketGeometry'), ("Prompt", 'NodeSocketString'),
                          ("Settings", 'NodeSocketString')):
@@ -96,6 +97,7 @@ def scene(name, users):
     tree.links.new(gi.outputs["Prompt"], node.inputs["Prompt"])
     tree.links.new(gi.outputs["Settings"], node.inputs["Settings"])
     tree.links.new(gi.outputs["Geometry"], go.inputs["Geometry"])
+    trigger(node)
     objects = {key: user(tree, key, prompt, settings) for key, prompt, settings in users}
     return tree, node, objects
 
@@ -119,10 +121,11 @@ def words(obj, **values):
 
 
 def wire(tree, node):
-    """Store every Dials output but Geometry on the points, named after it, for read()."""
+    """Store every Dials output but Geometry on the points that pass through the node, named after it, for read()."""
     gi = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
     go = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
-    geometry = gi.outputs["Geometry"]
+    tree.links.new(gi.outputs["Geometry"], node.inputs["Geometry"])
+    geometry = node.outputs["Geometry"]
     for x, socket in enumerate(s for s in node.outputs if s.type in STORED):
         geometry = store(tree, geometry, socket, socket.name, STORED[socket.type], 300 + 200 * x)
     tree.links.new(geometry, go.inputs["Geometry"])
@@ -423,7 +426,7 @@ def phase_live_outputs():
     settle_answered(calls)
     got = [s.name for s in node.outputs if s.is_linked]
     check("Ask Again: another stored entry's settings never take the outputs over, so their links survive",
-          linked == right_after == got == ["Mist", "Confidence"] and len(S.load(node).entries) == 2
+          linked == right_after == got == ["Geometry", "Mist", "Confidence"] and len(S.load(node).entries) == 2
           and not dials.WARNINGS.get(node.uid), (linked, right_after, got, dials.WARNINGS.get(node.uid)))
 
     def settings(name, question):
@@ -446,7 +449,7 @@ def phase_live_outputs():
     settle_answered(calls)
     got = [s.name for s in node.outputs if s.is_linked]
     check("Settings CSV edit: while its question is asked again, and after, the outputs and their links stay",
-          asked == {"How misty is the pier right now?"} and meanwhile == got == ["Mist", "Confidence"]
+          asked == {"How misty is the pier right now?"} and meanwhile == got == ["Geometry", "Mist", "Confidence"]
           and not dials.WARNINGS.get(node.uid), (asked, meanwhile, got, dials.WARNINGS.get(node.uid)))
     phase_new_setting()
 
@@ -467,7 +470,7 @@ def phase_new_setting():
     got = [(s.name, s.type, s.is_linked) for s in node.outputs]
     check("new setting: its output comes before its answer, and the other outputs keep their links",
           asked == {"Is it snowing in the harbour?"}
-          and got == [("Geometry", 'GEOMETRY', False), ("Fog", 'VALUE', True), ("Snow", 'BOOLEAN', False),
+          and got == [("Geometry", 'GEOMETRY', True), ("Fog", 'VALUE', True), ("Snow", 'BOOLEAN', False),
                       ("Confidence", 'VALUE', True)], (asked, got))
     phase_reorder()
 
@@ -527,9 +530,10 @@ def phase_chained_hint():
     calls.clear()
     with asking(calls):
         settle()
-    planned = {job.uid: job.rows[0].name for job, _missing in calls if job.uid in (amount.uid, one_of.uid)}
-    check("chained: while Dials is answered, both readers plan from its values",
-          planned.get(one_of.uid) == "Is it night?" and amount.uid in planned, planned)
+    planned = {node.uid: job.rows[0].name for node in (amount, one_of)
+               for _label, job, _entry in engine.answers_for(node)}
+    check("chained: while Dials is answered, both readers plan from its values (no modifier evaluates them, so "
+          "nothing asks them)", planned.get(one_of.uid) == "Is it night?" and amount.uid in planned, planned)
     dial.inputs["Prompt"].default_value = ""
     calls.clear()
     with asking(calls):

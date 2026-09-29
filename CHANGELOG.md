@@ -23,6 +23,13 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
   own words and answers. A node no evaluation uses reads its words as before, and words only Geometry Nodes computes
   wait for its first evaluation. In a file that isn't trusted, words an Import Text node reads from outside the
   file's folder are blocked, as before.
+- A node asks the model only while its **Trigger** is on, for the words it reported with the Trigger on, and never
+  asks just because its words changed. Link a Boolean node set to True to ask whenever something is missing. Files
+  saved by 1.0 keep their answers and ask nothing until a Trigger is linked. *Ask Again* still asks once, whatever
+  the Trigger.
+- A node with missing answers that nothing asks says why: *Link a Trigger to ask*, *Trigger off* or *Not
+  evaluated*, with how many answers are missing. The sidebar shows the active node's Trigger at the last evaluation
+  and how many sets of words the evaluation reported.
 
 ## 1.0.0
 

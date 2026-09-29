@@ -24,7 +24,7 @@ import time
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import ROOT, check, finish, sock, store  # noqa: E402
+from _harness import ROOT, check, finish, sock, store, trigger  # noqa: E402
 from openact import engine, evaluator, inner, lists, nodes, ops, pipeline, tables, words  # noqa: E402  (bpy first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
@@ -328,6 +328,7 @@ def phase_pick_pass():
                                     ("idx", "Index", 'INT')):
         geometry = store(group, geometry, picker.outputs[output], name, data_type)
     group.links.new(geometry, go.inputs[0])
+    trigger(picker)  # it asks only while its Trigger is on (§6.0)
     idents = {i.name: i.identifier for i in group.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
     lists_ = {}
     for name, children in (("Shelf", ("book", "lamp", "vase")), ("Kitchen", ("cup", "pan", "plate"))):
@@ -512,6 +513,7 @@ def phase_carry():
     geometry = store(group, group.nodes.new("NodeGroupInput").outputs["Geometry"], matcher.outputs["Probability"],
                      "prob", 'FLOAT')
     group.links.new(geometry, group.nodes.new("NodeGroupOutput").inputs[0])
+    trigger(matcher)  # it asks only while its Trigger is on (§6.0)
     user = user_of(group, "Carry", 3)
 
     def cells():

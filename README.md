@@ -45,8 +45,8 @@
   with nothing to parse.
 - **Runs on your GPU.** Qwen3.5-4B runs on your own NVIDIA card. After the one-time install, OpenAct talks only to
   `127.0.0.1`: nothing leaves your computer.
-- **Asks only when words change.** Never during evaluation, playback or rendering. Answers arrive in the background,
-  and only the rows whose words changed are asked again.
+- **Asks when you say so.** A node asks only while its Trigger input is on, and only for the words it has no answer
+  for yet. Never during evaluation, playback or rendering. Answers arrive in the background.
 - **Saved in the .blend.** Answers live in the file, so it opens, plays and renders without the model, and even
   without the add-on. Render farms need nothing extra.
 - **Written in CSV.** Keep rules, labels and settings in CSV files next to the .blend. Numbers beside labels and
@@ -141,9 +141,10 @@ The [user guide](docs/GUIDE.md#the-six-nodes) covers every input, output and opt
 
 ## How it works
 
-1. **You write words.** Type them on the node, expose them on the modifier panel, or keep them in CSV files.
-2. **OpenAct asks outside evaluation.** When words change, it sends only the new questions to its model server on
-   `127.0.0.1`. There, [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) scores each allowed answer with
+1. **You write words.** Type them on the node, expose them on the modifier panel, build them with other nodes, or
+   keep them in CSV files. Each node reports the words it evaluated.
+2. **OpenAct asks outside evaluation.** For a node whose Trigger is on, it sends only the new questions to its model
+   server on `127.0.0.1`. There, [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) scores each allowed answer with
    [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) in a single forward pass. No text is generated.
 3. **The answers become a table inside the node.** Geometry Nodes looks them up per element, through an ID or the
    Rules factor inputs, as fast as any other lookup.

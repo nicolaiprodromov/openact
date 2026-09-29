@@ -29,7 +29,7 @@ import time
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import ROOT, check, drive, enable_addon, finish, store  # noqa: E402
+from _harness import ROOT, check, drive, enable_addon, finish, store, trigger  # noqa: E402
 
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 MODEL = ARGS[ARGS.index("--model") + 1:ARGS.index("--model") + 3] if "--model" in ARGS else None
@@ -70,7 +70,8 @@ def enabled(sockets, name):
 
 
 def scene(name, factors, outcomes, values, answer_type='ONE_OF', question="", context=""):
-    """A tree with a Rules node, used by an object whose points carry the factor values as in_<factor>."""
+    """A tree with a Rules node, used by an object whose points carry the factor values as in_<factor>. The geometry
+    passes through the node, whose Trigger is on, so it asks (§6.0)."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -87,6 +88,7 @@ def scene(name, factors, outcomes, values, answer_type='ONE_OF', question="", co
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
     obj.modifiers.new("Rules", 'NODES').node_group = tree
+    trigger(rules)
     return tree, rules, obj, gi, go
 
 
@@ -102,9 +104,12 @@ def wire_inputs(tree, rules):
 
 
 def wire(tree, rules, gi, go, outputs, geometry=None):
-    """Factor sockets <- Named Attribute in_<factor>; each output -> Store Named Attribute out_<output>."""
+    """Factor sockets <- Named Attribute in_<factor>; each output -> Store Named Attribute out_<output>, by default on
+    the geometry that passes through the node."""
     wire_inputs(tree, rules)
-    geometry = geometry or gi.outputs["Geometry"]
+    if geometry is None:
+        tree.links.new(gi.outputs["Geometry"], rules.inputs["Geometry"])
+        geometry = rules.outputs["Geometry"]
     for name in outputs:
         geometry = store(tree, geometry, rules.outputs[name], "out_" + name, TYPES[rules.outputs[name].type])
     tree.links.new(geometry, go.inputs[0])
@@ -661,7 +666,7 @@ def phase_status():
 
 def shared_scene(name, words, values):
     """A tree whose Rules node takes these words from the modifier (word -> one text per object), used by one
-    object per item of values (its point attributes)."""
+    object per item of values (its point attributes). The geometry passes through the node, whose Trigger is on."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     for word in words:
@@ -687,6 +692,7 @@ def shared_scene(name, words, values):
             modifier[tree.interface.items_tree[word].identifier] = texts[k]
         obj.update_tag()
         objs.append(obj)
+    trigger(rules)
     return tree, rules, objs, gi, go
 
 
@@ -1149,6 +1155,7 @@ def phase_farm_frames():
         driven.links.new(pick.outputs[0], other.inputs["Question"])
         driver = pick.inputs["Switch"].driver_add("default_value").driver
         driver.type, driver.expression = 'SCRIPTED', "0"
+        engine.reask(other)  # nothing evaluates it: Ask Again asks it once (§6.0)
         for job, _missing in passed(other):
             gol_answers(job, {3}, {2, 3}, LIFE_NAMES)
         passed(other)

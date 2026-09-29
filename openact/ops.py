@@ -144,7 +144,7 @@ def _tables_writable(cls):
 class OPENACT_OT_reask(bpy.types.Operator):
     bl_idname = "openact.reask"
     bl_label = "Ask Again"
-    bl_description = "Forget this node's answers and ask the model again"
+    bl_description = "Forget this node's answers and ask the model again, once, whatever its Trigger"
     bl_options = {'REGISTER', 'UNDO'}
 
     uid: bpy.props.StringProperty(options={'HIDDEN'})

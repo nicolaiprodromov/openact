@@ -21,8 +21,10 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 - show_question returns exactly the state, instructions and options that the --record log shows for that row, and
   asks nothing; a row answered with older settings says so;
 - the pass drops the status records of nodes that are gone;
-- drawing the node body, the sidebar panels, the popup and the preferences into a stand-in layout: valid icons,
-  operators and properties, paging, the install's VRAM warning, and nothing planned or written while drawing;
+- drawing the node body, the sidebar panels (the active node's live activity: its Trigger at the last evaluation and
+  the word sets reported), the popup and the preferences into a stand-in layout: valid icons, operators and
+  properties, paging, the install's VRAM warning, and nothing planned or written while drawing;
+- every node this suite expects to ask gets a Trigger that is on (user()), as a node asks only then (§6.0);
 - Open File opens CSV files only.
 
 Run:  blender -b --factory-startup --python tests/status_blender.py
@@ -43,7 +45,7 @@ from types import SimpleNamespace
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import check, finish  # noqa: E402
+from _harness import check, finish, trigger  # noqa: E402
 
 os.environ["OPENACT_BACKEND"] = "fake"  # openact_server.py --backend fake: no torch, GPU or runtime
 os.environ["OPENACT_SERVER_PYTHON"] = sys.executable  # Blender's own Python runs it
@@ -115,7 +117,8 @@ def new_tree(name):
 
 
 def user(name, tree, **words):
-    """An object whose modifier uses the tree, with modifier inputs by name."""
+    """An object whose modifier uses the tree, with modifier inputs by name. Every OpenAct node of the tree gets a
+    Trigger that is on, so it asks (§6.0), and goes on the geometry's path if nothing reads it (_harness.trigger())."""
     obj = bpy.data.objects.new(name, bpy.data.meshes.new(name))
     bpy.context.scene.collection.objects.link(obj)
     mod = obj.modifiers.new("OpenAct", 'NODES')
@@ -123,6 +126,8 @@ def user(name, tree, **words):
     idents = {i.name: i.identifier for i in tree.interface.items_tree if getattr(i, "in_out", "") == 'INPUT'}
     for word, value in words.items():
         mod[idents[word]] = value
+    for node in [n for n in tree.nodes if n.bl_idname in engine.OPENACT_TYPES and not n.inputs["Trigger"].is_linked]:
+        trigger(node)
     return obj
 
 
@@ -725,6 +730,7 @@ def phase_import_csv(tree, answers):
     other = tree.nodes.new(engine.ASK_ID)
     other.inputs["Question"].default_value = "Is it very soft?"
     tree.links.new(plugged.outputs[0], other.inputs["Answers CSV"])
+    trigger(other)
     engine.schedule(immediate=True)
     settle(lambda: state(other) in ("warning", "complete"), 30)
     ident = csvfmt.identity(answers)
@@ -940,6 +946,10 @@ def phase_draw(pick, warned):
           "Show Question on each row", status(pick).text in log and "Filler > OpenAct" in log and "Table" in log
           and all(name in log for name in ("table", "lamp", "armchair"))
           and ("openact.show_question", "row", 2) in log and "[openact.write_overrides]" in log, log)
+    log = drawn(lambda layout: ui.draw_activity(layout, status(pick)))
+    check("draw: the Active Node panel shows the node's live activity above its status (§17.2): its Trigger, on at "
+          "the last evaluation, and the word sets reported",
+          log == [ui.TRIGGER_ROWS["on"][1], "1 word set reported"], log)
 
     ctx.space_data.edit_tree = warned.id_data
     warned.id_data.nodes.active = warned
@@ -995,8 +1005,9 @@ def phase_draw(pick, warned):
     engine.run_pass()
     check("draw: the next pass plans that edit (its payload output appears)", "metallic" in classify.outputs,
           [s.name for s in classify.outputs])
-    used = set(engine.ICONS.values()) | set(ui.ROW_ICONS.values()) | set(ui.PROBLEM_ICONS.values())
-    check("icons: every state, row and problem icon exists in this Blender", used <= ICONS, used - ICONS)
+    used = set(engine.ICONS.values()) | set(ui.ROW_ICONS.values()) | set(ui.PROBLEM_ICONS.values()) | {
+        icon for icon, _text in ui.TRIGGER_ROWS.values()}
+    check("icons: every state, row, problem and Trigger icon exists in this Blender", used <= ICONS, used - ICONS)
 
 
 def phase_open_file(answers):

@@ -48,8 +48,9 @@ Python while it evaluates. So every OpenAct node is a `GeometryNodeCustomGroup` 
 inner node group holds the model's decisions as a precomputed **table**. The add-on reads the
 node's words outside evaluation, asks the model in the background and rewrites the table.
 Geometry Nodes then applies the table **per element** through an ID or state field. Words go in
-and Geometry Nodes data comes out. The model runs only when the words change. It never runs
-during evaluation, playback or rendering, and the answers are saved in the .blend.
+and Geometry Nodes data comes out. The model is asked only for what a node misses while its
+**Trigger** is on (§6.0), or once after *Ask Again*. It never runs during evaluation, playback or
+rendering, and the answers are saved in the .blend.
 
 v1 rests on four foundations:
 - the static input evaluator;
@@ -402,7 +403,8 @@ columns are stored in the group's hidden table object (§8). Geometry Nodes appl
 field (Pick, Match, Classify) or through **factor** fields (Rules). This is an O(1) lookup per
 element, so evaluation cost does not depend on the model.
 
-The model runs only after the words change: a debounced pass, run from `tick()`. It
+The model is asked only for the word sets an evaluation reported with the node's Trigger on, or
+once after *Ask Again* (§6.0), by a debounced pass run from `tick()`. It
 never runs during evaluation, during playback or while a render job runs (`_playing()`). Answers
 persist in three places, all saved in the .blend:
 - the node's `entries` JSON;
@@ -680,9 +682,9 @@ sequenceDiagram
   A->>T: edits a socket or saves a CSV
   T->>T: schedule(), debounce 0.25 s (file watcher polls stat at 2 Hz)
   T->>P: run_pass() unless playing or rendering
-  P->>P: ensure_owned(), find_uses(), spec.plan(node, ctx) per context
+  P->>P: evaluate, channel.read(), ensure_owned(), spec.plan(node, ctx) per word set
   P->>P: resolve rows: lock, code, MEMORY[cell.key], stored entry
-  P->>Q: submit(job, missing cells, priority, generation)
+  P->>Q: submit(job, missing cells, priority, generation) of word sets reported with the Trigger on
   P->>P: store.save(node, store, live_gns) + tables.write_rows() (partial, stale-while-refilling)
   W->>Q: pop next chunk (one state, at most 32 questions / 64 rows)
   W->>S: POST /v1/systemone (X-OpenAct-Token)
@@ -739,7 +741,12 @@ sequenceDiagram
      3. a row with the same `wkey` in the stored entry for this `gn`, or in the entry this context
         showed last (`LAST_SHOWN`, §14.5);
      4. `MEMORY[cell.key]`.
-   - Everything still missing goes to `pipeline.submit()` in one call per Job.
+   - **Asking** (§6.0). Everything still missing of a word set that an evaluation reported with the
+     node's Trigger on, by any modifier, goes to `pipeline.submit()` in one call per Job; so does
+     everything missing of a node *Ask Again* asked, once, whatever its Trigger (`ASK_ONCE`,
+     consumed once its cells are pending). Nothing else is asked: a word set reported with the
+     Trigger off, and every statically planned word set. Its missing cells still count as pending
+     rows, and the status says why nothing asks them (§17.1).
 6. **Entries** are updated in `store`: at most 1024 **warm or cold** stored entries per node
    (`MAX_ENTRIES`), within the 2 MB soft cap, least recently used evicted. Live entries are exempt from that limit and never
    evicted (§8.1). Every stored entry is in the node's table object, but an entry whose key an
@@ -748,8 +755,8 @@ sequenceDiagram
    - otherwise `inner.update_values()`, values only: it rewrites the table object when its rows
      changed, their answers or single values, a new or evicted entry (`foreach_set`), and else at
      most the default a miss shows. A pass that changes nothing writes nothing.
-7. The node's status is computed (§17): hint, waiting, filling *n/N*, complete (with unsure and
-   locked counts), or error.
+7. The node's status is computed (§17): hint, idle (missing answers nothing asks), waiting,
+   filling *n/N*, complete (with unsure and locked counts), or error.
 
 **Chaining.** The single-value outputs of Ask, Pick and Dials can feed another node's words. The
 evaluator reads them from `MEMORY` or the stored entry, or raises `Pending`. Field outputs (Probability, Label, Outcome and so on) can never be words. The
@@ -1018,7 +1025,8 @@ each evaluation (`inner._Builder.warning()`).
 - `channel.read(nodes, contexts, depsgraph)` reads `mod.node_warnings` of each Geometry Nodes
   modifier whose tree holds an OpenAct node, and keeps what `words.parse()` accepts: node uid →
   (object pointer, modifier name) → {word tuple: triggered}. The same words reported with the
-  Trigger on and off count as triggered.
+  Trigger on and off count as triggered. The Trigger reported with a word set decides whether it
+  is asked (§6.0).
 - **A modifier that didn't evaluate reports nothing**, whatever list its last evaluation left: one
   disabled in the viewport (or in edit mode) or whose object isn't evaluated
   (`evaluated_get(depsgraph).is_evaluated`: disabled in viewports, in an excluded or hidden
@@ -1071,6 +1079,7 @@ each evaluation (`inner._Builder.warning()`).
   - `✓ 18 cells · 0 unsure · 2 locked`
   - `⏳ Filling 12/50 · ~2 s`
   - `ⓘ Type a question`
+  - `○ Trigger off: 3 answers missing`
   - `⚠ life_outcomes.csv row 3: 'when' is empty`
 - `draw_buttons_ext` (the Node tab and the OpenAct sidebar) shows:
   - the full status and one summary per context;
@@ -1110,11 +1119,23 @@ whatever its spec, dropdowns and dynamic sockets (`specs/base.py`: `SHARED`, `sh
   on every version (kind `single`, `compat.structure_type()`), and `hide_value` removes its
   checkbox. On is Blender's implicit conversion into a Bool socket: a Float or Int above 0, a
   Vector with any non-zero component, a Color whose grayscale is above 0 (alpha ignored).
-  *The asking rule arrives with the engine's change to asking; until then the pass asks as 1.0
-  does, whatever the Trigger.*
+  - **The asking rule.** The Warning channel reports the Trigger with the words (§5.7), and a pass
+    asks for the missing cells of a word set only when an evaluation reported it with the Trigger
+    on, by any modifier (§5.3 step 5). A node whose outputs are unused isn't evaluated, so it
+    reports nothing and never asks, whatever its Trigger; nor does a statically planned word set
+    (a context no evaluation reported). Firing once is the artist's business, through edge
+    detection in their own tree: a Trigger held on asks again only for what is missing, which
+    stored answers and the caches make cheap. v1's automatic "ask when the words change" is gone.
+  - ***Ask Again*** (`engine.reask()`, a UI action) forgets the node's answers of its current words
+    and asks them once, whatever its Trigger, statically planned word sets included (`ASK_ONCE`).
+  - **The status says why nothing asks** a node's missing answers (§17.1): "Link a Trigger to ask"
+    while it is unlinked, "Trigger off" while it is linked but off, "Not evaluated" when no
+    evaluation reported the missing word sets. Cells asked before still fill, and the stored
+    answers keep showing.
 - **Files saved by 1.0** lack the three sockets. The first pass adds them in their places
   (`inner.lacks()`, then `sync_interface()`), keeping every other socket's identifier and links,
-  and rebuilds the group, whose interface changed.
+  and rebuilds the group, whose interface changed. Their Trigger is unlinked, so they keep their
+  answers and never ask until one is linked.
 - **Reserved names.** No Rules factor may be called `Geometry` or `Trigger`
   (`csvfmt.RULES_INPUTS`, which also keeps the Trigger, a Bool input, from being taken for a flag
   factor), and no payload column or Dials setting `Geometry` (§7.3–§7.5).
@@ -3092,8 +3113,9 @@ And its work:
 - The file watcher runs in `tick()` (§7.8).
 - `run_pass()` follows §5.3, including the plan cache (`PLANS`), per-node dirty flags and the
   table writes (§8.8). It evaluates the depsgraph and reads the Warning channel once, at its start
-  (`channel.py`, §5.7), and plans every word set a context reported; a pass whose writes
-  re-evaluate the tree reads the same reports again and writes nothing, so it doesn't loop.
+  (`channel.py`, §5.7), plans every word set a context reported, and asks only for the ones
+  reported with the Trigger on (§6.0); a pass whose writes re-evaluate the tree reads the same
+  reports again and writes nothing, so it doesn't loop.
 - The file trust state is worked out once per pass (§5.3); `load_post` records which file was
   opened (§16.1).
 - `ensure_owned()` handles table objects (§8.5), and garbage collection of orphaned table objects
@@ -3779,18 +3801,28 @@ OpenAct is a local desktop tool with no telemetry (§16.3). "Observability" ther
 ```python
 @dataclass
 class NodeStatus:
-    state: str          # "hint" | "paused" | "starting" | "waiting" | "filling" | "complete" | "warning" | "error"
+    state: str          # "hint" | "idle" | "paused" | "starting" | "waiting" | "filling" | "complete" | "warning" | "error"
     text: str           # one line, e.g. "Filling 12/50 · ~2 s"
     rows: int; answered: int; pending: int; stale: int
     unsure: int; locked: int; code: int; errors: int
     eta_s: float | None # remaining scored rows × /health ms_per_row
     contexts: int       # live contexts, any number (§8.1)
     problems: list      # Problem records from csvfmt, the evaluator and the pipeline (§7.9)
+    trigger: str        # at the last evaluation: "unlinked" | "off" | "on" | "unused" (none reported the node)
+    reported: int       # distinct word sets the last evaluation reported for the node (§5.7)
 ```
+
+A missing answer nothing asks (§6.0) counts as a pending row. While such answers remain and nothing
+is asked or filled for the node, its state is **idle**, and its line says why, with how many answers
+are missing: "Link a Trigger to ask" (the Trigger is unlinked), "Trigger off" (an evaluation reported
+the word sets with the Trigger off) or "Not evaluated" (no evaluation reported them: its outputs are
+unused, its object isn't evaluated, or no modifier uses its tree). Cells asked before, still pending
+in `pipeline.PENDING`, show as filling, and the stored answers keep showing.
 
 | State | Icon | Example line |
 |---|---|---|
-| hint | `INFO` | "Type a question" / "Set a Factors CSV (sidebar: New CSV from Template)" |
+| hint | `INFO` | "Type a question" / "Set a Factors CSV (sidebar: New CSV from Template)" / "Its Question is read when the node evaluates" |
+| idle | `RADIOBUT_OFF` | "Link a Trigger to ask: 3 answers missing" / "Trigger off: 1 answer missing" / "Not evaluated: 18 answers missing" |
 | paused | `PAUSE` | "Model server is stopped (OpenAct tab)" (auto-start off) |
 | starting | `SORTTIME` | "Starting the model…" / "Installing the model… 3/5 PyTorch" |
 | waiting | `SORTTIME` | "Waiting for another OpenAct node…" |
@@ -3799,8 +3831,8 @@ class NodeStatus:
 | warning | `ERROR` (triangle) | "18 cells · 1 warning: column 'scale' has an empty cell (line 7)" |
 | error | `CANCEL` | "life_outcomes.csv:4 'if' names unknown level 'alvie' of factor 'state'" |
 
-The glyphs in §6.0's examples (✓ ⏳ ⓘ ⚠) stand for these Blender icons. Hard errors use `CANCEL`
-and warnings `ERROR`, so that they look different.
+The glyphs in §6.0's examples (✓ ⏳ ⓘ ○ ⚠) stand for these Blender icons. Hard errors use `CANCEL`
+and warnings `ERROR`, so that they look different; an idle node reads as information, not an error.
 
 ### 17.2 Sidebar (OpenAct tab, inspection only)
 
@@ -3810,11 +3842,14 @@ and warnings `ERROR`, so that they look different.
   - Throughput: `ms_per_row`, and the cache hit rate `cache_hits / questions`.
   - Buttons: Install / Start / Stop, and *Open Log*.
 - **Active node.**
-  - The status record, and one summary line per context: the object and modifier label.
+  - Its live activity (`ui.activity_rows()`): its Trigger at the last evaluation (unlinked, off,
+    on, or not evaluated) and how many word sets the evaluation reported for it (§5.7).
+  - The status record, and one summary line per word set: the object and modifier label, followed
+    by its first word when a context has several (a For Each Element zone's).
   - **A context with no table to show** says "Asking..." while the pass asks one of its cells (sent,
-    or sent once the model that is starting is ready), else "Not asked: see the status above": the
-    model is stopped, not installed or in error, the context waits or disagrees (§6.0), or its cell
-    failed. Once a row has an answer (a model or stale one), a context being filled shows its table so
+    or sent once the model that is starting is ready), else "Not asked: see the status above": its
+    Trigger is off or unlinked, the model is stopped, not installed or in error, the context waits
+    or disagrees (§6.0), or its cell failed. Once a row has an answer (a model or stale one), a context being filled shows its table so
     far (§5.4), and its line sums it up. A context that waits or disagrees shows its stored entry,
     also a table so far, while that entry's words key is its plan's; a Dials context shows its last
     good table, each row matched to the plan's by wkey.
@@ -3946,7 +3981,7 @@ A later run can diff these lines to spot performance regressions.
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
 | `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: the hash lookup on all six nodes (each context finds its entry by the key of its words; invalid IDs and a miss give fallbacks, or the default a miss shows); 3 contexts through the table object's header rows; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **No cap:** 20 objects with different words on one node each show their own answer; a new word set is new rows with the same nodes and layout, `append_entry()` and `set_default()` show at the next evaluation with no graph edit, and a second pass writes nothing. **Collisions:** words whose keys collide ('aZ' and 'b5') leave the later entry out and show the error naming both; a live entry wins its key over a warm one. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Key text (§8.2):** each word at its position, an absent one read as `""` (a Collection-source Pick finds its stored entry); word tuples that join to the same text have different keys. **Single values (§8.6):** Pick's Index feeds a single-value socket (Grid *Vertices X*). **A miss (§8.2):** with one live context, words with no entry show that context's own last answers; with two contexts, A's show neutral values, never B's answers; a cleared Question (a hint) shows neutral values; each change of the default is values only. **Layout (§8.8):** a group of another `LAYOUT`, or 1.0's, is rebuilt; the table keeps its digest through save and reload, so the reopened file's first update writes nothing. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: `inner.build()`, `update_values()` (unchanged, and one entry changed) and `append_entry()` on the demo and worst shapes, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
-| `tests/reports_blender.py` | Blender + fake server | fake | **The Warning channel's reader (§5.3, §5.7):** words the static evaluator can't read (Scene Time's frame through Value to String, a Repeat zone's count, a simulation's step) are planned from the report and answered; a For Each Element zone's word sets each become an entry; a Collection list source reads its collection statically while its Prompt comes from the report; group paths sharing a modifier split its report; words built from an unanswered node's fallback wait for it; a tree no modifier uses and an unused node are planned statically, an unreadable word there is a hint; a modifier that doesn't evaluate reports nothing (disabled in viewports or in the viewport), an object hidden with the eye still does; a copy's shared uid is ignored; `plan_words()` shares the plan cache; no pass loop; in an untrusted file an Import Text outside the folder is refused |
+| `tests/reports_blender.py` | Blender + fake server | fake | **The Warning channel's reader (§5.3, §5.7):** words the static evaluator can't read (Scene Time's frame through Value to String, a Repeat zone's count, a simulation's step) are planned from the report and answered; a For Each Element zone's word sets each become an entry; a Collection list source reads its collection statically while its Prompt comes from the report; group paths sharing a modifier split its report; words built from an unanswered node's fallback wait for it; a tree no modifier uses and an unused node are planned statically, an unreadable word there is a hint; a modifier that doesn't evaluate reports nothing (disabled in viewports or in the viewport), an object hidden with the eye still does; a copy's shared uid is ignored; `plan_words()` shares the plan cache; no pass loop; in an untrusted file an Import Text outside the folder is refused. **The Trigger (§6.0):** unlinked, a node asks nothing and says so; linked to True it asks; turned off, new words ask nothing and the stored answer keeps showing, while a cell asked before still fills; a Float −1 is off and 0.3 on, and an Int, a Vector and a Color convert as Blender does; a triggered node whose outputs are unused asks nothing; Ask Again asks once without a Trigger, a statically planned word set too; a file saved by 1.0 keeps its answers and asks nothing; the sidebar's live activity. Every suite that expects asking links a Trigger (`_harness.trigger()`) |
 | `tests/playback_blender.py` | Blender + fake server | fake | **Playback (§5.5):** a keyframed Menu Switch cycles through three rule sets, two of them answered while the scene was stopped; playing sends 0 requests and writes no table, each answered rule set shows its table and the one never answered the object's last rules (the default a miss shows, §8.2), never a fallback, and the pass after playback asks for it. **Words at other frames (§7.8):** the F-curves are found through the action slot's channelbag on 4.5 and 5.1, give the words the scene has at every frame with no scene evaluation, and clamp to the hard range; a background render (`on_render_pre`) compares the words of its frame through them, and a driven input, an NLA strip and Time Stretching as the file holds them. OpenAct's code calls no `temp_override` (§5.5) |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
 | `tests/startup_blender.py` | Blender | none | On 4.5 and newer: `runtime_root()` follows the Runtime Folder preference, else the default folder; a server of another program on the port gives the port error and launches nothing until it has gone and *Start Model* runs. On older Blender, enabling the add-on fails before anything is registered (§11) |
@@ -4266,7 +4301,7 @@ decided (§4.e).
 |---|---|---|---|
 | KD1 | The product is **OpenAct**: package and extension id `openact`, bl_idnames `GeometryNodeOpenAct*`, inner prefix `.OpenAct `. "Jev" appears only in credits and API-compatibility notes | "Jev" is TypeSafe's trademark, and SemIf renamed itself from "OpenJev" for the same reason. **User decision:** keep "OpenAct" for now, with no trademark gate before release; the user may rebrand later. Before 1.0 a rename changes only constants (id, bl_idname prefix, inner prefix, runtime folder) | R13 |
 | KD2 | **Six nodes, one per verb**: Ask, Pick, Match, Classify, Rules, Dials. They share list sources, one answer-set format, the answer types and one confidence definition | Discoverable, and each node shows only its own sockets. Consistency comes from shared code (`specs/base.py`, `lists.py`, `csvfmt.py`), not from one mode-laden node | §6, §15.1 |
-| KD3 | **Decide per meaning, apply per element.** Decisions are table rows in the node's hidden inner group, looked up per element through an ID or factor fields. The model never runs during evaluation, playback or rendering | Geometry Nodes cannot run Python while it evaluates. Tables are bounded by meaning (at most 4096 cells), saved, deterministic and safe on a render farm | §4.b, §8, §15.2 |
+| KD3 | **Decide per meaning, apply per element.** Decisions are table rows in the node's hidden inner group, looked up per element through an ID or factor fields. The model never runs during evaluation, playback or rendering: Python reads what each evaluation reported afterwards (§5.7), and asks only for word sets reported with the node's Trigger on, or once after *Ask Again* (§6.0) | Geometry Nodes cannot run Python while it evaluates. Tables are bounded by meaning (at most 4096 cells), saved, deterministic and safe on a render farm | §4.b, §8, §15.2 |
 | KD4 | Every answer set is **"answer + when it applies"**. Exact facts are handled by code: `if` restrictions, and single-option cells decided without the model | Measured: descriptions raised confidence from 0.32 to 0.61, and "outcome + when" made four Game of Life rule sets exact. Offering only the applicable clauses fixed 3 wrong cells | §4.c, §4.d, §9.4 |
 | KD5 | **CSV authoring with a text/numeric split.** Python parses every column, whether the file comes from a typed path or from a plugged-in Import CSV node (KD25). Text columns go to the model and into cell keys. Numeric payload columns are **baked** into the table and exposed as output sockets. The inner group never uses Import CSV's output | Import CSV drops text columns and caches by path (verified). Baking keeps the .blend self-contained, and numeric edits never re-ask the model | §7.1, §15.3 |
 | KD6 | Rules factors are declared in a **separate Factors CSV**. Artist overrides live in an **Overrides CSV** with a `lock` column. The sidebar is inspection only | "Everything happens in Geometry Nodes and files" (4.h). Files are diffable and can vary per object through Group Input | §7.4, §7.6, §15.5, §15.7 |

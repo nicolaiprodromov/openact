@@ -512,8 +512,9 @@ finally:
 engine.run_pass()  # the safety pass
 check("watch: a CSV another program holds open is planned once, not again on every poll",
       made == [1, 0, 0, 0] and during.text.startswith("Can't read"), (made, during))
-check("watch: let go, the safety pass reads it again, a Rules node's too",
-      planned.icon == engine.STATUS[held.uid].icon == 'PAUSE', (planned, engine.STATUS.get(held.uid)))
+check("watch: let go, the safety pass reads it again, a Rules node's too (planned, its cells missing: no modifier "
+      "evaluates it, so nothing asks them)",
+      planned.icon == engine.STATUS[held.uid].icon == 'RADIOBUT_OFF', (planned, engine.STATUS.get(held.uid)))
 
 # ------------------------------------------------------------------------ the trust rule
 proj, outside = os.path.join(TMP, "proj"), os.path.join(TMP, "outside")
@@ -623,8 +624,9 @@ check("trust: a trust change is in every plan's fingerprint, also where no read 
 engine.run_pass()
 statuses = [(getattr(engine.STATUS.get(node.uid), "icon", ""), getattr(engine.STATUS.get(node.uid), "text", ""))
             for node in (rules, far_pick)]
-check("trust: after Allow This File the pass reads them, for the Rules node too (its plan cache sees the change)",
-      statuses[0][0] == 'PAUSE' and statuses[1][1].startswith("secret item"), statuses)  # one item: decided by code
+check("trust: after Allow This File the pass reads them, for the Rules node too (its plan cache sees the change): it "
+      "plans, its cells missing (no modifier evaluates it, so nothing asks them)",
+      statuses[0][0] == 'RADIOBUT_OFF' and statuses[1][1].startswith("secret item"), statuses)  # one item: by code
 reader.inputs["Items"].default_value = far
 got = outcome(lambda: lists.resolve_items(reader, ctx, source='TEXT'))
 check("trust: after Allow This File the CSV is read", isinstance(got, lists.ItemList)

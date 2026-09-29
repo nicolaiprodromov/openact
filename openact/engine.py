@@ -8,7 +8,8 @@ node is answered outside evaluation:
    evaluation reported, and planned into a Job per word set (specs/, pipeline.py). A Job is
    planned again only when the fingerprint of what it was planned from changes.
 2. Its rows are answered by the validity rule: the node's stored answers while the words mean the
-   same, then this session's answers, then the local model, asked in the background (server.py).
+   same, then this session's answers, then the local model, asked in the background (server.py)
+   for a word set an evaluation reported with the node's Trigger on, or once after Ask Again.
 3. The answers are written into the node's table object, which its hidden node group reads, keyed
    by the hash of the words. Geometry Nodes finds the matching answer by itself, so one node group
    can be used on several objects with different prompts, answers switch instantly back and
@@ -55,8 +56,9 @@ STALL = 60.0  # seconds with cells asked of a ready model and no chunk answered:
 STALLED = "No answers for {:g} s: see the log"
 SLOW_MS, SLOW_FOR = 3 * pipeline.MS_PER_ROW, 60.0  # /health's ms_per_row above this for so long: the slow note (§17.3)
 SLOW = "Running slower than expected: is the GPU busy (rendering, another app)?"
-ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME', "filling": 'SORTTIME',
-         "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
+ICONS = {"hint": 'INFO', "idle": 'RADIOBUT_OFF', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": 'SORTTIME',
+         "filling": 'SORTTIME', "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
+IDLE = {"unlinked": "Link a Trigger to ask", "off": "Trigger off", "unused": "Not evaluated"}  # why none asks (§17.1)
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
 P0_CELLS = 8
 DIFFERS = "CSV {} differs from the saved table ({})"  # a file edited since a table read from it was stored (R23)
@@ -70,6 +72,7 @@ LIVE = {}  # node uid -> words keys of the entries its contexts showed at its la
 CONTEXTS = {}  # node uid -> the ctx keys of its contexts at the last pass: tells the pass when one goes away
 REPORTS = {}  # node uid -> {(object pointer, modifier name): {words: triggered}}: the pass's channel.read() (§5.7)
 SETS = {}  # node uid -> the _key()s of the word sets its last visit planned: tells a visit when a context's changed
+ASK_ONCE = set()  # uids Ask Again asked: their missing cells are asked whatever the Trigger, until submitted (§6.0)
 DIRTY = set()  # uids of the nodes the next pass visits, when not all of them are dirty
 GENERATIONS = {}  # node uid -> its generation, bumped when its words change: its older queued chunks are dropped
 NOTES = {}  # node uid -> what its last save evicted or kept above the soft cap (NodeStore.note), for its status
@@ -109,8 +112,10 @@ class NodeStatus:
     eta_s: float | None = None  # remaining scored rows × ms_per_row
     contexts: int = 0  # distinct live word sets (§8.1)
     problems: list = field(default_factory=list)  # csvfmt.Problem records: the errors, then the warnings
-    uses: list = field(default_factory=list)  # (context label, Job, entry shown or None) of each planned context
+    uses: list = field(default_factory=list)  # (label, Job, entry shown or None) of each planned word set
     asking: frozenset = frozenset()  # keys of the cells the pass asks: sent, or sent once the starting model is ready
+    trigger: str = ""  # at the last evaluation: "unlinked", "off", "on", or "unused" when none reported the node
+    reported: int = 0  # the distinct word sets the last evaluation reported for the node (§5.7)
 
     @property
     def icon(self) -> str:
@@ -430,6 +435,7 @@ def run_pass(everything=True):
         CONTEXTS.clear()
         REPORTS.clear()
         SETS.clear()
+        ASK_ONCE.clear()
         NOTES.clear()
         DRIFT.clear()
         WATCH.retain(())
@@ -487,6 +493,7 @@ def run_pass(everything=True):
     for cache in (LIVE, STATUS, SETS, NOTES, DRIFT):
         for uid in [uid for uid in cache if uid not in contexts]:
             del cache[uid]
+    ASK_ONCE.intersection_update(contexts)
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
     redraw()
 
@@ -512,11 +519,15 @@ def _process(tree, node, contexts):
     hidden = {}  # their (gn, words key) -> the partial table shown in their place, or None while nothing is known
     instead = {}  # (uid, ctx key) -> the words key of the partial table that context shows in a hidden entry's place
     problems, warnings, failed = [], [], []
-    uses, resolved, asked = [], {}, set()  # (label, Job) per planned word set; words -> entry shown; cells missing
+    uses, resolved, asked = [], {}, set()  # (label, Job) per planned word set; words -> entry shown; cells asked
     sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
-    upstream = waiting = changed = False
+    idle = set()  # missing cells nothing asks: of word sets not reported with the Trigger on (§6.0)
+    upstream = waiting = changed = unasked = False  # unasked: an idle word set was reported, with the Trigger off
+    reports = REPORTS.get(node.uid) or {}
+    on = {words for reported in reports.values() for words, triggered in reported.items() if triggered}
+    once = node.uid in ASK_ONCE
     generation = GENERATIONS.get(node.uid, 0)
-    planned = _scan(spec, node, _sets(spec, node, contexts, REPORTS.get(node.uid)))
+    planned = _scan(spec, node, _sets(spec, node, contexts, reports))
     _moved(node.uid, contexts, planned, generation)
     counts = Counter(ctx.key() for ctx, _words, _job in planned)  # several word sets in a context: a zone's (§5.7)
     # §6.0: the sockets follow the live jobs (Rules, Classify, Dials). Jobs that disagree answer nothing, so the last
@@ -607,12 +618,22 @@ def _process(tree, node, contexts):
                     entries.append(entry)
                 changed = True
         failed += errors
-        if missing:
+        if missing and (words in on or once):  # reported with its Trigger on, by any modifier, or Ask Again (§6.0)
             waiting = True
             asked.update(cell.key for cell in missing)
             if _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
                                            generation=GENERATIONS.get(node.uid, 0)), missing):
                 sent.update(cell.key for cell in missing)
+        elif missing:  # nothing asks it; cells asked before are still filled, and the node shows it
+            pending = {cell.key for cell in missing if cell.key in pipeline.PENDING}
+            rest = {cell.key for cell in missing} - pending
+            waiting |= bool(pending)
+            asked |= pending
+            idle |= rest
+            unasked |= bool(rest) and words is not None
+    # Ask Again is done once its cells are submitted, or none were missing; not while a word set waits or disagrees
+    if once and not (upstream or conflict or held) and asked <= pipeline.PENDING.keys():
+        ASK_ONCE.discard(node.uid)
     showing = {entry.words_key for entry in shown}
     left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
     LIVE[node.uid] = showing
@@ -648,13 +669,34 @@ def _process(tree, node, contexts):
         inner.build(node, graph, live, default)
     warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
-    state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
+    trigger = _trigger(node, reports)
+    state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings,
+                               _idle(trigger, unasked, len(idle)) if idle else "")
     STATUS[node.uid] = NodeStatus(
         state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings]
         + [_problem(INFO, note) for note in (NOTES.get(node.uid), *DRIFT.get(node.uid, {}).values()) if note],
-        asking=frozenset(sent), **_counts(spec, jobs, resolved, asked))
+        asking=frozenset(sent), trigger=trigger, reported=len({words for sets in reports.values() for words in sets}),
+        **_counts(spec, jobs, resolved, asked | idle))
     return changed
+
+
+def _trigger(node, reports):
+    """The node's Trigger at the last evaluation (§6.0): "unlinked", else "on" when one of its reports was triggered,
+    "off" when none was, or "unused" when no evaluation reported the node."""
+    socket = node.inputs.get(inner.TRIGGER)
+    if socket is None or all(link.is_muted for link in socket.links):
+        return "unlinked"
+    if not reports:
+        return "unused"
+    return "on" if any(on for sets in reports.values() for on in sets.values()) else "off"
+
+
+def _idle(trigger, unasked, count):
+    """The status line of a node whose missing answers nothing asks (§17.1): why, and how many. unasked: a word set
+    its evaluations reported is among them."""
+    why = IDLE["unlinked" if trigger == "unlinked" else "off" if unasked else "unused"]
+    return f"{why}: {count} answer{'s' if count != 1 else ''} missing"
 
 
 def _live(live, spec, node, ctx, words=None):
@@ -840,8 +882,9 @@ def _priority(spec, node, missing):
     return 2
 
 
-def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
-    """(state, text, ETA in seconds or None) of the node's status line (§17.1)."""
+def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings, idle=""):
+    """(state, text, ETA in seconds or None) of the node's status line (§17.1). idle: why nothing asks the answers
+    it misses (_idle()), shown while nothing is asked or filled."""
     if faults:
         return "error", faults[0], None
     if waiting or upstream:
@@ -863,6 +906,8 @@ def _status(spec, uid, jobs, shown, faults, hints, upstream, waiting, warnings):
         if stalled():  # its chunks stay queued
             return "warning", STALLED.format(STALL), None
         return ("filling", *_filling(uid))
+    if idle:
+        return "idle", idle, None
     if not jobs:
         return "hint", hints[0] if hints else spec.empty_hint, None
     text = spec.summary(shown[0])
@@ -889,8 +934,8 @@ def _filling(uid):
 
 def _counts(spec, jobs, resolved, asked):
     """The row counts of the node's tables (§17.1): by the source of each row of the entry a table shows, with its
-    unsure answers (spec.unsure()), else of its plan's rows, whose cells are asked (pending), failed (errors) or
-    answered this session."""
+    unsure answers (spec.unsure()), else of its plan's rows, whose cells are missing (pending: `asked` holds them,
+    asked or not), failed (errors) or answered this session."""
     counts = dict.fromkeys(("rows", "answered", "pending", "stale", "unsure", "locked", "code", "errors"), 0)
     letters = {"m": "answered", "p": "pending", "s": "stale", "l": "locked", "c": "code", "e": "errors"}
     for gn, (job, _ctx) in jobs.items():
@@ -936,7 +981,8 @@ def older_settings(node, entry):
 
 def reask(node):
     """Ask the node's questions again with its current settings: the stored answers of its current words, and this
-    session's answers and failures of their cells, are forgotten. Raises ValueError, changing nothing, if a newer
+    session's answers and failures of their cells, are forgotten, and the next pass asks them once, whatever the
+    Trigger, statically planned word sets included (ASK_ONCE, §6.0). Raises ValueError, changing nothing, if a newer
     OpenAct saved the answers."""
     if node.id_data.library is not None:  # linked data is read-only
         return
@@ -946,6 +992,7 @@ def reask(node):
     node_store.entries = [entry for entry in node_store.entries if entry.gn not in words]
     store.save(node, node_store)  # no live set: nothing is evicted (§13.3)
     pipeline.forget(row.cell.key for job in jobs for row in job.rows if row.cell is not None)
+    ASK_ONCE.add(node.uid)
     for key in [key for key in LAST_SHOWN if key[0] == node.uid]:
         del LAST_SHOWN[key]
     # as the next pass writes it: the live set, and no default now that nothing was shown; values only when it can
@@ -1177,6 +1224,7 @@ def on_load_post(*_args):
     CONTEXTS.clear()
     REPORTS.clear()
     SETS.clear()
+    ASK_ONCE.clear()
     NOTES.clear()
     DRIFT.clear()
     REPORTED.clear()

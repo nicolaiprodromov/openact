@@ -8,6 +8,7 @@ Everything about using OpenAct, in depth. For the overview, see the [README](../
 - [Install](#install)
   - [The model runtime](#the-model-runtime)
 - [The six nodes](#the-six-nodes)
+  - [When a node asks: the Trigger](#when-a-node-asks-the-trigger)
   - [Working with the nodes](#working-with-the-nodes)
 - [CSV files](#csv-files)
   - [Two ways to give a node its CSV](#two-ways-to-give-a-node-its-csv)
@@ -61,8 +62,8 @@ OpenAct adds six Geometry Nodes that make judgements. A question, a prompt, a li
 in; numbers, selections, picks and labels come out. Each node reports its words (typed on the node, set on the
 modifier panel, built by other nodes, or kept in CSV files) as the tree evaluates; OpenAct reads them afterwards,
 asks a model on your GPU in the background, and stores its answers in the node as a table that Geometry Nodes looks
-up, per element where needed. The model runs only when the
-words change, never during evaluation, playback or rendering. The answers are saved in the .blend, so a file opens,
+up, per element where needed. The model runs only for a node whose Trigger is on, and only for what that node is
+missing; never during evaluation, playback or rendering. The answers are saved in the .blend, so a file opens,
 plays and renders without the model, and without the add-on, on Blender 4.5 or newer.
 
 The model never generates text. It reads the probability of each allowed answer from one forward pass. That is the
@@ -79,12 +80,40 @@ method of **SemIf** (formerly OpenJev, MIT), running **Qwen3.5-4B** (Apache-2.0)
 
 Every node starts with the same three sockets. **Geometry**, in and out, passes the geometry through unchanged, so a
 node can sit on the geometry's path. **Trigger**, a Boolean without a checkbox, decides when the node may ask the
-model: when it is on. Unlinked, it is off, and the node never asks; it still outputs the answers it has. Any value
-converts: a number above 0, a vector that isn't zero or a colour lighter than black is on. Files saved by OpenAct 1.0
-get these sockets when they open, with their links.
+model: when it is on ([below](#when-a-node-asks-the-trigger)). Unlinked, it is off, and the node never asks; it still
+outputs the answers it has. Any value converts: a number above 0, a vector that isn't zero or a colour lighter than
+black is on. Files saved by OpenAct 1.0 get these sockets when they open, with their links, and keep their answers;
+they ask nothing until you link a Trigger.
 
 Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV that locks answers
 ([below](#overrides)), and **Key**. Ctrl H shows them.
+
+### When a node asks: the Trigger
+
+A node asks the model only for what it is missing, and only while its **Trigger** is on at an evaluation:
+
+- **To ask whenever something is missing**, link a Boolean node set to True. Words already answered cost nothing
+  (answers are kept by meaning), so only new words are asked.
+- **To ask once**, build the moment yourself in your tree: for example Scene Time's Frame into a Compare (Equal to
+  1) asks at frame 1 only, and a Simulation zone that keeps last frame's value can turn on only when a condition
+  becomes true.
+- **Unlinked**, the node never asks. It keeps showing what it has stored.
+- **Only an evaluated node asks.** Its outputs, or its Geometry, must lead to the modifier's result, and its object
+  must be evaluated (not disabled in the viewport). A node whose outputs lead nowhere asks nothing, whatever its
+  Trigger.
+- **Ask Again** (sidebar) forgets the node's answers for its current words and asks them once, whatever its Trigger.
+- Answers arrive in the background: until one lands, the node shows its stored answer, or its neutral values.
+
+The node's status says why nothing is asked, and the sidebar shows its Trigger at the last evaluation and how many
+sets of words the evaluation reported:
+
+| Status | Meaning |
+|---|---|
+| *Link a Trigger to ask: 3 answers missing* | The Trigger is unlinked. |
+| *Trigger off: 3 answers missing* | The Trigger is linked, but was off at the last evaluation. |
+| *Not evaluated: 3 answers missing* | No evaluation used the node: its outputs lead nowhere, its object is disabled in the viewport, or no modifier uses its tree. |
+| *Filling 12/50 · ~2 s* | Asking; the answers so far show, older ones meanwhile for rows being asked again. |
+| *Its Question is read when the node evaluates* | The words come from nodes only Geometry Nodes can compute, and nothing evaluates the node yet. |
 
 ### Working with the nodes
 
@@ -98,8 +127,7 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
   node's first evaluation, which the node's status says.
 - **One table per set of words.** A tree used by any number of objects, with words from each modifier, keeps one set
   of answers per object. The node also keeps the answers of up to 1024 sets of words no object uses now, within
-  2 MB, so switching back to them is instant. The model is asked only when words change, and only for the rows whose
-  words changed.
+  2 MB, so switching back to them is instant. A triggered node asks only for the rows whose words have no answer yet.
 - **Lists** (Pick, Match, Classify) come from the node's dropdown: **Text or CSV** (inline items or a `.csv` path),
   **Collection** (its children, in the order Collection Info gives them with *Separate Children*), **Materials** (an
   object's material slots, so ID = material index) or **Attributes** (the attribute names of an object's own mesh,
@@ -118,14 +146,15 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
 - **Info markers.** A node that an evaluation uses shows an info marker, on the node and on the modifier, whose
   message starts with *OpenAct*: it carries the words the node evaluated and whether its Trigger was on, for OpenAct
   to read. Renders report none.
-- **Sidebar** (N > OpenAct): the Model box; for the active node, its status, a summary per object, the table of
+- **Sidebar** (N > OpenAct): the Model box; for the active node, its Trigger at the last evaluation, its status, a
+  summary per object (per element in a For Each Element zone), the table of
   answers with confidence and source (*Show Question* shows exactly what a row asks the model), **Ask Again** and
   **Write Overrides CSV**; and the *Files* panel: each CSV the node reads, with its columns and problems, *Open File*
   and *New CSV from Template*. The sidebar never edits answers: to change one, change its words, or lock it in the
   Overrides CSV.
 - **Animated words.** OpenAct asks nothing during playback or rendering. Words that change over the frame range (a
   keyframed dropdown, say) and have no answer yet show the object's last answers, or neutral values on a tree several
-  objects share, until playback stops; then they are asked.
+  objects share, until playback stops; then they are asked, if the node's Trigger is on.
 
 ## CSV files
 
@@ -292,7 +321,10 @@ A script that authors headlessly (sets words, fills tables, saves) opts back in,
 
 Blender runs no timers while a `--python` script runs, so the script then calls `engine.tick()` every few
 hundredths of a second until its nodes are answered, and saves, as `drive()` in
-[`tests/_harness.py`](../tests/_harness.py) does. The test suites set the variable (`tests/_harness.py`).
+[`tests/_harness.py`](../tests/_harness.py) does. The test suites set the variable (`tests/_harness.py`). The nodes
+read the words each evaluation reports, so a script that sets a modifier input calls `update_tag()` on the object
+(Blender re-evaluates nothing else by itself), and a node it wants answered needs a Trigger that is on and an output
+the modifier's result uses, as in the interface.
 
 ## Privacy
 

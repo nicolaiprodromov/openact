@@ -2,7 +2,8 @@
 active node's status, contexts and table, and the files it reads. Inspection only: every change goes through a file,
 a socket or an operator.
 
-status_rows(), table_rows(), table_page() and banners() are plain data, so the tests check them without drawing.
+status_rows(), activity_rows(), table_rows(), table_page() and banners() are plain data, so the tests check them
+without drawing.
 Drawing plans and writes nothing: Blender refuses changes to nodes and data while it draws.
 """
 
@@ -45,6 +46,12 @@ SERVER_BANNERS = ("install", "runtime", "port")  # shown in the Model box, above
 IMPORT_CSV_NOTE = ("Import CSV '{}' reads the same file; Blender won't re-read it after edits in this session. Use "
                    "this node's payload outputs, or restart Blender")
 EMPTY_SLOT = "(empty slot)"  # a row without a name: an empty material slot, never offered
+TRIGGER_ROWS = {  # NodeStatus.trigger -> its activity line (§17.2)
+    "unlinked": ('UNLINKED', "Trigger unlinked: never asks"),
+    "off": ('RADIOBUT_OFF', "Trigger off at the last evaluation"),
+    "on": ('RADIOBUT_ON', "Trigger on at the last evaluation: asks what is missing"),
+    "unused": ('RADIOBUT_OFF', "Not evaluated: no evaluation reported it"),
+}
 
 
 def wrap(layout, text, width=46, icon='NONE'):
@@ -76,6 +83,17 @@ def status_rows(status) -> list[tuple[str, str]]:
         rows.append(('BLANK1', f"{total}: {counts}" if counts else total))
     return rows + [(PROBLEM_ICONS.get(problem.severity, 'INFO'), problem.message) for problem in status.problems
                    if problem.message != status.text]  # an error's line is its first problem
+
+
+def activity_rows(status) -> list[tuple[str, str]]:
+    """(icon, text) lines of the active node's live activity (§17.2): its Trigger at the last evaluation, and how many
+    word sets the evaluation reported for it (§5.7)."""
+    if status is None or not status.trigger:  # a linked node's, or one no pass has visited
+        return []
+    rows = [TRIGGER_ROWS[status.trigger]]
+    if status.reported:
+        rows.append(('BLANK1', f"{status.reported} word set{'s' if status.reported != 1 else ''} reported"))
+    return rows
 
 
 def table_rows(spec, job, entry=None) -> list[tuple]:
@@ -273,6 +291,13 @@ def draw_preferences(prefs, context, layout):
     note.label(text="Qwen3.5-4B by Alibaba Qwen, Apache-2.0. Not affiliated with TypeSafe or Jev", icon='BLANK1')
 
 
+def draw_activity(layout, status):
+    """The active node's live activity (activity_rows(), §17.2), above its status."""
+    col = layout.column(align=True)
+    for icon, text in activity_rows(status):
+        col.label(text=text, icon=icon)
+
+
 def draw_table(layout, context, node, uses, index):
     """The table of context `index` (§17.2), PAGE_ROWS rows a page: name, answer, confidence bar, source icon, and
     Show Question."""
@@ -396,6 +421,7 @@ class NODE_PT_openact_node(bpy.types.Panel):
     def draw(self, context):
         node = _active(context)
         self.layout.label(text=node.name, icon='NODE')
+        draw_activity(self.layout, engine.STATUS.get(node.uid))
         node.draw_buttons_ext(context, self.layout)
 
 

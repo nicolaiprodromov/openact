@@ -27,7 +27,7 @@ import time
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import check, drive, enable_addon, finish, store  # noqa: E402
+from _harness import check, drive, enable_addon, finish, store, trigger  # noqa: E402
 
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 MODEL = [int(arg) for arg in ARGS[ARGS.index("--model") + 1:][:2]] if "--model" in ARGS else None
@@ -59,7 +59,8 @@ FAMILY_ANSWERS = {"steel": [0.9, 0.05, 0.03, 0.02], "oak planks": [0.1, 0.8, 0.0
 # ------------------------------------------------------------------------------ scenes
 
 def make_tree(name, idname, words=()):
-    """A tree whose OpenAct node takes `words` from the modifier, and ID = index + Shift (a modifier input)."""
+    """A tree whose OpenAct node takes `words` from the modifier, and ID = index + Shift (a modifier input). The
+    geometry passes through the node, so every evaluation evaluates it, and its Trigger is on: it asks (§6.0)."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     for word in words:
@@ -75,15 +76,21 @@ def make_tree(name, idname, words=()):
     tree.links.new(tree.nodes.new("GeometryNodeInputIndex").outputs[0], shifted.inputs[0])
     tree.links.new(gi.outputs["Shift"], shifted.inputs[1])
     tree.links.new(shifted.outputs[0], node.inputs["ID"])
+    store_outputs(tree, node, {})
+    trigger(node)
     return tree, node
 
 
 def store_outputs(tree, node, outputs):
-    """Store each of the node's outputs {name: data type} as a point attribute of that name."""
-    geometry = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput").outputs["Geometry"]
+    """Store each of the node's outputs {name: data type} as a point attribute of that name, on the geometry that
+    passes through the node into the Group Output."""
+    tree.links.new(next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput").outputs["Geometry"],
+                   node.inputs["Geometry"])
+    geometry = node.outputs["Geometry"]
     for output, data_type in outputs.items():
         geometry = store(tree, geometry, node.outputs[output], output, data_type)
-    tree.links.new(geometry, tree.nodes.new("NodeGroupOutput").inputs[0])
+    out = next((n for n in tree.nodes if n.bl_idname == "NodeGroupOutput"), None) or tree.nodes.new("NodeGroupOutput")
+    tree.links.new(geometry, out.inputs[0])
 
 
 def user(name, tree, attributes=None, **inputs):
@@ -767,6 +774,8 @@ def phase_model(port, gpu):
     geometry = store(tree, geometry, match.outputs["Probability"], "kitchen", 'FLOAT')
     geometry = store(tree, geometry, classify.outputs["Label"], "family", 'INT')
     tree.links.new(geometry, tree.nodes.new("NodeGroupOutput").inputs[0])
+    trigger(match)
+    trigger(classify)
     obj = user("Model", tree)
     engine.schedule(immediate=True)
     started = time.time()

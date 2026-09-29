@@ -57,6 +57,30 @@ def drive(engine, done, timeout):
     return False
 
 
+def trigger(node, on=True):
+    """Link a Boolean node set to `on` into the node's Trigger, so it asks for what it misses (§6.0), and, when none of
+    the node's outputs is linked, pass its tree's geometry through it into the Group Output: an unused node is not
+    evaluated, so it reports nothing and never asks. Returns the Boolean node, whose `boolean` turns it off."""
+    tree = node.id_data
+    switch = tree.nodes.new("FunctionNodeInputBool")
+    switch.boolean = on
+    tree.links.new(switch.outputs[0], node.inputs["Trigger"])
+    if not any(output.is_linked for output in node.outputs):
+        out = next((n for n in tree.nodes if n.bl_idname == "NodeGroupOutput" and n.is_active_output), None)
+        out = out or tree.nodes.new("NodeGroupOutput")
+        target = next((s for s in out.inputs if s.type == 'GEOMETRY'), None)
+        if target is not None:
+            source = target.links[0].from_socket if target.is_linked else None
+            if source is None:
+                gi = next((n for n in tree.nodes if n.bl_idname == "NodeGroupInput"), None)
+                gi = gi or tree.nodes.new("NodeGroupInput")
+                source = next((s for s in gi.outputs if s.type == 'GEOMETRY'), None)
+            if source is not None:
+                tree.links.new(source, node.inputs["Geometry"])
+            tree.links.new(node.outputs["Geometry"], target)
+    return switch
+
+
 def store(tree, geometry_socket, value_socket, name, data_type, x=0):
     """Store the value as a point attribute, so the test can read it from the evaluated mesh."""
     node = tree.nodes.new("GeometryNodeStoreNamedAttribute")

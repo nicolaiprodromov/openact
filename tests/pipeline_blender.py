@@ -26,9 +26,12 @@ starts itself (OPENACT_BACKEND=fake), whose --record log holds every request it 
 - entry validity (§5.4), from the --record log: a template bump and a Balance Option Order toggle send 0 requests;
   after a text edit only the row whose wkey changed is asked, with the node's current options.debias; Ask Again
   re-asks with it; two nodes with different toggles send their own debias;
-- the plan cache: a node read as words from a nested group of a tree no modifier uses keeps the context only the
-  evaluator reaches, so the scene settles (only safety passes, nothing planned again, no generation bumped); TIMING
-  per unchanged node and per idle pass, with a 4096-cell Rules node used by 16 contexts.
+- the plan cache: a node read as words from a nested group of a tree no modifier uses (asked through Ask Again, as
+  nothing evaluates it) keeps the context only the evaluator reaches, so the scene settles (only safety passes,
+  nothing planned again, no generation bumped); TIMING per unchanged node and per idle pass, with a 4096-cell Rules
+  node used by 16 contexts.
+
+Every node this suite expects to ask gets a Trigger that is on (_harness.trigger()), as a node asks only then (§6.0).
 
 Run:  blender -b --factory-startup --python tests/pipeline_blender.py
 """
@@ -57,7 +60,7 @@ os.environ["OPENACT_STATE_DIR"] = os.path.join(TMP, "state")  # the server log s
 import bpy  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import FAILURES, check, drive, finish, store  # noqa: E402
+from _harness import FAILURES, check, drive, finish, store, trigger  # noqa: E402
 from openact import csvfmt, engine, lists, nodes, pipeline, server, sources, tables  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402
@@ -185,7 +188,7 @@ def ask_job(uid, context):
 
 def match_tree(name, *words):
     """A tree used by one object of POINTS points, with a Match node per (question, items) typed on it, whose
-    Probability is stored as p0, p1, ..."""
+    Probability is stored as p0, p1, ..., and whose Trigger is on."""
     tree = bpy.data.node_groups.new(name, 'GeometryNodeTree')
     tree.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -195,6 +198,7 @@ def match_tree(name, *words):
         node.inputs["Question"].default_value = question
         node.inputs["Items"].default_value = items
         geometry = store(tree, geometry, node.outputs["Probability"], f"p{i}", 'FLOAT', 300 * i)
+        trigger(node)
         found.append(node)
     tree.links.new(geometry, tree.nodes.new("NodeGroupOutput").inputs["Geometry"])
     return tree, found, user(name, tree)
@@ -814,6 +818,7 @@ def phase_lost():
     tree.links.new(group_in.outputs["Question"], node.inputs["Question"])
     tree.links.new(store(tree, group_in.outputs["Geometry"], node.outputs["Probability"], "p0", 'FLOAT'),
                    tree.nodes.new("NodeGroupOutput").inputs["Geometry"])
+    trigger(node)
     loud, quiet = user("Lost A", tree), user("Lost B", tree)  # A's context comes first: its first chunk is in flight
     loud.modifiers["OpenAct"][question], quiet.modifiers["OpenAct"][question] = "Is it loud?", "Is it quiet?"
     start = len(records())
@@ -839,8 +844,9 @@ def phase_lost():
 
 def phase_nested():
     """A node read as words from inside a nested group, in a tree no modifier uses: the evaluator plans it in a context
-    find_uses() doesn't list, which the pass keeps (§5.3). The scene settles: only the 2 s safety passes run, nothing
-    is planned again and no generation is bumped, and the reader has its answer."""
+    find_uses() doesn't list, which the pass keeps (§5.3). Nothing evaluates either node, so Ask Again asks them, once
+    (§6.0): the reader once the Pick it waits for has its answer. The scene settles: only the 2 s safety passes run,
+    nothing is planned again and no generation is bumped, and the reader has its answer."""
     inner = bpy.data.node_groups.new("Nested inner", 'GeometryNodeTree')
     inner.interface.new_socket("Item", in_out='OUTPUT', socket_type='NodeSocketString')
     pick = inner.nodes.new(PICK.idname)
@@ -853,6 +859,9 @@ def phase_nested():
     reader = outer.nodes.new(ASK.idname)
     reader.inputs["Question"].default_value = "Can a person sit on this?"
     outer.links.new(group.outputs["Item"], reader.inputs["Context"])
+    engine.run_pass()
+    engine.reask(pick)
+    engine.reask(reader)
     answered = drive(engine, lambda: bool(S.load(reader).entries), 30)
     drive(engine, lambda: False, 1.0)  # the passes the answers schedule
     passes, run_pass = [], engine.run_pass
@@ -868,10 +877,10 @@ def phase_nested():
     finally:
         engine.run_pass = run_pass
     got = (passes, engine._plans_made - plans, engine.GENERATIONS.get(pick.uid, 0) - generation)
-    check("nested reader: a Pick read as words from a nested group of a tree no modifier uses is answered, and so is "
-          "its reader; then the scene settles: in 4 s only the 2 s safety passes, nothing planned again and no "
-          "generation bumped", answered and 1 <= len(passes) <= 3 and all(passes) and got[1:] == (0, 0),
-          (answered, got))
+    check("nested reader: a Pick read as words from a nested group of a tree no modifier uses is answered after Ask "
+          "Again, and so is its reader, once the Pick is; then the scene settles: in 4 s only the 2 s safety passes, "
+          "nothing planned again and no generation bumped", answered and 1 <= len(passes) <= 3 and all(passes)
+          and got[1:] == (0, 0), (answered, got))
 
 
 # ------------------------------------------------------------------------------ the plan cache
@@ -899,7 +908,8 @@ def fake(cell):
 
 def phase_timing():
     """§3.2: at most 5 ms per unchanged node, and 50 ms per idle pass with a 4096-cell Rules node used by 16 contexts
-    (planned once each, then only fingerprinted), beside an Ask and a 20-item Match node used once each."""
+    (planned once each, then only fingerprinted), beside an Ask and a 20-item Match node used once each, all
+    triggered, so each context reports its words."""
     for obj in list(bpy.data.objects):
         bpy.data.objects.remove(obj)
     for group in list(bpy.data.node_groups):
@@ -912,6 +922,7 @@ def phase_timing():
             handle.writelines(f"{factor},category,{factor} {v},{v},The {factor} is at step {v} of 16.\n" for v in range(16))
     tree, rules = plain_tree("Timing", RULES.idname, Question="What happens to the plant here?", Factors=path,
                              Outcomes="grows; stays; shrinks")
+    trigger(rules)
     for i in range(16):
         user(f"Timing {i}", tree)
     small = []
@@ -919,6 +930,7 @@ def phase_timing():
                                 ("Timing match", MATCH.idname, {"Question": "Is it round?",
                                                                 "Items": ", ".join(f"thing {i}" for i in range(20))})):
         small_tree, node = plain_tree(name, idname, **words)
+        trigger(node)
         user(name, small_tree)
         small.append(node)
     asked, submit = [], engine._submit

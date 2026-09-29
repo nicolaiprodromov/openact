@@ -18,7 +18,7 @@ import time
 import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import check, drive, enable_addon, finish, store  # noqa: E402
+from _harness import check, drive, enable_addon, finish, store, trigger  # noqa: E402
 
 SCENES = {
     "A": ("A snowy mountain village at night, warm windows glowing.", "something to sit on"),
@@ -92,6 +92,8 @@ def build_scene():
     tree.links.new(realize.outputs[0], join.inputs[0])
     tree.links.new(geometry, join.inputs[0])
     tree.links.new(join.outputs[0], g_out.inputs["Geometry"])
+    for node in (night, pick, sit, lamp, cold):  # a node asks only while its Trigger is on (§6.0); all are evaluated
+        trigger(node)
 
     ids = {item.name: item.identifier for item in tree.interface.items_tree
            if getattr(item, "in_out", "") == 'INPUT'}
@@ -143,8 +145,8 @@ def verify(tag):
 
 
 def all_answered(engine):
-    """Nodes of the scene's trees must be answered; nodes in unused copies may show a hint instead
-    (an unused tree has empty default inputs, e.g. no prompt)."""
+    """Nodes of the scene's trees must be answered; nodes in unused copies may show a hint instead (an unused tree
+    has empty default inputs, e.g. no prompt), or wait for an evaluation, which alone asks (§6.0)."""
     from openact import pipeline
 
     nodes = list(engine.iter_nodes())
@@ -152,7 +154,8 @@ def all_answered(engine):
         return False
     for tree, node in nodes:
         icon = getattr(engine.STATUS.get(node.uid), "icon", "")
-        allowed = ('CHECKMARK',) if tree.name in ("OpenActTest", "OpenActNested") else ('CHECKMARK', 'INFO')
+        allowed = ('CHECKMARK',) if tree.name in ("OpenActTest", "OpenActNested") else (
+            'CHECKMARK', 'INFO', engine.ICONS["idle"])
         if icon not in allowed:
             return False
     return True
