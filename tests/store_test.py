@@ -28,7 +28,7 @@ from openact.specs import ask, base, pick  # noqa: E402
 
 NodeStore, MB, SOFT_CAP = store.NodeStore, store.MB, store.SOFT_CAP
 EMPTY = '{"schema":2,"entries":[]}'
-KEPT = "live and pinned contexts are kept; pin fewer word sets to shrink the file"
+KEPT = "live contexts are kept"
 
 
 class Node:
@@ -73,7 +73,7 @@ def loading(text):
 
 
 def rules(first, t, rows, pinned=False):
-    """A Rules One-of entry with `rows` rows, last used at t."""
+    """A Rules One-of entry with `rows` rows, last used at t; pinned: with the pin and frames OpenAct 1.0 saved."""
     names = [f"level {r // 64}|level {r % 64}" for r in range(rows)]
     return store.Entry(
         words_key=hashlib.sha1(first.encode()).hexdigest(), asks=["ask"], pv=1, t=t, pinned=pinned,
@@ -85,7 +85,8 @@ def rules(first, t, rows, pinned=False):
 
 
 def life():
-    """Every schema-2 field set: a pinned Game of Life entry with payload and top answers."""
+    """Every schema-2 field set: a Game of Life entry with payload and top answers, pinned with its frames as OpenAct
+    1.0 saved it."""
     names = [f"{state}|{n}" for state in ("dead", "alive") for n in range(9)]
     outcome = [0 if n == 3 else 1 for n in range(9)] + [2 if n in (2, 3) else 3 for n in range(9)]
     return store.Entry(
@@ -130,12 +131,13 @@ def phase_round_trip():
     store.save(node, full)
     check("round trip: load returns what save wrote", store.load(node) == full)
     data = json.loads(node.entries)
-    pinned, plain = data["entries"]
-    check("round trip: the documented schema-2 fields, in order",
-          data["schema"] == 2 and list(pinned) == ["words_key", "asks", "pv", "t", "pinned", "frames", "gn",
-                                                   "model", "kind", "answer_type", "shape", "rows", "single", "csv"]
-          and list(pinned["rows"]) == ["name", "wkey", "ask", "src", "v", "payload", "top"], list(pinned))
-    check("round trip: frames only on pinned entries, top only when given",
+    whole, plain = data["entries"]
+    check("round trip: the documented schema-2 fields, in order, a 1.0 pin's pinned and frames kept",
+          data["schema"] == 2 and list(whole) == ["words_key", "asks", "pv", "t", "pinned", "frames", "gn",
+                                                  "model", "kind", "answer_type", "shape", "rows", "single", "csv"]
+          and (whole["pinned"], whole["frames"]) == (True, [[1, 48], [60, 90]])
+          and list(whole["rows"]) == ["name", "wkey", "ask", "src", "v", "payload", "top"], list(whole))
+    check("round trip: frames only when an entry has some, top only when given",
           "frames" not in plain and "top" not in plain["rows"], list(plain))
     check("round trip: non-ASCII words are stored as they are", "\u2014" in node.entries)
 
@@ -147,11 +149,12 @@ def phase_max_entries():
     entries = live[:9] + old[:10] + [pinned] + live[9:] + old[10:]
     live_gns = frozenset(gn(f"live {i}") for i in range(18))
     recent = set(words(sorted(old, key=lambda e: e.t)[-store.MAX_ENTRIES:]))
-    expected = [first for first in words(entries) if not first.startswith("old") or first in recent]
+    expected = [first for first in words(entries) if first.startswith("live") or first in recent]
     kept, node = NodeStore(list(entries)), Node()
     store.save(node, kept, live_gns)
-    check("16 entries: keeps every live and pinned entry and the 16 most recent others, in order",
-          words(kept.entries) == expected, words(kept.entries))
+    check("16 entries: keeps every live entry and the 16 most recent others, in order; an entry OpenAct 1.0 pinned "
+          "is evicted like the others", words(kept.entries) == expected and "pinned" not in words(kept.entries),
+          words(kept.entries))
     check("16 entries: the node holds exactly what save() kept", store.load(node).entries == kept.entries)
     check("16 entries: no note", kept.note == "", kept.note)
     kept = NodeStore(list(entries))
@@ -162,20 +165,20 @@ def phase_max_entries():
 
 def phase_soft_cap():
     live = rules("live", 1, 3000)
-    pinned = rules("pinned", 2, 3000, pinned=True)
-    old = [rules(f"old {i}", 10 + (5 * i) % 8, 3000) for i in range(8)]
-    entries = [old[0], live, *old[1:5], pinned, *old[5:]]
+    pinned = rules("pinned", 2, 3000, pinned=True)  # older than every other warm or cold entry
+    old = [pinned, *(rules(f"old {i}", 10 + (5 * i) % 8, 3000) for i in range(8))]
+    entries = [old[1], live, *old[2:6], pinned, *old[6:]]
     whole, alone = Node(), Node()
     store.save(whole, NodeStore(list(entries)))
-    store.save(alone, NodeStore([live, pinned]))
-    check("soft cap: the store exceeds 2 MB, its live and pinned entries do not",
+    store.save(alone, NodeStore([live]))
+    check("soft cap: the store exceeds 2 MB, its live entry does not",
           size_of(whole) > SOFT_CAP > size_of(alone), (size_of(whole), size_of(alone)))
     kept, node = NodeStore(list(entries)), Node()
     store.save(node, kept, frozenset({gn("live")}))
     by_age = words(sorted(old, key=lambda e: e.t))
-    dropped = len(old) - sum(first.startswith("old") for first in words(kept.entries))
-    check("soft cap: keeps live and pinned, evicts the least recently used others first",
-          0 < dropped < len(old) and set(words(kept.entries)) == {"live", "pinned", *by_age[dropped:]},
+    dropped = len(old) + 1 - len(kept.entries)
+    check("soft cap: keeps live, evicts the least recently used others first, an entry OpenAct 1.0 pinned first",
+          0 < dropped < len(old) and set(words(kept.entries)) == {"live", *by_age[dropped:]} and by_age[0] == "pinned",
           words(kept.entries))
     check("soft cap: kept entries keep their order",
           words(kept.entries) == [first for first in words(entries) if first in words(kept.entries)])
@@ -212,23 +215,23 @@ def phase_both_caps():
 
 
 def phase_precedence():
-    live = [rules(f"live {i}", 10 + i, 4096) for i in range(4)]
-    pinned = [rules(f"pinned {i}", 1 + i, 4096, pinned=True) for i in range(4)]
+    live = [rules(f"live {i}", 10 + i, 4096) for i in range(8)]
     others = [rules(f"old {i}", t, rows) for i, (t, rows) in enumerate(
         ((50, 64), (60, 4096), (5, 64), (70, 64), (40, 4096), (55, 64)))]  # most are more recent than live
-    entries = [others[0], live[0], pinned[0], others[1], live[1], live[2], pinned[1], others[2], pinned[2],
-               others[3], live[3], pinned[3], others[4], others[5]]
-    live_gns = frozenset(gn(f"live {i}") for i in range(4))  # built from the words, as the pass will
-    alone, both = Node(), NodeStore(live + pinned)
+    others += [rules(f"pinned {i}", 80 + i, 4096, pinned=True) for i in range(2)]  # 1.0 pins, the most recent of all
+    entries = [others[0], live[0], others[6], others[1], live[1], live[2], live[3], others[2], live[4], others[7],
+               others[3], live[5], live[6], others[4], live[7], others[5]]
+    live_gns = frozenset(gn(f"live {i}") for i in range(8))  # built from the words, as the pass will
+    alone, both = Node(), NodeStore(list(live))
     store.save(alone, both, live_gns)
-    check("precedence: live and pinned entries alone exceed 2 MB", size_of(alone) > SOFT_CAP, size_of(alone))
+    check("precedence: the live entries alone exceed 2 MB", size_of(alone) > SOFT_CAP, size_of(alone))
     check("precedence: with nothing to drop, the note gives the size",
           both.note == f"entries use {mb(size_of(alone))} MB: {KEPT}", both.note)
 
     kept, node = NodeStore(list(entries)), Node()
     store.save(node, kept, live_gns)
-    check("precedence: every live and pinned entry is kept, and every warm and cold one evicted",
-          words(kept.entries) == [first for first in words(entries) if not first.startswith("old")],
+    check("precedence: every live entry is kept, and every warm and cold one evicted, the ones OpenAct 1.0 pinned too",
+          words(kept.entries) == [first for first in words(entries) if first.startswith("live")],
           words(kept.entries))
     check("precedence: the node holds exactly what save() kept", store.load(node).entries == kept.entries)
     check("precedence: the note reports the drops and the size",

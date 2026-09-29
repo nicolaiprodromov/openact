@@ -5,6 +5,8 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
 ## Unreleased
 
 - The demos are removed.
+- *Prepare for Playback* is removed, with its pins, *Unpin* and *Unpin All*. An entry that 1.0 pinned is kept in the
+  file, but may now be dropped like any other stored answer to keep the file small.
 
 ## 1.0.0
 

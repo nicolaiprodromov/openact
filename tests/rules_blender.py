@@ -7,8 +7,8 @@ keep the table (§5.4), the status shows the plan's problems (§17.1), contexts 
 only the pass writes the interface: not a draw, and again after an undo. In background mode without the opt-in a
 pass neither plans again nor re-bakes from files and prints each changed CSV once under the path as written, also in
 a moved project, and so does a background render for each frame it renders (§7.8); a render job starts no pass, and
-Ask Again and Prepare for Playback refuse while either holds the tables; a file reopened with a CSV edited meanwhile
-re-bakes, and its status notes the file (R23).
+Ask Again refuses while either holds the tables; a file reopened with a CSV edited meanwhile re-bakes, and its status
+notes the file (R23).
 
 With -- --model PORT GPU, the real model answers the Game of Life rule sets (18/18 exact, 0 unsure each).
 
@@ -961,8 +961,8 @@ def phase_background():
     """§7.8, R23, on a Rules node whose Factors CSV is typed, whose Outcomes CSV comes through an Import CSV node and
     whose Overrides CSV locks a cell, all '//' paths. In background mode without the opt-in a pass neither plans again
     nor re-bakes from files, and prints once per file each CSV that differs from the stored table, under the path as
-    written, also once the project is copied elsewhere; Ask Again and Prepare for Playback refuse, and while a render
-    job runs ticks start no pass. With the opt-in the pass plans and re-bakes as before. An edit that changes no table
+    written, also once the project is copied elsewhere; Ask Again refuses, and while a render job runs ticks start no
+    pass. With the opt-in the pass plans and re-bakes as before. An edit that changes no table
     reports nothing, and the pass keeps that file's new hashes. Reopened elsewhere with a CSV edited meanwhile, the
     first pass re-bakes as usual and the status notes the file once. It opens files, so it runs last."""
     check("OPENACT_BACKGROUND_PASSES: 1, true or yes opts in, spaces ignored (Windows cmd's `set X=1 && ...` keeps "
@@ -1010,15 +1010,15 @@ def phase_background():
                   "//farm_factors.csv", "//farm_outcomes.csv", "//farm_overrides.csv"], (saved, keys))
 
         engine.allow_background_passes(False)
-        polls = (bpy.ops.openact.reask.poll(), bpy.ops.openact.prepare_playback.poll())
+        poll = bpy.ops.openact.reask.poll()
         try:
             bpy.ops.openact.reask(uid=rules.uid)
             refused = ""
         except RuntimeError as error:  # how a failed poll reaches a Python caller, with its message
             refused = str(error)
-        check("background without the opt-in: Ask Again and Prepare for Playback refuse and say why, and the entries "
-              "stay", polls == (False, False) and "allow_background_passes(True)" in refused
-              and rules.entries == stored, (polls, refused))
+        check("background without the opt-in: Ask Again refuses and says why, and the entries stay",
+              poll is False and "allow_background_passes(True)" in refused and rules.entries == stored,
+              (poll, refused))
 
         edit(factors, "Exactly three live neighbours.", "Precisely three live neighbours.")  # text: 2 cells' facts
         edit(outcomes, "comes to life.,state=dead,1", "comes to life.,state=dead,7")  # numbers: Birth's payload
@@ -1037,7 +1037,7 @@ def phase_background():
         engine.allow_background_passes(True)
         rendering, engine._rendering = engine._rendering, lambda: True  # stands in for is_job_running('RENDER')
         try:
-            polls = (bpy.ops.openact.reask.poll(), bpy.ops.openact.prepare_playback.poll())
+            poll = bpy.ops.openact.reask.poll()
             engine.schedule(immediate=True)
             for _ in range(3):
                 engine._last_refresh = time.monotonic()  # no server.refresh(): this suite runs no model server
@@ -1047,8 +1047,8 @@ def phase_background():
             server.Worker.render_running.clear()  # tick() published the render job for the decision worker
         got = read(obj, ["Outcome", "alive"])
         check("render job: with the opt-in too, ticks start no pass, so nothing is planned again, stored or re-baked, "
-              "and Ask Again and Prepare for Playback refuse", polls == (False, False) and engine.PLANS == plans
-              and rules.entries == stored and got == saved, (polls, got))
+              "and Ask Again refuses", poll is False and engine.PLANS == plans and rules.entries == stored
+              and got == saved, (poll, got))
 
         asked = passed(rules)
         for job, _missing in asked:

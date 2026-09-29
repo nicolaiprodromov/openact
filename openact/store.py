@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field, fields
 
 SCHEMA = 2
-MAX_ENTRIES = 16  # warm or cold entries per node; live and pinned entries come on top
+MAX_ENTRIES = 16  # warm or cold entries per node; live entries come on top
 MB = 1024 * 1024
 SOFT_CAP = 2 * MB  # per node; only warm and cold entries are evicted to meet it
 HARD_CAP = 4 * MB  # per entry
@@ -39,8 +39,8 @@ class Entry:
     asks: list[str] = field(default_factory=list)
     pv: int = 0
     t: float = 0.0  # last use: warm and cold entries are evicted least recently used first
-    pinned: bool = False
-    frames: list[list[int]] = field(default_factory=list)  # [start, end] ranges of a pinned entry's words
+    pinned: bool = False  # kept in the JSON, unused: OpenAct 1.0 pinned entries for playback (§14.2)
+    frames: list[list[int]] = field(default_factory=list)  # kept too: the [start, end] frame ranges of a 1.0 pin
     gn: tuple[str, ...] = ()
     model: str = ""
     kind: str = ""
@@ -90,8 +90,8 @@ def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = N
 
     live_gns holds the gn tuples of the node's live contexts. "Live" is not saved, so only a caller
     that knows it may evict: warm and cold entries go, least recently used first, beyond MAX_ENTRIES
-    and then until the JSON fits SOFT_CAP. Live and pinned entries are never evicted, even when they
-    alone exceed SOFT_CAP. None means the live set is unknown, and nothing is evicted.
+    and then until the JSON fits SOFT_CAP. Live entries are never evicted, even when they alone
+    exceed SOFT_CAP. None means the live set is unknown, and nothing is evicted.
 
     Sets store.note for the node's status. Raises ValueError, writing nothing, if the store holds a
     newer OpenAct's JSON, or if an entry is damaged (load() would skip it) or larger than HARD_CAP.
@@ -109,7 +109,7 @@ def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = N
         parts.append((entry, text, size))
     evicted, note = set(), ""
     if live_gns is not None:
-        old = sorted((i for i, (entry, _, _) in enumerate(parts) if not entry.pinned and entry.gn not in live_gns),
+        old = sorted((i for i, (entry, _, _) in enumerate(parts) if entry.gn not in live_gns),
                      key=lambda i: parts[i][0].t)
         evicted.update(old[:-MAX_ENTRIES])  # all but the MAX_ENTRIES most recent
         # bytes of the JSON: _HEAD, the kept entries with a comma between each two, _TAIL
@@ -123,8 +123,8 @@ def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = N
             dropped += 1
         drops = f"{dropped} old context{'s' if dropped > 1 else ''} dropped" if dropped else ""
         if total > SOFT_CAP:
-            note = (f"{drops}; entries still use" if drops else "entries use") + (
-                f" {_mb(total)} MB: live and pinned contexts are kept; pin fewer word sets to shrink the file")
+            note = f"{drops}; entries still use" if drops else "entries use"
+            note += f" {_mb(total)} MB: live contexts are kept"
         elif drops:
             note = f"{drops} to keep the file small"
     kept = [part for i, part in enumerate(parts) if i not in evicted]

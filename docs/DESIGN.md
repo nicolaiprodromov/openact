@@ -284,7 +284,6 @@ reading of evaluated geometry through `GeometrySet`.
 | Main-thread cost per pass | ≤ 5 ms per unchanged node; ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts | §5.3 |
 | Graph edits on the main thread | `inner.build()` ≤ 100 ms for the demo shapes (≤ 250 ms for the interpolated Rules demo) and ≤ 1 s at each derived worst shape (§8.4), run only on shape or materialised-set changes, at most one per edit; `update_values()` (entry-level Index Switches only) ≤ 30 ms when one entry's values change, ≤ 150 ms when all 16 entries' values change at once; a table-object write ≤ 5 ms | §8.4, §8.8 |
 | Add-on upgrade (new templates) or toggling a node's *Balance Option Order* | 0 requests until the words change | §5.4, §10.3 |
-| Prepare for Playback over 250 frames | < 1 s on the F-curve path (channelbag F-curves, no scene evaluation). The fallback for drivers, NLA, tweak mode or blended actions costs frames × one scene evaluation, with progress and Esc | §5.5 |
 | Blender versions | 4.5 LTS, 5.0, 5.1 | §11 |
 
 ### 3.3 Non-Goals (v1)
@@ -720,8 +719,8 @@ sequenceDiagram
      4. `MEMORY[cell.key]`.
    - Everything still missing goes to `pipeline.submit()` in one call per Job.
 6. **Entries** are updated in `store`: at most 16 **warm or cold** stored entries per node
-   (`MAX_ENTRIES`), least recently used evicted. Live and pinned entries are exempt from that limit
-   and never evicted (§8.1). The
+   (`MAX_ENTRIES`), least recently used evicted. Live entries are exempt from that limit and never
+   evicted (§8.1). The
    **materialised** set, i.e. the entries present in the Geometry Nodes graph and table object, is
    chosen as in §8.1, with the hard cap of 16. Then one of three things happens:
    - the table **shape** or the materialised set changed: `inner.build()`, at most once per pass;
@@ -847,8 +846,8 @@ stateDiagram-v2
 | Amount levels | 2–16 | error outside |
 | Cells (Rules: product of level counts) | 4096 | error above: "Rules has 5 400 cells (limit 4 096): use fewer bands" |
 | Estimated scored rows (sum of `cell.cost`) | 8192 | error above; the status shows an ETA from the measured rows/s above 1024 rows |
-| Stored entries per node | 16 warm or cold entries (`MAX_ENTRIES`), plus every live and pinned entry, which are exempt | least recently used warm or cold entries evicted, also by the 2 MB soft cap; live and pinned entries never evicted, and kept even above 2 MB with a size note; the 4 MB per-entry hard cap and the 12-pin limit bound the total (§8.1, §14.7) |
-| Materialised entries per node | at most 16 (`MATERIALISED_MAX`): every live context, then at most 12 pinned, then warm entries while the total is below 4 | more than 16 distinct live word sets: an error, and the extra contexts show neutral values. If live plus pinned grows past 16 after pinning, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5), with a status message. The rest stay stored in JSON only (§8.1) |
+| Stored entries per node | 16 warm or cold entries (`MAX_ENTRIES`), plus every live entry, which is exempt | least recently used warm or cold entries evicted, also by the 2 MB soft cap; live entries never evicted, and kept even above 2 MB with a size note; the over-cap error (16 live word sets) and the 4 MB per-entry hard cap bound the total (§8.1, §14.7) |
+| Materialised entries per node | at most 16 (`MATERIALISED_MAX`): every live context, then warm entries while the total is below 4 | more than 16 distinct live word sets: an error, and the extra contexts show neutral values. The rest stay stored in JSON only (§8.1) |
 
 The ETA uses the server's measured rate: `/health` reports `ms_per_row`, with defaults of 21 ms
 per two-option row and 36 ms per seven-option row, from the 3090 figures (24 and 14 cells/s with
@@ -904,74 +903,25 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
   pass. The worker may finish queued chunks, but tables are written only after playback stops
   (NG1).
   - **Rule:** words that change *during* playback (a keyframed or driven modifier input, such as a
-    rule-set Menu Switch, or a CSV edited while playing) must have been answered beforehand.
-  - **Two mechanisms keep simulations alive:**
-    1. **On a node used by exactly one live context**, a no-match falls back to that context's
-       last-shown entry (`k_default`, §8.2), not to the neutral fallbacks. A single-object sim,
-       such as the hero demo, keeps its own last rules instead of reading `alive = −1`. On shared
-       trees a no-match gives neutral values, so no object ever runs on another's rules.
-    2. **Prepare for Playback** (`openact.prepare_playback`) collects every distinct word tuple
-       each context will see over the frame range, answers them, and **pins** those entries
-       (§8.1). It saves with `store.save(node, store)` (`live_gns=None`), which evicts nothing
-       (§13.3).
-  - **How Prepare for Playback reads future words without evaluating the scene:**
-    1. The evaluator records the **read set** of each context: every modifier input and
-       node-socket default a word depended on.
-    2. **F-curve path (default).** Only numeric and menu values can be keyframed; String socket
-       values cannot.
-       - **Finding the F-curves.** `Action.fcurves` no longer exists in 5.x (review, round 3).
-         F-curves are found through the owning ID's `animation_data.action` and `action_slot`,
-         with `bpy_extras.anim_utils.action_get_channelbag_for_slot(action, slot)`. That call
-         exists on 4.5, 5.0 and 5.1, so no `compat.py` switch is needed.
-         - The owning ID is the object for modifier inputs (`modifiers["…"]["Socket_n"]`) and the
-           node tree for socket defaults.
-       - **Evaluating.** For each frame in `frame_start…frame_end`, every animated value in the read
-         set is replaced by `fcurve.evaluate(frame)`. F-curve modifiers apply, because `evaluate()`
-         includes them. The words are then re-evaluated with those overrides, purely in Python,
-         with no scene evaluation.
-       - **Cost:** 250 frames × a few words is well under 1 s.
-    3. **Fallback when the active action's F-curves don't tell the whole story.** It falls back to
-       `scene.frame_set()` stepping if, for any ID in the read set:
-       - a read value is **driven**;
-       - the ID has **NLA tracks**;
-       - the action is in **tweak mode** (`animation_data.use_tweak_mode`);
-       - the action is **blended** (`action_blend_type != 'REPLACE'` or `action_influence < 1`).
-
-       It also falls back when an animated value is read while **Time Stretching** is on
-       (`render.frame_map_old != frame_map_new`), which plays animation at remapped times.
-
-       The fallback runs as a **modal operator** with progress in the status bar and **Esc to
-       cancel**. Cost is frames × one scene evaluation, e.g. 250 × 50 ms ≈ 12 s, shown up front as
-       an estimate. Cancelling pins nothing.
-    4. **Afterwards.** The current frame is restored. Pinning changes the inner group, which
-       invalidates unbaked simulation caches. Baked simulations are flagged "re-bake: rules changed
-       for frames …". Python can't tell a baked simulation or Bake node from an unbaked one, so every
-       modifier with bakes whose rules the new pins change is named.
-  - **Limits and overflow.**
-    - At most 12 pinned entries, and live plus pinned at most 16 (§8.1).
-    - If the range yields more distinct word tuples, it **refuses without asking anything**: "40
-      distinct word sets over frames 1–250; the limit is 12".
-    - A new run replaces the previous pins, so pins expire only then, or through `openact.unpin`
-      (the sidebar's per-entry *Unpin* and *Unpin All*).
-    - Pinned entries are saved with `pinned: true` and their `frames` (§14.2), so they survive save
-      and reload.
-    - **Pin order is deterministic: by the first frame at which each word tuple occurs**, with ties
-      broken by tuple order. It is used when live plus pinned later exceeds 16 (§8.1): the pins
-      with the earliest first frames stay materialised, and those that start latest go inactive.
-      Every pin from one run shares the same pin time, so time could not order them.
+    rule-set Menu Switch, or a CSV edited while playing) show their stored answers while the node's
+    graph holds them (the materialised entries, §8.1). Words with no answer there show the fallback
+    below until the first pass after playback asks for them.
+  - **On a node used by exactly one live context**, a no-match falls back to that context's
+    last-shown entry (`k_default`, §8.2), not to the neutral fallbacks. A single-object sim, such as
+    the hero demo, keeps its own last rules instead of reading `alive = −1`. On shared trees a
+    no-match gives neutral values, so no object ever runs on another's rules.
 - **Rendering.** While `render_running` is set, the worker starts no new chunk, so the model does
   not compete with Cycles or EEVEE for the GPU. `tick()` sets the event from
   `bpy.app.is_job_running('RENDER')` on the main thread, and the worker never calls `bpy`. The
   in-flight chunk completes.
 - **Undo and redo.** Entries JSON, inner groups and table objects are ordinary data inside undo
   steps. `on_undo_redo` schedules an immediate pass, and `MEMORY` makes re-applying answers free.
-- **Operators take the context as it is.** A timer's context has the first window, so the pins'
-  own undo step (`ed.undo_push`) needs no `temp_override`, and OpenAct calls none. Under one, Blender 4.5 and 5.0 (Python 3.11) read the
-  override without the GIL during `bpy.ops`, which crashes while the worker or a probe runs Python
-  (`playback_blender.py` stresses it). Blender's own calls of that kind (the node editor's viewer
-  shortcuts, Ctrl+1…9 and 1…9; Quick Effects) and other add-ons' can still crash those versions
-  when they meet one of those brief moments; OpenAct can't change them (README, *Known issues*).
-  Blender 5.1 (Python 3.13) is not affected.
+- **No `temp_override`.** Under one, Blender 4.5 and 5.0 (Python 3.11) read the override without
+  the GIL during `bpy.ops`, which crashes while the worker or a probe runs Python, so OpenAct calls
+  none (`playback_blender.py` checks its code). Blender's own calls of that kind (the node editor's
+  viewer shortcuts, Ctrl+1…9 and 1…9; Quick Effects) and other add-ons' can still crash those
+  versions when they meet one of those brief moments; OpenAct can't change them (GUIDE,
+  *Limitations and known issues*). Blender 5.1 (Python 3.13) is not affected.
 
 **Headless and tests.** With `bpy.app.background` set, as in a render farm's `blender -b -f`,
 OpenAct renders the saved answers and does not re-plan or re-bake from files (§7.8, R23). Headless
@@ -1972,9 +1922,23 @@ The watcher (`engine.WATCH: {path_id: (stamp, CsvDoc)}`) behaves as follows:
   neither re-plans nor re-bakes from files. A farm renders exactly the saved answers and payload.
   If a referenced CSV's `text_hash` or `num_hash` differs from the stored ones, it prints once per
   file: "CSV <path> differs from the saved table (text/numbers); rendering the saved answers" (R23).
-  A background render compares the words of each frame it renders, read through the F-curves; a
-  context whose words only a frame change reveals (a driver, NLA, or another fallback case of
-  §5.5) is compared as the file holds it, and the render shows the saved answers either way.
+  A background render compares the words of each frame it renders (`on_render_pre`), and shows the
+  saved answers either way. It sets its frame without evaluating the original data, so the words
+  there are read through the F-curves (`engine.FrameWords`), a context at a time, with no scene
+  evaluation:
+  - The evaluator records the values each context's words read (modifier inputs, socket defaults,
+    the Integer and Boolean nodes: `evaluator.READS`), and reads them again with each animated one
+    replaced by its F-curve's value at the frame (`evaluator.OVERRIDES`), clamped to the
+    property's hard range as Blender clamps it. `fcurve.evaluate()` applies F-curve modifiers.
+  - `Action.fcurves` no longer exists in 5.x, so the F-curves are found through the owning ID's
+    `animation_data.action` and `action_slot`, with
+    `bpy_extras.anim_utils.action_get_channelbag_for_slot(action, slot)`, which exists on 4.5, 5.0
+    and 5.1. The owning ID is the object for modifier inputs and the node tree for socket defaults.
+  - A context whose words only setting the frame would tell is compared as the file holds it: a
+    read value that is **driven**, an owner with **NLA tracks**, an action in **tweak mode** or
+    **blended** (`action_blend_type != 'REPLACE'` or `action_influence < 1`), a keyframed menu
+    socket, or an animated value under **Time Stretching**
+    (`render.frame_map_old != frame_map_new`).
   - **Headless authoring opts back in.** This covers the test suites and any script that sets
     prompts headlessly and saves, as the 1.0 demo build did. There are two ways:
     - the environment variable `OPENACT_BACKGROUND_PASSES=1`, set before Blender starts;
@@ -2038,35 +2002,19 @@ The sidebar lists every problem (at most 50 per file), each with *Open File*.
 - **Stored** entries live in the node's `entries` JSON. They make switch-back and undo free of
   model calls.
   - At most 16 **warm and cold** entries are kept, evicted least recently used.
-  - **Live and pinned entries are exempt from that limit, and are never evicted, not even by the
-    2 MB soft cap.** The soft cap evicts only warm and cold entries. Live plus pinned entries are
-    kept even above 2 MB, with a size note, bounded by the 12-pin limit and the 4 MB per-entry
-    hard cap (§14.7).
+  - **Live entries are exempt from that limit, and are never evicted, not even by the 2 MB soft
+    cap.** The soft cap evicts only warm and cold entries. Live entries are kept even above 2 MB,
+    with a size note, bounded by the over-cap error below (16 live word sets) and the 4 MB
+    per-entry hard cap (§14.7).
 - **Materialised** entries are the ones present in the Geometry Nodes graph (match chain and
-  table object). There is **one hard cap: `MATERIALISED_MAX = 16` per node, pinned included**. They
-  are, in order:
+  table object). There is **one hard cap: `MATERIALISED_MAX = 16` per node**. They are, in order:
   1. every entry whose `gn` equals the words of a **live** context;
-  2. then **pinned** entries: those answered by *Prepare for Playback* for animated words (§5.5).
-     There are at most 12, stored with `pinned: true` (§14.2), in pin order: by the first frame of
-     each word tuple;
-  3. then **warm** entries (the most recently live, not live now), only while the total is below
+  2. then **warm** entries (the most recently live, not live now), only while the total is below
      4, and only if they fit the row budget (at most 16 × 4096 rows).
 - **Above the cap.** More than 16 distinct live word sets on one node is an error: "20 objects use
   this tree with different words; the limit is 16: split the tree". The first 16 contexts, in
   context order, stay materialised. The others show neutral values and name the limit in their
   status.
-
-  Prepare for Playback refuses when live plus pinned would exceed 16 (§5.5).
-  - **More objects after pinning.** Live plus pinned can still exceed 16 later, when more objects
-    start using the tree. Then **live entries win**:
-    - pins are materialised in **pin order**: by the first frame at which each word tuple occurs,
-      ties broken by tuple order (§5.5). The pins that start latest in the frame range are the
-      ones left out;
-    - those pins stay stored with `pinned: true`, never evicted;
-    - the node's status says "3 pinned entries are inactive: this tree is now used by more objects
-      (live + pinned > 16). Re-run Prepare for Playback, or split the tree".
-
-    If the live entries alone exceed 16, the over-cap error above applies.
   - **Why a cap.** Every materialised entry costs graph nodes and items (§8.2, §8.4). The PR-08
     spike confirmed that the §8.4 budgets hold at 16, so the cap did not drop to 8.
 
@@ -2140,12 +2088,11 @@ The match chain (`_Builder.match_chain`):
     that context's last-shown entry (`LAST_SHOWN`, §14.5).
     - Between an edit and the next pass (at most about 0.35 s), the outputs keep that object's own
       last answers, marked stale, instead of flashing to fallbacks.
-    - During playback, unprepared animated words keep the object's own last rules instead of
-      breaking a simulation (§5.5).
+    - During playback, animated words that match no materialised entry keep the object's own last
+      rules instead of breaking a simulation (§5.5).
   - **Two or more live contexts:** `k_default = 0`, so a no-match gives the neutral fallbacks.
     While OpenAct is running, one object can never show another object's answers.
-    (Without the add-on, `k_default` stays as saved; see R6.) *Prepare for Playback*
-    (§5.5) remains the tool for animated words on shared trees.
+    (Without the add-on, `k_default` stays as saved; see R6.)
   - **A hint or error state** (a cleared Question, "only one answer can show", a file error):
     `k_default = 0`, so errors are never hidden behind old answers.
   - **Never answered:** `k_default = 0`.
@@ -3135,10 +3082,10 @@ def load(node) -> NodeStore: ...                                # schema 2 (§14
 def save(node, store: NodeStore, live_gns: frozenset[tuple[str, ...]] | None = None) -> None: ...
     # live_gns: the gn tuples of the node's live contexts, computed by the pass (find_uses + evaluator).
     # "Live" is not saved in entries, so eviction (16 warm/cold, 2 MB soft cap) needs it:
-    # it never removes an entry whose gn is in live_gns, nor one with pinned: true (§8.1, §14.7).
+    # it never removes an entry whose gn is in live_gns (§8.1, §14.7).
     # None (the default) means "live set unknown": save() then evicts NOTHING.
     # Only engine.run_pass() passes a live set. Every other writer saves with None and leaves
-    # eviction to the next pass: openact.reask, openact.unpin and Prepare for Playback.
+    # eviction to the next pass: openact.reask.
 
 # inner.py / tables.py
 def sync_interface(node, wanted: list[SocketDef]) -> None: ...  # diff, never clear (§6.0)
@@ -3160,7 +3107,6 @@ def attribute_names(obj, exclude: set[str] = ()) -> list[str]: ...  # original d
 | `openact.open_log`, `openact.open_runtime_folder` | Logs and folders |
 | `openact.write_overrides` (§7.6), `openact.new_csv_from_template` (§7.10), `openact.open_file`, `openact.copy_diagnostics` (§17) | CSV files and diagnostics |
 | `openact.allow_file`, `openact.trust_folder` | "Allow this file" adds this .blend's path to `trusted_files` (§16.1); "Trust this folder" adds the folder, and so its subfolders, to `trusted_folders` |
-| `openact.prepare_playback`, `openact.unpin` | Answer and pin animated words, modal only on the driver fallback; unpin one entry, or all (§5.5) |
 | `openact.show_question` | Shows the exact request of a table row without calling the model (§17.2) |
 | `openact.locate_runtime` | Picks an existing runtime folder and runs the probe (§10.5; PR-07) |
 | `openact.refresh_import_csv` | Conditional: ships only if follow-up F1 shows the trick works on 4.5 and 5.1 (§7.1) |
@@ -3306,7 +3252,7 @@ classDiagram
 |---|---|
 | `schema` | always 2 (§14.4) |
 | `words_key` | what the artist said (§5.4). The entry is reused while it matches, whatever its ask keys. On a mismatch for the same `gn`, a new entry is built and rows with an unchanged `wkey` carry over |
-| `pinned`, `frames` | `pinned: true` for entries answered by *Prepare for Playback* (§5.5), with `frames: [[start, end], …]`, the frame ranges where those words occur. Pinned entries are saved, never evicted, materialised before warm ones (§8.1), and count towards the cap. They expire only on the next Prepare for Playback run or through `openact.unpin` |
+| `pinned`, `frames` | Kept in the JSON, unused. OpenAct 1.0's *Prepare for Playback* pinned entries for playback with `pinned: true` and their `frames: [[start, end], …]`; nothing sets them any more, and a pinned entry is evicted like any other (§14.7). `frames` is written only when an entry has some |
 | `asks` | the ask keys (templates, debias, backend) that produced this entry's rows; `rows.ask` indexes into it. A key other than the current one only labels rows "asked with older settings" |
 | `gn` | raw word strings, in `spec.words()` order, compared by the match chain (§8.2) |
 | `pv`, `model` | template version and model provenance. Shown in the sidebar, never part of a key |
@@ -3391,27 +3337,20 @@ requires that interpreter's folder to exist, and the start-up probe checks that 
 | Game of Life, 18 rows, 1 payload | ≈ 1.5 KB | about 40 nodes | 18 vertices × 3 columns, < 1 KB |
 | Pick, 255 items (Probability field linked) | ≈ 5 KB | about 20 nodes | 255 vertices, about 4 KB |
 | Rules, 4096 rows, 2 payload columns, one context | ≈ 250 KB (no `top` above 1024 rows) | about 60 nodes | 4096 vertices, about 150 KB |
-| Worst case: **16 warm or cold entries, plus live (at most 16) and pinned (at most 12) entries**, × 4096 rows; materialised up to the cap of 16, pinned included (usually 4 or fewer, §8.1) | warm/cold bounded by the 2 MB soft cap; live and pinned kept above it with a size note; each entry ≤ 4 MB (below). Realistic worst case about 3 MB (12 pins of a 4096-cell table) | at most about 300 nodes for the derived worst shapes (§8.4) | typically 4 × 4096 = 16 384 vertices, about 0.6 MB; 65 536 and about 2.4 MB at the cap |
+| Worst case: **16 warm or cold entries, plus live ones (at most 16)**, × 4096 rows; materialised up to the cap of 16 (usually 4 or fewer, §8.1) | warm/cold bounded by the 2 MB soft cap; live kept above it with a size note; each entry ≤ 4 MB (below). Worst case about 4 MB (16 live contexts of a 4096-cell table) | at most about 300 nodes for the derived worst shapes (§8.4) | typically 4 × 4096 = 16 384 vertices, about 0.6 MB; 65 536 and about 2.4 MB at the cap |
 
 - **Soft cap.** If a node's `entries` exceeds 2 MB, the least recently used **warm and cold**
   entries are evicted until it fits. The status notes "2 old contexts dropped to keep the file
   small".
-  - **Precedence:** live and pinned entries are **never** evicted by the soft cap (§8.1).
-    - "Pinned" is saved in each entry (`pinned: true`).
-    - "Live" is not: the pass passes it to `store.save(node, store, live_gns)` (§13.3) as the `gn`
-      tuples of its current contexts.
-    - Every other writer (*Ask Again*, *Unpin*, Prepare for Playback) saves with `live_gns=None`,
-      which evicts nothing; the next pass evicts with the real live set.
-  - If live plus pinned entries alone exceed 2 MB, they are **kept**. The status notes the size,
-    e.g. "entries use 3.1 MB: live and pinned contexts are kept; pin fewer word sets to shrink the
-    file".
-  - They are still bounded: at most 12 pins, each entry within the 4 MB hard cap below. A realistic
-    worst case is 12 pins of a 4096-cell Rules table, about 3 MB.
-  - Prepare for Playback shows the projected size before pinning ("pinning 12 entries adds about
-    3 MB to the file").
-  - Pins are an explicit artist action for playback, so silently evicting them would break the
-    playback they exist for. Refusing them by size would make Prepare for Playback unusable on
-    large Rules tables.
+  - **Precedence:** live entries are **never** evicted by the soft cap (§8.1).
+    - "Live" is not saved: the pass passes it to `store.save(node, store, live_gns)` (§13.3) as the
+      `gn` tuples of its current contexts.
+    - Every other writer (*Ask Again*) saves with `live_gns=None`, which evicts nothing; the next
+      pass evicts with the real live set.
+  - If the live entries alone exceed 2 MB, they are **kept**. The status notes the size, e.g.
+    "entries use 3.1 MB: live contexts are kept".
+  - They are still bounded: at most 16 live word sets (§8.1), each entry within the 4 MB hard cap
+    below. The worst case is 16 live contexts of a 4096-cell Rules table, about 4 MB.
 - **Hard cap.** A single entry above 4 MB is an error. Only an absurd table could reach this,
   because the 4096-row limit bounds it first.
 - **Undo memory.** JSON changes land in undo steps with the node-tree data-block. During a fill the
@@ -3546,7 +3485,7 @@ updates for everything per element.
 | Local files | A malicious .blend points word sockets (a CSV path, or an Import Text path) at private files. OpenAct would read them and **store their contents** in the file (`gn`, Compare `B_STR` defaults, row names), which is exfiltration once the file is saved and sent back | **Trust rule** (below). In an untrusted file every read is confined to the .blend's own folder tree, and blocked text is never read, hashed or stored. OpenAct reads CSVs only from paths ending in `.csv`, at most 1 MB. The sidebar's *Files* panel lists every file each node reads |
 | Local files | Writes in unexpected places | OpenAct writes only the runtime folder, plus files the user picks in *Write Overrides CSV* or *New CSV from Template* (file dialog, never overwrites a template, atomic replace). It never writes automatically. In an untrusted file the trust rule (below) confines writes as it does reads: "Blocked writing <path>: outside this file's folder". *Write Overrides CSV* refuses, and leaves as it was, a file that a node in the open .blend reads as another input (such as Items), has errors, isn't an Overrides CSV for the node (no key column, or no `lock` column) or is read-only. Its temporary file is created new, so a planted link is never followed (§7.6) |
 | Answers | Prompt injection inside CSV text ("ignore the rules, answer Birth") | The model can only pick among the fixed options; no text is generated (NG4). The worst case is a wrong answer, which confidence flags and a lock overrides (4.e, 4.f) |
-| Blender responsiveness | Huge inputs exhaust memory or time | Limits: 1 MB per CSV, 4096 rows or cells, 8192 scored rows per context, 256 questions per request, a 4 MB body. Stored JSON per node: 16 warm or cold entries within a 2 MB soft cap; at most 16 live word sets (the over-cap error, §8.1) and 12 pins, kept above 2 MB with a size note; a 4 MB hard cap per entry |
+| Blender responsiveness | Huge inputs exhaust memory or time | Limits: 1 MB per CSV, 4096 rows or cells, 8192 scored rows per context, 256 questions per request, a 4 MB body. Stored JSON per node: 16 warm or cold entries within a 2 MB soft cap; at most 16 live word sets (the over-cap error, §8.1), kept above 2 MB with a size note; a 4 MB hard cap per entry |
 | Installed runtime | Compromised or changed downloads | See 16.2 |
 
 **Trust rule for opened files** (`trust.is_trusted()`, worked out once per pass; `load_post`
@@ -3809,14 +3748,14 @@ A later run can diff these lines to spot performance regressions.
 | Suite | Runs in | Model | What it checks |
 |---|---|---|---|
 | `tests/csv_test.py` | CPython + Blender | none | `csvfmt` dialect (BOM, CRLF and CR, `;` and tab delimiters, quoting); INT/FLOAT/text classification; limits; every §7.9 message by fixture; the `parse_answer_set` / `parse_factors` / `parse_settings` / `parse_overrides` parsers; the `if` grammar; `lists.parse_inline` (newline, then `;`, then `,`); `text_hash` unchanged by numeric edits and `num_hash` unchanged by text edits |
-| **`tests/store_test.py`** | CPython + Blender | none | The reading rules of §14.4 (damaged entries skipped, anything but schema 2 read as empty, a newer schema left unread); a changed `PROMPT_VERSION` or `debias` changes the ask key but no words key; save/load round trip with the documented field order; 2 MB soft-cap eviction removes only warm and cold entries and **keeps live and pinned entries**, even when live plus pinned alone exceed 2 MB (with the size note) |
+| **`tests/store_test.py`** | CPython + Blender | none | The reading rules of §14.4 (damaged entries skipped, anything but schema 2 read as empty, a newer schema left unread); a changed `PROMPT_VERSION` or `debias` changes the ask key but no words key; save/load round trip with the documented field order; 2 MB soft-cap eviction removes only warm and cold entries, a pinned one of OpenAct 1.0 among them, and **keeps live entries**, even when they alone exceed 2 MB (with the size note) |
 | `tests/rules_math_test.py` | CPython + Blender | none | The 4.e confidence formulas: uniform answers give exactly 0 for L = 2…16, point masses give 1, near-uniform answers stay below 0.30, and the documented examples (0.65; the bimodal split gives 0). `itertools.product` order equals `ravel`; allowed sets and code-decided cells; the reference interpolation (corners, weights, renormalisation); dithering probabilities, analytic versus 100 000 samples within ±1 % |
 | **`tests/evaluator_blender.py`** (extended) | Blender | none | Every existing case, plus **Menu Switch**: a value typed on the socket and a value coming from a modifier's Group Input menu, for String, Int and Float, covering both storage forms (§10.1). Also Special Characters, String Length, OpenAct single-value outputs used as words, field outputs rejected with the breadcrumb message, a muted Pick that passes a linked ID on (and its unlinked ID, the index, rejected as a field, §6.0), and the per-pass memo returning identical values. All are checked against Geometry Nodes ground truth with Compare nodes, the existing technique. **`trace_csv_source()`** (added by PR-13): a direct link; a Path exposed on the modifier; Reroute, nested-group and Geometry Menu Switch pass-through; the Import CSV Path/Delimiter socket identifiers pinned on 4.5, 5.0 and 5.1; both error messages |
 | `tests/csv_probe_blender.py` | Blender | none | **Import CSV parity** per fixture: point count equals `csvfmt` data rows; kept attributes equal `csvfmt` numeric columns with the same INT/FLOAT types and values. It records Blender's behaviour for blank lines, quoted line breaks, BOM and `;` in `tests/fixtures/import_csv_behaviour.json`. It re-asserts the path-cache fact (an edited file still returns old rows), so a future Blender change is noticed |
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5) |
-| `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **Pins:** when live plus pinned exceeds 16, the pins whose word tuples start latest in the frame range go inactive (pin order, §5.5). **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
+| `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: invalid IDs give fallbacks; 3 contexts through the match chain; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **Materialised set:** 10 successive Question edits on an 18-row Rules node keep at most 4 materialised entries, with at most one rebuild per edit; switching back to a stored but not materialised prompt sends 0 requests. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Joined key (§8.2):** most-recent-first link order; an absent position joined as a constant `""` matches its stored entry (a Collection-source Pick); a word containing `"\x1f"` uses the per-word fallback. **Dials (§8.4):** a Dials output feeds a single-value socket (Grid *Vertices X*), and, after a new prompt's one rebuild, the answers arriving update the values through `write_rows()` with no further rebuild. **No-match fallback (§8.2):** with one live context, unmatched words show that context's own last answers; with two contexts, A's unmatched words show neutral values, never B's answers; a cleared Question (a hint) shows neutral values. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: per-element lookup, `inner.build()`, `update_values()`, `tables.write_rows()`, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
-| `tests/playback_blender.py` | Blender + fake server | fake | **Prepare for Playback and pins (§5.5, §8.1, §14.7):** a keyframed Menu Switch cycling through three rule sets is answered and pinned, and playing the range then sends 0 requests and never shows a fallback; the F-curve path reads 250 frames in under 1 s with no scene evaluation, reads a context whose words read nothing animated once, finds the F-curves through the action slot's channelbag on 4.5 and 5.1, and clamps to the hard range; drivers, NLA tracks and Time Stretching take the `frame_set` fallback, which restores the frame and can be cancelled (the modal operator's functions on stand-ins); 13 word sets are refused, asking nothing; pins survive save and reload, and *Unpin* and *Unpin All* remove them. **Undo, for real:** pins a pass writes get a step of their own, and wait while a redo is possible, in Edit Mode and during a modal tool, but land in Pose Mode, Weight Paint and Vertex Paint; re-bake flags follow undo and redo. Pin order once live plus pinned exceeds 16; pins above 2 MB are kept, with the size note. **Stress:** the pins' undo step is checked and pushed for 3 s while another thread runs Python, and OpenAct's code calls no `temp_override` (§5.5) |
+| `tests/playback_blender.py` | Blender + fake server | fake | **Playback (§5.5):** a keyframed Menu Switch cycles through three rule sets, two of them answered while the scene was stopped; playing sends 0 requests and writes no table, each answered rule set shows its table and the one never answered the object's last rules (`k_default`, §8.2), never a fallback, and the pass after playback asks for it. **Words at other frames (§7.8):** the F-curves are found through the action slot's channelbag on 4.5 and 5.1, give the words the scene has at every frame with no scene evaluation, and clamp to the hard range; a background render (`on_render_pre`) compares the words of its frame through them, and a driven input, an NLA strip and Time Stretching as the file holds them. OpenAct's code calls no `temp_override` (§5.5) |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
 | `tests/startup_blender.py` | Blender | none | On 4.5 and newer: `runtime_root()` follows the Runtime Folder preference, else the default folder; a server of another program on the port gives the port error and launches nothing until it has gone and *Start Model* runs. On older Blender, enabling the add-on fails before anything is registered (§11) |
 | `tests/e2e_blender.py` (extended) | Blender + real model | real | The existing `build` / `noaddon` / `reopen` phases, now covering all six nodes. **Game of Life acceptance:** Conway, HighLife, Seeds and Day & Night, each 18/18 exact with 0 unsure. Biome: mean confidence ≥ 0.55 with all 7 outcomes used. Sanity checks for Match, Classify and Dials; Pick's Probability field; `noaddon` with table objects and entry-level Index Switches; `reopen` sends 0 requests. TIMING lines are compared with §3.2 |
@@ -3864,8 +3803,9 @@ written, with the hashes of what it held (§14.2), so the files find their CSVs 
 1. Title card: "Words in, Geometry Nodes data out".
 2. Life from a CSV. **While playback is stopped**, switch the dropdown (the table refills in about
    1 s), press play, then stop and edit Birth in the CSV and play again. For a continuous shot
-   through all four rule sets, keyframe the dropdown and run *Prepare for Playback* first (§5.5).
-   Without it, unanswered words would show the last good rules, never a dead grid.
+   through all four rule sets, answer each while stopped, then keyframe the dropdown: the node
+   keeps up to four recent entries in its graph (§8.1), and unanswered words would show the last
+   good rules, never a dead grid (§5.5).
 3. The biome grows from habitat descriptions.
 4. Weather dials from one sentence.
 5. The clutter and material demos as quick cuts.
@@ -3895,7 +3835,7 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 | R14 | **Threading bug.** `bpy` is touched off the main thread and Blender crashes | High | Low | Strict rule: all `bpy` access on the main thread through `post()`/`pump()`. The worker holds only plain data. The fake-backend pipeline suite runs under load. Review checklist item |
 | R15 | **GPU contention** with Cycles, EEVEE or other applications: slowdowns or out-of-memory | Medium | Medium | The worker pauses during render jobs (§5.5); *Stop Model* frees VRAM; a slow-server warning (§17.3); OOM surfaces as a server error with the log |
 | R16 | **Weaker tournaments** above 16 options: conservative confidence and occasional misses | Low | Medium | Unsure flags; README recommends 16 labels or fewer per question, or a two-level split; locks |
-| R17 | **Undo and file-size growth** from large `entries` JSON | Low | Low | The 2 MB soft cap bounds warm and cold entries. **Deliberate exception:** live and pinned entries are kept above 2 MB with a size note, bounded by the 16-live-word-set over-cap error, the 12-pin limit and the 4 MB per-entry hard cap (realistic worst case about 3 MB: 12 pins of a 4096-cell table). Prepare for Playback shows the projected size first. During fills the JSON is written at most every 2 s and once at completion (§14.7) |
+| R17 | **Undo and file-size growth** from large `entries` JSON | Low | Low | The 2 MB soft cap bounds warm and cold entries. **Deliberate exception:** live entries are kept above 2 MB with a size note, bounded by the 16-live-word-set over-cap error and the 4 MB per-entry hard cap (worst case about 4 MB: 16 live contexts of a 4096-cell table). During fills the JSON is written at most every 2 s and once at completion (§14.7) |
 | R18 | **Scope creep towards agents** delays v1 | Medium | Medium | NG1. v1 ships only the hooks (§5.6), and the PR Plan contains no playback-time updates |
 | R19 | **Main-thread planning and graph-edit cost at the documented limits** (measured: RNA writes slow down as trees grow; planning 4096 cells takes about 120 ms, and a 64-setting Dials graph took 1.9 s to build, so Dials is limited to 32 settings, §8.4) | Medium | Medium | Per-element data in the table object (§8.4); bounded materialised entries (§8.1); plan cache and fingerprints (§5.3); the PR-08 contract spike; `--bench` and TIMING budgets as merge gates (§3.2, §8.7) |
 | R20 | **Mass re-asks** after an add-on upgrade (new templates), toggling a node's *Balance Option Order*, or a backend switch, silently changing saved scenes | High | Low (by design) | Words keys decide validity and ask keys only label rows (§5.4). A template bump and a toggle change each send 0 requests, asserted in `store_test` and `pipeline_blender` |
@@ -4138,7 +4078,7 @@ decided (§4.e).
 | KD4 | Every answer set is **"answer + when it applies"**. Exact facts are handled by code: `if` restrictions, and single-option cells decided without the model | Measured: descriptions raised confidence from 0.32 to 0.61, and "outcome + when" made four Game of Life rule sets exact. Offering only the applicable clauses fixed 3 wrong cells | §4.c, §4.d, §9.4 |
 | KD5 | **CSV authoring with a text/numeric split.** Python parses every column, whether the file comes from a typed path or from a plugged-in Import CSV node (KD25). Text columns go to the model and into cell keys. Numeric payload columns are **baked** into the table and exposed as output sockets. The inner group never uses Import CSV's output | Import CSV drops text columns and caches by path (verified). Baking keeps the .blend self-contained, and numeric edits never re-ask the model | §7.1, §15.3 |
 | KD6 | Rules factors are declared in a **separate Factors CSV**. Artist overrides live in an **Overrides CSV** with a `lock` column. The sidebar is inspection only | "Everything happens in Geometry Nodes and files" (4.h). Files are diffable and can vary per object through Group Input | §7.4, §7.6, §15.5, §15.7 |
-| KD7 | **Every per-element column lives in the node's hidden table object** (Object Info + Sample Index). Index Switch holds only entry-level single values. Only **materialised** entries enter the graph: live contexts, then at most 12 pinned, then warm entries up to 4, with a hard cap of 16. More live word sets than that is an error. The **stored** entries live in `entries` JSON, the single source of truth, whose `shape` suffices to rebuild without CSVs. Live and pinned entries are never evicted | Measured: graph edits cost much more as trees grow, while per-element lookup is nearly free on both paths. Value updates become `foreach_set` with a constant graph. Table size depends on live contexts, not edit history. Derived data can always be rebuilt | §8.1, §8.4, §8.5, §14.1 |
+| KD7 | **Every per-element column lives in the node's hidden table object** (Object Info + Sample Index). Index Switch holds only entry-level single values. Only **materialised** entries enter the graph: live contexts, then warm entries up to 4, with a hard cap of 16. More live word sets than that is an error. The **stored** entries live in `entries` JSON, the single source of truth, whose `shape` suffices to rebuild without CSVs. Live entries are never evicted | Measured: graph edits cost much more as trees grow, while per-element lookup is nearly free on both paths. Value updates become `foreach_set` with a constant graph. Table size depends on live contexts, not edit history. Derived data can always be rebuilt | §8.1, §8.4, §8.5, §14.1 |
 | KD8 | **Rules maths runs in nodes:** row-major cell index; bands, categories and flags mapped by node graphs; multilinear interpolation between band centres for Yes/No and Amount (at most 3 Amount factors, renormalised by `ok`); random dithering near band edges for One-of | Words in, data out (4.a). Amount answers are smooth and monotonic (measured), so interpolation removes stair steps. Dithering blends discrete outcomes honestly | §9 |
 | KD9 | **Confidence everywhere:** `abs(2p−1)` for Yes/No, top minus runner-up for One-of, and `clamp(1 − σ/σu(L), 0, 1)` for Amount (new; σu is the spread of a uniform answer). All three map "no information" to 0 and "certain" to 1. Rows below "Unsure below" (0.30) are flagged | Low confidence tracked the measured errors. Top-minus-runner-up misreads ordinal answers. Anchoring all types at the same endpoints makes one threshold meaningful. **User decision:** 0.30 by default, adjustable in the preferences, tuned later with beta feedback (follow-up F3) | §4.e, §21 F3 |
 | KD10 | **Minimum Blender 4.5 LTS**; tested on 4.5, 5.0 and 5.1 | Import CSV, Import Text, `GeometrySet`, the input nodes, Integer Math and evaluation without the add-on all require 4.5. 4.2's LTS window has closed | §11 |
@@ -4155,7 +4095,7 @@ decided (§4.e).
 | KD21 | **Trust model for opened files.** Untrusted files may read only inside their own folder tree. Trust comes from a per-file *Allow this file* (`trusted_files`) or an explicit *Trust this folder* (`trusted_folders`), and a file created in this session is trusted. Blender's *Auto Run Python Scripts* does not count: a file that reads outside its folder needs one *Allow this file* click. Appended groups inherit the host file's trust, which is a documented residual risk | OpenAct stores the words it reads in the saved file, so a crafted file could otherwise exfiltrate local text. Blender can refuse Auto Run for one file (*Trusted Source* unchecked), and an add-on can't see that refusal. Demos with their CSVs still work, and allowing one download does not trust a whole Downloads folder | §16.1 |
 | KD22 | **v1 platform matrix.** Windows 10/11 with an NVIDIA GPU of ≥ 10 GB is supported and tested. Linux with NVIDIA is best effort. There is **no CPU path** in v1: the installer refuses without an NVIDIA GPU, and at run time `auto` means CUDA only. macOS is unsupported for authoring (future work) | Every gate runs on the one tested platform. A 13 GB install that cannot meet any target is refused up front, and a model that cannot use CUDA reports an error instead of crawling on the CPU | §3.3, §5.2, §10.5 |
 | KD23 | **Main-thread discipline.** A plan cache with fingerprints; rebuilds only on shape or materialised-set changes; table-object writes throttled; budgets as merge gates | Graph edits and planning are the expensive side (measured); an unchanged scene must cost almost nothing per pass | §5.3, §8.4, §8.8 |
-| KD24 | **Playback safety.** On a node used by exactly one live context, and not in a hint or error state, a no-match falls back to that context's last-shown entry. Shared trees fall back to neutral values. *Prepare for Playback* pins the entries animated words need | Passes stay paused during playback (NG1), yet a single-object sim must not break. On shared trees, one object must never silently show another's answers while OpenAct runs. Without the add-on, `k_default` stays as saved (R6) | §5.5, §8.1, §8.2 |
+| KD24 | **Playback safety.** On a node used by exactly one live context, and not in a hint or error state, a no-match falls back to that context's last-shown entry. Shared trees fall back to neutral values | Passes stay paused during playback (NG1), yet a single-object sim must not break. On shared trees, one object must never silently show another's answers while OpenAct runs. Without the add-on, `k_default` stays as saved (R6) | §5.5, §8.1, §8.2 |
 | KD25 | **Import CSV hand-off** (user decision). A node gets its CSV from a typed path (String input) **or** from Blender's own Import CSV node plugged into the companion `<Input> CSV` Geometry socket. OpenAct traces the link (Reroutes, nested groups, Geometry selectors with static selectors) to the Import CSV node, reads its Path and Delimiter statically, and parses the file itself. A link wins over a typed path. Any other node, or a modifying node in between, is an error ("connect the Import CSV node directly") | Artists can wire CSVs the Blender way, while OpenAct keeps the text columns and always sees edits. The Import CSV geometry and path cache are never used. Limitation: the match chain can't see a traced path, so per-object files use route (a) or `Key` | §6.0, §7.7, §10.1 |
 | KD26 | **Per-node order balancing** (user decision). *Balance Option Order* (`balance_order`) is a node checkbox, default on, seeded from the global `debias` preference. It belongs to the ask key: toggling it discards nothing and sends 0 requests; new asks, and *Ask Again*, use the node's current setting | Some work doesn't need the double check, which costs 2× scored rows. Keeping it in the ask key preserves answers (KD13). Measuring accuracy with and without it is follow-up F2 | §6.0, §10.3, §14.2 |
 | KD27 | **Build orchestration** (user decision). The PR Plan is built locally by parallel worker subagents, one per PR, each in its own git worktree and branch, under an orchestrator that dispatches waves, reviews against *Tests to merge*, merges in dependency order, re-runs `tests/run_all.ps1`, and pushes `main`. Shared-resource rules: two GPU leases (one real-model run per RTX 3090, own port), a read-only runtime (`OPENACT_STATE_DIR` per worker), at most 4 headless Blenders, and tests tolerant of shared GPUs | Parallel waves shorten the build to about the critical path, while `origin/main` stays green and shared resources are never corrupted | §20.6 |
@@ -4227,7 +4167,7 @@ it, with the same dependencies.
 | PR-20 | Dials node | M | PR-14, PR-15 | PR-16 … PR-19 | — |
 | PR-21 | Overrides CSV: locks and export (all six nodes) | M | PR-16, PR-17, PR-19, PR-20 | — | — |
 | PR-22 | Node status, sidebar inspection, Show Question | M | PR-07, PR-21 | — | — |
-| PR-23 | Templates, diagnostics, logs, alerts, playback prep, unpin, server sharing | XL | PR-22 | — | a: templates, diagnostics, JSONL log, alerts, server sharing · b: Prepare for Playback (read sets, channelbag F-curve path, NLA/driver fallback), pins, unpin |
+| PR-23 | Templates, diagnostics, logs, alerts, server sharing | XL | PR-22 | — | a: templates, diagnostics, JSONL log, alerts · b: server sharing |
 | PR-25 | Demo scenes | L | PR-23 | — | a: `life` and `biome` · b: the other four demos, and the no-add-on render check |
 | PR-26 | **Release 1.0.0** | S | PR-07, PR-25 | — | — |
 
@@ -4351,16 +4291,16 @@ flowchart LR
   - `NodeStore` and its entry dataclasses, with columnar rows (§14.2), plus `load(node)` /
     `save(node, store, live_gns=None)`.
   - The reading rules of §14.4.
-  - The 2 MB soft cap (evicts least recently used **warm and cold** entries only; keeps live and
-    pinned entries, even above 2 MB, with a size note) and the 4 MB per-entry hard cap (§14.7).
+  - The 2 MB soft cap (evicts least recently used **warm and cold** entries only; keeps live
+    entries, even above 2 MB, with a size note) and the 4 MB per-entry hard cap (§14.7).
   - `save(node, store, live_gns=None)` (§13.3): live entries are identified by the `gn` tuples the
     caller passes, because "live" is not saved. **`None`, the default, means "unknown" and evicts
     nothing**, so operators that edit entries can never evict live ones by accident. PR-08 wires
     the pass, the only caller that passes a live set, to fill `live_gns` from its current contexts.
   - The store is not wired into the engine yet (PR-08).
 - **Tests to merge:** `tests/store_test.py` under CPython and inside Blender 4.5 and 5.1. It
-  includes the precedence case: a store whose live and pinned entries alone exceed 2 MB keeps all
-  of them, evicts every warm and cold entry, and reports the size. The test passes the live set
+  includes the precedence case: a store whose live entries alone exceed 2 MB keeps all of them,
+  evicts every warm and cold entry, and reports the size. The test passes the live set
   **explicitly** as `live_gns`, because the store is not wired to the pass until PR-08. A second
   case saves the same over-limit store with `live_gns=None` and asserts that **nothing** is
   evicted.
@@ -4611,7 +4551,7 @@ flowchart LR
   - The **table object** `.OpenAct Table <uid>`: a mesh with `oa_*` POINT attributes, written by
     `write_rows()` (`foreach_set`, at most every 0.5 s during a fill).
   - Every per-element column is read through Object Info + Sample Index, with the §6.0 fallbacks.
-  - **Materialised set:** live entries, then pinned, then warm up to 4 in total, with the hard cap
+  - **Materialised set:** live entries, then warm up to 4 in total, with the hard cap
     `MATERIALISED_MAX = 16` (§8.1), confirmed by the PR-08 spike (§8.4).
   - **`k_default`** (§8.2): set only when exactly one context is live and the node is not in a hint
     or error state, otherwise 0.
@@ -4974,7 +4914,7 @@ flowchart LR
       backend's `--record` log shows for that row.
   - A manual screenshot checklist in the PR, on 4.5 and 5.1.
 
-### PR-23: Templates, diagnostics, logs, alerts, playback prep, unpin, server sharing
+### PR-23: Templates, diagnostics, logs, alerts, server sharing
 - **Files/components:**
   - `openact/templates/` (`life_factors.csv`, `life_outcomes.csv`, `labels.csv`, `items.csv`,
     `weather_dials.csv`);
@@ -4985,46 +4925,13 @@ flowchart LR
     - the JSONL request log and crash-loop protection;
     - **server sharing**: `<runtime>/server-<port>.token` (mode 0600 on POSIX), and a second Blender
       attaching through it (§10.5). Moved here from PR-10 to keep PR-10 within one session;
-  - `openact/engine.py` (stalled-fill and slow-server alerts; **Prepare for Playback** and entry
-    pinning, §5.5 and §8.1);
-  - `openact/evaluator.py` (the **read set** and value overrides used by the F-curve path, §5.5);
-  - `openact/ops.py` (`openact.prepare_playback`, modal only for the driver fallback;
-    `openact.unpin`, per entry or all). Both save with `live_gns=None` (no eviction, §13.3), and
-    the next pass applies the limits;
-  - `openact/ui.py` (the *Unpin* / *Unpin All* buttons);
-  - `openact/blender_manifest.toml` (the `clipboard` permission, §13.5);
-  - `tests/pipeline_blender.py`.
+  - `openact/engine.py` (stalled-fill and slow-server alerts);
+  - `openact/blender_manifest.toml` (the `clipboard` permission, §13.5).
 - **Depends on:** PR-22. **Parallel with:** none.
-- **Changes:** §7.10, §16.3, §17.4–§17.6, plus the `clipboard` permission and Prepare for
-  Playback (§5.5):
-  - the F-curve path through `animation_data.action` + `action_slot` and
-    `anim_utils.action_get_channelbag_for_slot()` (4.5–5.1);
-  - the `frame_set` fallback (modal, progress, Esc) for drivers, NLA tracks, tweak mode and
-    blended actions;
-  - the current frame restored afterwards;
-  - pins saved as `pinned: true` with `frames`, at most 12, and live plus pinned at most 16;
-  - refusal on overflow with nothing asked;
-  - `openact.unpin`.
+- **Changes:** §7.10, §16.3, §17.4–§17.6, plus the `clipboard` permission.
 - **Tests to merge:**
   - `blender --command extension validate` passes with the `clipboard` permission.
-  - pipeline:
-    - a keyframed Menu Switch cycling through three Outcomes CSVs: after Prepare for Playback, 0
-      requests and no fallback outputs during playback;
-    - over a **250-frame range**, the F-curve path finishes in < 1 s with no scene evaluation;
-    - a driven input uses the modal fallback, which can be cancelled with nothing pinned, and the
-      current frame is restored;
-    - an **NLA-animated** input (a strip on an NLA track) takes the fallback path, and pins the
-      right word tuples;
-    - on 4.5 **and** 5.1, a keyframed Int modifier input is read through the channelbag API
-      (`Action.fcurves` is absent on 5.x), and `evaluate()` returns the keyed values;
-    - 13 distinct word sets are refused with the limit message, and nothing is asked;
-    - pins survive save and reload (`pinned: true`), and `openact.unpin` removes them;
-    - **pin order**: after pinning 12 word sets, adding objects until live plus pinned exceeds 16
-      makes the pins whose tuples start latest in the frame range go inactive, the same ones on
-      every run;
-    - pins whose total size exceeds 2 MB are kept, the size note appears, and Prepare for Playback
-      showed the projected size first (§14.7).
-  - `tests/support_blender.py` (new, so it doesn't meet the playback work in pipeline):
+  - `tests/support_blender.py` (new):
     - two Blender processes share one server through the token file, and the second attaches
       without loading a second model; its Stop Model only detaches;
     - a template copy never overwrites (it creates `name 2.csv`) and fills an empty, unlinked

@@ -13,9 +13,9 @@ The one geometry link followed is a CSV socket's, by trace_csv_source(), and onl
 and Delimiter of the Import CSV node at its end. Import CSV and Import Text Paths resolve as Geometry
 Nodes resolves them (import_path()), and Import Text obeys the file trust rule (trust.py).
 
-For Prepare for Playback (§5.5), the values animation can change (modifier inputs, socket defaults, the
-Integer and Boolean nodes) are recorded in READS, and OVERRIDES replaces them, e.g. by their F-curves'
-values at another frame.
+For the words at other frames (engine.FrameWords), which a background render compares with the saved
+tables (§7.8), the values animation can change (modifier inputs, socket defaults, the Integer and
+Boolean nodes) are recorded in READS, and OVERRIDES replaces them by their F-curves' values there.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from .csvfmt import CsvSource
 MAX_CONTEXTS = 64
 MAX_DEPTH = 64
 MEMO = None  # (output socket pointer, Ctx.key()) -> (value, depth read at) during engine.run_pass(); else None
-READS = None  # while Prepare for Playback reads words: (ID pointer, data path) -> (struct, name, custom, value) read
-OVERRIDES = None  # while Prepare for Playback reads words: (ID pointer, data path) -> the value read instead
+READS = None  # while words are read at other frames: (ID pointer, data path) -> (struct, name, custom, value) read
+OVERRIDES = None  # while words are read at another frame: (ID pointer, data path) -> the value read instead
 
 
 class Unresolvable(Exception):

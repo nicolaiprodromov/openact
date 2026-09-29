@@ -1,9 +1,8 @@
 """The sidebar (Geometry Node editor > N > OpenAct) and the preferences panel (§17.2): banners, the Model box, the
-active node's status, contexts, table and pins, and the files it reads. Inspection only: every change goes through a
-file, a socket or an operator.
+active node's status, contexts and table, and the files it reads. Inspection only: every change goes through a file,
+a socket or an operator.
 
-status_rows(), table_rows(), table_page(), pin_rows() and banners() are plain data, so the tests check them without
-drawing.
+status_rows(), table_rows(), table_page() and banners() are plain data, so the tests check them without drawing.
 Drawing plans and writes nothing: Blender refuses changes to nodes and data while it draws.
 """
 
@@ -110,18 +109,6 @@ def table_page(rows, page=0):
         icon = ROW_ICONS.get(source, 'QUESTION' if unsure else 'BLANK1')
         lines.append((name, answer, confidence, icon, source not in ("stale", "pending")))
     return lines, page, pages
-
-
-def pin_rows(pins) -> list[tuple[str, str]]:
-    """(words key, text) of each pinned entry (NodeStatus.pins, in pin order): the frames its words occur at, and the
-    words that tell it from the node's other pins, a CSV path by its file name."""
-    varying = [j for j in range(len(pins[0].gn) if pins else 0) if len({entry.gn[j] for entry in pins}) > 1]
-    rows = []
-    for entry in pins:
-        words = [os.path.basename(word) if lists.is_csv_path(word) else word
-                 for j, word in enumerate(entry.gn) if word and (j in varying or not varying)]
-        rows.append((entry.words_key, f"Frames {engine.frames_text(entry.frames)}: {' · '.join(words)}"))
-    return rows
 
 
 def banners(state, message, probe="", blocked=0, notes=(), over=()) -> list[tuple]:
@@ -322,23 +309,6 @@ def draw_table(layout, context, node, uses, index):
         op.uid, op.context_index, op.row = node.uid, index, page * PAGE_ROWS + i
 
 
-def draw_pins(layout, node):
-    """The node's pinned entries (§5.5), each with Unpin, and Unpin All."""
-    status = engine.STATUS.get(node.uid)
-    rows = pin_rows(status.pins) if status is not None else []
-    if not rows:
-        return
-    box = layout.box()
-    head = box.row(align=True)
-    head.label(text=f"Pinned for playback: {len(rows)}", icon='PINNED')
-    head.operator("openact.unpin", text="Unpin All", icon='UNPINNED').uid = node.uid
-    for key, text in rows:
-        row = box.row(align=True)
-        row.label(text=text, icon='BLANK1')
-        op = row.operator("openact.unpin", text="", icon='UNPINNED')
-        op.uid, op.words_key = node.uid, key
-
-
 def draw_files(layout, node):
     """The files the node reads (§7.10): New CSV from Template where one of the node's inputs has a starter file, then
     each file's path, rows, text and payload columns, when read, the Import CSV note, and up to FILE_PROBLEMS problems,
@@ -411,23 +381,6 @@ class NODE_PT_openact(bpy.types.Panel):
             if banner[0] not in SERVER_BANNERS:
                 draw_banner(layout.box(), banner)
         draw_server(layout, next((banner for banner in found if banner[0] in SERVER_BANNERS), None))
-        if engine.STATUS:  # the file has OpenAct nodes
-            col = layout.column(align=True)
-            col.operator("openact.prepare_playback", icon='PLAY')
-            waiting, held = engine.pinning(), engine.held()
-            if waiting:
-                sets = f"{waiting} word set{'s' if waiting != 1 else ''}"
-                wrap(col, f"{sets} answered: {held}" if held else f"Pinning {sets} once the model has answered them",
-                     icon='SORTTIME')
-                col.operator("openact.cancel_playback", icon='CANCEL')
-            if engine.PLAYBACK_NOTE:
-                wrap(col, engine.PLAYBACK_NOTE, icon='INFO')
-            for flag in dict.fromkeys(filter(None, (engine.rebake(uid, status.pins)
-                                                    for uid, status in engine.STATUS.items()))):
-                wrap(col, flag, icon='ERROR')
-            pinned = sum(len(status.pins) for status in engine.STATUS.values())  # as the entries hold them
-            if pinned:
-                col.label(text=f"{pinned} word set{'s' if pinned != 1 else ''} pinned for playback", icon='PINNED')
         if _active(context) is None:
             col = layout.column(align=True)
             col.label(text="Add nodes with Shift A > OpenAct", icon='INFO')
@@ -450,7 +403,6 @@ class NODE_PT_openact_node(bpy.types.Panel):
         node = _active(context)
         self.layout.label(text=node.name, icon='NODE')
         node.draw_buttons_ext(context, self.layout)
-        draw_pins(self.layout, node)
 
 
 class NODE_PT_openact_files(bpy.types.Panel):

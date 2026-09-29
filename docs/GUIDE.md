@@ -106,9 +106,9 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
   **Write Overrides CSV**; and the *Files* panel: each CSV the node reads, with its columns and problems, *Open File*
   and *New CSV from Template*. The sidebar never edits answers: to change one, change its words, or lock it in the
   Overrides CSV.
-- **Animated words.** OpenAct asks nothing during playback or rendering. When words change over the frame range (a
-  keyframed dropdown, say), run **Prepare for Playback** in the sidebar first: it answers every set of words the
-  frames show and pins those answers in the file. *Unpin* in the node's panel releases them.
+- **Animated words.** OpenAct asks nothing during playback or rendering. Words that change over the frame range (a
+  keyframed dropdown, say) and have no answer yet show the object's last answers, or neutral values on a tree several
+  objects share, until playback stops; then they are asked.
 
 ## CSV files
 
