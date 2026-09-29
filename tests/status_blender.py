@@ -11,6 +11,8 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
   context's CSV is missing, and one with a table so far sums it up, its pending rows with no answer, also while the
   contexts disagree; a Pick of material slots before its first answer says "Asking...", with no top items; a failed
   cell is in error in the table, the counts and Show Question, and not asked again;
+- Pick's unsure count, whose confidence is the pick's: a pick the model made below Unsure Below is one unsure answer,
+  one at it none; the stale pick shown while new words are asked, and a table so far with no answer yet, count none;
 - the Model box's queue: the chunks waiting in each class and the cells in flight;
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
   trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
@@ -533,6 +535,48 @@ def phase_slots():
           and ui.table_rows(engine.SPECS[pick.bl_idname], job, entry) == [
               ("Steel", "", None, "pending"), ("Gold", "", None, "pending"), (ui.EMPTY_SLOT, "", None, "code")],
           (got, log))
+    check("slots: that table so far counts no unsure answer, although its Confidence, the fallback's 0, is below "
+          "Unsure Below: it is no answer yet", entry is not None and entry.single["Confidence"] < P.UNSURE_BELOW
+          and got.unsure == 0 and ('BLANK1', "3 rows: 2 pending, 1 by code") in ui.status_rows(got),
+          (got.unsure, ui.status_rows(got)))
+    bpy.data.node_groups.remove(tree)
+    bpy.data.objects.remove(obj)
+    engine.run_pass()
+
+
+def phase_unsure():
+    """Pick keeps its confidence in single(), the pick's, not in a row's c column (4.e): a pick the model made below
+    Unsure Below is one unsure answer of the status record. The stale pick a table so far shows while new words are
+    asked is no answer (§5.4)."""
+    tree = new_tree("Unsure")
+    pick = tree.nodes.new(engine.PICK_ID)
+    pick.inputs["Prompt"].default_value = "something to read"
+    pick.inputs["Items"].default_value = "a novel, a spoon, a letter"
+    obj = user("Reader", tree)
+    engine.schedule(immediate=True)
+    done, _seen = settle(lambda: state(pick) == "complete", 60)
+    confidence = status(pick).uses[0][2].single["Confidence"]
+    counted = []
+    try:
+        for below in (confidence + 1e-6, confidence):  # a confidence below the threshold is unsure, one at it is not
+            P._Defaults.unsure_below = below
+            engine.run_pass()
+            counted.append((status(pick).unsure, ui.status_rows(status(pick))[1]))
+        P._Defaults.unsure_below = 1.0  # every model answer below it but a certain one
+        pick.inputs["Context"].default_value = "In a library."  # new words: the old pick shows, stale, while asked
+        engine.run_pass()  # asks the new words' cell; no tick, so no answer arrives meanwhile
+        stale = status(pick)
+        entry = stale.uses[0][2]
+    finally:
+        P._Defaults.unsure_below = P.UNSURE_BELOW
+    check("unsure: a Pick the model answered counts one unsure answer while its confidence, its table's, is below "
+          "Unsure Below, and none at it; the record's counts line says so",
+          done and 0 < confidence < 1 and counted == [(1, ('BLANK1', "3 rows: 3 answered, 1 unsure")),
+                                                       (0, ('BLANK1', "3 rows: 3 answered"))], (confidence, counted))
+    check("unsure: while its new words are asked, the stale pick it shows is no answer: no unsure answer, even below "
+          "a threshold of 1", entry is not None and entry.rows.src == "sss" and entry.single["Confidence"] < 1.0
+          and (stale.stale, stale.unsure) == (3, 0), (entry and entry.rows.src, stale.stale, stale.unsure))
+    settle(lambda: state(pick) == "complete", 30)
     bpy.data.node_groups.remove(tree)
     bpy.data.objects.remove(obj)
     engine.run_pass()
@@ -985,6 +1029,7 @@ try:
     phase_held()
     phase_failed()
     phase_slots()
+    phase_unsure()
     lines_tree, warned_node, answers_csv = phase_lines()
     phase_crowd()
     phase_banners()

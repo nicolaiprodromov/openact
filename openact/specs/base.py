@@ -426,6 +426,12 @@ class Spec:
         """The answer in a few words, for the status line and the sidebar."""
         raise NotImplementedError
 
+    def unsure(self, entry) -> int:
+        """How many of the entry's answers are unsure (4.e): its model rows below unsure_below(). A pending or stale
+        row of a table so far is no answer (§5.4)."""
+        below = unsure_below()
+        return sum(src == "m" and c < below for src, c in zip(entry.rows.src, entry.rows.v.get("c") or ()))
+
     def node_warnings(self, node) -> tuple[str, ...]:
         """Warnings about the node itself once it is built, for its status."""
         return ()

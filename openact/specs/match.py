@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .. import pipeline
 from ..csvfmt import _n
-from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, unsure_below, warnings
+from .base import KEY, Spec, confidence, lock_answer, number_text, overrides_inputs, warnings
 
 ROW_LIMIT = 8192  # estimated scored rows per context, sum(cell.cost): refused above, before anything is sent (§5.4)
 
@@ -76,11 +76,6 @@ class PerItemSpec(Spec):
     def offered(self, entry, column):
         """(name, value) of the rows that are items, without empty material slots."""
         return [(name, value) for name, value in zip(entry.rows.name, entry.rows.v[column]) if name]
-
-    def unsure(self, entry) -> int:
-        """Model rows below unsure_below(): a pending or stale row of a table so far is no answer (§5.4)."""
-        below = unsure_below()
-        return sum(src == "m" and c < below for src, c in zip(entry.rows.src, entry.rows.v["c"]))
 
 
 class MatchSpec(PerItemSpec):

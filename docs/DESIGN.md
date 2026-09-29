@@ -456,7 +456,9 @@ therefore means "close to no information" for every answer type.
 A row with *c* below the **Unsure below** preference (default 0.30) is flagged in three places:
 the node's status line ("· 3 unsure"), marked rows in the sidebar, and `unsure=1` in an exported
 Overrides CSV. Confidence is also a node output (a single value or a field), so artists can show
-it or gate on it in Geometry Nodes.
+it or gate on it in Geometry Nodes. Pick's confidence is its table's, the pick's, not a row's: a
+pick the model made below the threshold counts as one unsure answer in the node's status (§17.1),
+and a table so far, pending or stale, counts none (§5.4).
 
 ### 4.f The model drafts, the artist decides
 Tables are visible: the sidebar inspects them, and they can be exported to the node's

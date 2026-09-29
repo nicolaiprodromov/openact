@@ -36,7 +36,7 @@ from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses, is_field
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
-from .specs.base import orphaned, unsure_below
+from .specs.base import orphaned
 from .specs.pick import PickSpec
 from .watch import WATCH
 
@@ -541,7 +541,7 @@ def _process(tree, node, contexts):
         state, text, eta_s=eta, contexts=len(live), uses=[(label, job, resolved.get(job.gn)) for label, job in uses],
         problems=[_problem(ERROR, fault) for fault in faults] + [_problem(WARNING, w) for w in warnings]
         + [_problem(INFO, note) for note in (NOTES.get(node.uid), *DRIFT.get(node.uid, {}).values()) if note],
-        asking=frozenset(sent), **_counts(jobs, resolved, asked))
+        asking=frozenset(sent), **_counts(spec, jobs, resolved, asked))
     return changed
 
 
@@ -722,20 +722,19 @@ def _filling(uid):
     return f"Filling {done}/{total} · {left}", eta
 
 
-def _counts(jobs, resolved, asked):
-    """The row counts of the node's tables (§17.1): by the source of each row of the entry a table shows, else of its
-    plan's rows, whose cells are asked (pending), failed (errors) or answered this session."""
+def _counts(spec, jobs, resolved, asked):
+    """The row counts of the node's tables (§17.1): by the source of each row of the entry a table shows, with its
+    unsure answers (spec.unsure()), else of its plan's rows, whose cells are asked (pending), failed (errors) or
+    answered this session."""
     counts = dict.fromkeys(("rows", "answered", "pending", "stale", "unsure", "locked", "code", "errors"), 0)
     letters = {"m": "answered", "p": "pending", "s": "stale", "l": "locked", "c": "code", "e": "errors"}
-    below = unsure_below()
     for gn, (job, _ctx) in jobs.items():
         counts["rows"] += len(job.rows)
         entry = resolved.get(gn)
         if entry is not None:
             for letter in entry.rows.src:
                 counts[letters.get(letter, "answered")] += 1
-            confidences = entry.rows.v.get("c") or ()
-            counts["unsure"] += sum(src == "m" and c < below for src, c in zip(entry.rows.src, confidences))
+            counts["unsure"] += spec.unsure(entry)
             continue
         for row in job.rows:
             if row.cell is None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from .. import pipeline
-from .base import KEY, Spec, confidence, named, option_text, overrides_inputs, state_text, warnings
+from .base import KEY, Spec, confidence, named, option_text, overrides_inputs, state_text, unsure_below, warnings
 
 PICK_STATE = "Choose one of the listed items."
 
@@ -158,6 +158,12 @@ class PickSpec(Spec):
     def summary(self, entry):
         p = entry.rows.v["prob"][entry.single["Index"]]
         return f"{entry.single['Item']}  ({p * 100:.0f}%)"
+
+    def unsure(self, entry):
+        """1 when the model's pick is below unsure_below(): Pick's confidence is its table's (single()), not a row's
+        (4.e). The pick of a table so far, pending or stale, is no answer (§5.4), nor is a lock's or code's."""
+        index = entry.single["Index"]
+        return int(index >= 0 and entry.rows.src[index] == "m" and entry.single["Confidence"] < unsure_below())
 
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy
