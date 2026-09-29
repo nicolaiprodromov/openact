@@ -11,6 +11,7 @@ Pure Python (no bpy): the pure suites check it against hashes that Blender compu
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 MARK = "OpenAct"  # the first word of every message an inner group reports
@@ -71,7 +72,8 @@ def _rotate(x, k):
     return ((x << k) | (x >> (32 - k))) & _M
 
 
-def key(words) -> int:
+@functools.lru_cache(maxsize=8192)  # every pass keys each stored entry, up to 1024 per node, in pure Python
+def key(words: tuple[str, ...]) -> int:
     """The key of a word tuple, as the inner group's Hash Value computes it (§8.2)."""
     return blender_hash(key_text(words))
 

@@ -191,8 +191,11 @@ def phase_cell_index():
     bad = [(combo, g, e) for combo, g, e in zip(combos, got["Outcome"], expected) if g != e]
     check(f"cell index: every combination of {len(job.rows)} cells, invalid category values and clamped amounts "
           f"({len(combos)} points) equal rules_core.cell_of", not bad and len(set(expected)) == 163, bad[:3])
-    check("cell index: the non-contiguous map sits in the table after every cell row",
-          rc.category_map(factors[1]) is not None and entry.shape["rows"] == 162)
+    levels, heads = rc.category_map(factors[1]), tables.read(rules, tables.HEAD).tolist()
+    check("cell index: the non-contiguous map sits right after the table's meta row, before the entry's header row and "
+          "its 162 cell rows", levels is not None and entry.shape["rows"] == 162
+          and tables.read(rules, "map").tolist()[1:1 + len(levels)] == list(levels)
+          and heads.index(True) == 1 + len(levels) and len(heads) == 1 + len(levels) + 1 + 162, heads.index(True))
     confidences = {round(c, 6) for c, e in zip(got["Confidence"], expected) if e >= 0}
     check("cell index: Confidence reads the cell's c, 0 where the cell is invalid",
           confidences == {0.5} and all(c == 0.0 for c, e in zip(got["Confidence"], expected) if e < 0))

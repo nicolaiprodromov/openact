@@ -1,22 +1,22 @@
-"""The hidden node group inside every OpenAct node, `.OpenAct <Node> <uid>`.
+"""The hidden node group inside every OpenAct node, `.OpenAct <Node> <uid>`, and the rows of its table object.
 
 It is derived data: build() regenerates it, and the node's table object (tables.py), from the node's
-stored entries (store.py) at any time. Only the materialised entries (§8.1) are laid out. Geometry
-Nodes selects the entry whose words equal the node's live inputs (the joined-key match chain, §8.2),
-reads that entry's single values from Index Switches, and its per-element rows from the table object
-at base + ID (§8.3), so one tree answers every context that uses it, with no Python at evaluation.
-Every group passes its Geometry input to its Geometry output unchanged (§6.0), and reports its uid,
-Trigger and live words through one Warning node (§5.7). The interface is never cleared:
-sync_interface() diffs it, so the links from the outer tree survive every rebuild.
+stored entries (store.py) at any time. The table object holds every stored entry (§8.1): a meta row,
+then one block per entry, its header row and its element rows (§8.5). Geometry Nodes finds the entry
+of the node's live words by their hash, Hash Value of the key text, among the header rows (Attribute
+Statistic, §8.2), reads its single values at that row (§8.6) and its per-element rows after it
+(§8.3), so one tree answers every context that uses it, with no Python at evaluation. A new entry
+is new rows, never a graph edit: the graph depends only on the layout (_built(), §8.8). Every group
+passes its Geometry input to its Geometry output unchanged (§6.0), and reports its uid, Trigger and
+live words through one Warning node (§5.7). The interface is never cleared: sync_interface() diffs
+it, so the links from the outer tree survive every rebuild.
 """
 
 from __future__ import annotations
 
+import array
 import hashlib
-import itertools
 import json
-import math
-import struct
 from dataclasses import dataclass
 
 import bpy
@@ -26,33 +26,35 @@ from . import store as _store  # build() and update_values() take `store`, the n
 from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
-BUILT = "openact_built"  # ID property of the group: what build() laid out, for update_values()
-LAYOUT = 3  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
-SEP = "\x1f"  # joins a word tuple into one key (§8.2)
+BUILT = "openact_built"  # ID property of the group: the layout build() laid out (_built()), for update_values()
+LAYOUT = 4  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
 UNLINKED = -2**31 + 1  # an unlinked ID's hidden value, read as the index (_Builder.ident()); no float converts to it
-MATERIALISED_MAX = 16  # entries in the graph and table object, pinned included (§8.1)
-WARM_TOTAL = 4  # warm entries are materialised only while the total is below this
-ROW_BUDGET = 16 * 4096  # flat rows warm entries may bring the table object to
-K_DEFAULT = "OpenAct k_default"  # the chain's innermost Switch: its False value is what a no-match shows
-BASE, COUNT = "OpenAct base", "OpenAct count"  # Index Switches: each entry's first flat row, its row count
 GEOMETRY = "Geometry"  # the input and output every node passes its geometry through (§6.0)
 TRIGGER = "Trigger"  # the input whose state the Warning reports (§5.7)
 UID = "OpenAct uid"  # the String node holding the uid the Warning reports: update_values() rewrites it for a copy
 GATES = {'VALUE': 'FLOAT', 'INT': 'INT', 'BOOLEAN': 'BOOLEAN', 'STRING': 'STRING', 'GEOMETRY': 'GEOMETRY',
          'MATERIAL': 'MATERIAL'}  # output socket type -> the input_type of the Switch it is read through (gate())
+_PACK = {'FLOAT': 'd', 'INT': 'q', 'BOOLEAN': 'B'}  # array codes the rows are digested with (_digest())
+_CAST = {'FLOAT': float, 'INT': int, 'BOOLEAN': bool}
 
 
 @dataclass(frozen=True)
 class Column:
-    """A per-element output, read from the node's table object at base + ID (§8.3). A spec lists its columns
-    in the optional `per_element` attribute (a tuple, or a callable taking the node); the default is none."""
+    """A column of the node's table object (§8.5). A spec lists its per-element columns, read at row + 1 + ID (§8.3),
+    in the optional `per_element` attribute, and its single values, read at the entry's header row (§8.6), in the
+    optional `single_values` attribute: each a tuple, or a callable taking the node; the default is none."""
 
-    output: str  # the group output it feeds, e.g. "Probability"; "" writes the table only (Rules reads it)
-    name: str  # the entries' rows.v column, stored as the attribute "oa_<name>"
+    output: str  # the group output it feeds, e.g. "Probability"; "" writes the table only (the spec reads it)
+    name: str  # stored as the attribute "oa_<name>"; per element, the entries' rows.v column of that name
     data_type: str  # 'FLOAT', 'INT' or 'BOOLEAN'
-    fallback: object  # §6.0: 0.0, -1 or False, for invalid IDs and unanswered contexts
-    linked_only: bool = False  # built only while the output is linked, else the node holds no table (Pick)
+    fallback: object  # §6.0: 0.0, -1 or False, for invalid IDs, unanswered contexts and the rows that don't use it
+    linked_only: bool = False  # per element, built only while the output is linked (Pick's Probability)
     payload: bool = False  # read from rows.payload[output], a baked CSV column (§14.2), instead of rows.v[name]
+
+
+RESERVED = (Column("", tables.DEFAULT, 'INT', -1), Column("", tables.HEAD, 'BOOLEAN', False),
+            Column("", tables.KEY, 'INT', 0), Column("", tables.COUNT, 'INT', 0))  # every table's own columns (§8.5)
+LEAD = 1  # the row after the meta row (point 0), where a spec's lead rows start: Rules' category maps (§9.2)
 
 
 @dataclass(frozen=True)
@@ -89,19 +91,20 @@ class _Builder:
     """Adds nodes and links to an inner group. finish() writes every location in one batched call,
     because each single write costs up to a few milliseconds once the tree is large."""
 
-    def __init__(self, tree, default=0, per_word=False):
+    def __init__(self, tree):
         self.tree = tree
         self.locations = {}  # node pointer -> (x, y)
-        self.default = default  # k_default: what the match chain yields when no entry matches (§8.2)
-        self.per_word = per_word  # a word contains SEP: compare word by word
-        self.key = None  # the key text of the live words (key_text()), which the Warning reports
-        self.k = None  # the match chain's output, which the per-element lookup reads
+        self.key = None  # the key text of the live words (key_text()): the Warning reports it, find() hashes it
+        self.row = None  # the header row of the entry the live words find, -1 for none (find())
+        self.found = None  # row >= 0: the single values read the entry, else their fallbacks
         self.after_elements = []  # a spec's callables (valid, {output: value}), run once per_element() built them
-        self.node = None  # the OpenAct node, for a spec that samples its own table object (entry_table, below)
-        self.table = None  # the node's table object, when it has one (build() sets it)
+        self.node = None  # the OpenAct node (build() sets it), for a spec that reads its own sockets or outputs
+        self.table = None  # the node's table object (build() sets it)
         self.index = None  # what per_element() reads at: None for the ID input; Rules sets its cell index
         self._info = None  # the group's one Object Info, table_geometry()
         self._ident = None  # the ID as the lookups read it, ident()
+        self._first = None  # row + 1, the entry's first element row, first()
+        self._count = None  # its element rows, count()
 
     def new(self, idname, x, y):
         node = self.tree.nodes.new(idname)
@@ -122,14 +125,14 @@ class _Builder:
 
     def words(self, gi, names):
         """The Group Input sockets of the node's word tuple, in order, None where the interface has no such
-        String socket (e.g. Items under a Collection source): match_chain() joins those as "" (§8.2)."""
+        String socket (e.g. Items under a Collection source): key_text() reads those as "" (§8.2)."""
         return [next((s for s in gi.outputs if s.name == name and s.type == 'STRING'), None) for name in names]
 
     def key_text(self, sockets):
         """The key text of the live words, words.key_text() in Geometry Nodes (§5.7): per word, its length in code
         points (String Length, then Value to String INT), ":" and the word, all joined in one Join Strings. A word
-        the node has no socket for (None) is "", the constant "0:", as the match chain treats it (§8.2); a word
-        socket a dropdown removes before the next rebuild leaves its length 0 and ":", so it reads "" too. Kept as
+        the node has no socket for (None) is "", the constant "0:", as spec.gn() reads it (§8.2); a word socket a
+        dropdown removes before the next rebuild leaves its length 0 and ":", so it reads "" too. Kept as
         self.key."""
         key = self.new("GeometryNodeStringJoin", -250, 700)
         key.hide = True
@@ -191,64 +194,68 @@ class _Builder:
                 self.link(socket.links[0].from_socket, sock(switch.inputs, "True"))
             self.link(switch.outputs[0], socket)
 
-    def match_chain(self, sockets, keys):
-        """Integer socket k: 1 + index of the entry whose words equal the live words, else k_default; None
-        when no entry can match. `sockets` has one item per word position, None for an absent socket (§8.2).
-        A key of another length (saved before the fixed word tuples) never matches: its words sit at other
-        positions."""
-        keys = [tuple(key) for key in keys]
-        self.k = None
-        if not any(len(key) == len(sockets) for key in keys):
-            return None
-        sockets = [self._empty(j) if s is None else s for j, s in enumerate(sockets)]
-        if self.per_word:
-            joined = None
-        else:
-            join = self.new("GeometryNodeStringJoin", -760, 400)
-            join.hide = True
-            join.inputs["Delimiter"].default_value = SEP
-            for socket in reversed(sockets):  # Join Strings puts the most recently linked item first
-                self.link(socket, join.inputs["Strings"])
-            joined = join.outputs[0]
-        for i, key in enumerate(keys, start=1):
-            if len(key) != len(sockets):
-                continue
-            y = 400 - i * 110
-            pairs = list(zip(sockets, key)) if joined is None else [(joined, SEP.join(key))]
-            conditions = []
-            for j, (socket, value) in enumerate(pairs):
-                compare = self.new("FunctionNodeCompare", -600 + j * 40, y - j * 40)
-                compare.data_type = 'STRING'
-                compare.operation = 'EQUAL'
-                compare.hide = True
-                self.link(socket, sock(compare.inputs, "A_STR"))
-                sock(compare.inputs, "B_STR").default_value = value
-                conditions.append(compare.outputs[0])
-            condition = conditions[0]
-            for other in conditions[1:]:
-                both = self.new("FunctionNodeBooleanMath", -380, y)
-                both.operation = 'AND'
-                both.hide = True
-                self.link(condition, both.inputs[0])
-                self.link(other, both.inputs[1])
-                condition = both.outputs[0]
-            switch = self.new("GeometryNodeSwitch", -200, y)
-            switch.input_type = 'INT'
-            switch.hide = True
-            self.link(condition, sock(switch.inputs, "Switch"))
-            if self.k is None:
-                switch.name = K_DEFAULT  # update_values() rewrites its False value
-                sock(switch.inputs, "False").default_value = self.default
-            else:
-                self.link(self.k, sock(switch.inputs, "False"))
-            sock(switch.inputs, "True").default_value = i
-            self.k = switch.outputs[0]
-        return self.k
+    def find(self):
+        """The header row of the entry whose words are the live words (§8.2). The key, Hash Value (String) of the key
+        text, selects the header rows that hold it (oa_head AND oa_key == key), and Attribute Statistic's Max of
+        index + 1 over them is 1 + that row, 0 when there is none: then the row is the default at point 0
+        (oa_default, -1 for none). Sets self.row, and self.found = row >= 0. The table object has no row for new words
+        until their entry is written, and a written entry is rows only: the graph never changes for it."""
+        geometry = self.table_geometry()
+        hashed = self.new("FunctionNodeHashValue", -250, 300)
+        hashed.data_type = 'STRING'
+        self.link(self.key, _enabled(hashed.inputs, "Value"))
+        same = self._compare('EQUAL', self.attribute(tables.KEY, 'INT', -250, 200), hashed.outputs["Hash"], -50, 250)
+        chosen = self._and(self.attribute(tables.HEAD, 'BOOLEAN', -250, 100), same, 100, 200)
+        plus = self.new("ShaderNodeMath", -50, 50)  # index + 1: exact in a float below 2**24 rows
+        plus.operation = 'ADD'
+        self.link(self.new("GeometryNodeInputIndex", -250, 0).outputs[0], plus.inputs[0])
+        plus.inputs[1].default_value = 1.0
+        statistic = self.new("GeometryNodeAttributeStatistic", 250, 200)
+        statistic.data_type, statistic.domain = 'FLOAT', 'POINT'
+        self.link(geometry, statistic.inputs["Geometry"])
+        self.link(chosen, statistic.inputs["Selection"])
+        self.link(plus.outputs[0], _enabled(statistic.inputs, "Attribute"))
+        top = self.new("FunctionNodeFloatToInt", 400, 200)
+        top.rounding_mode = 'ROUND'
+        self.link(_enabled(statistic.outputs, "Max"), top.inputs[0])
+        hit = self.new("FunctionNodeIntegerMath", 550, 250)
+        hit.operation = 'SUBTRACT'
+        self.link(top.outputs[0], hit.inputs[0])
+        hit.inputs[1].default_value = 1
+        row = self.new("GeometryNodeSwitch", 700, 200)
+        row.input_type = 'INT'
+        self.link(self._compare('GREATER_THAN', top.outputs[0], 0, 550, 150), sock(row.inputs, "Switch"))
+        self.link(self.sample(geometry, tables.DEFAULT, 'INT', 0, 400, 50), sock(row.inputs, "False"))
+        self.link(hit.outputs[0], sock(row.inputs, "True"))
+        self.row = row.outputs[0]
+        self.found = self._compare('GREATER_EQUAL', self.row, 0, 850, 200)
 
-    def _empty(self, j):
-        node = self.new("FunctionNodeInputString", -960, 400 - 40 * j)  # holds ""
-        node.hide = True
-        return node.outputs[0]
+    def first(self):
+        """row + 1: the entry's first element row (§8.3), laid out once."""
+        if self._first is None:
+            node = self.new("FunctionNodeIntegerMath", 850, 50)
+            node.operation = 'ADD'
+            self.link(self.row, node.inputs[0])
+            node.inputs[1].default_value = 1
+            self._first = node.outputs[0]
+        return self._first
+
+    def count(self):
+        """The entry's element rows, oa_count at its header row (§8.3), laid out once. It reads 0 when no entry is
+        found: Sample Index gives 0 outside the rows, as at row -1."""
+        if self._count is None:
+            self._count = self.sample(self.table_geometry(), tables.COUNT, 'INT', self.row, 700, -50)
+        return self._count
+
+    def single(self, column, x, y):
+        """An entry-level value (§8.6): its column sampled at the header row, behind Switch(found, value, fallback)."""
+        value = self.sample(self.table_geometry(), column.name, column.data_type, self.row, x, y)
+        switch = self.new("GeometryNodeSwitch", x + 300, y)
+        switch.input_type = column.data_type
+        self.link(self.found, sock(switch.inputs, "Switch"))
+        sock(switch.inputs, "False").default_value = column.fallback
+        self.link(value, sock(switch.inputs, "True"))
+        return switch.outputs[0]
 
     def _compare(self, operation, a, b, x, y):
         """An INT Compare of a socket with a socket or a number."""
@@ -290,12 +297,12 @@ class _Builder:
             self._ident = switch.outputs[0]
         return self._ident
 
-    def per_element(self, gi, go, entries, columns):
-        """Per-element outputs (§8.3): each column sampled from the table object at flat = base + ID behind
-        valid = 0 <= ID < count, else its fallback. base and count are Index Switches on k, so a no-match
-        (k = 0) and an invalid ID both give the fallbacks. Without an ID input, the element index is used;
-        a spec may set self.index to read elsewhere (Rules: its cell index, -1 when invalid). Columns
-        without an output are only written to the table: the spec reads them itself."""
+    def per_element(self, gi, go, columns):
+        """Per-element outputs (§8.3): each column sampled from the table object at flat = row + 1 + ID behind
+        valid = 0 <= ID < count, else its fallback. When no entry is found, count reads 0 (count()), so a miss
+        and an invalid ID both give the fallbacks. Without an ID input, the element index is used; a spec may
+        set self.index to read elsewhere (Rules: its cell index, -1 when invalid). Columns without an output
+        are only written to the table: the spec reads them itself."""
         columns = [column for column in columns if column.output]
         if not columns:
             return
@@ -304,14 +311,11 @@ class _Builder:
             ident = self.ident(gi)
         if ident is None:
             ident = self.new("GeometryNodeInputIndex", -900, -700).outputs[0]
-        counts = [row_count(entry) for entry in entries]
-        bases = list(itertools.accumulate([0] + counts))[:-1]
         flat = self.new("FunctionNodeIntegerMath", 300, -600)
         flat.operation = 'ADD'
-        self.lookup(self.k, 'INT', 0, bases, flat.inputs[0], -600).node.name = BASE
+        self.link(self.first(), flat.inputs[0])
         self.link(ident, flat.inputs[1])
-        below = self._compare('LESS_THAN', ident, None, 300, -750)
-        self.lookup(self.k, 'INT', 0, counts, sock(below.node.inputs, "B_INT"), -750).node.name = COUNT
+        below = self._compare('LESS_THAN', ident, self.count(), 300, -750)
         valid = self._and(self._compare('GREATER_EQUAL', ident, 0, 300, -900), below, 450, -800)
         geometry = self.table_geometry()
         values = {}
@@ -339,15 +343,18 @@ class _Builder:
         return self._info.outputs["Geometry"]
 
     def sample(self, geometry, name, data_type, index, x, y, attribute=None):
-        """Column "oa_<name>" of the table object at the `index` socket (§8.3): Named Attribute, Sample Index
-        (POINT). attribute: a Named Attribute output to share between lookups of the same column."""
+        """Column "oa_<name>" of the table object at `index`, a socket or a row number (§8.3): Named Attribute, Sample
+        Index (POINT). attribute: a Named Attribute output to share between lookups of the same column."""
         if attribute is None:
             attribute = self.attribute(name, data_type, x, y)
         sampled = self.new("GeometryNodeSampleIndex", x + 150, y)
         sampled.data_type = data_type
         self.link(geometry, sampled.inputs["Geometry"])
         self.link(attribute, _enabled(sampled.inputs, "Value"))
-        self.link(index, sampled.inputs["Index"])
+        if isinstance(index, int):
+            sampled.inputs["Index"].default_value = index
+        else:
+            self.link(index, sampled.inputs["Index"])
         return _enabled(sampled.outputs, "Value")
 
     def attribute(self, name, data_type, x, y):
@@ -364,8 +371,9 @@ class _Builder:
         return both
 
     def lookup(self, index, data_type, fallback, values, target, y):
-        """An entry-level value: an Index Switch on the match chain, items [fallback, value 1 ...]. A MATERIAL
-        value may be a material's name (entries store it so, §8.6)."""
+        """An Index Switch on the `index` socket, items [fallback, value 1 ...]: a constant the graph bakes (Rules'
+        band widths and centres, §9.2) or one of Pick's names (§8.6). A MATERIAL value may be a material's name
+        (entries store it so, §8.6)."""
         node = self.new("GeometryNodeIndexSwitch", 150, y)
         node.data_type = data_type
         items = node.index_switch_items
@@ -400,86 +408,106 @@ def create_inner(node, store=None):
 
 
 def build(node, store, live=None, default=None):
-    """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept, the
-    geometry passed through (§6.0), the Warning channel laid out (§5.7) and the ID's hidden value set
-    (_Builder.ident()).
+    """Rebuild the inner group's nodes, and rewrite its table object, from the store: every entry but the refused
+    ones (_written(), §8.2). The interface is kept, the geometry passed through (§6.0), the Warning channel laid out
+    (§5.7) and the ID's hidden value set (_Builder.ident()).
 
-    live: the gn tuples of the node's live contexts, in context order (§8.1). None means unknown: every
-    stored entry is laid out, in store order; only the pass knows the live set. default: the words_key of
-    the entry a no-match shows (k_default_key(), §8.2)."""
+    live: the gn tuples of the node's live contexts (§8.1), whose entries win a key they share with others; None
+    means unknown. default: the words_key of the entry a miss shows (k_default_key(), §8.2)."""
     tree = node.node_tree
     if tree is None:
         create_inner(node, store)
         return
     tree.pop(BUILT, None)  # a build that raises leaves a partial graph, which update_values() must not write
-    entries = materialised(store.entries, live, default)
-    columns = _columns(node)
-    own = _entry_table(node)
-    table = tables.ensure_table(node) if columns or own else None  # before clear(), which drops the reference
+    table = tables.ensure_table(node)  # before clear(), which drops the reference
+    rows = _rows(node, store.entries, live, default)
     tree.nodes.clear()
-    split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
-    builder = _Builder(tree, _k(entries, default), split)
+    builder = _Builder(tree)
     builder.node, builder.table = node, table
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
     builder.pass_through(group_in, group_out)
     spec = SPECS[node.bl_idname]
-    builder.key_text(builder.words(group_in, spec.words(node)))  # before the spec's build(), which may read it
+    builder.key_text(builder.words(group_in, spec.words(node)))  # before find(), which hashes it
     warning = builder.warning(group_in, node.uid)
-    if table is not None:  # the table's only user, and how find() sees it, even while nothing samples it yet
-        builder.table_geometry()
-    spec.build(builder, group_in, group_out, entries)
-    if columns:
-        builder.per_element(group_in, group_out, entries, columns)
+    builder.find()
+    spec.build(builder, group_in, group_out, rows.entries)
+    builder.per_element(group_in, group_out, rows.columns)
     builder.gate(group_out, warning)  # last: every output, whatever built it
     builder.finish()
-    if columns:
-        tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
-    elif own:
-        tables.write_rows(node, *own(node, entries))
-    tree[BUILT] = _built(node, entries, columns, split)
+    tables.write_rows(node, rows.flat, rows.types, rows.digest)
+    tree[BUILT] = rows.built
 
 
-def update_values(node, store, live=None, default=None, rows=True):
-    """Values only (§8.8): write the changed entry-level Index Switch values (each output's single values,
-    each entry's base and row count), k_default and the uid the Warning reports (§5.7), and with `rows` the
-    table object's per-element rows. Returns False, writing nothing, when build() laid out another
-    materialised set or shape, so build() is needed. live and default as for build(); the pass passes the
-    same ones to both."""
+def update_values(node, store, live=None, default=None):
+    """Values only (§8.8): rewrite the table object when its rows changed (their digest), else write the default at
+    point 0 alone when it changed, and rewrite the uid the Warning reports (§5.7). So a pass that changes nothing
+    writes nothing, and its table write re-evaluates no modifier. Returns False, writing nothing, when build() laid
+    out another layout (_built()), so build() is needed. live and default as for build(); the pass passes the same
+    ones to both."""
     tree = node.node_tree
-    if tree is None:
+    if tree is None or tables.find(node) is None:
         return False
-    entries = materialised(store.entries, live, default)
-    columns = _columns(node)
-    own = _entry_table(node)
-    split = per_word(itertools.chain((entry.gn for entry in entries), live or ()))
-    if tree.get(BUILT) != _built(node, entries, columns, split) or ((columns or own) and tables.find(node) is None):
-        return False
-    own_rows = own(node, entries) if own else None
-    if own and own_rows is None:  # the spec wants other outputs
-        return False
-    feeds = [(name, source.node.data_type, _items(source.node)) for name, source in _feeds(tree)
-             if source.node.bl_idname == "GeometryNodeIndexSwitch"]
-    if any(len(slots) != len(entries) + 1 for _name, _type, slots in feeds):
+    rows = _rows(node, store.entries, live, default)
+    if tree.get(BUILT) != rows.built:
         return False
     ident = tree.nodes.get(UID)
     if ident is not None and ident.string != node.uid:  # a copy's group, which engine.ensure_owned() copied
         ident.string = node.uid
-    for name, data_type, slots in feeds:  # an entry without the value (e.g. no Material) holds the fallback
-        _write(slots[1:], _values(data_type, [entry.single.get(name, slots[0].default_value) for entry in entries]))
-    counts = [row_count(entry) for entry in entries]
-    for name, values in ((BASE, list(itertools.accumulate([0] + counts))[:-1]), (COUNT, counts)):
-        switch = tree.nodes.get(name)
-        if switch is not None:
-            _write(_items(switch)[1:], values)
-    end = tree.nodes.get(K_DEFAULT)
-    if end is not None:
-        _write([sock(end.inputs, "False")], [_k(entries, default)])
-    if rows and columns:
-        tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
-    elif rows and own_rows:
-        tables.write_rows(node, *own_rows)
+    if tables.digest(node) != rows.digest:
+        tables.write_rows(node, rows.flat, rows.types, rows.digest)
+    else:
+        tables.write_value(node, tables.DEFAULT, 0, rows.default)
     return True
+
+
+def append_entry(node, entry) -> bool:
+    """Append one entry's block to the node's table object, values only (§8.8): its header row and element rows after
+    every other row, so nothing else moves, and the graph finds it at the next evaluation. For the playback path,
+    which never calls build(). Returns False, writing nothing, when that takes build() or a pass: no layout built,
+    another one due (the interface or the columns changed), an entry the graph can't read (spec.fits(): Rules'
+    reference factors), or a key the table already holds, the entry's own words or words it collides with (§8.2).
+    A Pick entry whose item the graph doesn't list shows the fallback Item and Material until a pass rebuilds it."""
+    tree = node.node_tree
+    if tree is None or BUILT not in tree or tables.find(node) is None:
+        return False
+    try:
+        layout = json.loads(tree[BUILT])[-1]
+    except (ValueError, TypeError, IndexError):  # laid out by an older OpenAct (LAYOUT): the next pass rebuilds it
+        return False
+    columns, singles = _columns(node), _singles(node)
+    fits = getattr(SPECS[node.bl_idname], "fits", None)
+    if tree[BUILT] != _built(node, columns, singles, layout) or (fits is not None and not fits(node, layout, entry)):
+        return False
+    if words.key(entry.gn) in tables.header_rows(node):
+        return False
+    block = {column.name: [] for column in (*RESERVED, *singles, *columns)}
+    _blocks(block, [entry], _headers(node, [entry], singles, layout), singles, columns)
+    tables.append_rows(node, block)
+    return True
+
+
+def set_default(node, words_key, store=None):
+    """Write the default a miss shows (§8.2), values only: point 0's oa_default, the header row of the entry with this
+    words key, -1 for None or an entry the table doesn't hold. For the playback path, which never calls build().
+    store: the entries the table was written from (the pass's, with the table so far shown in a hidden entry's
+    place, §5.4); by default the node's stored ones."""
+    row = -1
+    if words_key:
+        entries = (_store.load(node) if store is None else store).entries
+        entry = next((entry for entry in entries if entry.words_key == words_key), None)
+        if entry is not None:
+            row = tables.header_rows(node).get(words.key(entry.gn), -1)
+    tables.write_value(node, tables.DEFAULT, 0, row)
+
+
+def collisions(entries, live):
+    """(kept, other) of each live word tuple whose entry the lookup can't find (§8.2): its key equals that of a word
+    tuple before it, an entry of the table or, for words with no entry yet, a live one. The lookup finds the kept
+    one's entry for both, so the pass shows each pair as an error."""
+    live = list(live or ())
+    wanted = set(live)
+    return [(kept, other) for kept, other in words.shared_keys(_order(entries, live) + live) if other in wanted]
 
 
 def _feeds(tree):
@@ -501,110 +529,142 @@ def _values(data_type, values):
     return [bpy.data.materials.get(v) if isinstance(v, str) else v for v in values]
 
 
-def _write(slots, values):
-    for slot, value in zip(slots, values):
-        if not _same(slot.default_value, value):  # every write costs a tree update
-            slot.default_value = value
-
-
-def materialised(entries, live=None, default=None):
-    """The entries the graph and table object hold (§8.1), in store order: every entry whose gn is live (the
-    first MATERIALISED_MAX in context order), then pinned ones in pin order, then warm ones, the default
-    first and then the most recently used, while the total is below WARM_TOTAL and their rows fit ROW_BUDGET.
-    live=None (unknown) gives every stored entry. Pass live as a list: a set has no context order."""
-    if live is None:
-        return list(entries)
-    rank = {tuple(gn): i for i, gn in reversed(list(enumerate(live)))}  # a gn's first context wins
-    chosen = sorted((e for e in entries if e.gn in rank), key=lambda e: rank[e.gn])[:MATERIALISED_MAX]
-    pins = sorted((e for e in entries if e.pinned and e.gn not in rank), key=_pin_order)
-    chosen += pins[:MATERIALISED_MAX - len(chosen)]
-    total = sum(row_count(e) for e in chosen)
-    for entry in sorted((e for e in entries if not e.pinned and e.gn not in rank),
-                        key=lambda e: (not default or e.words_key != default, -e.t)):  # "" names no entry (_k())
-        if len(chosen) >= WARM_TOTAL:
-            break
-        if total + row_count(entry) <= ROW_BUDGET:
-            chosen.append(entry)
-            total += row_count(entry)
-    keep = {id(entry) for entry in chosen}
-    return [entry for entry in entries if id(entry) in keep]
-
-
-def _pin_order(entry):
-    """By the first frame at which the entry's words occur, ties broken by the words (§5.5)."""
-    return min((span[0] for span in entry.frames if span), default=math.inf), entry.gn
-
-
 def k_default_key(last_shown, blocked=False):
-    """The words_key a no-match shows (§8.2): the last-shown entry when exactly one context is live and the
-    node is in neither a hint nor an error state (blocked); else None, so k_default = 0 and every no-match
-    shows the neutral fallbacks. last_shown: LAST_SHOWN of each live context, None where it never showed one."""
+    """The words_key a miss shows (§8.2): the last-shown entry when exactly one context is live and the node is in
+    neither a hint nor an error state (blocked); else None, so every miss shows the neutral fallbacks. last_shown:
+    LAST_SHOWN of each live context, None where it never showed one."""
     return last_shown[0] if len(last_shown) == 1 and not blocked else None
-
-
-def per_word(gns):
-    """True when a word contains SEP: its joined key could equal another tuple's, so the node compares word
-    by word (§8.2)."""
-    return any(SEP in word for gn in gns for word in gn)
 
 
 def row_count(entry):
     return len(entry.rows.name)
 
 
-def flat_rows(entries, columns):
-    """The table object's columns (§8.1): entry e's rows at base_e + r, entries in materialised order. An
-    entry without a column holds that column's fallback."""
-    flat = {}
-    for column in columns:
-        if column.name in flat:
+@dataclass
+class _Rows:
+    """What build() and update_values() write into the table object (§8.5), and the layout the graph reads it with."""
+
+    flat: dict  # column -> its value on every row
+    types: dict  # column -> 'FLOAT', 'INT' or 'BOOLEAN'
+    default: int  # the header row a miss shows, -1 for none (§8.2), on point 0
+    digest: str  # of every value but that one, which set_default() writes alone
+    built: str  # the layout (_built())
+    entries: list  # the entries written, in store order
+    columns: list  # the per-element columns
+
+
+def _rows(node, entries, live=None, default=None):
+    """The table object's rows (§8.5): point 0, the meta row; then the spec's lead rows (Rules' category maps, §9.2);
+    then one block per written entry, in store order (_blocks()). A column a row doesn't use holds its fallback."""
+    spec = SPECS[node.bl_idname]
+    written = _written(entries, live)
+    columns, singles = _columns(node), _singles(node)
+    layout = spec.layout(node, written) if hasattr(spec, "layout") else None
+    everything = (*RESERVED, *singles, *columns)
+    flat = {column.name: [column.fallback] for column in everything}  # the meta row, its default set below
+    lead = spec.lead_rows(node, written) if hasattr(spec, "lead_rows") else {}
+    count = len(next(iter(lead.values()), ()))
+    for column in everything:
+        flat[column.name].extend(lead.get(column.name) or [column.fallback] * count)
+    heads = _blocks(flat, written, _headers(node, written, singles, layout), singles, columns)
+    types = {column.name: column.data_type for column in everything}
+    digest = _digest(flat, types)
+    found = next((row for row, entry in zip(heads, written) if default and entry.words_key == default), -1)
+    flat[tables.DEFAULT][0] = found  # "" names no entry
+    return _Rows(flat, types, found, digest, _built(node, columns, singles, layout), written, columns)
+
+
+def _blocks(flat, entries, headers, singles, columns):
+    """Append each entry's block to the columns in flat (§8.5): its header row (oa_head, its key, the count of element
+    rows after it, its single values), then its element rows, one per table row while the node has per-element
+    columns. Returns each header row."""
+    counts = [row_count(entry) if columns else 0 for entry in entries]
+    heads, at = [], len(flat[tables.HEAD])
+    for count in counts:
+        heads.append(at)
+        at += 1 + count
+    per_entry = [(tables.DEFAULT, [-1] * len(entries), -1), (tables.HEAD, [True] * len(entries), False),
+                 (tables.KEY, [words.key(entry.gn) for entry in entries], 0), (tables.COUNT, counts, 0)]
+    for name, values, rest in per_entry + [(c.name, headers[c.name], c.fallback) for c in singles]:
+        target = flat[name]
+        if not columns:  # header rows only (Ask, Dials)
+            target.extend(values)
             continue
-        values = flat[column.name] = []
-        for entry in entries:
+        for value, count in zip(values, counts):
+            target.append(value)
+            target.extend([rest] * count)
+    for column in columns:
+        target, rest = flat[column.name], column.fallback
+        for entry, count in zip(entries, counts):
             own = entry.rows.payload.get(column.output) if column.payload else entry.rows.v.get(column.name)
-            values.extend(own if own is not None else [column.fallback] * row_count(entry))
-    return flat
+            target.append(rest)
+            target.extend(own if own is not None else [rest] * count)
+    return heads
+
+
+def _headers(node, entries, singles, layout):
+    """{column: its value on each entry's header row} (§8.6): the spec's own headers(node, entries, layout), by default
+    each entry's single value of the column's output, else the column's fallback."""
+    own = getattr(SPECS[node.bl_idname], "headers", None)
+    if own is not None:
+        return own(node, entries, layout)
+    return {column.name: [entry.single.get(column.output, column.fallback) for entry in entries] for column in singles}
+
+
+def _written(entries, live=None):
+    """The entries the table holds, in store order (§8.2): all but those whose key an earlier one has
+    (words.shared_keys()). Live ones come first, so a warm entry never takes a live one's place."""
+    refused = {other for _kept, other in words.shared_keys(_order(entries, live))}
+    return [entry for entry in entries if entry.gn not in refused]
+
+
+def _order(entries, live):
+    """The stored entries' word tuples in the order they claim a key: the live ones, then all in store order."""
+    stored = {entry.gn for entry in entries}
+    return [gn for gn in live or () if gn in stored] + [entry.gn for entry in entries]
+
+
+def _digest(flat, types):
+    """A digest of the rows, column by column (tables.DIGEST)."""
+    digest = hashlib.sha1()
+    for name in sorted(flat):
+        values, kind = flat[name], types[name]
+        try:
+            packed = array.array(_PACK[kind], values)
+        except TypeError:  # e.g. floats such as 1.0 in an INT column, as tables.write_rows() casts them
+            packed = array.array(_PACK[kind], map(_CAST[kind], values))
+        digest.update(f"{name} {kind} {len(values)}\n".encode())
+        digest.update(packed.tobytes())
+    return digest.hexdigest()
 
 
 def _columns(node):
-    """The spec's per-element columns whose output the node has; a linked_only one only while it is linked."""
+    """The spec's per-element columns whose output the node has; a linked_only one only while it is linked. A name
+    listed twice is one column."""
     wanted = getattr(SPECS[node.bl_idname], "per_element", ())
     if callable(wanted):
         wanted = wanted(node)
     outputs = {socket.name: socket for socket in node.outputs}
-    return [c for c in wanted if not c.output  # table only: the spec reads it itself
-            or (c.output in outputs and (outputs[c.output].is_linked or not c.linked_only))]
+    chosen = [c for c in wanted if not c.output  # table only: the spec reads it itself
+              or (c.output in outputs and (outputs[c.output].is_linked or not c.linked_only))]
+    return [c for i, c in enumerate(chosen) if all(c.name != other.name for other in chosen[:i])]
 
 
-def _table_rows(node, entries, columns):
-    """The table object's columns: flat_rows(), or the spec's own table_rows(node, entries, columns) (Rules)."""
-    own = getattr(SPECS[node.bl_idname], "table_rows", None)
-    return flat_rows(entries, columns) if own is None else own(node, entries, columns)
+def _singles(node):
+    """The spec's single-value columns (§8.6), read at the entry's header row."""
+    wanted = getattr(SPECS[node.bl_idname], "single_values", ())
+    return list(wanted(node) if callable(wanted) else wanted)
 
 
-def _k(entries, default):
-    """k of the entry with words_key `default`, 0 when there is none: k_default (§8.2). The words key "" names
-    no entry."""
-    return next((k for k, entry in enumerate(entries, start=1) if default and entry.words_key == default), 0)
-
-
-def _built(node, entries, columns, split):
-    """What the graph build() lays out depends on: LAYOUT, the node type, the materialised entries' words in
-    order, the per-element columns, per-word compares, the interface (an absent word is joined as ""), and
-    what the spec bakes from the entries besides, its optional layout(node, entries) (Rules: the factors)."""
+def _built(node, columns, singles, layout):
+    """The layout the graph reads the table object with (§8.8), as JSON text: LAYOUT, the node type, the interface
+    (an absent word is read as ""), the per-element and single-value columns, and what the spec bakes besides, its
+    optional layout(node, entries) (Rules: the reference factors; Dials: the outputs; Pick: the names its Item and
+    Material choose from). Entries change it only through the last; append_entry() reads it back."""
     face = sorted((i.in_out, i.name, i.socket_type) for i in node.node_tree.interface.items_tree
                   if i.item_type == 'SOCKET')
-    layout = getattr(SPECS[node.bl_idname], "layout", None)
-    text = json.dumps([LAYOUT, node.bl_idname, [entry.gn for entry in entries],
-                       [(c.output, c.name, c.data_type) for c in columns], split, face,
-                       layout and layout(node, entries)], ensure_ascii=False, sort_keys=True)
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
-
-
-def _same(current, value):
-    if isinstance(current, float):  # a float socket holds the value rounded to 32 bits
-        return current == struct.unpack("f", struct.pack("f", value))[0]
-    return current == value
+    return json.dumps([LAYOUT, node.bl_idname, face, [(c.output, c.name, c.data_type) for c in columns],
+                       [(c.output, c.name, c.data_type) for c in singles], layout], ensure_ascii=False, sort_keys=True)
 
 
 def sync_interface(node, wanted):
@@ -651,12 +711,3 @@ def lacks(node, wanted) -> bool:
 def _set(item, name, value):
     if getattr(item, name) != value:  # every write updates the interface and the nodes using it
         setattr(item, name, value)
-
-
-# ------------------------------------------------------------ one-row-per-entry tables (Dials, §8.4)
-# A spec with entry_table(node, entries) -> (columns, types), or None when build() must run, samples its own table
-# object at k - 1 in its build(), through builder.node and builder.table. build() and update_values() write the rows.
-
-
-def _entry_table(node):
-    return getattr(SPECS[node.bl_idname], "entry_table", None)

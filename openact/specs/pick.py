@@ -167,18 +167,45 @@ class PickSpec(Spec):
         index = entry.single["Index"]
         return int(index >= 0 and entry.rows.src[index] == "m" and entry.single["Confidence"] < unsure_below())
 
+    def single_values(self, node):
+        """The columns of the entry's header row (§8.6): Index and Confidence, and the position of the picked item
+        among the names the graph lists (layout()), as a table holds no strings or materials."""
+        from ..inner import Column  # imports bpy
+
+        return (Column("Index", "index", 'INT', -1), Column("Confidence", "conf", 'FLOAT', 0.0),
+                Column("", "item", 'INT', 0))
+
+    def layout(self, node, entries):
+        """What build() bakes besides the table (inner._built()): the names Item chooses from, those of every entry's
+        items, and its pick, in store order (§8.6). Material Slots' items are named after their materials, which
+        Material chooses from by the same names. So a new answer never changes the layout; an item no entry listed
+        before does, and the pass rebuilds the graph for it."""
+        return list(dict.fromkeys(name for entry in entries for name in (*entry.rows.name, entry.single.get("Item"))
+                                  if name))
+
+    def headers(self, node, entries, layout):
+        """Each entry's header row (§8.6): its Index and Confidence, and 1 + the position of its item among the
+        layout's names, 0 (the fallback) for one the layout doesn't list."""
+        names = {name: i for i, name in enumerate(layout, start=1)}
+        return {"index": [entry.single.get("Index", -1) for entry in entries],
+                "conf": [entry.single.get("Confidence", 0.0) for entry in entries],
+                "item": [names.get(entry.single.get("Item"), 0) for entry in entries]}
+
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy
 
-        index = b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
-        picked = b.lookup(index, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
-        b.lookup(index, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
-        b.lookup(index, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
+        columns = {column.name: column for column in self.single_values(b.node)}
+        names = self.layout(b.node, entries)
+        picked = b.single(columns["index"], -300, 300)
+        b.link(picked, go.inputs["Index"])
+        b.link(b.single(columns["conf"], -300, 150), go.inputs["Confidence"])
+        item = b.single(columns["item"], -300, 0)
+        b.lookup(item, 'STRING', "", names, go.inputs["Item"], 0)
         ident = b.ident(gi)
         if ident is not None and "Selection" in go.inputs:
             b.selection(ident, picked, go.inputs["Selection"])
-        if "Material" in go.inputs:
-            b.lookup(index, 'MATERIAL', None, [e.single.get("Material") for e in entries], go.inputs["Material"], -250)
+        if "Material" in go.inputs:  # by name, resolved now; a missing one is None (§8.6)
+            b.lookup(item, 'MATERIAL', None, names, go.inputs["Material"], -250)
         collection = next((s for s in gi.outputs if s.name == "Collection"), None)
         if collection is None or "Instance" not in go.inputs:
             return

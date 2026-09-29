@@ -2,7 +2,7 @@
 model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record, so every request it sends is logged:
 - a fill: waiting -> filling -> complete, with n/N and an ETA from pipeline.progress();
 - the warning and error lines: a CSV warning, a missing CSV, Rules cells no outcome applies to (its other cells say
-  "Asking..." while they are asked) and an outcome never offered, more than 16 live word sets;
+  "Asking..." while they are asked) and an outcome never offered; more than 16 live word sets, all answered;
 - table_page(): rows, icons and paging; table_rows() of answered and pending tables, of an entry whose rows are in
   another order (by wkey, Show Question's ask key too) and of an empty material slot;
 - while a Classify context's CSV has errors or the contexts disagree, a context whose words didn't change shows its
@@ -17,7 +17,7 @@ model server itself (OPENACT_BACKEND=fake, §18.1) on a free port, with --record
 - the banner conditions, and live: reads blocked in an untrusted file (an Ask's and a Rules node's), which either
   trust button lets every node make and a deleted node stops counting in, a blocked read counted once when another
   node reads the blocked node's answer, a sidebar draw that resolves no path while nothing is blocked, an Import CSV
-  node on a file a node reads, and over-cap;
+  node on a file a node reads;
 - show_question returns exactly the state, instructions and options that the --record log shows for that row, and
   asks nothing; a row answered with older settings says so;
 - the pass drops the status records of nodes that are gone;
@@ -51,7 +51,7 @@ TMP = tempfile.mkdtemp(prefix="openact_status_")
 OUTSIDE = tempfile.mkdtemp(prefix="openact_status_outside_")  # outside the folder the .blend is saved in
 os.environ.setdefault("OPENACT_STATE_DIR", os.path.join(TMP, "state"))  # where the server writes its log
 
-from openact import csvfmt, engine, lists, nodes, ops, pipeline, server, trust, ui, watch  # noqa: E402
+from openact import csvfmt, engine, lists, nodes, ops, pipeline, server, tables, trust, ui, watch  # noqa: E402
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402
 from openact.specs.base import number_text  # noqa: E402
@@ -667,27 +667,25 @@ def phase_lines():
 
 
 def phase_crowd():
-    """More than 16 distinct live word sets on one node (§8.1)."""
+    """More than 16 distinct live word sets on one node: no cap (§8.1), so all are answered, with no error line and
+    no banner."""
     tree = new_tree("Crowd")
     tree.interface.new_socket("Question", in_out='INPUT', socket_type='NodeSocketString')
     ask = tree.nodes.new(engine.ASK_ID)
     tree.links.new(tree.nodes.new("NodeGroupInput").outputs["Question"], ask.inputs["Question"])
     users = [user(f"Crowd {i}", tree, Question=f"Is this object number {i}?") for i in range(17)]
+    kinds = set(banner_kinds())
     engine.schedule(immediate=True)
-    done, _seen = settle(lambda: state(ask) == "error", 60)
+    done, _seen = settle(lambda: state(ask) == "complete", 60)
     got = status(ask)
-    check("over-cap: 17 live word sets on one node give the error line naming the limit",
-          done and got.icon == 'CANCEL' and got.contexts == 17
-          and got.text == "17 objects use this tree with different words; the limit is 16: split the tree", got)
-    over = [banner for banner in ui.live_banners(bpy.context) if banner[0] == "over_cap"]
-    check("over-cap banner: names the node and the limit", over == [
-        ("over_cap", 'CANCEL', "Ask: 17 objects use this tree with different words; the limit is 16: split the tree",
-         ())], over)
+    check("no cap: 17 live word sets on one node are all answered, with a checkmark and no error line",
+          done and got.icon == 'CHECKMARK' and got.contexts == 17 and (got.rows, got.answered) == (17, 17)
+          and not got.problems and len(tables.header_rows(ask)) == 17, got)
+    check("no cap: no banner about it", set(banner_kinds()) == kinds, banner_kinds())
     for obj in users:
         bpy.data.objects.remove(obj)
     engine.schedule(immediate=True)
     settle(lambda: state(ask) == "hint", 30)
-    check("over-cap banner: gone with the objects", "over_cap" not in banner_kinds(), banner_kinds())
 
 
 # ------------------------------------------------------------------------------------------ banners
@@ -709,14 +707,12 @@ def phase_banners():
         (ui.banners("ready", "", blocked=2), [("trust", 'ERROR', "This file is not trusted, so 2 reads outside its "
                                                "folder were blocked", ("openact.allow_file", "openact.trust_folder"))]),
         (ui.banners("ready", "", notes=["a.csv: note"]), [("import_csv", 'INFO', "a.csv: note", ())]),
-        (ui.banners("ready", "", over=["Ask: too many"]), [("over_cap", 'CANCEL', "Ask: too many", ())]),
     ]
     wrong = [(got, wanted) for got, wanted in cases if got != wanted]
     check("banners: model not installed, checking the runtime, a failed probe, a port conflict, an untrusted file's "
-          "blocked reads, Import CSV notes and over-cap; nothing otherwise", not wrong, wrong)
-    both = ui.banners("not_installed", "", blocked=1, notes=["a.csv: note"], over=["Ask: too many"])
-    check("banners: most urgent first", [banner[0] for banner in both] == ["install", "trust", "over_cap", "import_csv"],
-          both)
+          "blocked reads and Import CSV notes; nothing otherwise", not wrong, wrong)
+    both = ui.banners("not_installed", "", blocked=1, notes=["a.csv: note"])
+    check("banners: most urgent first", [banner[0] for banner in both] == ["install", "trust", "import_csv"], both)
     check("banners: while the fake server is ready, no server banner", server.status()[0] == "ready"
           and not set(banner_kinds()) & set(ui.SERVER_BANNERS), (server.status(), banner_kinds()))
 

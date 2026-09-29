@@ -14,7 +14,7 @@ from collections import Counter
 
 import bpy
 
-from . import csvfmt, engine, inner, lists, pipeline, server, store, trust, ui
+from . import csvfmt, engine, lists, pipeline, server, store, tables, trust, ui
 from . import prefs as P
 from .evaluator import Ctx, Hint, Pending, Unresolvable, find_uses
 from .specs.base import stored_rows, table_of, unsure_below
@@ -732,11 +732,12 @@ def diagnostics() -> str:
         for problem in status.problems if status else ():  # its node type and severity, never its text (§16.3)
             problems[f"{node.bl_label} {problem.severity}"] += 1
         jobs = [job for _label, job, _entry in status.uses] if status else []
-        entries = store.load(node).entries
+        table = tables.find(node) if node.node_tree else None
         lines.append(f"  {node.bl_label}: {status.state if status else 'no pass yet'}; rows per table "
                      f"{', '.join(str(len(job.rows)) for job in jobs) or 'none'}; "
-                     f"{len(inner.materialised(entries, [job.gn for job in jobs]))} of {len(entries)} stored entries "
-                     f"materialised; {len(node.node_tree.nodes) if node.node_tree else 0} nodes in the inner group")
+                     f"{len(store.load(node).entries)} stored entries; {len(table.data.vertices) if table else 0} rows "
+                     f"in the table object; {len(node.node_tree.nodes) if node.node_tree else 0} nodes in the inner "
+                     f"group")
     lines.append(f"Problems: {problems.total()}")
     lines += [f"  {kind}" + (f" (x{count})" if count > 1 else "") for kind, count in list(problems.items())[:10]]
     return "\n".join(lines)

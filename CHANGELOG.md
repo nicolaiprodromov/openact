@@ -13,6 +13,10 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
   called Geometry or Trigger, and payload columns and Dials settings can't be called Geometry.
 - Nodes show an info marker that carries their words: each one reports its words and whether its Trigger is on
   through a Warning node, on every evaluation that uses it.
+- No limit on the sets of words a node answers: a tree used by any number of objects with different words shows each
+  its own answer, and every stored answer switches back instantly, as nodes find answers by a hash of their words in
+  their table. The error "... the limit is 16: split the tree" is gone; two sets of words whose hashes collide, which
+  is rare, get an error asking for another Key. Files saved by 1.0 are rebuilt on their first pass.
 
 ## 1.0.0
 

@@ -156,8 +156,6 @@ class MatchSpec(PerItemSpec):
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy
 
-        b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
-
         def selection(valid, values):  # Selection = valid AND p >= Threshold (§6.3); Threshold may be a field
             at_least = b.new("FunctionNodeCompare", 900, -1300)
             at_least.data_type = 'FLOAT'

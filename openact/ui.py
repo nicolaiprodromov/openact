@@ -111,10 +111,10 @@ def table_page(rows, page=0):
     return lines, page, pages
 
 
-def banners(state, message, probe="", blocked=0, notes=(), over=()) -> list[tuple]:
+def banners(state, message, probe="", blocked=0, notes=()) -> list[tuple]:
     """The sidebar's banners (§17.2), most urgent first: (kind, icon, text, operator idnames of its buttons). Plain
     data: live_banners() passes the live state. state, message: server.status(); probe: the runtime probe's failure;
-    blocked: how many reads of this untrusted file were blocked; notes: Import CSV notes; over: the over-cap errors."""
+    blocked: how many reads of this untrusted file were blocked; notes: Import CSV notes."""
     found = []
     if state == "not_installed":
         found.append(("install", 'ERROR', "Model not installed: Install Model downloads it once (about 12 GB); Locate "
@@ -130,7 +130,6 @@ def banners(state, message, probe="", blocked=0, notes=(), over=()) -> list[tupl
         found.append(("trust", 'ERROR', f"This file is not trusted, so {blocked} read{'s' if blocked > 1 else ''} "
                       f"outside its folder {'were' if blocked > 1 else 'was'} blocked",
                       ("openact.allow_file", "openact.trust_folder")))
-    found += [("over_cap", 'CANCEL', text, ()) for text in over]
     found += [("import_csv", 'INFO', text, ()) for text in notes]
     return found
 
@@ -177,14 +176,9 @@ def live_banners(_context) -> list[tuple]:
                for problem in status.problems if trust.BLOCKED in problem.message}
     if blocked and trust.is_trusted():  # allowed since the pass; asked only then, as it resolves paths
         blocked = set()
-    over = []
-    if any(status.contexts > inner.MATERIALISED_MAX for status in records):
-        over = [f"{node.name}: {engine.OVER_CAP.format(status.contexts, inner.MATERIALISED_MAX)}"
-                for _tree, node in engine.iter_nodes()
-                if (status := engine.STATUS.get(node.uid)) and status.contexts > inner.MATERIALISED_MAX]
     notes = [f"{os.path.basename(WATCH.files[ident].path)}: {note}" for ident, note in import_csv_notes().items()
              if ident in WATCH.files]
-    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", len(blocked), notes, over)
+    return banners(state, message, server.STATE.probes.get(P.runtime_root()) or "", len(blocked), notes)
 
 
 # ------------------------------------------------------------------------------------------ drawing

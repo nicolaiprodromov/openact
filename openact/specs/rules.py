@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import json
 
 from .. import csvfmt, pipeline, rules_core
 from .base import (KEY, Spec, confidence, lock_answer, named, number_text, overrides_inputs, shared_sockets,
@@ -332,35 +333,41 @@ class RulesSpec(Spec):
                         Column("", "ok", 'FLOAT', 0.0)]
         return tuple(columns)
 
-    def table_rows(self, node, entries, columns):
-        """inner.flat_rows(), then the category maps after every cell row (§9.2)."""
-        from ..inner import flat_rows
-
+    def lead_rows(self, node, entries):
+        """The category maps (§9.2), between the table's meta row and its entries: the reference entry's non-contiguous
+        category factors', in factor order, at the rows the graph bakes (_Graph.map_base)."""
         tree = node.node_tree
-        flat, fallbacks = flat_rows(entries, columns), {column.name: column.fallback for column in columns}
-        for rows in _maps(_reference(tree, entries, _mode(tree))):
-            for name, values in flat.items():
-                values.extend(rows if name == "map" else [fallbacks[name]] * len(rows))
-        return flat
+        rows = [level for levels in _maps(_reference(tree, entries, _mode(tree))) for level in levels]
+        return {"map": rows} if rows else {}
 
     def layout(self, node, entries):
-        """What build() bakes from the entries besides their words (inner._built()): the reference entry's
-        factors, and the cell rows that the category maps follow."""
+        """What build() bakes from the entries (inner._built()): the reference entry's factor layout (_layout()), which
+        the cell index and the category maps follow."""
         tree = node.node_tree
         reference = _reference(tree, entries, _mode(tree))
-        return reference and [reference.shape["factors"], sum(len(entry.rows.name) for entry in entries)]
+        return reference and _layout(reference.shape["factors"])
+
+    def fits(self, node, layout, entry):
+        """Whether a graph laid out for `layout` reads the entry (inner.append_entry()). One that would be the new
+        reference (_reference(): the newest of the node's answer type whose factors are the interface's) must bake the
+        same layout; any other is read through the reference, as a warm one is."""
+        tree = node.node_tree
+        factors = entry.shape.get("factors")
+        if entry.answer_type != _mode(tree) or not factors or [
+                (f["name"], f["kind"]) for f in factors] != _factor_sockets(tree):
+            return True
+        return json.dumps(_layout(factors)) == json.dumps(layout)  # the layout comes back from JSON: lists, no tuples
 
     # ------------------------------------------------------------------ the graph
 
     def build(self, b, gi, go, entries):
-        b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
         mode = _mode(b.tree)
         reference = _reference(b.tree, entries, mode)
         if reference is None:
             if mode == 'ONE_OF':  # nothing answered for these factors: every element reads the fallbacks
                 b.index = _node(b, "FunctionNodeInputInt", -300, -700, integer=-1).outputs[0]
             return
-        graph = _Graph(b, gi, go, entries, reference)
+        graph = _Graph(b, gi, go, reference)
         if mode == 'ONE_OF':
             b.index = graph.one_of()
         else:
@@ -499,14 +506,14 @@ class _Graph:
     """The per-element graph of one reference shape: level indices (§9.2), the cell index (§9.3), dithering
     (§9.7) and the corner blend (§9.6). rules_core holds the Python reference of each."""
 
-    def __init__(self, b, gi, go, entries, reference):
+    def __init__(self, b, gi, go, reference):
+        from ..inner import LEAD  # imports bpy
+
         self.b, self.gi, self.go = b, gi, go
         self.factors = [factor_of(f) for f in reference.shape["factors"]]
         self.steps = rules_core.strides(rules_core.level_counts(self.factors))
         self.sockets = [gi.outputs.get(f.name) for f in self.factors]
-        self.counts = [len(entry.rows.name) for entry in entries]
-        self.bases = list(itertools.accumulate([0] + self.counts))[:-1]
-        self.map_base, at = {}, sum(self.counts)  # the maps follow every cell row (table_rows())
+        self.map_base, at = {}, LEAD  # the maps follow the table's meta row (lead_rows()), before any entry
         for j, factor in enumerate(self.factors):
             rows = rules_core.category_map(factor) if factor.kind == "category" else None
             if rows is not None:
@@ -623,17 +630,11 @@ class _Graph:
 
     def blend(self, mode):
         """Yes/No and Amount (§9.6): the 2^Ka corner rows weighted by w * ok and renormalised; the fallbacks when
-        a category value matches no level, no entry matches, or the answered corners weigh <= 1e-6."""
-        from ..inner import BASE, COUNT
-
+        a category value matches no level, no entry is found (its count reads 0), or the answered corners weigh
+        <= 1e-6. The entry's cell rows start at the row after its header row."""
         b, go = self.b, self.go
         interpolated = rules_core.interpolated_factors(self.factors)
-        start = _node(b, "FunctionNodeIntegerMath", 300, 300, operation='ADD')
-        b.lookup(b.k, 'INT', 0, self.bases, start.inputs[0], 300).node.name = BASE
-        start.inputs[1].default_value = 0
-        matched = _node(b, "FunctionNodeCompare", 300, 150, data_type='INT', operation='GREATER_THAN')
-        b.lookup(b.k, 'INT', 0, self.counts, _sock(matched.inputs, "A_INT"), 150).node.name = COUNT
-        valid, flat = matched.outputs[0], start.outputs[0]
+        valid, flat = _cmp(b, 'INT', 'GREATER_THAN', b.count(), 0, 300, 150), b.first()
         for j in range(len(self.factors)):
             if j not in interpolated:
                 level, ok = self.level(j)

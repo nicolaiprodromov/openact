@@ -1,10 +1,10 @@
 """Dials: one prompt, many named settings (§6.6).
 
 Every setting is one question about the Prompt, and all of them travel in one request. A context's answers are one
-row per setting. The node has one output per setting, synchronised by name and type, and reads them from a
-one-row-per-entry table object at k - 1 (§8.4, §8.6): each setting's value, its min and max, and the entry's lowest
-confidence. Amount settings go through a Map Range into their min/max. Those are per-entry data (shape.settings,
-§14.2), so contexts may use different ranges, and a min/max edit carries every answer over (0 requests).
+row per setting. The node has one output per setting, synchronised by name and type, and reads them from its entry's
+header row in the table object (§8.4, §8.6): each setting's value, its min and max, and the entry's lowest confidence.
+Amount settings go through a Map Range into their min/max. Those are per-entry data (shape.settings, §14.2), so
+contexts may use different ranges, and a min/max edit carries every answer over (0 requests).
 """
 
 from __future__ import annotations
@@ -166,7 +166,7 @@ class DialsSpec(Spec):
 
     def agree(self, node, jobs, unknown=False, _entries=()):
         """§6.0, once per pass before any context is answered: every context that plans must plan the same settings,
-        by name and type in any order, since each entry fills the outputs by name (_cell()). Jobs that agree give the
+        by name and type in any order, since each entry fills the outputs by name (_cells()). Jobs that agree give the
         node the outputs of the first one's settings, so they exist before the first answer, and "" is returned; with
         no job, the node keeps its outputs and their links. Otherwise the error naming the first two contexts that
         differ is returned, and the node, its entries and its graph stay as they are. unknown: a live context has no
@@ -252,64 +252,75 @@ class DialsSpec(Spec):
     def build(self, b, gi, go, entries):
         from ..inner import sock  # imports bpy
 
-        node = b.node
-        outputs = self.outputs(node)
-        k = b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
-        if k is None:  # nothing stored: every output shows its fallback
-            zero = b.new("FunctionNodeInputInt", -200, 400)
-            zero.integer = 0
-            k = zero.outputs[0]
-        row = b.new("FunctionNodeIntegerMath", -200, 200)
-        row.operation = 'SUBTRACT'
-        b.link(k, row.inputs[0])
-        row.inputs[1].default_value = 1
-        live = b._compare('GREATER_THAN', k, 0, -200, 100)
-        geometry, index = b.table_geometry(), row.outputs[0]  # a single-value index gives single values (§8.4)
-        for j, (name, kind) in enumerate([*outputs, ("Confidence", "conf")]):
+        geometry = b.table_geometry()  # sampled at the header row, a single value, so every output is one (§8.4)
+        for j, (name, kind) in enumerate([*self.outputs(b.node), ("Confidence", "conf")]):
             y = 300 - 250 * j
             column, data_type = ("conf", 'FLOAT') if kind == "conf" else (f"v{j}", DATA[kind])
-            value = b.sample(geometry, column, data_type, index, 0, y)
+            value = b.sample(geometry, column, data_type, b.row, 0, y)
             if kind == "amount":
                 scale = b.new("ShaderNodeMapRange", 350, y)
                 scale.data_type, scale.interpolation_type, scale.clamp = 'FLOAT', 'LINEAR', False
                 b.link(value, scale.inputs["Value"])
-                b.link(b.sample(geometry, f"min{j}", 'FLOAT', index, 0, y - 80), scale.inputs["To Min"])
-                b.link(b.sample(geometry, f"max{j}", 'FLOAT', index, 0, y - 160), scale.inputs["To Max"])
+                b.link(b.sample(geometry, f"min{j}", 'FLOAT', b.row, 0, y - 80), scale.inputs["To Min"])
+                b.link(b.sample(geometry, f"max{j}", 'FLOAT', b.row, 0, y - 160), scale.inputs["To Max"])
                 value = scale.outputs["Result"]
             switch = b.new("GeometryNodeSwitch", 550, y)
             switch.input_type = data_type
-            b.link(live, sock(switch.inputs, "Switch"))
+            b.link(b.found, sock(switch.inputs, "Switch"))
             sock(switch.inputs, "False").default_value = 0.0 if kind == "conf" else FALLBACK[kind]
             b.link(value, sock(switch.inputs, "True"))
             b.link(switch.outputs[0], go.inputs[name])
 
     def layout(self, node, entries):
-        """What build() bakes besides the entries' words (inner._built()): output j reads table column j, so a
-        Settings CSV whose rows only move needs a new graph, while a min/max edit stays values only."""
+        """What build() bakes besides the table (inner._built()): output j reads header column j, so a Settings CSV
+        whose rows only move needs a new graph, while a min/max edit stays values only."""
         return self.outputs(node)
 
-    def entry_table(self, node, entries):
-        """The one-row-per-entry table (§8.4): row e holds materialised entry e's value of each output setting (its
-        fallback where the entry lacks it), min and max for Amount, and its lowest confidence."""
+    def single_values(self, node):
+        """The columns of the entry's header row (§8.4): each output setting's value, its min and max for Amount, and
+        the entry's lowest confidence."""
+        from ..inner import Column  # imports bpy
+
+        columns = []
+        for j, (name, kind) in enumerate(self.outputs(node)):
+            columns.append(Column(name, f"v{j}", DATA[kind], FALLBACK[kind]))
+            if kind == "amount":
+                columns += [Column("", f"min{j}", 'FLOAT', 0.0), Column("", f"max{j}", 'FLOAT', 1.0)]
+        return (*columns, Column("Confidence", "conf", 'FLOAT', 0.0))
+
+    def headers(self, node, entries, layout):
+        """Each entry's header row (§8.4): its value of each output setting (its fallback where the entry lacks it),
+        min and max for Amount, and its lowest confidence."""
         outputs = self.outputs(node)
         columns = {"conf": [min(entry.rows.v.get("c", ()), default=0.0) for entry in entries]}
-        types = {"conf": 'FLOAT'}
-        for j, (name, kind) in enumerate(outputs):
-            cells = [self._cell(entry, name, kind) for entry in entries]
-            columns[f"v{j}"], types[f"v{j}"] = [cell[0] for cell in cells], DATA[kind]
+        for j, (_name, kind) in enumerate(outputs):
+            columns[f"v{j}"] = []
             if kind == "amount":
-                columns[f"min{j}"], columns[f"max{j}"] = [cell[1] for cell in cells], [cell[2] for cell in cells]
-                types[f"min{j}"] = types[f"max{j}"] = 'FLOAT'
-        return columns, types
+                columns[f"min{j}"], columns[f"max{j}"] = [], []
+        for entry in entries:
+            for j, ((_name, kind), (value, low, high)) in enumerate(zip(outputs, self._cells(entry, outputs))):
+                columns[f"v{j}"].append(value)
+                if kind == "amount":
+                    columns[f"min{j}"].append(low)
+                    columns[f"max{j}"].append(high)
+        return columns
 
     @staticmethod
-    def _cell(entry, name, kind):
-        """(value, min, max) of an entry's setting, with the value in its table type."""
-        for i, setting in enumerate(entry.shape.get("settings", ())):
-            if (setting["name"], setting["type"]) == (name, kind):
-                value = entry.rows.v["value"][i]
-                return (mapped(kind, value) if kind != "amount" else float(value)), setting["min"], setting["max"]
-        return FALLBACK[kind], 0.0, 1.0
+    def _cells(entry, outputs):
+        """(value, min, max) of the entry's setting of each output (name, type), found by name and type, with the value
+        in its table type; the output's fallback, 0 and 1 where the entry lacks it."""
+        settings = entry.shape.get("settings", ())
+        rows = {(setting["name"], setting["type"]): i for i, setting in enumerate(settings)}
+        cells = []
+        for name, kind in outputs:
+            i = rows.get((name, kind))
+            if i is None:
+                cells.append((FALLBACK[kind], 0.0, 1.0))
+                continue
+            value = entry.rows.v["value"][i]
+            cells.append(((mapped(kind, value) if kind != "amount" else float(value)), settings[i]["min"],
+                          settings[i]["max"]))
+        return cells
 
     # ------------------------------------------------------------------ the Overrides CSV (§7.6)
 

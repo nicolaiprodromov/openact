@@ -8,8 +8,8 @@ node is answered outside evaluation:
    fingerprint of what it was planned from changes.
 2. Its rows are answered by the validity rule: the node's stored answers while the words mean the
    same, then this session's answers, then the local model, asked in the background (server.py).
-3. The answers are written into the node's hidden node group as a small lookup table keyed by the
-   exact input strings. Geometry Nodes picks the matching answer by itself, so one node group
+3. The answers are written into the node's table object, which its hidden node group reads, keyed
+   by the hash of the words. Geometry Nodes finds the matching answer by itself, so one node group
    can be used on several objects with different prompts, answers switch instantly back and
    forth, and they are saved with the file (Blender 4.5+ even evaluates them without the add-on).
 """
@@ -46,7 +46,8 @@ DEBOUNCE = 0.25
 SAFETY_PASS = 2.0  # edits to trees no modifier uses send no depsgraph update; it re-plans only changed fingerprints
 CLASH = ("'{}' and '{}' share every word but not their list (a collection, object or CSV): only one answer can "
          "show. Give each a different Key (Ctrl H shows it; expose it on the modifier)")
-OVER_CAP = "{} objects use this tree with different words; the limit is {}: split the tree"
+COLLIDE = ("The words '{}' and '{}' hash to the same key: only the first one's answer can show. Give one a different "
+           "Key (Ctrl H shows it; expose it on the modifier)")  # the lookup finds an entry by its key (§8.2)
 STALL = 60.0  # seconds with cells asked of a ready model and no chunk answered: the stalled-fill alert (§17.6)
 STALLED = "No answers for {:g} s: see the log"
 SLOW_MS, SLOW_FOR = 3 * pipeline.MS_PER_ROW, 60.0  # /health's ms_per_row above this for so long: the slow note (§17.3)
@@ -55,7 +56,6 @@ ICONS = {"hint": 'INFO', "paused": 'PAUSE', "starting": 'SORTTIME', "waiting": '
          "complete": 'CHECKMARK', "warning": 'ERROR', "error": 'CANCEL', "linked": 'LINKED'}
 INTERACTIVE = ("ask", "pick", "dials")  # asked at P0 whatever their size, as is any job of at most P0_CELLS (§5.5)
 P0_CELLS = 8
-PARTIAL = "openact_partial"  # ID property of the inner group: digest of the unstored partial tables its table holds
 DIFFERS = "CSV {} differs from the saved table ({})"  # a file edited since a table read from it was stored (R23)
 RENDERING = "; rendering the saved answers"  # ... printed where passes leave the saved tables as they are (§7.8)
 
@@ -101,7 +101,7 @@ class NodeStatus:
     code: int = 0
     errors: int = 0
     eta_s: float | None = None  # remaining scored rows × ms_per_row
-    contexts: int = 0  # distinct live word sets; above inner.MATERIALISED_MAX the node shows the over-cap error (§8.1)
+    contexts: int = 0  # distinct live word sets (§8.1)
     problems: list = field(default_factory=list)  # csvfmt.Problem records: the errors, then the warnings
     uses: list = field(default_factory=list)  # (context label, Job, entry shown or None) of each planned context
     asking: frozenset = frozenset()  # keys of the cells the pass asks: sent, or sent once the starting model is ready
@@ -497,9 +497,6 @@ def _process(tree, node, contexts):
             if _submit(dataclasses.replace(job, priority=_priority(spec, node, missing),
                                            generation=GENERATIONS.get(node.uid, 0)), missing):
                 sent.update(cell.key for cell in missing)
-    if len(live) > inner.MATERIALISED_MAX:  # the first contexts stay materialised, the others show neutral values
-        problems.append(OVER_CAP.format(len(live), inner.MATERIALISED_MAX))
-    rows = changed  # entries were added or replaced: the table object's rows too
     showing = {entry.words_key for entry in shown}
     left = LIVE.get(node.uid, showing) - showing  # entries no context shows any more
     LIVE[node.uid] = showing
@@ -517,26 +514,22 @@ def _process(tree, node, contexts):
             NOTES[node.uid] = node_store.note
         except ValueError as error:  # a damaged or too large entry: the node keeps what it has
             problems.append(str(error))
-            changed = rows = False
+            changed = False
             node_store = store.load(node)
     warnings += orphaned([job for job, _ctx in jobs.values()])  # locks no context's rows use (§7.6)
-    keys = [(node.uid, ctx.key()) for ctx in contexts]
-    last = [instead.get(key, LAST_SHOWN.get(key)) for key in keys]  # a no-match shows what the graph showed last
-    default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
+    # An unstored partial table has the gn of the entry it shows instead of, so it takes that entry's place in the table
     graph = node_store
-    if hidden:  # a hidden entry leaves the graph, or leaves its place to the partial table shown instead
+    if hidden:  # a hidden entry leaves the table, or leaves its place to the partial table shown instead
         graph = store.NodeStore([entry for entry in (hidden.get((stored.gn, stored.words_key), stored)
                                                      for stored in node_store.entries) if entry is not None])
-    # An unstored partial table has the gn, so the place in the graph, of the entry it shows instead of. The table
-    # object's rows are rewritten when the partial tables shown change, and once after (also in a reopened file): only
-    # then, as a rewrite re-evaluates every modifier that reads the table, whose depsgraph update schedules a pass.
-    partials = [(entry.words_key, entry.rows.v, entry.rows.payload) for entry in hidden.values() if entry is not None]
-    partial = pipeline.digest(*partials) if partials else ""
-    written = node.node_tree.get(PARTIAL, "") if node.node_tree is not None else ""
-    if not inner.update_values(node, graph, live, default, rows=rows or partial != written):  # values only (§8.8)
+    problems += [COLLIDE.format(_named(kept), _named(other)) for kept, other in inner.collisions(graph.entries, live)]
+    keys = [(node.uid, ctx.key()) for ctx in contexts]
+    last = [instead.get(key, LAST_SHOWN.get(key)) for key in keys]  # a miss shows what the table showed last
+    default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
+    # The table object is written only when its rows change: a write re-evaluates every modifier that reads it, whose
+    # depsgraph update schedules a pass, which then finds them unchanged and writes nothing
+    if not inner.update_values(node, graph, live, default):  # values only (§8.8)
         inner.build(node, graph, live, default)
-    if partial != written:  # the table object holds the rows of the graph just laid out
-        node.node_tree[PARTIAL] = partial
     warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
     state, text, eta = _status(spec, node.uid, jobs, shown, faults, hints, upstream, waiting, warnings)
@@ -561,6 +554,11 @@ def _gn(spec, node, ctx):
         return spec.gn(node, ctx)
     except (Hint, Pending, Unresolvable):
         return None
+
+
+def _named(gn):
+    """A word tuple as a status line names it: its words, empty ones left out, each cut to 40 characters."""
+    return " · ".join(word if len(word) <= 40 else word[:39] + "…" for word in gn if word)
 
 
 def _scan(spec, node, contexts):
@@ -786,8 +784,10 @@ def reask(node):
     pipeline.forget(row.cell.key for job in jobs for row in job.rows if row.cell is not None)
     for key in [key for key in LAST_SHOWN if key[0] == node.uid]:
         del LAST_SHOWN[key]
-    # as the next pass lays it out: the live set, and no default now that nothing was shown
-    inner.build(node, node_store, list(dict.fromkeys(job.gn for job in jobs)), None)
+    # as the next pass writes it: the live set, and no default now that nothing was shown; values only when it can
+    live = list(dict.fromkeys(job.gn for job in jobs))
+    if not inner.update_values(node, node_store, live, None):
+        inner.build(node, node_store, live, None)
     schedule(immediate=True)
 
 

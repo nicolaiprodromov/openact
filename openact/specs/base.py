@@ -192,7 +192,7 @@ class Spec:
     idname = ""  # "GeometryNodeOpenActAsk", ...
     label = ""  # the node's label, also in its inner group's name
     PROMPT_VERSION = 1  # the templates: stored per entry as pv, part of the ask key and never of a words key
-    WORDS: tuple[str, ...] = ()  # the fixed word tuple, in match-chain order, Key last (§8.2)
+    WORDS: tuple[str, ...] = ()  # the fixed word tuple, in key-text order, Key last (§8.2)
     FALLBACK: dict = {}  # single-value output -> its value before the first answer (§6.0)
     empty_hint = ""
 
@@ -205,7 +205,7 @@ class Spec:
         raise NotImplementedError
 
     def gn(self, node, ctx) -> tuple[str, ...]:
-        """The raw words in ctx, as the match chain compares them: "" for a word the node has no socket for."""
+        """The raw words in ctx, as the inner group's key text holds them: "" for a word the node has no socket for."""
         from ..evaluator import as_text, eval_input  # imports bpy
 
         sockets = [node.inputs.get(name) for name in self.words(node)]
@@ -451,5 +451,6 @@ class Spec:
         return ()
 
     def build(self, b, gi, go, entries) -> None:
-        """Lay out the inner group's nodes for these entries (inner.build())."""
+        """Lay out the inner group's own nodes (inner.build()), which read the entry the builder found (b.row, b.found).
+        entries: the ones the table object holds, for what the graph bakes from them (layout())."""
         raise NotImplementedError

@@ -425,11 +425,11 @@ def phase_diagnostics():
     check("diagnostics: no server or account name: the Python only by its folder's name, and a runtime in the home "
           "folder itself as ~", "fileserver" not in text and "users$" not in text and "\nRuntime: ~\n" in in_home,
           (text, in_home))
-    check("diagnostics: the queue, a count per node type, and per node its rows per table, materialised entries and "
-          "inner-group nodes", "Queue: 0/0/0 chunks (P0/P1/P2), 0 cells in flight, 0 pending" in text
+    check("diagnostics: the queue, a count per node type, and per node its rows per table, stored entries, table "
+          "object rows and inner-group nodes", "Queue: 0/0/0 chunks (P0/P1/P2), 0 cells in flight, 0 pending" in text
           and re.search(r"^Nodes: .*\b\d+ Match\b", text, re.M) is not None and re.search(
-              r"^  Match: complete; rows per table 2; 1 of 1 stored entries materialised; \d+ nodes in the inner "
-              r"group$", text, re.M) is not None, text)
+              r"^  Match: complete; rows per table 2; 1 stored entries; 4 rows in the table object; \d+ nodes in the "
+              r"inner group$", text, re.M) is not None, text)
     check("diagnostics: a problem is copied as its node type and severity, never its text",
           "'okapi-sentinel' appears twice" in quoted and "folder-sentinel" in pathed
           and "zebrafactor=quokkalevel" in named and re.search(r"^  Match error \(x2\)$", text, re.M)

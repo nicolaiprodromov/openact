@@ -148,4 +148,4 @@ class ClassifySpec(PerItemSpec):
         return f"{len(rows)} items · {used} label{'' if used == 1 else 's'} used · {self.unsure(entry)} unsure"
 
     def build(self, b, gi, go, entries):
-        b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])  # every output is a per-element column
+        """Nothing of its own: every output is a per-element column (inner's per_element())."""

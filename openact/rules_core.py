@@ -152,7 +152,7 @@ def level_index(factor, value) -> int | None:
 
 def category_map(factor) -> tuple[int, ...] | None:
     """None when the category's values count up by one (the graph subtracts u_0), else the map rows the table object
-    stores after the cell rows: the level of each value 0..u_max, or -1 where no level has the value."""
+    stores after its meta row: the level of each value 0..u_max, or -1 where no level has the value."""
     values = [level.value for level in factor.levels]
     if all(value == values[0] + i for i, value in enumerate(values)):
         return None

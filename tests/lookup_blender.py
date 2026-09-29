@@ -1,10 +1,10 @@
-"""The inner group built from a node's entries, with no server: the match chain, entry-level values,
-values-only updates and rebuilds, single-value sampling from a table object, and per-element values with an
-unlinked ID in a second Blender, without the add-on (G6). With --bench, also the
-main-thread budgets of §8.4, as BENCH lines: inner.build() and update_values() for the Ask and Pick
-shapes and the contract spike's stand-ins for the demo and worst shapes of the nodes still to come; and,
-recorded without a gate, the planning cost of a 4096-cell context (§5.3). As §18.2 checks timings, a
-measurement above its budget prints a WARN line and fails only above twice the budget.
+"""The inner group and table object built from a node's entries, with no server: the hash lookup (each entry found by
+the key of its words among the table's header rows, and the default a miss shows), single values and per-element rows
+of all six nodes, values-only updates, appends and rebuilds, more than 16 word sets on one node, words whose keys
+collide, and per-element values with an unlinked ID in a second Blender, without the add-on (G6). With --bench, also
+the main-thread budgets of §8.7, as BENCH lines: inner.build(), update_values() and append_entry() on the demo shapes
+and the worst ones the limits allow; and, recorded without a gate, the planning cost of a 4096-cell context (§5.3). As
+§18.2 checks timings, a measurement above its budget prints a WARN line and fails only above twice the budget.
 
 Run:  blender -b --factory-startup --python tests/lookup_blender.py [-- --bench]
       OPENACT_BENCH_SHAPE=demo|worst limits --bench to one set of shapes (default: both).
@@ -25,12 +25,12 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import ROOT, check, finish, sock, store  # noqa: E402
-from openact import engine, evaluator, inner, nodes, ops, pipeline, tables  # noqa: E402  (bpy must be imported first)
+from openact import engine, evaluator, inner, lists, nodes, ops, pipeline, tables, words  # noqa: E402  (bpy first)
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
-from openact.inner import SocketDef  # noqa: E402
-from openact.specs.base import Spec, shared_sockets  # noqa: E402
+from openact.specs.base import Spec  # noqa: E402
 from openact.specs.classify import ClassifySpec  # noqa: E402
+from openact.specs.dials import DialsSpec  # noqa: E402
 from openact.specs.match import MatchSpec  # noqa: E402
 from openact.specs.rules import RulesSpec  # noqa: E402
 
@@ -38,10 +38,10 @@ P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 ops.register()
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-MATERIALISED_MAX = 16  # the cap of §8.1: every worst shape has this many entries
+MANY = 1024  # blocks in the bench's largest tables: every stored entry is a block, with no cap (§8.1)
 DIALS_MAX_SETTINGS = 32  # §7.5
-BUDGET_MS = {"build demo": 100, "build demo interpolated": 250, "build worst": 1000,  # §8.4
-             "update_values": 30, "update_values all": 150}
+BUDGET_MS = {"build demo": 100, "build demo interpolated": 250, "build worst": 1000,  # §8.7
+             "update_values": 10, "update_values worst": 100, "append": 5, "append worst": 20}
 
 # ------------------------------------------------------------------------------ the scene
 
@@ -75,14 +75,14 @@ WORDS = {  # object -> the words its modifier gives the tree
     "C": {"Question": "Is it loud?", "Prompt": "something to eat", "Items": "apple, pear", "Item": ""},
 }
 objects = {}
-for key, words in WORDS.items():
+for key, given in WORDS.items():
     mesh = bpy.data.meshes.new(key)
     mesh.from_pydata([(0, 0, 0)], [], [])
     obj = objects[key] = bpy.data.objects.new(key, mesh)
     bpy.context.scene.collection.objects.link(obj)
     mod = obj.modifiers.new("Lookup", 'NODES')
     mod.node_group = tree
-    for name, value in words.items():
+    for name, value in given.items():
         mod[ids[name]] = value
 
 
@@ -94,14 +94,17 @@ def ask_entry(key, answer, confidence):
 def pick_entry(key, index, confidence):
     words = WORDS[key]
     names = [name.strip() for name in words["Items"].split(",")]
+    rows = S.Rows(name=names, wkey=[""] * len(names), ask=[0] * len(names), src="m" * len(names),
+                  v={"prob": [float(r == index) for r in range(len(names))]})
     return S.Entry(words_key=key, gn=(words["Prompt"], "", words["Items"], "", ""), kind="pick", answer_type='ONE_OF',
-                   single={"Index": index, "Item": names[index], "Confidence": confidence})
+                   asks=["a"], rows=rows, single={"Index": index, "Item": names[index], "Confidence": confidence})
 
 
-def asked(question, p, t):
-    """The entry the pass stores once an Ask whose only word is this Question is answered p, last used at t."""
+def asked(question, p, t, key=""):
+    """The entry the pass stores once an Ask whose only words are this Question and Key is answered p, last used at
+    t."""
     spec = engine.SPECS[engine.ASK_ID]
-    job = spec.job((question, "", "", "", ""), 'YES_NO', True)
+    job = spec.job((question, "", "", "", key), 'YES_NO', True)
     rows = spec.rows(job, {job.rows[0].cell.key: {"p": p, "model": "fake"}})
     return dataclasses.replace(spec.entry(job, rows, "fake"), t=t)
 
@@ -138,8 +141,7 @@ def phase_lookup():
     placed = {n.bl_idname: tuple(n.location) for n in ask.node_tree.nodes}
     check("build: locations are written in one batch",
           placed["NodeGroupInput"] == (-900, 0) and placed["NodeGroupOutput"] == (800, 0)
-          and sorted(n.location.y for n in ask.node_tree.nodes if n.bl_idname == "GeometryNodeIndexSwitch")
-          == [-200, 0, 200], placed)
+          and placed["GeometryNodeAttributeStatistic"] == (250, 200), placed)
 
     before = pointers(ask), pointers(pick)
     asks.entries[1] = ask_entry("B", 0.625, 0.25)
@@ -154,17 +156,23 @@ def phase_lookup():
           got)
 
     grown = S.NodeStore(asks.entries + [ask_entry("C", 1.0, 1.0)])
-    refused = inner.update_values(ask, grown)
-    check("update_values: other entries need build(), and nothing is written",
-          refused is False and pointers(ask) == before[0] and read("C")["answer"] == 0.0, (refused, read("C")))
-    inner.build(ask, grown)
+    added = inner.update_values(ask, grown)
     got = {key: read(key) for key in WORDS}
-    check("build: the new entry reaches its context", got["C"]["answer"] == 1.0 and got["C"]["yes"] is True, got["C"])
+    check("update_values: a new entry is new rows of the table, values only: the same nodes, and its context reads it",
+          added is True and pointers(ask) == before[0] and got["C"]["answer"] == 1.0 and got["C"]["yes"] is True,
+          (added, got["C"]))
+
+    def broken(*_args, **_kwargs):
+        raise ValueError("the table can't be written")
+
+    write_rows, tables.write_rows = tables.write_rows, broken
     try:
-        inner.build(ask, S.NodeStore(grown.entries + [S.Entry(gn=("Is it broken?", "", "", "", ""))]))  # no values
+        inner.build(ask, grown)
         raised = False
-    except KeyError:
+    except ValueError:
         raised = True
+    finally:
+        tables.write_rows = write_rows
     check("build: after a build that raised, update_values() refuses even the entries built before it",
           raised and inner.update_values(ask, grown) is False, raised)
     inner.build(ask, grown)
@@ -174,9 +182,9 @@ def phase_lookup():
 
 
 def phase_positions():
-    """The match chain compares each word at its position (§8.2): a text Pick's entry matches only its prompt and
-    Items text, a collection Pick's entry only its prompt with no Items text. An entry with too few words, not a
-    tuple the node makes, matches nothing, and the entries after it keep their numbers."""
+    """The key text holds each word at its position (§8.2): a text Pick's entry is found only by its prompt and Items
+    text, a collection Pick's entry only by its prompt with no Items text. An entry with too few words, not a tuple the
+    node makes, is found by none, and the entries after it still are."""
     collection = S.Entry(words_key="B", gn=(WORDS["B"]["Prompt"], "", "", "", ""), kind="pick", answer_type='ONE_OF',
                          single={"Index": 0, "Item": "book", "Confidence": 0.5})
     short = S.Entry(words_key="short", gn=(WORDS["C"]["Prompt"], WORDS["C"]["Items"]), kind="pick",
@@ -190,8 +198,8 @@ def phase_positions():
         got[f"C with {key}'s prompt"] = read("C")["index"]
     mod[ids["Prompt"]], mod[ids["Items"]] = WORDS["C"]["Prompt"], WORDS["C"]["Items"]
     objects["C"].update_tag()
-    check("word positions: each entry matches its own words at their positions, an entry with too few words matches "
-          "nothing, and the entries after it keep their numbers",
+    check("word positions: each entry is found by its own words at their positions, an entry with too few words by "
+          "none, and the entries after it still are",
           got == {"A": 1, "B": -1, "C": 0, "C with A's prompt": -1, "C with B's prompt": 0}, got)
 
 
@@ -238,10 +246,10 @@ def phase_pass():
           node_.entries.startswith('{"schema":2,') and [e.gn[0] for e in saved[:1] + saved[-1:]] == ["Old words", "New words"]
           and [e.gn[0] for e in saved[1:-1]] == [f"Warm {i}?" for i in range(2, S.MAX_ENTRIES + 2)],
           [e.gn[0] for e in saved])
-    check("pass: the inner group shows the stored answers, the live ones materialised", engine.STATUS[node_.uid].icon
-          == 'CHECKMARK' and inner.update_values(node_, S.load(node_), [job.gn for job in jobs.values()])
-          and len(inner.materialised(saved, [job.gn for job in jobs.values()])) == inner.WARM_TOTAL,
-          engine.STATUS[node_.uid])
+    check("pass: the table object holds every stored entry, a header row each, and a values-only update keeps it",
+          engine.STATUS[node_.uid].icon == 'CHECKMARK'
+          and inner.update_values(node_, S.load(node_), [job.gn for job in jobs.values()])
+          and len(tables.header_rows(node_)) == len(saved), (engine.STATUS[node_.uid], len(saved)))
 
     before, questions = node_.entries, []
     with asking(node_, questions):
@@ -275,8 +283,9 @@ def phase_pass():
           and saved == [(("Old words", "", "", "", ""), 0.25), (("New words", "", "", "", ""), 0.875)],
           (questions, saved))
     engine.reask(node_)
-    check("Ask Again: the node's answers are forgotten, saved as schema 2 and the group rebuilt",
-          node_.entries == '{"schema":2,"entries":[]}' and inner.update_values(node_, S.NodeStore()), node_.entries)
+    check("Ask Again: the node's answers are forgotten, saved as schema 2, and its table holds none",
+          node_.entries == '{"schema":2,"entries":[]}' and inner.update_values(node_, S.NodeStore())
+          and not tables.header_rows(node_), node_.entries)
 
     newer = '{"schema":3,"entries":[{"written by":"a newer OpenAct"}]}'
     node_.entries = newer
@@ -399,8 +408,7 @@ def phase_pick_pass():
 
 def phase_stored_default():
     """A single context whose words changed keeps showing its own last answer while it waits, a stored one too, never
-    another stored entry's (§8.2). The words key "" names no entry: with that default, the warm entries are the most
-    recent ones, never the keyless."""
+    another stored entry's (§8.2). The words key "" names no entry, not even one stored without a words key."""
     group = bpy.data.node_groups.new("Stored", 'GeometryNodeTree')
     for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Question", 'NodeSocketString')):
         group.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
@@ -435,11 +443,11 @@ def phase_stored_default():
     check("stored entries: a single context whose words changed keeps showing its own stored answer, never the other "
           "stored entry's", before == 0.125 and after == 0.125, (before, after))
     live = S.Entry(words_key="live", gn=("Live?", "", "", "", ""))
-    old = [S.Entry(words_key="", gn=(f"Keyless {i}?", "", "", "", ""), t=float(i)) for i in range(3)]
-    recent = [S.Entry(words_key=f"recent {i}", gn=(f"Recent {i}?", "", "", "", ""), t=10.0 + i) for i in range(3)]
-    warm = [e.gn[0] for e in inner.materialised(old + recent + [live], [live.gn], "")]
-    check("entries without a words key: with the default \"\", the warm entries are the most recent, never the keyless",
-          warm == ["Recent 0?", "Recent 1?", "Recent 2?", "Live?"], warm)
+    keyless = [S.Entry(words_key="", gn=(f"Keyless {i}?", "", "", "", ""), t=float(i)) for i in range(3)]
+    inner.build(asker, S.NodeStore(keyless + [live]), [live.gn], "")
+    default = tables.read(asker, tables.DEFAULT)
+    check("entries without a words key: the default \"\" names none of them, so a miss shows the fallbacks",
+          default is not None and default[0] == -1 and len(tables.header_rows(asker)) == 4, default)
     bpy.data.objects.remove(user)
     bpy.data.node_groups.remove(group)
 
@@ -648,8 +656,8 @@ def phase_live_set():
 
 
 def phase_last_shown():
-    """k_default names a stored entry by its words key: a single context showing one gets new words that no model
-    answers, and keeps showing its own answer, never another question's (§8.2)."""
+    """The default a miss shows names a stored entry by its words key: a single context showing one gets new words
+    that no model answers, and keeps showing its own answer, never another question's (§8.2)."""
     group = bpy.data.node_groups.new("LastShown", 'GeometryNodeTree')
     group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -690,453 +698,353 @@ def phase_statuses():
           status.icon == 'CANCEL' and "newer OpenAct" in status.text, status)
 
 
-# ------------------------------------------------------------------ stand-ins for later nodes
-# The contract spike (§8.4): graphs with the node types and counts that the nodes still to come will
-# build for their demos and at their documented limits, built through the real inner.build() on an
-# Ask node that stands in for them.
+# ------------------------------------------------------------------ all six nodes, appends, no cap, collisions
 
-TABLE = bpy.data.objects.new(".OpenAct Table bench", bpy.data.meshes.new(".OpenAct Table bench"))
-MATERIALS = [bpy.data.materials.new(f"Bench {i}") for i in range(MATERIALISED_MAX)]
-INTEGER, REAL = "FunctionNodeIntegerMath", "ShaderNodeMath"
+SIX_WORDS = ("first", "second", "third")  # each object's Word in six_scene(); entry i holds SIX_VALUES[i]
+SIX_ITEMS = ["table", "chair", "lamp"]
+SIX_READS = ("ask", "index", "item", "prob", "match", "label", "outcome", "rain", "wind")  # six_scene()'s attributes
+LIT = {"name": "lit", "kind": "flag", "levels": ["dark", "bright"], "values": [0, 1], "edges": None}  # declare()d
+SETTINGS = [{"name": "Rain", "type": "yes_no", "min": 0.0, "max": 1.0},
+            {"name": "Wind", "type": "amount", "min": 0.0, "max": 10.0}]
+SIX_VALUES = (  # per entry: Answer, Index, prob, Match p, Label, Outcome, Dials values (Rain p, Wind 0-1)
+    (0.25, 1, [0.125, 0.75, 0.125], [0.875, 0.125], [0, 1], [0, 1], [0.75, 0.5]),
+    (0.75, 2, [0.0625, 0.25, 0.6875], [0.25, 0.625], [1, 0], [1, 0], [0.25, 0.25]),
+    (0.625, 0, [0.5, 0.25, 0.25], [0.375, 0.5], [1, 1], [1, 1], [0.875, 0.75]))
 
 
 def enabled(sockets, name):
     return next(s for s in sockets if s.name == name and s.enabled)
 
 
-def chain(b, gi, words, entries):
-    """The joined-key match chain of §8.2: one Join Strings, then a Compare and a Switch per entry."""
-    join = b.new("GeometryNodeStringJoin", -900, 600)
-    join.inputs["Delimiter"].default_value = "\x1f"
-    for word in reversed(words):  # Join Strings joins the most recently linked first
-        b.link(gi.outputs[word], join.inputs["Strings"])
-    k = None
-    for i, entry in enumerate(entries, start=1):
-        compare = b.new("FunctionNodeCompare", -700, 600 - 30 * i)
-        compare.data_type, compare.operation = 'STRING', 'EQUAL'
-        b.link(join.outputs[0], sock(compare.inputs, "A_STR"))
-        sock(compare.inputs, "B_STR").default_value = "\x1f".join(entry.gn)
-        switch = b.new("GeometryNodeSwitch", -500, 600 - 30 * i)
-        switch.input_type = 'INT'
-        b.link(compare.outputs[0], sock(switch.inputs, "Switch"))
-        if k is None:
-            sock(switch.inputs, "False").default_value = 0
-        else:
-            b.link(k, sock(switch.inputs, "False"))
-        sock(switch.inputs, "True").default_value = i
-        k = switch.outputs[0]
-    return k
+def six_scene():
+    """One tree of all six nodes, used by three objects of 2 points: each node's first word comes from the modifier's
+    Word, its other words are typed, and each output is a point attribute (Pick's Item as its length). Rules has one
+    flag factor, lit, read from the points' own attribute (False, True); Dials has the settings Rain and Wind."""
+    group = bpy.data.node_groups.new("Six", 'GeometryNodeTree')
+    for name, socket_type in (("Geometry", 'NodeSocketGeometry'), ("Word", 'NodeSocketString')):
+        group.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi = group.nodes.new("NodeGroupInput")
+    made = [group.nodes.new(idname) for idname in (engine.ASK_ID, engine.PICK_ID, MatchSpec.idname,
+                                                    ClassifySpec.idname, RulesSpec.idname, DialsSpec.idname)]
+    asker, picker, matcher, classifier, rules, dial = made
+    inner.sync_interface(rules, engine.SPECS[RulesSpec.idname].interface(rules, [("lit", "flag")], []))
+    inner.sync_interface(dial, engine.SPECS[DialsSpec.idname].interface(dial, [("Rain", "yes_no"), ("Wind", "amount")]))
+    for node_, first in zip(made, ("Question", "Prompt", "Question", "Question", "Question", "Prompt")):
+        group.links.new(gi.outputs["Word"], node_.inputs[first])
+    picker.inputs["Items"].default_value = ", ".join(SIX_ITEMS)
+    matcher.inputs["Items"].default_value = classifier.inputs["Items"].default_value = "pan, sofa"
+    classifier.inputs["Labels"].default_value = "kitchen; living room"
+    lit = group.nodes.new("GeometryNodeInputNamedAttribute")
+    lit.data_type = 'BOOLEAN'
+    lit.inputs["Name"].default_value = "lit"
+    group.links.new(enabled(lit.outputs, "Attribute"), rules.inputs["lit"])
+    length = group.nodes.new("FunctionNodeStringLength")
+    group.links.new(picker.outputs["Item"], length.inputs["String"])
+    geometry = gi.outputs["Geometry"]
+    for name, output, data_type in zip(SIX_READS, (
+            asker.outputs["Answer"], picker.outputs["Index"], length.outputs["Length"], picker.outputs["Probability"],
+            matcher.outputs["Probability"], classifier.outputs["Label"], rules.outputs["Outcome"],
+            dial.outputs["Rain"], dial.outputs["Wind"]), ('FLOAT', 'INT', 'INT', 'FLOAT', 'FLOAT', 'INT', 'INT',
+                                                          'BOOLEAN', 'FLOAT')):
+        geometry = store(group, geometry, output, name, data_type)
+    group.links.new(geometry, group.nodes.new("NodeGroupOutput").inputs[0])
+    users = {}
+    for word in SIX_WORDS:
+        users[word] = obj = user_of(group, f"Six {word}", points=2)
+        obj.data.attributes.new("lit", 'BOOLEAN', 'POINT').data.foreach_set("value", [False, True])
+        set_word(obj, word)
+    return made, users
 
 
-def node(b, idname, x, y, **settings):
-    made = b.new(idname, x, y)
-    for name, value in settings.items():
-        setattr(made, name, value)
-    return made
+def set_word(obj, word):
+    mod = obj.modifiers[0]
+    mod[mod.node_group.interface.items_tree["Word"].identifier] = word
+    obj.update_tag()
 
 
-def math(b, idname, operation, x, y, *values):
-    """A math node whose inputs are linked from sockets or set to numbers, in order."""
-    made = node(b, idname, x, y, operation=operation)
-    for socket, value in zip(made.inputs, values):
-        if isinstance(value, (int, float)):
-            socket.default_value = value
-        else:
-            b.link(value, socket)
-    return made.outputs[0]
+def six_entry(node_, obj, i):
+    """The node's entry for the words it has in obj's context (spec.gn()), holding SIX_VALUES[i]."""
+    spec = engine.SPECS[node_.bl_idname]
+    gn = spec.gn(node_, next(c for c in evaluator.find_uses()[node_.id_data.as_pointer()] if c.obj == obj))
+    answer, index, probs, p, labels, outcomes, settings = SIX_VALUES[i]
+    names, v, extra = ["only"], {}, {}
+    if spec.name == "ask":
+        extra = {"answer_type": 'YES_NO', "single": {"Answer": answer, "Yes": answer >= 0.5, "Confidence": 0.5}}
+    elif spec.name == "pick":
+        names, v = SIX_ITEMS, {"prob": probs}
+        extra = {"answer_type": 'ONE_OF', "single": {"Index": index, "Item": SIX_ITEMS[index], "Confidence": 0.5}}
+    elif spec.name in ("match", "classify"):
+        names, v = ["pan", "sofa"], {"p": p, "c": [0.5, 0.5]} if spec.name == "match" else {"label": labels,
+                                                                                                "c": [0.5, 0.5]}
+    elif spec.name == "rules":
+        names, v = ["dark", "bright"], {"outcome": outcomes, "c": [0.5, 0.5]}
+        extra = {"answer_type": 'ONE_OF', "shape": {"factors": [dict(LIT)], "payload": [], "outcomes": ["A", "B"]}}
+    else:
+        names, v = ["Rain", "Wind"], {"value": settings, "c": [0.5, 0.5]}
+        extra = {"shape": {"settings": [dict(s) for s in SETTINGS]}}
+    rows = S.Rows(name=list(names), wkey=[""] * len(names), ask=[0] * len(names), src="m" * len(names), v=v)
+    return S.Entry(words_key=f"{spec.name} {i}", gn=gn, t=1.0 + i, kind=spec.name, asks=["a"], rows=rows, **extra)
 
 
-def sample(b, table, column, data_type, index, x, y):
-    """One lookup on the table object (§8.3): Named Attribute and Sample Index."""
-    attribute = node(b, "GeometryNodeInputNamedAttribute", x, y, data_type=data_type)
-    attribute.inputs["Name"].default_value = column
-    sampled = node(b, "GeometryNodeSampleIndex", x + 150, y, data_type=data_type)
-    b.link(table, sampled.inputs["Geometry"])
-    b.link(enabled(attribute.outputs, "Attribute"), enabled(sampled.inputs, "Value"))
-    b.link(index, sampled.inputs["Index"])
-    return enabled(sampled.outputs, "Value")
+def six_expected(i):
+    """What an object of six_scene() reads, point by point (ID = index, lit False then True), when its words find entry
+    i, or with None the fallbacks."""
+    if i is None:
+        return {"ask": [0.0] * 2, "index": [-1] * 2, "item": [0] * 2, "prob": [0.0] * 2, "match": [0.0] * 2,
+                "label": [-1] * 2, "outcome": [-1] * 2, "rain": [False] * 2, "wind": [0.0] * 2}
+    answer, index, probs, p, labels, outcomes, settings = SIX_VALUES[i]
+    return {"ask": [answer] * 2, "index": [index] * 2, "item": [len(SIX_ITEMS[index])] * 2, "prob": probs[:2],
+            "match": p, "label": labels, "outcome": outcomes, "rain": [settings[0] >= 0.5] * 2,
+            "wind": [settings[1] * 10.0] * 2}
 
 
-def guarded(b, valid, value, data_type, fallback, x, y):
-    """valid ? value : fallback."""
-    switch = node(b, "GeometryNodeSwitch", x, y, input_type=data_type)
-    b.link(valid, sock(switch.inputs, "Switch"))
-    sock(switch.inputs, "False").default_value = fallback
-    b.link(value, sock(switch.inputs, "True"))
-    return switch.outputs[0]
+def phase_six():
+    """All six nodes in one tree shared by three objects (§8.2): the first two objects' words find their own entry of
+    each node, single values at its header row and per-element rows after it; the third's find none, so on the shared
+    tree they read the neutral fallbacks. The default a miss shows is a row of the table: pointed at the first entry,
+    values only, it gives the third object that entry's values on every node."""
+    made, users = six_scene()
+    stores = {node_.name: S.NodeStore([six_entry(node_, users[word], i) for i, word in enumerate(SIX_WORDS[:2])])
+              for node_ in made}
+    for node_ in made:
+        inner.build(node_, stores[node_.name])
+    got = {word: table_read(obj, SIX_READS) for word, obj in users.items()}
+    check("six nodes: each object's words find their own entry of every node, its single values and its per-element "
+          "rows", got["first"] == six_expected(0) and got["second"] == six_expected(1), got)
+    check("six nodes: words that find no entry, on a shared tree, read every node's neutral fallbacks",
+          got["third"] == six_expected(None), got["third"])
+    before = [pointers(node_) for node_ in made]
+    updated = [inner.update_values(node_, stores[node_.name], None, stores[node_.name].entries[0].words_key)
+               for node_ in made]
+    got = table_read(users["third"], SIX_READS)
+    check("six nodes: the default a miss shows is a row of the table, written values only: the third object reads the "
+          "first one's entry on every node", updated == [True] * 6 and [pointers(n) for n in made] == before
+          and got == six_expected(0), (updated, got))
+    for node_ in made:
+        inner.update_values(node_, stores[node_.name])
+    return made, users, stores
 
 
-def flat_index(b, k, entries, rows, index, x, y):
-    """flat = base + index and valid = 0 <= index < count, with base and count on k (§8.3)."""
-    flat = node(b, INTEGER, x + 400, y, operation='ADD')
-    b.lookup(k, 'INT', 0, [rows * e for e in range(len(entries))], flat.inputs[0], y)
-    b.link(index, flat.inputs[1])
-    below = node(b, "FunctionNodeCompare", x + 400, y - 150, data_type='INT', operation='LESS_THAN')
-    b.lookup(k, 'INT', 0, [rows] * len(entries), sock(below.inputs, "B_INT"), y - 150)
-    b.link(index, sock(below.inputs, "A_INT"))
-    above = node(b, "FunctionNodeCompare", x + 400, y - 300, data_type='INT', operation='GREATER_EQUAL')
-    b.link(index, sock(above.inputs, "A_INT"))
-    valid = math(b, "FunctionNodeBooleanMath", 'AND', x + 600, y - 200, above.outputs[0], below.outputs[0])
-    return flat.outputs[0], valid
+def phase_append(made, users, stores):
+    """The playback path's writes, values only (§8.8): append_entry() adds the third object's entry of every node as
+    new rows, found at the next evaluation with no graph edit; the same words again are refused, and so is a Rules
+    entry whose factors the graph doesn't read. A Pick entry with a new item name shows its Index at once and its Item
+    after the rebuild the new name asks for. set_default() points a miss at an entry, and back at the fallbacks."""
+    before, built = [pointers(node_) for node_ in made], [node_.node_tree[inner.BUILT] for node_ in made]
+    third = {node_.name: six_entry(node_, users["third"], 2) for node_ in made}
+    appended = [inner.append_entry(node_, third[node_.name]) for node_ in made]
+    got = table_read(users["third"], SIX_READS)
+    check("append_entry: the third object's entry of every node is appended values only and found at once, with the "
+          "same nodes and layout", appended == [True] * 6 and [pointers(n) for n in made] == before
+          and [n.node_tree[inner.BUILT] for n in made] == built and got == six_expected(2), (appended, got))
+    again = [inner.append_entry(node_, third[node_.name]) for node_ in made]
+    rules = made[4]
+    reversed_lit = dict(LIT, levels=["bright", "dark"], values=[1, 0])  # another layout: the flag's levels swapped
+    other = dataclasses.replace(third[rules.name], gn=("other",) + third[rules.name].gn[1:],
+                                shape=dict(third[rules.name].shape, factors=[reversed_lit]))
+    check("append_entry: words the table holds are refused, and so is a Rules entry whose factor layout the graph "
+          "doesn't read", again == [False] * 6 and inner.append_entry(rules, other) is False
+          and [pointers(n) for n in made] == before, again)
+
+    picker = made[1]
+    set_word(users["third"], "fourth")
+    named = dataclasses.replace(six_entry(picker, users["third"], 2), words_key="pick 3",
+                                single={"Index": 2, "Item": "a new name", "Confidence": 0.5})
+    added = inner.append_entry(picker, named)
+    first = table_read(users["third"], ("index", "item"))
+    grown = S.NodeStore(stores[picker.name].entries + [third[picker.name], named])
+    rebuilt = not inner.update_values(picker, grown)
+    if rebuilt:
+        inner.build(picker, grown)
+    check("append_entry: a Pick entry whose item the graph doesn't list shows its Index at once and the fallback Item; "
+          "the new name is a new layout, whose rebuild shows it", added and first == {"index": [2] * 2, "item": [0] * 2}
+          and rebuilt and table_read(users["third"], ("item",))["item"] == [10] * 2, (added, first, rebuilt))
+    inner.build(picker, S.NodeStore(stores[picker.name].entries + [third[picker.name]]))
+
+    set_word(users["third"], "fifth")  # words with no entry
+    before = [pointers(node_) for node_ in made]
+    missing = table_read(users["third"], SIX_READS)
+    for node_ in made:
+        inner.set_default(node_, stores[node_.name].entries[1].words_key, stores[node_.name])
+    pointed = table_read(users["third"], SIX_READS)
+    for node_ in made:
+        inner.set_default(node_, None)
+    check("set_default: a miss shows the entry it names on every node, values only, and the fallbacks again for None",
+          missing == six_expected(None) and pointed == six_expected(1)
+          and table_read(users["third"], SIX_READS) == six_expected(None) and [pointers(n) for n in made] == before,
+          (missing, pointed))
+    group = made[0].id_data
+    for obj in users.values():
+        bpy.data.objects.remove(obj)
+    bpy.data.node_groups.remove(group)
+    tables.collect_garbage(list(engine.iter_nodes()))  # their tables go now: phase_save_reload counts what goes
 
 
-def table_geometry(b, table=TABLE):
-    info = b.new("GeometryNodeObjectInfo", -300, -900)
-    info.inputs["Object"].default_value = table
-    return info.outputs["Geometry"]
+def ask_tree(name, words):
+    """A tree whose Ask reads each of `words` from the modifier and stores its Answer as the point attribute answer."""
+    group = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    for word in words:
+        group.interface.new_socket(word, in_out='INPUT', socket_type='NodeSocketString')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    gi = group.nodes.new("NodeGroupInput")
+    asker = group.nodes.new(engine.ASK_ID)
+    for word in words:
+        group.links.new(gi.outputs[word], asker.inputs[word])
+    group.links.new(store(group, gi.outputs["Geometry"], asker.outputs["Answer"], "answer", 'FLOAT'),
+                    group.nodes.new("NodeGroupOutput").inputs[0])
+    return group, asker
 
 
-def words_iface(words):
-    """Every node's shared sockets (§6.0), then these words."""
-    return (*shared_sockets(), *(SocketDef('INPUT', w, 'NodeSocketString', kind="word") for w in words))
+def use(obj, **words):
+    mod = obj.modifiers[0]
+    for word, value in words.items():
+        mod[mod.node_group.interface.items_tree[word].identifier] = value
+    obj.update_tag()
 
 
-class StandIn:
-    """What inner.build() reads of a spec besides its build(): its label and its words (Spec.words())."""
-
-    label, WORDS = "", ()
-
-    def words(self, node=None):
-        return self.WORDS
-
-
-class RulesStandIn(StandIn):
-    """Rules in Amount mode (§9.2, §9.6): three Amount factors of `bands` bands, interpolated over 8
-    corners with 3 lookups each (value, c, ok), weights and the renormalised blend. Custom edges cost a
-    Compare and an Add per edge; equal-width bands a fixed graph."""
-
-    label, WORDS = "Rules", ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
-    iface = words_iface(WORDS) + tuple(SocketDef('INPUT', f"f{j}", 'NodeSocketFloat', kind="field")
-                                       for j in range(3)) + (
-        SocketDef('OUTPUT', "Amount", 'NodeSocketFloat'), SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'))
-
-    def __init__(self, bands, custom_edges):
-        self.bands, self.custom_edges = bands, custom_edges
-
-    def build(self, b, gi, go, entries):
-        n = self.bands
-        k = chain(b, gi, self.WORDS, entries)
-        table = table_geometry(b)
-        lower, weight = [], []  # per factor: (b0, b0 + 1) and (1 - t, t)
-        for j in range(3):
-            y = -1200 * j
-            x = node(b, "ShaderNodeClamp", -900, y)
-            b.link(gi.outputs[f"f{j}"], x.inputs["Value"])
-            if self.custom_edges:  # b0 = the number of edges at or below x; t from the centres around it
-                total = 0
-                for e in range(n - 1):
-                    above = node(b, "FunctionNodeCompare", -700, y - 40 * e, operation='GREATER_EQUAL')
-                    b.link(x.outputs[0], sock(above.inputs, "A"))
-                    sock(above.inputs, "B").default_value = (e + 1) / n
-                    total = math(b, INTEGER, 'ADD', -500, y - 40 * e, above.outputs[0], total)
-                upper = math(b, INTEGER, 'ADD', -300, y, total, 1)
-                offset = node(b, REAL, -100, y, operation='SUBTRACT')
-                span = node(b, REAL, -100, y - 100, operation='SUBTRACT')
-                centres = [(i + 0.5) / n for i in range(n)]
-                low = b.lookup(total, 'FLOAT', 0.0, centres, offset.inputs[1], y)
-                b.link(low, span.inputs[1])
-                b.lookup(upper, 'FLOAT', 0.0, centres, span.inputs[0], y - 100)
-                b.link(x.outputs[0], offset.inputs[0])
-                t = math(b, REAL, 'DIVIDE', 100, y, offset.outputs[0], span.outputs[0])
-                t.node.use_clamp = True
-            else:  # u = clamp(x n - 1/2, 0, n - 1), b0 = min(floor(u), n - 2), t = u - b0
-                u = node(b, "ShaderNodeClamp", -500, y)
-                b.link(math(b, REAL, 'MULTIPLY_ADD', -700, y, x.outputs[0], n, -0.5), u.inputs["Value"])
-                u.inputs["Max"].default_value = n - 1
-                floor = node(b, "FunctionNodeFloatToInt", -300, y, rounding_mode='FLOOR')
-                b.link(u.outputs[0], floor.inputs[0])
-                total = math(b, INTEGER, 'MINIMUM', -100, y, floor.outputs[0], n - 2)
-                upper = math(b, INTEGER, 'ADD', 100, y, total, 1)
-                t = math(b, REAL, 'SUBTRACT', 100, y - 100, u.outputs[0], total)
-            lower.append((total, upper))
-            weight.append((math(b, REAL, 'SUBTRACT', 300, y, 1.0, t), t))
-        sums = {"w": [], "v": [], "c": []}
-        base = None
-        for c, s in enumerate(itertools.product((0, 1), repeat=3)):  # the 8 corners
-            y = -400 * c
-            cell = math(b, INTEGER, 'MULTIPLY_ADD', 500, y, lower[1][s[1]], n, lower[2][s[2]])
-            cell = math(b, INTEGER, 'MULTIPLY_ADD', 700, y, lower[0][s[0]], n * n, cell)
-            flat = node(b, INTEGER, 900, y, operation='ADD')
-            if base is None:
-                base = b.lookup(k, 'INT', 0, [n ** 3 * e for e in range(len(entries))], flat.inputs[0], y)
-            else:
-                b.link(base, flat.inputs[0])
-            b.link(cell, flat.inputs[1])
-            v, conf, ok = (sample(b, table, column, 'FLOAT', flat.outputs[0], 1100, y - 120 * i)
-                           for i, column in enumerate(("oa_amount", "oa_c", "oa_ok")))
-            w = math(b, REAL, 'MULTIPLY', 1500, y, weight[0][s[0]], weight[1][s[1]])
-            w = math(b, REAL, 'MULTIPLY', 1700, y, w, weight[2][s[2]])
-            w_ok = math(b, REAL, 'MULTIPLY', 1900, y, w, ok)
-            sums["w"].append(w_ok)
-            sums["v"].append(math(b, REAL, 'MULTIPLY', 2100, y, w_ok, v))
-            sums["c"].append(math(b, REAL, 'MULTIPLY', 2100, y - 100, w_ok, conf))
-        totals = {}
-        for name, terms in sums.items():
-            total = terms[0]
-            for term in terms[1:]:
-                total = math(b, REAL, 'ADD', 2300, 0, total, term)
-            totals[name] = total
-        valid = node(b, "FunctionNodeCompare", 2500, 200, operation='GREATER_THAN')
-        b.link(totals["w"], sock(valid.inputs, "A"))
-        sock(valid.inputs, "B").default_value = 1e-6
-        for name, output in (("v", "Amount"), ("c", "Confidence")):
-            value = math(b, REAL, 'DIVIDE', 2500, 0, totals[name], totals["w"])
-            b.link(guarded(b, valid.outputs[0], value, 'FLOAT', 0.0, 2700, 0), go.inputs[output])
-
-
-class RulesOneOfStandIn(StandIn):
-    """Rules in One-of mode (§9.2, §9.3, §9.7): three equal-width Amount factors of `bands` bands, each
-    dithered with its own Random Value, the row-major cell index, and lookups of outcome, c and the
-    payload columns."""
-
-    label, WORDS = "Rules", ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
-    iface = words_iface(WORDS) + tuple(SocketDef('INPUT', f"f{j}", 'NodeSocketFloat', kind="field")
-                                       for j in range(3)) + (
-        SocketDef('INPUT', "Dither", 'NodeSocketFloat'), SocketDef('INPUT', "Seed", 'NodeSocketInt'),
-        SocketDef('OUTPUT', "Outcome", 'NodeSocketInt'), SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'),
-        SocketDef('OUTPUT', "instance", 'NodeSocketInt'), SocketDef('OUTPUT', "scale", 'NodeSocketFloat'))
-
-    def __init__(self, bands):
-        self.bands = bands
-
-    def build(self, b, gi, go, entries):
-        n = self.bands
-        k = chain(b, gi, self.WORDS, entries)
-        levels = []
-        for j in range(3):  # x' = clamp(x + (r - 0.5) Dither / n), b = min(floor(x' n), n - 1)
-            y = -600 * j
-            x = node(b, "ShaderNodeClamp", -900, y)
-            b.link(gi.outputs[f"f{j}"], x.inputs["Value"])
-            random = node(b, "FunctionNodeRandomValue", -900, y - 200, data_type='FLOAT')
-            b.link(math(b, INTEGER, 'ADD', -1100, y - 200, gi.outputs["Seed"], 7919 * j), random.inputs["Seed"])
-            jitter = math(b, REAL, 'SUBTRACT', -700, y - 200, enabled(random.outputs, "Value"), 0.5)
-            jitter = math(b, REAL, 'MULTIPLY', -500, y - 200, jitter, gi.outputs["Dither"])
-            moved = math(b, REAL, 'MULTIPLY_ADD', -300, y, jitter, 1 / n, x.outputs[0])
-            moved.node.use_clamp = True
-            band = node(b, "FunctionNodeFloatToInt", -100, y, rounding_mode='FLOOR')
-            b.link(math(b, REAL, 'MULTIPLY', -200, y, moved, n), band.inputs[0])
-            levels.append(math(b, INTEGER, 'MINIMUM', 100, y, band.outputs[0], n - 1))
-        cell = math(b, INTEGER, 'MULTIPLY_ADD', 300, 0, levels[1], n, levels[2])
-        cell = math(b, INTEGER, 'MULTIPLY_ADD', 500, 0, levels[0], n * n, cell)
-        flat = node(b, INTEGER, 700, 0, operation='ADD')
-        b.lookup(k, 'INT', 0, [n ** 3 * e for e in range(len(entries))], flat.inputs[0], 0)
-        b.link(cell, flat.inputs[1])
-        table = table_geometry(b)
-        for i, (column, data_type, output) in enumerate((("oa_outcome", 'INT', "Outcome"), ("oa_c", 'FLOAT', "Confidence"),
-                                                          ("oa_pl_0", 'INT', "instance"), ("oa_pl_1", 'FLOAT', "scale"))):
-            b.link(sample(b, table, column, data_type, flat.outputs[0], 900, -150 * i), go.inputs[output])
-
-
-class DialsStandIn(StandIn):
-    """Dials with `settings` Amount settings (§8.4, §8.6): each one's value, min and max sampled from the
-    one-row-per-entry table at k - 1 behind a Switch on k > 0, then Map Range; and the Confidence."""
-
-    label, WORDS = "Dials", ("Prompt", "Settings", "Overrides", "Key")
-
-    def __init__(self, settings):
-        self.settings = settings
-        self.iface = words_iface(self.WORDS) + tuple(
-            SocketDef('OUTPUT', f"s{s}", 'NodeSocketFloat') for s in range(settings)) + (
-            SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'),)
-
-    def build(self, b, gi, go, entries):
-        k = chain(b, gi, self.WORDS, entries)
-        table = table_geometry(b)
-        row = math(b, INTEGER, 'SUBTRACT', -300, 0, k, 1)
-        live = node(b, "FunctionNodeCompare", -300, -100, data_type='INT', operation='GREATER_THAN')
-        b.link(k, sock(live.inputs, "A_INT"))
-        for s in range(self.settings):
-            y = -250 * s
-            value, low, high = (sample(b, table, f"oa_{column}_{s}", 'FLOAT', row, 0, y - 80 * i)
-                                for i, column in enumerate(("v", "min", "max")))
-            mapped = node(b, "ShaderNodeMapRange", 400, y, clamp=False)
-            b.link(value, mapped.inputs["Value"])
-            b.link(low, mapped.inputs["To Min"])
-            b.link(high, mapped.inputs["To Max"])
-            b.link(guarded(b, live.outputs[0], mapped.outputs["Result"], 'FLOAT', 0.0, 600, y), go.inputs[f"s{s}"])
-        confidence = sample(b, table, "oa_conf", 'FLOAT', row, 0, 300)
-        b.link(guarded(b, live.outputs[0], confidence, 'FLOAT', 0.0, 600, 300), go.inputs["Confidence"])
-
-
-class PickPayloadStandIn(StandIn):
-    """Pick at its limits (§8.4): Index, Item and Confidence, 16 payload columns and Material on k, each
-    an Index Switch of 17 items, plus the per-element prob lookup (Probability, Selection) on ID."""
-
-    label, WORDS = "Pick", ("Prompt", "Context", "Items", "Overrides", "Key")
-    singles = [("Index", 'INT', -1), ("Item", 'STRING', ""), ("Confidence", 'FLOAT', 0.0)] + [
-        (f"p{c}", 'FLOAT', 0.0) for c in range(16)] + [("Material", 'MATERIAL', None)]
-    iface = words_iface(WORDS) + (
-        SocketDef('INPUT', "ID", 'NodeSocketInt', kind="field", default_input='INDEX', hide_value=True),) + tuple(
-        SocketDef('OUTPUT', name, {'INT': 'NodeSocketInt', 'STRING': 'NodeSocketString', 'FLOAT': 'NodeSocketFloat',
-                                   'MATERIAL': 'NodeSocketMaterial'}[data_type]) for name, data_type, _ in singles) + (
-        SocketDef('OUTPUT', "Selection", 'NodeSocketBool'), SocketDef('OUTPUT', "Probability", 'NodeSocketFloat'))
-
-    def build(self, b, gi, go, entries):
-        k = chain(b, gi, self.WORDS, entries)
-        picked = [b.lookup(k, data_type, fallback, [e.single[name] for e in entries], go.inputs[name], 300 - 150 * i)
-                  for i, (name, data_type, fallback) in enumerate(self.singles)][0]
-        flat, valid = flat_index(b, k, entries, 255, gi.outputs["ID"], -300, -3000)
-        probability = sample(b, table_geometry(b), "oa_prob", 'FLOAT', flat, 300, -3000)
-        b.link(guarded(b, valid, probability, 'FLOAT', 0.0, 600, -3000), go.inputs["Probability"])
-        same = node(b, "FunctionNodeCompare", 300, -3300, data_type='INT', operation='EQUAL')
-        b.link(gi.outputs["ID"], sock(same.inputs, "A_INT"))
-        b.link(picked, sock(same.inputs, "B_INT"))
-        answered = node(b, "FunctionNodeCompare", 300, -3450, data_type='INT', operation='GREATER_EQUAL')
-        b.link(picked, sock(answered.inputs, "A_INT"))
-        b.link(math(b, "FunctionNodeBooleanMath", 'AND', 600, -3300, same.outputs[0], answered.outputs[0]),
-               go.inputs["Selection"])
-
-
-class ClassifyStandIn(StandIn):
-    """Classify with `payload` payload columns (§8.3, §8.4): label, c and each payload column, a
-    per-element lookup on ID behind the valid switch. Match has the same graph with only p and c."""
-
-    label, WORDS = "Classify", ("Question", "Context", "Items", "Labels", "Overrides", "Key")
-
-    def __init__(self, payload):
-        self.columns = [("oa_label", 'INT', -1), ("oa_c", 'FLOAT', 0.0)] + [
-            (f"oa_pl_{c}", 'FLOAT', 0.0) for c in range(payload)]
-        self.iface = words_iface(self.WORDS) + (
-            SocketDef('INPUT', "ID", 'NodeSocketInt', kind="field", default_input='INDEX', hide_value=True),) + tuple(
-            SocketDef('OUTPUT', column, 'NodeSocketInt' if data_type == 'INT' else 'NodeSocketFloat')
-            for column, data_type, _ in self.columns)
-
-    def build(self, b, gi, go, entries):
-        k = chain(b, gi, self.WORDS, entries)
-        flat, valid = flat_index(b, k, entries, 255, gi.outputs["ID"], -300, 0)
-        table = table_geometry(b)
-        for i, (column, data_type, fallback) in enumerate(self.columns):
-            value = sample(b, table, column, data_type, flat, 300, -150 * i)
-            b.link(guarded(b, valid, value, data_type, fallback, 700, -150 * i), go.inputs[column])
-
-
-class SampledCount(StandIn):
-    """One Dials-like output: an INT sampled from a table object at k - 1, a single-value index."""
-
-    label, WORDS = "Dials", ("Prompt",)
-    iface = words_iface(WORDS) + (SocketDef('OUTPUT', "Count", 'NodeSocketInt'),)
-
-    def __init__(self, table):
-        self.table = table
-
-    def build(self, b, gi, go, entries):
-        row = math(b, INTEGER, 'SUBTRACT', -300, 0, chain(b, gi, self.WORDS, entries), 1)
-        b.link(sample(b, table_geometry(b, self.table), "oa_count", 'INT', row, 0, 0), go.inputs["Count"])
+def answer_of(obj):
+    return table_read(obj, ("answer",))["answer"][0]
 
 
 @contextlib.contextmanager
-def standing_in(node_, spec):
-    """Build a stand-in shape with the real inner functions, on an Ask node whose spec it replaces."""
-    saved = inner.SPECS[node_.bl_idname]
-    inner.SPECS[node_.bl_idname] = spec
+def counting_writes(writes):
+    """Every table write inside goes into `writes`, as the name of the tables function that wrote."""
+    saved = {name: getattr(tables, name) for name in ("write_rows", "write_value", "append_rows")}
+
+    def counted(name):
+        def write(*args, **kwargs):
+            wrote = saved[name](*args, **kwargs)
+            if wrote:  # write_value() compares first, and writes only a new value
+                writes.append(name)
+            return wrote
+        return write
+
+    for name in saved:
+        setattr(tables, name, counted(name))
     try:
-        inner.sync_interface(node_, spec.iface)
         yield
     finally:
-        inner.SPECS[node_.bl_idname] = saved
+        for name, function in saved.items():
+            setattr(tables, name, function)
+
+
+def phase_no_cap():
+    """No cap on word sets (§8.1): 20 objects share one Ask with different words, and each shows its own stored answer,
+    with no error. A new word set is a new block of rows: the pass writes it values only, with the same nodes and
+    layout. A second pass writes nothing, so the depsgraph update of a write schedules no endless passes."""
+    group, asker = ask_tree("Crowd", ["Question"])
+    questions = [f"Is this object number {i}?" for i in range(21)]
+    entries = [asked(question, (i + 1) / 32, float(i)) for i, question in enumerate(questions)]
+    users = []
+    for i in range(20):
+        users.append(user_of(group, f"Crowd {i}"))
+        use(users[-1], Question=questions[i])
+    S.save(asker, S.NodeStore(entries[:20]))
+    asked_now = []
+    with asking(asker, asked_now):
+        engine.run_pass()
+    got, status = [answer_of(obj) for obj in users], engine.STATUS[asker.uid]
+    check("no cap: 20 objects with different words on one node each show their own stored answer, with no error, and "
+          "the table holds 20 entries", got == [(i + 1) / 32 for i in range(20)] and status.icon == 'CHECKMARK'
+          and status.contexts == 20 and not asked_now and len(tables.header_rows(asker)) == 20, (got, status))
+    before, built = pointers(asker), asker.node_tree[inner.BUILT]
+    users.append(user_of(group, "Crowd 20"))
+    use(users[-1], Question=questions[20])
+    S.save(asker, S.NodeStore(entries))
+    with asking(asker, asked_now):
+        engine.run_pass()
+    check("no cap: a new word set is a new block of rows, written values only: the same nodes and layout, and its "
+          "object shows its answer", pointers(asker) == before and asker.node_tree[inner.BUILT] == built
+          and answer_of(users[-1]) == 21 / 32 and len(tables.header_rows(asker)) == 21, answer_of(users[-1]))
+    writes = []
+    with counting_writes(writes), asking(asker, asked_now):
+        engine.run_pass()
+    check("a second pass writes nothing: no table write and no graph edit", not writes and pointers(asker) == before
+          and not asked_now, writes)
+    for obj in users:
+        bpy.data.objects.remove(obj)
+    bpy.data.node_groups.remove(group)
+    tables.collect_garbage(list(engine.iter_nodes()))
+
+
+def phase_collision():
+    """Words whose keys collide (§8.2): the Keys 'aZ' and 'b5' after the same Question hash alike. On two objects, the
+    entry stored later is left out of the table, so both show the first one's answer, and the node's status names both
+    word sets and asks for another Key. With another Key each shows its own answer, and the warm entry whose key a live
+    one has stays out, with no error. A live entry wins its key over an earlier warm one."""
+    group, asker = ask_tree("Collide", ["Key"])
+    asker.inputs["Question"].default_value = "Is it night?"
+    gns = {key: ("Is it night?", "", "", "", key) for key in ("aZ", "b5", "b6")}
+    users = {key: user_of(group, f"Collide {key}") for key in ("aZ", "b5")}
+    for key, obj in users.items():
+        use(obj, Key=key)
+    S.save(asker, S.NodeStore([asked("Is it night?", p, t, key) for key, p, t in (
+        ("aZ", 0.875, 1.0), ("b5", 0.125, 2.0), ("b6", 0.5, 3.0))]))
+    with asking(asker, []):
+        engine.run_pass()
+    status, got = engine.STATUS[asker.uid], (answer_of(users["aZ"]), answer_of(users["b5"]))
+    check("collision: 'aZ' and 'b5' share a key (words.shared_keys()), so the entry stored later is left out of the "
+          "table, and both objects show the first one's answer", words.shared_keys([gns["aZ"], gns["b5"]]) == [
+              (gns["aZ"], gns["b5"])] and got == (0.875, 0.875)
+          and set(tables.header_rows(asker)) == {words.key(gns["aZ"]), words.key(gns["b6"])}, got)
+    check("collision: the node's status is the error naming both word sets and asking for another Key",
+          (status.icon, status.text) == ('CANCEL', engine.COLLIDE.format("Is it night? · aZ", "Is it night? · b5")),
+          status)
+    use(users["b5"], Key="b6")
+    with asking(asker, []):
+        engine.run_pass()
+    status, got = engine.STATUS[asker.uid], (answer_of(users["aZ"]), answer_of(users["b5"]))
+    check("collision: with another Key each object shows its own answer, with no error, and the warm entry whose key "
+          "a live one has stays out of the table", status.icon == 'CHECKMARK' and got == (0.875, 0.5)
+          and len(tables.header_rows(asker)) == 2, (status, got))
+    bpy.data.objects.remove(users.pop("aZ"))
+    use(users["b5"], Key="b5")
+    with asking(asker, []):
+        engine.run_pass()
+    status = engine.STATUS[asker.uid]
+    check("collision: a live entry wins its key over an earlier warm one, with no error",
+          status.icon == 'CHECKMARK' and answer_of(users["b5"]) == 0.125, (status, answer_of(users["b5"])))
+    bpy.data.objects.remove(users.pop("b5"))
+    bpy.data.node_groups.remove(group)
+    tables.collect_garbage(list(engine.iter_nodes()))
 
 
 def phase_single_value_sample():
-    """§8.4 regression guard: Sample Index at a single-value index gives a single value, so a Dials output
-    can drive a single-value socket such as Grid's Vertices X."""
-    mesh = bpy.data.meshes.new(".OpenAct Table sampled")
-    mesh.from_pydata([(0, 0, 0)] * 3, [], [])
-    mesh.attributes.new("oa_count", 'INT', 'POINT').data.foreach_set("value", [5, 7, 9])
-    table = bpy.data.objects.new(mesh.name, mesh)
+    """§8.6 regression guard: a single value sampled at the header row the lookup found is a single value, so Pick's
+    Index can drive a single-value socket such as Grid's Vertices X."""
+    items = "a, b, c, d, e, f, g, h"
     grid_tree = bpy.data.node_groups.new("Sampled", 'GeometryNodeTree')
     grid_tree.interface.new_socket("Prompt", in_out='INPUT', socket_type='NodeSocketString')
     grid_tree.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
     gi, go = grid_tree.nodes.new("NodeGroupInput"), grid_tree.nodes.new("NodeGroupOutput")
-    stand = grid_tree.nodes.new(engine.ASK_ID)
+    picker = grid_tree.nodes.new(engine.PICK_ID)
+    picker.inputs["Items"].default_value = items
+    grid_tree.links.new(gi.outputs["Prompt"], picker.inputs["Prompt"])
     grid = grid_tree.nodes.new("GeometryNodeMeshGrid")
     grid.inputs["Vertices Y"].default_value = 2
+    link = grid_tree.links.new(picker.outputs["Index"], grid.inputs["Vertices X"])
+    grid_tree.links.new(grid.outputs["Mesh"], go.inputs["Geometry"])
     obj = bpy.data.objects.new("Sampled", bpy.data.meshes.new("Sampled"))
     bpy.context.scene.collection.objects.link(obj)
     mod = obj.modifiers.new("Sampled", 'NODES')
     mod.node_group = grid_tree
     mod[grid_tree.interface.items_tree["Prompt"].identifier] = "second"
-    with standing_in(stand, SampledCount(table)):
-        grid_tree.links.new(gi.outputs["Prompt"], stand.inputs["Prompt"])
-        link = grid_tree.links.new(stand.outputs["Count"], grid.inputs["Vertices X"])
-        grid_tree.links.new(grid.outputs["Mesh"], go.inputs["Geometry"])
-        inner.build(stand, S.NodeStore([S.Entry(gn=("first",)), S.Entry(gn=("second",))]))
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        depsgraph.update()
-        evaluated = obj.evaluated_get(depsgraph)
-        count = len(evaluated.to_mesh().vertices)
-        evaluated.to_mesh_clear()
-        shape = getattr(stand.outputs["Count"], "inferred_structure_type", 'SINGLE')  # 5.0+ only
-        check("Sample Index at a single-value index drives Grid's Vertices X (§8.4)",
-              link.is_valid and count == 7 * 2 and shape == 'SINGLE', (link.is_valid, count, shape))
+    inner.build(picker, S.NodeStore([S.Entry(words_key=prompt, gn=(prompt, "", items, "", ""), single={
+        "Index": index, "Item": items.split(", ")[index], "Confidence": 0.5}) for prompt, index in (("first", 5),
+                                                                                                    ("second", 7))]))
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    evaluated = obj.evaluated_get(depsgraph)
+    count = len(evaluated.to_mesh().vertices)
+    evaluated.to_mesh_clear()
+    shape = getattr(picker.outputs["Index"], "inferred_structure_type", 'SINGLE')  # 5.0+ only
+    check("a single value sampled at the found header row drives Grid's Vertices X (§8.6)",
+          link.is_valid and count == 7 * 2 and shape == 'SINGLE', (link.is_valid, count, shape))
 
 
-# ------------------------------------------ the materialised set, table objects, the per-element lookup
-
-def phase_materialised():
-    """§8.1: live entries first (at most 16, in context order), then pins in pin order, then warm ones while the
-    total is below 4; laid out in store order. Ten successive edits of one context stay within 4 entries."""
-    def entry(i, t=0.0, pinned=False, frames=()):
-        return S.Entry(words_key=f"k{i}", gn=(f"Question {i}?", ""), t=t, pinned=pinned, frames=[list(f) for f in frames],
-                       kind="ask", answer_type='YES_NO', single={"Answer": i / 32, "Yes": False, "Confidence": 0.5})
-
-    def keys(entries, live, default=None):
-        return [e.words_key for e in inner.materialised(entries, live, default)]
-
-    many = [entry(i, t=i) for i in range(20)]
-    got = keys(many, [e.gn for e in reversed(many)])
-    check("materialised: at most 16, the first live contexts in context order, laid out in store order",
-          got == [f"k{i}" for i in range(4, 20)], got)
-    mixed = [entry(0, t=5), entry(1, pinned=True, frames=[(30, 40)]), entry(2, pinned=True, frames=[(10, 20)]),
-             entry(3, t=9), entry(4, t=8), entry(5, pinned=True, frames=[(50, 60)])]
-    warm = [entry(0, t=5), entry(1, t=9), entry(2, t=7), entry(3, t=8), entry(4, t=6)]
-    crowded = [entry(i, t=i) for i in range(10)] + [entry(10 + p, pinned=True, frames=[(100 - p, 200)]) for p in range(12)]
-    got = (keys(mixed, [mixed[0].gn]), keys(warm, [warm[0].gn]), keys(warm, [warm[0].gn], "k4"),
-           keys(crowded, [e.gn for e in crowded[:10]]))
-    check("materialised: live, then pins, then the most recent warm entries (the default first) up to 4 in total; "
-          "above 16, the pins that start latest stay out",
-          got == (["k0", "k1", "k2", "k5"], ["k0", "k1", "k2", "k3"], ["k0", "k1", "k3", "k4"],
-                  [f"k{i}" for i in range(10)] + [f"k{i}" for i in range(16, 22)]), got)
-
-    stored, sizes, rebuilds = [], [], []
-    for i in range(10):  # ten successive Question edits of one context
-        stored.append(entry(100 + i, t=100 + i))
-        live = [stored[-1].gn]
-        rebuilt = not inner.update_values(ask, S.NodeStore(stored), live)
-        if rebuilt:
-            inner.build(ask, S.NodeStore(stored), live)
-        rebuilds.append(rebuilt and inner.update_values(ask, S.NodeStore(stored), live))
-        sizes.append(sum(n.bl_idname == "FunctionNodeCompare" for n in ask.node_tree.nodes))
-    back = keys(stored, [stored[0].gn])
-    check("materialised: 10 successive edits keep at most 4 entries in the graph, one rebuild per edit; "
-          "switching back materialises the stored entry",
-          max(sizes) <= 4 and all(rebuilds) and "k100" in back and len(back) <= 4, (sizes, rebuilds, back))
-
-
-class PickV1(Spec):
-    """Pick as the 5-word specs declare it (§6.2, §8.2), built from inner's primitives only: the recipe for
-    specs/pick.py. Context, Overrides and Key are absent from this interface, so the chain joins them as ""."""
-
-    name, label = "pick", "Pick"
-    WORDS = ("Prompt", "Context", "Items", "Overrides", "Key")
-    per_element = (inner.Column("Probability", "prob", 'FLOAT', 0.0, linked_only=True),)
-    iface = (SocketDef('INPUT', "Prompt", 'NodeSocketString', kind="word"),
-             SocketDef('INPUT', "Items", 'NodeSocketString', kind="word"),
-             SocketDef('INPUT', "ID", 'NodeSocketInt', kind="field", default_input='INDEX', hide_value=True),
-             SocketDef('OUTPUT', "Index", 'NodeSocketInt'), SocketDef('OUTPUT', "Item", 'NodeSocketString'),
-             SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'), SocketDef('OUTPUT', "Selection", 'NodeSocketBool'),
-             SocketDef('OUTPUT', "Probability", 'NodeSocketFloat'))
-
-    def interface(self, node):
-        return list(self.iface)
-
-    @staticmethod
-    def build(b, gi, go, entries):
-        k = b.match_chain(b.words(gi, PickV1.WORDS), [e.gn for e in entries])
-        picked = b.lookup(k, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
-        b.lookup(k, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
-        b.lookup(k, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
-        b.selection(gi.outputs["ID"], picked, go.inputs["Selection"])
-
+# ------------------------------------------ table objects and the per-element lookup, on a Pick
 
 POINTS = 6
 TABLE_WORDS = {  # object -> its modifier's words, and the shift of its ID (ID = index + Shift)
@@ -1231,31 +1139,43 @@ def phase_table(tree_, picker, users, idents):
     entries = [table_entry("TA", 1, [0.25, 0.625, 0.125]), table_entry("TB", 3, [0.125, 0.25, 0.125, 0.5]),
                table_entry("TC", 0, [0.75, 0.25])]
     node_store, live = S.NodeStore(entries), [e.gn for e in entries]
-    inner.build(picker, S.NodeStore(), live)  # never answered, Probability linked: an empty table
-    empty = tables.find(picker)
-    check("table: before the first answer, an empty table object and neutral values everywhere",
-          empty is not None and len(empty.data.vertices) == 0 and "oa_prob" in empty.data.attributes
+    inner.build(picker, S.NodeStore(), live)  # never answered, Probability linked
+    empty, bare = tables.find(picker), len(picker.node_tree.nodes)
+    check("table: before the first answer, the table object holds its meta row alone, which points a miss at no row, "
+          "and every context reads neutral values",
+          empty is not None and len(empty.data.vertices) == 1 and list(tables.read(picker, tables.DEFAULT)) == [-1]
+          and "oa_prob" in empty.data.attributes
           and reads(users, [None] * 3)[0] == {key: table_expected(None, TABLE_WORDS[key]["Shift"]) for key in users},
           reads(users, [None] * 3)[0])
     inner.build(picker, node_store, live)
     table = tables.find(picker)
-    column = table and [round(d.value, 6) for d in table.data.attributes["oa_prob"].data]
-    check("table: one loose vertex per flat row, an oa_prob column, named after the node, linked to no collection",
-          table is not None and table.name == tables.PREFIX + picker.uid and table.get(tables.UID) == picker.uid
-          and not table.users_collection and column == [0.25, 0.625, 0.125, 0.125, 0.25, 0.125, 0.5, 0.75, 0.25],
-          column)
+    columns = {name: [round(v, 6) if isinstance(v, float) else v for v in tables.read(picker, name).tolist()]
+               for name in (tables.HEAD, tables.KEY, tables.COUNT, "prob", "index")}
+    heads = [False, True, False, False, False, True, False, False, False, False, True, False, False]
+    keys = [words.key(entry.gn) for entry in entries]
+    check("table: point 0, the meta row, then a block per entry: its header row (oa_head, the key of its words, the "
+          "count of rows after it, its single values) and one row per item (oa_prob); named after the node, linked to "
+          "no collection", table is not None and table.name == tables.PREFIX + picker.uid
+          and table.get(tables.UID) == picker.uid and not table.users_collection and columns == {
+              tables.HEAD: heads, tables.KEY: [0, keys[0], 0, 0, 0, keys[1], 0, 0, 0, 0, keys[2], 0, 0],
+              tables.COUNT: [0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 2, 0, 0],
+              "prob": [0.0, 0.0, 0.25, 0.625, 0.125, 0.0, 0.125, 0.25, 0.125, 0.5, 0.0, 0.75, 0.25],
+              "index": [-1, 1, -1, -1, -1, 3, -1, -1, -1, -1, 0, -1, -1]}, columns)
     got, want = reads(users, entries)
-    check("per-element: 3 contexts through the joined-key chain each read their own rows at base + ID, and "
-          "Selection = (ID == Index) AND (Index >= 0)", got == want, got)
-    check("per-element: invalid IDs (-1 on TA's first point; past the row count on TB, where TC's rows follow) "
+    check("per-element: 3 contexts, each finding its entry by the key of its words, read their own rows at row + 1 + "
+          "ID, and Selection = (ID == Index) AND (Index >= 0)", got == want, got)
+    check("per-element: invalid IDs (-1 on TA's first point; past the row count on TB, where TC's block follows) "
           "give the fallbacks", got["TA"]["prob"][0] == 0.0 and got["TA"]["sel"][0] is False
           and got["TB"]["prob"][4:] == [0.0, 0.0] and got["TC"]["prob"][2:] == [0.0] * 4, got)
-    joins, empties = chain_joins(picker), [n for n in picker.node_tree.nodes
-                                           if n.bl_idname == "FunctionNodeInputString" and n.string == ""]
-    check("joined key: one Join Strings with SEP over the 5-word tuple, linked in reverse order; the absent Context, "
-          "Overrides and Key are constant \"\" nodes, and every stored entry matches",
-          len(joins) == 1 and len(joins[0].inputs["Strings"].links) == 5 and len(empties) == 3
-          and [got[key]["idx"][0] for key in users] == [1, 3, 0], (len(joins), len(empties)))
+    kinds = [n.bl_idname for n in picker.node_tree.nodes]
+    hashed = [n for n in picker.node_tree.nodes if n.bl_idname == "FunctionNodeHashValue"]
+    statistic = [n for n in picker.node_tree.nodes if n.bl_idname == "GeometryNodeAttributeStatistic"]
+    check("hash lookup: one Hash Value (String) of the key text and one Attribute Statistic (Float, Point) over the "
+          "table object, no String Compare, and as many nodes as with no entry: nothing per entry",
+          len(hashed) == 1 and hashed[0].data_type == 'STRING' and len(statistic) == 1
+          and (statistic[0].data_type, statistic[0].domain) == ('FLOAT', 'POINT') and len(kinds) == bare
+          and not any(n.bl_idname == "FunctionNodeCompare" and n.data_type == 'STRING'
+                      for n in picker.node_tree.nodes), (len(kinds), bare))
 
     tables.write_rows(picker, {"prob": [0.5] * 3})  # damaged: the rebuild must regenerate it from entries alone
     pointer = table.as_pointer()
@@ -1270,7 +1190,7 @@ def phase_table(tree_, picker, users, idents):
     got, want = reads(users, entries)
     check("values only: new rows, single values and a changed row count, with the same nodes",
           updated is True and pointers(picker) == before and got == want
-          and len(tables.find(picker).data.vertices) == 10, (updated, got))
+          and len(tables.find(picker).data.vertices) == 14, (updated, got))
     return node_store, live
 
 
@@ -1282,42 +1202,36 @@ def phase_no_match(picker, users, idents, node_store, live):
     two = inner.k_default_key(["TA", "TB"])
     updated = [inner.update_values(picker, node_store, [edited, live[1]], two)]
     got = table_read(users["TA"]), table_read(users["TB"])
-    check("no match, two live contexts: TA's unmatched words show neutral values, never another context's answers",
-          two is None and got == (table_expected(None, -1), table_expected(entries[1], 0)), got)
+    check("a miss, two live contexts: TA's words, which find no entry, show neutral values, never another context's "
+          "answers", two is None and got == (table_expected(None, -1), table_expected(entries[1], 0)), got)
     one = inner.k_default_key(["TA"])
     updated.append(inner.update_values(picker, node_store, [edited], one))
     got = table_read(users["TA"])
-    check("no match, one live context: TA shows its own last answers", one == "TA"
-          and got == table_expected(entries[0], -1), got)
+    check("a miss, one live context: TA shows its own last answers, the default the meta row points at", one == "TA"
+          and got == table_expected(entries[0], -1) and tables.read(picker, tables.DEFAULT)[0] == 1, got)
     set_words(users, idents, "TA", Prompt="")
     hint = inner.k_default_key(["TA"], blocked=True)
     updated.append(inner.update_values(picker, node_store, [], hint))
     got = table_read(users["TA"])
-    check("no match, a cleared Prompt (a hint): neutral values", hint is None and got == table_expected(None, -1), got)
-    check("no match: every k_default change is a values-only update", updated == [True] * 3
+    check("a miss, a cleared Prompt (a hint): neutral values", hint is None and got == table_expected(None, -1), got)
+    check("a miss: every change of the default is a values-only update", updated == [True] * 3
           and pointers(picker) == before, updated)
     set_words(users, idents, "TA", Prompt=TABLE_WORDS["TA"]["Prompt"])
     inner.update_values(picker, node_store, live)
 
 
-def chain_joins(node_):
-    """The match chain's Join Strings in the node's group: the one joining with SEP (the Warning's key text has its
-    own, §5.7)."""
-    return [n for n in node_.node_tree.nodes
-            if n.bl_idname == "GeometryNodeStringJoin" and n.inputs["Delimiter"].default_value == inner.SEP]
-
-
-def phase_per_word(picker, users, idents, node_store, live):
-    """A word containing SEP could make two different tuples join to the same key, so the node compares each word."""
+def phase_key_text(picker, users, idents, node_store, live):
+    """The key text writes each word's length before it (§8.2), so two word tuples whose words join to the same text,
+    ("p\\x1f", "i") and ("p", "\\x1fi"), have different keys and each finds its own entry."""
     tricky = table_entry("TX", 0, [0.375], prompt="p\x1f", items="i")
+    other = table_entry("TY", 1, [0.25, 0.625], prompt="p", items="\x1fi")
     set_words(users, idents, "TA", Prompt="p\x1f", Items="i")  # tricky's words
-    set_words(users, idents, "TB", Prompt="p", Items="\x1fi")  # joined, the same key as tricky's
-    gns = [tricky.gn, ("p", "", "\x1fi", "", ""), live[2]]
-    inner.build(picker, S.NodeStore([tricky, node_store.entries[2]]), gns)
+    set_words(users, idents, "TB", Prompt="p", Items="\x1fi")  # other's: joined, the same text as tricky's
+    inner.build(picker, S.NodeStore([tricky, other, node_store.entries[2]]), [tricky.gn, other.gn, live[2]])
     got = {key: table_read(obj) for key, obj in users.items()}
-    check("joined key: a word containing \\x1f switches the node to per-word Compares, which still match",
-          "\x1f".join(gns[0]) == "\x1f".join(gns[1]) and not chain_joins(picker)
-          and got == {"TA": table_expected(tricky, -1), "TB": table_expected(None, 0),
+    check("key text: word tuples whose words join to the same text have different keys, and each finds its own entry",
+          "".join(tricky.gn) == "".join(other.gn) and words.key(tricky.gn) != words.key(other.gn)
+          and got == {"TA": table_expected(tricky, -1), "TB": table_expected(other, 0),
                       "TC": table_expected(node_store.entries[2], 0)}, got)
     for key in ("TA", "TB"):
         set_words(users, idents, key, Prompt=TABLE_WORDS[key]["Prompt"], Items=TABLE_WORDS[key]["Items"])
@@ -1348,8 +1262,10 @@ def phase_write_rows(picker, users, node_store, live):
     restored = inner.update_values(picker, node_store, live)
     names = sorted(a.name for a in tables.find(picker).data.attributes if a.name.startswith(tables.ATTR))
     got, want = reads(users, node_store.entries)
-    check("values only: the node's own rows are back, columns it no longer writes are gone, evaluation sees them",
-          restored and names == ["oa_prob"] and got == want, (restored, names, got))
+    check("values only: a write not from the node's entries leaves no digest, so the next update brings the node's own "
+          "rows back; columns it no longer writes are gone, and evaluation sees them", restored and names == [
+              "oa_conf", "oa_count", "oa_default", "oa_head", "oa_index", "oa_item", "oa_key", "oa_prob"]
+          and got == want, (restored, names, got))
 
 
 def phase_table_copies(tree_, picker, users, node_store, live):
@@ -1380,21 +1296,24 @@ def phase_table_copies(tree_, picker, users, node_store, live):
     tree_.links.remove(link)
     refused = inner.update_values(picker, node_store, live)
     inner.build(picker, node_store, live)
-    released = tables.find(picker) is None
+    heads = tables.read(picker, tables.HEAD)
+    kept = tables.find(picker) == mine and heads is not None and heads.tolist() == [False, True, True, True] \
+        and "oa_prob" not in mine.data.attributes
     removed = tables.collect_garbage(list(engine.iter_nodes()))
     tree_.links.new(picker.outputs["Probability"], target)
     rebuilt = not inner.update_values(picker, node_store, live)
     inner.build(picker, node_store, live)
     got, want = reads(users, node_store.entries)
-    check("Pick: with Probability unlinked, build() releases the table object and garbage removes it; linked "
-          "again, a rebuild brings a new one", refused is False and released and removed == 1 and rebuilt
-          and tables.find(picker) is not None and got == want, (refused, released, removed, rebuilt))
-
+    check("Pick: with Probability unlinked, its table object holds the header rows alone, and stays; linked again, a "
+          "rebuild brings the rows per item back", refused is False and kept and removed == 0 and rebuilt
+          and got == want, (refused, kept, removed, rebuilt))
+    S.save(picker, node_store)  # phase_save_reload() reopens the file: its entries are the node's own
 
 def phase_save_reload():
     """Last, because it reloads the file (§8.5): the table object, in no collection, is saved through the Object
-    Info that reads it and survives Purge Unused Data; appending its tree brings a table along, renamed .001, and
-    garbage collection, going by reference, keeps both."""
+    Info that reads it and survives Purge Unused Data, with its digest, so the reopened file's first update writes
+    nothing; appending its tree brings a table along, renamed .001, and garbage collection, going by reference, keeps
+    both."""
     def picker_in(group):
         return next(n for n in group.nodes if n.bl_idname == engine.PICK_ID)
 
@@ -1413,6 +1332,11 @@ def phase_save_reload():
         check("save/reload: the table object, in no collection, is saved with the group that reads it and survives "
               "Purge Unused Data", table is not None and not table.users_collection and after == before
               and bpy.data.objects.get(name) is not None and purged == before, (name, after, purged))
+        reopened, writes = picker_in(bpy.data.node_groups["Table"]), []
+        with counting_writes(writes):
+            updated = inner.update_values(reopened, S.load(reopened))
+        check("save/reload: the table keeps its digest, so the reopened file's first update writes nothing",
+              updated and not writes and table_read(bpy.data.objects["TA"]) == before["TA"], (updated, writes))
 
         with bpy.data.libraries.load(twin_path) as (_source, target):
             target.node_groups = ["Table"]
@@ -1430,16 +1354,22 @@ def phase_save_reload():
 
 def phase_layout_version():
     """A newer OpenAct whose build() lays out another graph for the same entries bumps inner.LAYOUT: update_values()
-    then refuses the groups built before it, so the first pass after an upgrade or a file load rebuilds them."""
+    and append_entry() then refuse the groups built before it, so the first pass after an upgrade or a file load
+    rebuilds them. A group OpenAct 1.0 laid out, with its match chain, holds a digest there instead of a layout."""
     asks = S.NodeStore([ask_entry("A", 0.875, 0.75)])
     inner.build(ask, asks)
     inner.LAYOUT += 1
     try:
-        bumped = inner.update_values(ask, asks)
+        bumped = inner.update_values(ask, asks), inner.append_entry(ask, ask_entry("B", 0.25, 0.5))
     finally:
         inner.LAYOUT -= 1
-    check("layout version: a group laid out under another LAYOUT needs build()",
-          bumped is False and inner.update_values(ask, asks), bumped)
+    ask.node_tree[inner.BUILT] = "6f1c0e8b9d2a4c7e5f3b1a0d9c8e7f6a5b4c3d2e"  # a 1.0 group's sha1
+    old = inner.update_values(ask, asks), inner.append_entry(ask, ask_entry("B", 0.25, 0.5))
+    heads = len(tables.header_rows(ask))
+    inner.build(ask, asks)
+    check("layout version: a group laid out under another LAYOUT, or by OpenAct 1.0, needs build(): update_values() "
+          "and append_entry() refuse it, writing nothing", bumped == old == (False, False) and heads == 1
+          and inner.update_values(ask, asks), (bumped, old, heads))
 
 
 NO_ADDON_ITEMS = "pan, sofa, kettle, lamp"
@@ -1583,18 +1513,13 @@ def phase_factor_id():
 
 
 def phase_tables():
-    """The per-element path on synthetic tables, through a stand-in Pick (PickV1) on a real Pick node."""
-    saved = inner.SPECS[engine.PICK_ID]
-    inner.SPECS[engine.PICK_ID] = PickV1()
-    try:
-        tree_, picker, users, idents = table_scene()
-        node_store, live = phase_table(tree_, picker, users, idents)
-        phase_no_match(picker, users, idents, node_store, live)
-        phase_per_word(picker, users, idents, node_store, live)
-        phase_write_rows(picker, users, node_store, live)
-        phase_table_copies(tree_, picker, users, node_store, live)
-    finally:
-        inner.SPECS[engine.PICK_ID] = saved
+    """The table object and the per-element path on synthetic entries, through a Pick."""
+    tree_, picker, users, idents = table_scene()
+    node_store, live = phase_table(tree_, picker, users, idents)
+    phase_no_match(picker, users, idents, node_store, live)
+    phase_key_text(picker, users, idents, node_store, live)
+    phase_write_rows(picker, users, node_store, live)
+    phase_table_copies(tree_, picker, users, node_store, live)
 
 
 # ------------------------------------------------------------------------------ the bench
@@ -1620,23 +1545,25 @@ def bench_line(path, elements, ms, budget=None):
     check(f"bench: {path} within 2x its {budget} ms budget", ms <= 2 * budget, f"{ms:.1f} ms, {elements} elements")
 
 
-def bench_shape(label, node_, store_a, store_b, shape, budget=None):
-    """build() from store_a, then update_values() alternating with store_b, whose values all differ: once
-    with every entry changed (every entry-level socket written), once with one entry changed."""
-    ms = timed(lambda: inner.build(node_, store_a))
-    bench_line(f"build/{label}/{shape}", len(node_.node_tree.nodes), ms, BUDGET_MS[budget or "build " + shape])
-    if store_b is None:
-        return
-    switches = [source for _name, source in inner._feeds(node_.node_tree)  # the outputs' own, behind their gates
-                if source.node.bl_idname == "GeometryNodeIndexSwitch"]
-    one = S.NodeStore(list(store_a.entries))
-    one.entries[-1] = store_b.entries[-1]
-    for variant, other, writes, limit in (
-            ("all-entries", store_b, len(switches) * len(store_a.entries), BUDGET_MS["update_values all"]),
-            ("one-entry", one, len(switches), BUDGET_MS["update_values"])):
-        stores = itertools.cycle((other, store_a))
-        ms = timed(lambda: check_update(node_, next(stores)), runs=9)
-        bench_line(f"update_values/{label}/{shape}/{variant}", writes, ms, limit)
+def bench_shape(label, node_, make, count, shape, budget):
+    """build() from `count` entries make(i, 0), then update_values() when nothing changed, then alternating with a
+    store whose last entry's values differ (make(i, 1)), a table rewrite, then append_entry() of new words, a block of
+    rows (§8.8). BENCH elements: the graph's nodes for build(), else the table's rows."""
+    store_a = S.NodeStore([make(i, 0) for i in range(count)])
+    store_b = S.NodeStore(store_a.entries[:-1] + [make(count - 1, 1)])
+    worst = " worst" if shape == "worst" else ""
+    ms = timed(lambda: inner.build(node_, store_a), runs=3 if worst else 5)
+    bench_line(f"build/{label}/{shape}", len(node_.node_tree.nodes), ms, BUDGET_MS[budget])
+    rows = len(tables.find(node_).data.vertices)
+    ms = timed(lambda: check_update(node_, store_a))
+    bench_line(f"update_values/{label}/{shape}/unchanged", rows, ms, BUDGET_MS["update_values" + worst])
+    stores = itertools.cycle((store_b, store_a))
+    ms = timed(lambda: check_update(node_, next(stores)), runs=6)
+    bench_line(f"update_values/{label}/{shape}/one-entry", rows, ms, BUDGET_MS["update_values" + worst])
+    fresh = iter([make(count + i, 0) for i in range(5)])
+    ms = timed(lambda: check_append(node_, next(fresh)))
+    bench_line(f"append/{label}/{shape}", rows, ms, BUDGET_MS["append" + worst])
+    inner.build(node_, S.NodeStore())  # its table goes back to a meta row, which the next shapes' timings don't carry
 
 
 def check_update(node_, node_store):
@@ -1644,33 +1571,84 @@ def check_update(node_, node_store):
         raise AssertionError("update_values() refused the entries build() laid out")
 
 
-def ask_store(count, offset=0.0):
-    return S.NodeStore([S.Entry(words_key=str(i), gn=(f"Question {i}?", f"Context {i}", "", "", ""), single={
-        "Answer": (i + offset) / 40, "Yes": i % 2 == bool(offset), "Confidence": (i + 2 * offset) / 50})
-        for i in range(count)])
+def check_append(node_, entry):
+    if not inner.append_entry(node_, entry):
+        raise AssertionError("append_entry() refused new words")
 
 
-def pick_store(count, offset=0):
-    return S.NodeStore([S.Entry(words_key=str(i), gn=(f"Prompt {i}", "", "table, chair, lamp, rug, bookshelf", "", ""),
-                                single={"Index": (i + offset) % 5, "Item": f"item {(i + offset) % 5}",
-                                        "Confidence": (i + offset) / 40})
-                        for i in range(count)])
+BENCH_ITEMS = ["table", "chair", "lamp", "rug", "bookshelf"]
 
 
-def pick_payload_store(count, offset=0):
-    entries = []
-    for i in range(count):
-        single = {"Index": (i + offset) % 5, "Item": f"item {(i + offset) % 5}", "Confidence": (i + offset) / 40,
-                  "Material": MATERIALS[(i + offset) % len(MATERIALS)]}
-        single.update({f"p{c}": (i * 16 + c + offset) / 1000 for c in range(16)})
-        entries.append(S.Entry(words_key=str(i), gn=(f"Prompt {i}", "", "//props.csv", "", ""), single=single))
-    return S.NodeStore(entries)
+def rows_entry(i, gn, names, v, payload=None, **fields):
+    """An entry of one row per name, answered v (and payload columns), last used at i."""
+    n = len(names)
+    return S.Entry(words_key=str(i), gn=gn, t=float(i), asks=["a"], **fields, rows=S.Rows(
+        name=list(names), wkey=[""] * n, ask=[0] * n, src="m" * n, v=v, payload=payload or {}))
 
 
-def words_store(spec, count):
-    """Entries whose words fill every word of the spec; stand-ins need no values."""
-    return S.NodeStore([S.Entry(words_key=str(e), gn=tuple(f"{word} of context {e}" for word in spec.WORDS))
-                        for e in range(count)])
+def bench_ask(i, offset):
+    return S.Entry(words_key=str(i), gn=(f"Question {i}?", f"Context {i}", "", "", ""), single={
+        "Answer": (i + offset) % 40 / 40, "Yes": (i + offset) % 2 == 0, "Confidence": (i + 2 * offset) % 50 / 50})
+
+
+def bench_pick(materials=()):
+    """Entries of a Pick of BENCH_ITEMS or, with materials, of Material Slots, whose items are the materials' names;
+    each item's probability per row."""
+    names = [material.name for material in materials] or BENCH_ITEMS
+
+    def make(i, offset):
+        index = (i + offset) % len(names)
+        probs = [0.6 if r == index else 0.1 for r in range(len(names))]
+        single = {"Index": index, "Item": names[index], "Confidence": (i + offset) % 40 / 40}
+        if materials:
+            single["Material"] = names[index]
+        gn = (f"Prompt {i}", "", "" if materials else ", ".join(names), "", "")
+        return rows_entry(i, gn, names, {"prob": probs}, single=single)
+    return make
+
+
+def bench_classify(payload, items):
+    """Entries of a Classify of `items` items and 4 labels, each label with `payload` payload columns."""
+    names = [f"item {r}" for r in range(items)]
+
+    def make(i, offset):
+        labels = [(r + i + offset) % 4 for r in range(items)]
+        return rows_entry(i, (f"Question {i}?", "", "//items.csv", "//labels.csv", "", ""), names,
+                          {"label": labels, "c": [0.5] * items},
+                          {f"p{c}": [(label + c) / 10 for label in labels] for c in range(payload)})
+    return make
+
+
+def bench_rules(bands, custom, mode):
+    """Entries of a Rules of 3 Amount factors of `bands` bands (custom edges or equal widths): bands**3 cells."""
+    factors = [{"name": f"f{j}", "kind": "amount", "levels": [f"band {b}" for b in range(bands)], "values": None,
+                "edges": [b / bands for b in range(bands + 1)] if custom else None} for j in range(3)]
+    cells = bands ** 3
+    names = [f"cell {c}" for c in range(cells)]
+
+    def make(i, offset):
+        gn = (f"Question {i}?", "", "//factors.csv", "//outcomes.csv", "", "")
+        if mode == 'ONE_OF':
+            outcomes = [(c + i + offset) % 7 for c in range(cells)]
+            return rows_entry(i, gn, names, {"outcome": outcomes, "c": [0.5] * cells},
+                              {"instance": [o % 3 for o in outcomes], "scale": [o / 7 for o in outcomes]},
+                              answer_type=mode, shape={"factors": factors})
+        return rows_entry(i, gn, names, {"amount": [(c + i + offset) % 100 / 100 for c in range(cells)],
+                                         "c": [0.5] * cells, "ok": [1.0] * cells}, answer_type=mode,
+                          shape={"factors": factors})
+    return make
+
+
+def bench_dials(settings):
+    """Entries of a Dials of `settings` Amount settings, each with its own range."""
+    shape = {"settings": [{"name": f"s{s}", "type": "amount", "min": 0.0, "max": 1.0 + s} for s in range(settings)]}
+    names = [f"s{s}" for s in range(settings)]
+
+    def make(i, offset):
+        return rows_entry(i, (f"Prompt {i}", "//settings.csv", "", ""), names,
+                          {"value": [(s + i + offset) % 10 / 10 for s in range(settings)], "c": [0.5] * settings},
+                          shape=shape)
+    return make
 
 
 def plan_4096():
@@ -1693,29 +1671,59 @@ def plan_4096():
 
 
 def phase_bench(shapes):
-    stand_ins = []
-    if "demo" in shapes:  # the demo scenes of §18.4, one context each
-        bench_shape("ask", ask, ask_store(2), ask_store(2, 1.0), "demo")
-        bench_shape("pick", pick, pick_store(2), pick_store(2, 1), "demo")
-        stand_ins += [("classify-materials", ClassifyStandIn(2), 1, "demo", "build demo"),
-                      ("rules-biome", RulesOneOfStandIn(3), 1, "demo", "build demo"),
-                      ("rules-snow", RulesStandIn(3, custom_edges=False), 1, "demo", "build demo interpolated"),
-                      ("dials-weather", DialsStandIn(5), 1, "demo", "build demo")]
-    if "worst" in shapes:  # every shape at the MATERIALISED_MAX cap
-        bench_shape("ask", ask, ask_store(MATERIALISED_MAX), ask_store(MATERIALISED_MAX, 1.0), "worst")
-        bench_shape("pick", pick, pick_store(MATERIALISED_MAX), pick_store(MATERIALISED_MAX, 1), "worst")
-        stand_ins += [("pick-payload", PickPayloadStandIn(), None, "worst", "build worst"),
-                      ("classify", ClassifyStandIn(16), MATERIALISED_MAX, "worst", "build worst"),
-                      ("dials", DialsStandIn(DIALS_MAX_SETTINGS), MATERIALISED_MAX, "worst", "build worst"),
-                      ("rules", RulesStandIn(16, custom_edges=True), MATERIALISED_MAX, "worst", "build worst")]
-    for label, spec, entries, shape, budget in stand_ins:
-        stand = N.new(engine.ASK_ID)
-        with standing_in(stand, spec):
-            if entries is None:
-                bench_shape(label, stand, pick_payload_store(MATERIALISED_MAX), pick_payload_store(MATERIALISED_MAX, 1),
-                            shape, budget)
-            else:
-                bench_shape(label, stand, words_store(spec, entries), None, shape, budget)
+    """The six nodes' graphs and tables through the real inner.build(), in a tree a modifier uses, as the demo scenes'
+    are: the demo shapes of §18.4, one context each (Ask and Pick two), and the worst ones the limits allow (§7.5,
+    §8.7, §9.8), the largest graphs with tables of MANY blocks or 16 blocks of 4096 or 255 rows."""
+    group = bpy.data.node_groups.new("Bench", 'GeometryNodeTree')
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    group.links.new(group.nodes.new("NodeGroupInput").outputs[0], group.nodes.new("NodeGroupOutput").inputs[0])
+    user_of(group, "Bench")
+    materials = [bpy.data.materials.new(f"Bench {i}") for i in range(lists.MAX_ITEMS)]  # Item's and Material's names
+
+    def made(idname, factors=None, payload=(), outputs=None, mode=None, list_source=None, linked=False):
+        node_ = group.nodes.new(idname)
+        spec = engine.SPECS[idname]
+        if mode is not None:
+            node_.answer_type = mode
+        if list_source is not None:
+            node_.list_source = list_source
+        if factors is not None:
+            inner.sync_interface(node_, spec.interface(node_, factors, list(payload)))
+        elif payload:
+            inner.sync_interface(node_, spec.interface(node_, list(payload)))
+        elif outputs is not None:
+            inner.sync_interface(node_, spec.interface(node_, outputs))
+        if linked:  # Probability read, so the table holds a row per item
+            probe = group.nodes.new("GeometryNodeStoreNamedAttribute")
+            group.links.new(node_.outputs["Probability"], enabled(probe.inputs, "Value"))
+        return node_
+
+    three = [(f"f{j}", "amount") for j in range(3)]
+    plans = []
+    if "demo" in shapes:
+        plans += [("ask", made(engine.ASK_ID), bench_ask, 2, "build demo"),
+                  ("pick", made(engine.PICK_ID), bench_pick(), 2, "build demo"),
+                  ("classify-materials", made(ClassifySpec.idname, payload=[("p0", 'FLOAT'), ("p1", 'FLOAT')]),
+                   bench_classify(2, 4), 1, "build demo"),
+                  ("rules-biome", made(RulesSpec.idname, three, [("instance", "INT"), ("scale", "FLOAT")],
+                                       mode='ONE_OF'), bench_rules(3, False, 'ONE_OF'), 1, "build demo"),
+                  ("rules-snow", made(RulesSpec.idname, three, mode='AMOUNT'), bench_rules(3, False, 'AMOUNT'), 1,
+                   "build demo interpolated"),
+                  ("dials-weather", made(DialsSpec.idname, outputs=[(f"s{s}", "amount") for s in range(5)]),
+                   bench_dials(5), 1, "build demo")]
+    if "worst" in shapes:
+        plans += [("ask", made(engine.ASK_ID), bench_ask, MANY, "build worst"),
+                  ("pick-materials", made(engine.PICK_ID, list_source='MATERIALS', linked=True),
+                   bench_pick(materials), 16, "build worst"),
+                  ("classify", made(ClassifySpec.idname, payload=[(f"p{c}", 'FLOAT') for c in range(16)]),
+                   bench_classify(16, 255), 16, "build worst"),
+                  ("dials", made(DialsSpec.idname, outputs=[(f"s{s}", "amount") for s in range(DIALS_MAX_SETTINGS)]),
+                   bench_dials(DIALS_MAX_SETTINGS), MANY, "build worst"),
+                  ("rules", made(RulesSpec.idname, three, mode='AMOUNT'), bench_rules(16, True, 'AMOUNT'), 16,
+                   "build worst")]
+    for label, node_, make, count, budget in plans:
+        bench_shape(label, node_, make, count, "demo" if "demo" in budget else "worst", budget)
     bench_line("plan/rules", 4096, timed(plan_4096, runs=3))  # recorded only: the pass's TIMING covers planning
 
 
@@ -1730,7 +1738,9 @@ phase_live_set()
 phase_last_shown()
 phase_statuses()
 phase_single_value_sample()
-phase_materialised()
+phase_no_cap()
+phase_collision()
+phase_append(*phase_six())
 phase_tables()
 phase_layout_version()
 phase_no_addon()

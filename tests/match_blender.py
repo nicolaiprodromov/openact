@@ -200,7 +200,8 @@ def phase_match_table():
     inner.build(node, node_store, live)
     names = ("Probability", "Selection", "Confidence")
     got = {key: read(obj, names) for key, obj in users.items()}
-    check("match table: two contexts read Probability and Confidence per element at base + ID (MB's ID = index - 1)",
+    check("match table: two contexts read Probability and Confidence per element at row + 1 + ID, after the header row "
+          "their words find (MB's ID = index - 1)",
           got["MA"]["Probability"] == [0.9, 0.6, 0.3, 0.45, 0.0, 0.0]
           and got["MA"]["Confidence"] == [0.8, 0.2, 0.4, 0.1, 0.0, 0.0]
           and got["MB"]["Probability"] == [0.0, 0.95, 0.05, 0.7, 0.0, 0.0]
@@ -245,7 +246,9 @@ def phase_classify_table():
     table = tables.find(node)
     types = {a.name: a.data_type for a in table.data.attributes if a.name.startswith(tables.ATTR)}
     check("classify table: the table object holds oa_label (INT), oa_c, and the payload as oa_pl_0 (FLOAT) and "
-          "oa_pl_1 (INT)", types == {"oa_label": 'INT', "oa_c": 'FLOAT', "oa_pl_0": 'FLOAT', "oa_pl_1": 'INT'}, types)
+          "oa_pl_1 (INT), beside every table's own columns", types == {
+              "oa_label": 'INT', "oa_c": 'FLOAT', "oa_pl_0": 'FLOAT', "oa_pl_1": 'INT', "oa_default": 'INT',
+              "oa_head": 'BOOLEAN', "oa_key": 'INT', "oa_count": 'INT'}, types)
 
 
 # ------------------------------------------------------------------------------ planned jobs

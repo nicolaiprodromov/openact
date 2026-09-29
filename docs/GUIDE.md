@@ -90,8 +90,9 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
 - **Words.** The text inputs are *words*: typed on the node, or linked from the modifier panel (Group Input), String,
   Join Strings, Menu Switch, Import Text, or another OpenAct node's single-value output. OpenAct reads them outside
   evaluation, so they must be single values: a field linked into a word is an error on the node.
-- **One table per set of words.** A tree used by several objects, with words from each modifier, keeps one set of
-  answers per object. The model is asked only when words change, and only for the rows whose words changed.
+- **One table per set of words.** A tree used by any number of objects, with words from each modifier, keeps one set
+  of answers per object, and every set of words it answered stays in the node, so switching back is instant. The
+  model is asked only when words change, and only for the rows whose words changed.
 - **Lists** (Pick, Match, Classify) come from the node's dropdown: **Text or CSV** (inline items or a `.csv` path),
   **Collection** (its children, in the order Collection Info gives them with *Separate Children*), **Materials** (an
   object's material slots, so ID = material index) or **Attributes** (the attribute names of an object's own mesh,
@@ -300,8 +301,9 @@ saved .blend holds its words, the item and outcome names, and the answers, so sh
 - **Blender 4.5 or newer only.** Older versions lack nodes OpenAct builds on.
 - **NVIDIA GPUs (CUDA) only.** The installer refuses to install without one, and there is no CPU backend yet (see
   [Future work](#future-work)). macOS is not supported for authoring.
-- **At most 16 sets of words per node.** A tree used by more than 16 objects with different words is an error on the
-  node: split the tree.
+- **Rarely, two sets of words look alike to a node.** A node finds each answer by a short hash of its words, and very
+  rarely two different sets of words share one, such as two Keys that differ by a character or two. Only the first
+  set's answer can show then, and the node's status says so, naming both: give one of them another Key.
 - **Rare crash on Blender 4.5 and 5.0.** With OpenAct enabled, a Blender bug can crash Blender when the node editor's
   viewer shortcuts (Ctrl+1…9 and 1…9), Quick Effects or some other add-ons' tools run. It is rare, and Blender 5.1 is
   not affected.

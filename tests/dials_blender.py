@@ -1,19 +1,19 @@
 """Dials (§6.6) in a headless Blender.
 
 Without arguments no model is needed: fake answers stand in for it. The weather settings plan into one request, and
-their outputs exist before the first answer, showing their fallbacks; the one-row-per-entry table object gives each
-output its setting's answer, Amount mapped into min-max; a min/max edit is a values-only update with 0 requests; two
-contexts with different ranges each get their own values; contexts with other setting names give the status error
-naming both, and every context keeps its last good table and every output its link, whichever context changed, also
-after an object rename, while the same settings in another order agree; meanwhile the sidebar's table and the export
-of a context whose settings moved give each setting its own answer; an output drives Grid's Vertices X through a
-valid link; renaming a setting warns (in the CSV or inline) until its new socket is linked, or it comes back linked
-(File > Revert), and typed back it warns until linked again; after Ask Again, or while an edited question is asked
-again, the outputs and their links stay; a CSV whose rows only move keeps each output on its own setting; a new
-setting gets its output before its answer; a node reading a setting as a word waits while Dials shows a hint; while a
-context has no job (a missing Settings CSV, an inline error, an Import CSV node without a Path), every output keeps
-its link, another context's new prompt is still asked and shown, and a rename in it waits; a setting retyped then, or
-in a conflict, is exported unanswered.
+their outputs exist before the first answer, showing their fallbacks; the entry's header row in the table object
+gives each output its setting's answer, Amount mapped into min-max; a min/max edit is a values-only update with 0
+requests; two contexts with different ranges each get their own values; contexts with other setting names give the
+status error naming both, and every context keeps its last good table and every output its link, whichever context
+changed, also after an object rename, while the same settings in another order agree; meanwhile the sidebar's table
+and the export of a context whose settings moved give each setting its own answer; an output drives Grid's Vertices X
+through a valid link; renaming a setting warns (in the CSV or inline) until its new socket is linked, or it comes
+back linked (File > Revert), and typed back it warns until linked again; after Ask Again, or while an edited question
+is asked again, the outputs and their links stay; a CSV whose rows only move keeps each output on its own setting; a
+new setting gets its output before its answer; a node reading a setting as a word waits while Dials shows a hint;
+while a context has no job (a missing Settings CSV, an inline error, an Import CSV node without a Path), every output
+keeps its link, another context's new prompt is still asked and shown, and a rename in it waits; a setting retyped
+then, or in a conflict, is exported unanswered.
 
 With -- --model PORT GPU the real model answers the weather dials on that port and GPU: the storm prompt gives
 Rain = true, a new prompt is answered in about 0.6 s, and switching back is instant.
@@ -216,10 +216,12 @@ def phase_nomodel():
           got == EXPECTED, got)
     table = tables.find(node)
     names = sorted(a.name for a in table.data.attributes if a.name.startswith(tables.ATTR)) if table else []
-    check("table: one row per entry, each setting's value, min/max for Amount and conf, in no collection",
-          table is not None and len(table.data.vertices) == 1 and not table.users_collection and names == sorted(
-              ["oa_conf", "oa_v0", "oa_v1", "oa_min1", "oa_max1", "oa_v2", "oa_v3", "oa_v4", "oa_min4", "oa_max4"]),
-          names)
+    heads = tables.read(node, tables.HEAD) if table else None
+    check("table: after the meta row, one header row per entry and no row per setting: each setting's value, min/max "
+          "for Amount and conf, in no collection", table is not None and heads.tolist() == [False, True]
+          and not table.users_collection and names == sorted(
+              ["oa_conf", "oa_v0", "oa_v1", "oa_min1", "oa_max1", "oa_v2", "oa_v3", "oa_v4", "oa_min4", "oa_max4",
+               "oa_default", "oa_head", "oa_key", "oa_count"]), (names, heads))
     status = engine.STATUS[node.uid]
     check("status: the node sums up its settings", (status.icon, status.text) == (
         'CHECKMARK', "5 settings · lowest confidence 0.50"), status)
@@ -252,9 +254,9 @@ def phase_nomodel():
         settle()
     a, b = read(users["A"]), read(users["B"])
     check("two contexts: the same questions ask nothing more", not calls, len(calls))
-    check("two contexts: each maps with its own min/max from its own table row",
+    check("two contexts: each maps with its own min/max from its own header row",
           a == dict(EXPECTED, **{"Wind speed": 40.0}) and b == dict(EXPECTED, **{"Wind speed": 75.0})
-          and len(tables.find(node).data.vertices) == 2, (a, b))
+          and len(tables.header_rows(node)) == 2, (a, b))
 
     # contexts must agree on the setting names and types (§6.0). Otherwise the node shows the error and answers no
     # context, so each keeps its last good table and the outputs their links, whichever context is first

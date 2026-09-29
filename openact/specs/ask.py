@@ -106,7 +106,13 @@ class AskSpec(Spec):
         p = entry.single["Answer"]
         return f"{'Yes' if p >= 0.5 else 'No'}  ({p * 100:.0f}% yes)"
 
+    def single_values(self, node):
+        """Every output is a single value, a column of the entry's header row (§8.6)."""
+        from ..inner import Column  # imports bpy
+
+        return tuple(Column(output, name, data_type, self.FALLBACK[output]) for output, name, data_type in (
+            ("Answer", "answer", 'FLOAT'), ("Yes", "yes", 'BOOLEAN'), ("Confidence", "conf", 'FLOAT')))
+
     def build(self, b, gi, go, entries):
-        index = b.match_chain(b.words(gi, self.WORDS), [e.gn for e in entries])
-        for name, data_type, y in (("Answer", 'FLOAT', 200), ("Yes", 'BOOLEAN', 0), ("Confidence", 'FLOAT', -200)):
-            b.lookup(index, data_type, self.FALLBACK[name], [e.single[name] for e in entries], go.inputs[name], y)
+        for j, column in enumerate(self.single_values(b.node)):
+            b.link(b.single(column, 0, 200 - 200 * j), go.inputs[column.output])

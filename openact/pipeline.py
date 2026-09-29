@@ -75,7 +75,7 @@ class Job:
     """One node context's table: its words, its rows, and how its questions are asked."""
 
     uid: str  # node uid
-    gn: tuple[str, ...]  # the raw words the match chain compares, Key included
+    gn: tuple[str, ...]  # the raw words the inner group's key text holds, Key included
     words_key: str  # words_key()
     shape: TableShape
     rows: list[Row]
