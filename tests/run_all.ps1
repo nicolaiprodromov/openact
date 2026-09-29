@@ -115,7 +115,8 @@ function Invoke-Suite([string]$Suite, [string]$Where, [string]$Exe, [string[]]$A
             if ($null -eq $line) { continue }
             Write-Host $line
             if ($k -eq 1) { continue }
-            if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ } elseif ($line.StartsWith("WARN ")) { $warn++ }
+            # A suite's timing warning is "WARN <text>"; Blender's own log writes "WARN (<area>): ...", which is no check
+            if ($line.StartsWith("PASS ")) { $pass++ } elseif ($line.StartsWith("FAIL ")) { $fail++ } elseif ($line -match '^WARN (?!\()') { $warn++ }
             if ($line -match '^(?:BLENDER (.+)|PYTHON \S+) RESULT (OK|FAILED: .*)$') {
                 $result = $Matches[2]
                 if ($Matches[1]) { $Where = "Blender " + $Matches[1] }
