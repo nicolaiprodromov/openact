@@ -10,6 +10,7 @@ Everything about using OpenAct, in depth. For the overview, see the [README](../
 - [The six nodes](#the-six-nodes)
   - [When a node asks: the Trigger](#when-a-node-asks-the-trigger)
   - [Working with the nodes](#working-with-the-nodes)
+  - [Playback and simulations](#playback-and-simulations)
 - [CSV files](#csv-files)
   - [Two ways to give a node its CSV](#two-ways-to-give-a-node-its-csv)
   - [Formats](#formats)
@@ -63,8 +64,9 @@ in; numbers, selections, picks and labels come out. Each node reports its words 
 modifier panel, built by other nodes, or kept in CSV files) as the tree evaluates; OpenAct reads them afterwards,
 asks a model on your GPU in the background, and stores its answers in the node as a table that Geometry Nodes looks
 up, per element where needed. The model runs only for a node whose Trigger is on, and only for what that node is
-missing; never during evaluation, playback or rendering. The answers are saved in the .blend, so a file opens,
-plays and renders without the model, and without the add-on, on Blender 4.5 or newer.
+missing, also while the timeline plays ([below](#playback-and-simulations)); never while Blender renders. The answers
+are saved in the .blend, so a file opens, plays and renders without the model, and without the add-on, on Blender
+4.5 or newer.
 
 The model never generates text. It reads the probability of each allowed answer from one forward pass. That is the
 method of **SemIf** (formerly OpenJev, MIT), running **Qwen3.5-4B** (Apache-2.0) on your GPU.
@@ -152,9 +154,33 @@ sets of words the evaluation reported:
   **Write Overrides CSV**; and the *Files* panel: each CSV the node reads, with its columns and problems, *Open File*
   and *New CSV from Template*. The sidebar never edits answers: to change one, change its words, or lock it in the
   Overrides CSV.
-- **Animated words.** OpenAct asks nothing during playback or rendering. Words that change over the frame range (a
-  keyframed dropdown, say) and have no answer yet show the object's last answers, or neutral values on a tree several
-  objects share, until playback stops; then they are asked, if the node's Trigger is on.
+
+### Playback and simulations
+
+While the timeline plays, a node whose Trigger is on keeps asking for what it misses:
+
+- **After each frame**, OpenAct reads the words the frame evaluated: a keyframed dropdown, the frame through Value to
+  String, a simulation's state. Words already answered show at once and cost nothing. New ones are asked right away,
+  ahead of other work, and their answer shows a frame or so after it arrives. Until then the node shows what it
+  showed last: its previous answer when one object uses it, or a table's old rows, marked stale; on a tree several
+  objects share, neutral values.
+- **An untriggered node** asks nothing and costs nothing during playback, and its stored answers show as they would.
+- **Words that change faster than the model answers**, such as a new question at every frame: a node keeps only its
+  newest questions waiting, and drops its older ones not sent yet. The elements of a For Each Element zone keep all
+  of theirs.
+- **Answers are stored** in the node once playback stops, or when you save, so they survive saving and reopening the
+  file. The node's status, and the sidebar, catch up then too.
+- **Nothing rebuilds a node while the timeline plays.** A Pick whose answer names an item its lists never had shows
+  that Item once playback stops.
+- OpenAct keeps its own work to a few milliseconds per frame. Each answer written makes Blender evaluate the frame
+  once more.
+- **Simulations continue** without resetting: an answer written at one frame is used from the next, and the
+  simulation doesn't start over. Scrubbing back shows the frames as they were simulated; going back to the start
+  frame simulates them again with the new answers.
+- **A live run doesn't replay identically.** Answers arrive when they arrive, so a second playback, with everything
+  answered, can differ from the first. For a result that stays the same, don't trigger nodes during playback, and
+  bake simulations before final renders. Renders never ask: they use the answers stored in the file, and a still
+  render of frame 50 can't simulate the frames before it, nor can a farm that splits the frames across machines.
 
 ## CSV files
 
@@ -310,8 +336,10 @@ answers and CSV payload saved in the file: it doesn't plan again or re-bake from
 renders, it prints once per file each CSV whose edits would change a saved table, e.g.
 `CSV //life_outcomes.csv differs from the saved table (numbers); rendering the saved answers`. Words that only a
 frame change reveals (a driver, NLA, a keyframed menu socket) are compared as the file holds them; the render shows
-the saved answers either way. A render job in an open Blender leaves the tables as they are too. Opened
-interactively, the file re-bakes from its CSVs as usual, and the node's status notes each file that differed.
+the saved answers either way. A render job in an open Blender leaves the tables as they are too, and asks nothing,
+even while the timeline plays. Bake simulations before sending a file to a farm: each machine renders its frames
+without the ones before them ([Playback and simulations](#playback-and-simulations)). Opened interactively, the file
+re-bakes from its CSVs as usual, and the node's status notes each file that differed.
 
 A script that authors headlessly (sets words, fills tables, saves) opts back in, either way:
 - set the environment variable `OPENACT_BACKGROUND_PASSES=1` (or `true`) before starting Blender;
@@ -340,6 +368,8 @@ saved .blend holds its words, the item and outcome names, and the answers, so sh
 - **Blender 4.5 or newer only.** Older versions lack nodes OpenAct builds on.
 - **NVIDIA GPUs (CUDA) only.** The installer refuses to install without one, and there is no CPU backend yet (see
   [Future work](#future-work)). macOS is not supported for authoring.
+- **Asking during playback shares the GPU with the viewport**, which can slow both down; OpenAct doesn't balance
+  them. A render job pauses the model instead.
 - **Rarely, two sets of words look alike to a node.** A node finds each answer by a short hash of its words, and very
   rarely two different sets of words share one, such as two Keys that differ by a character or two. Only the first
   set's answer can show then, and the node's status says so, naming both: give one of them another Key.

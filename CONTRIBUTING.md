@@ -104,9 +104,10 @@ Each suite prints a `PASS` or `FAIL` line per check and ends with one `RESULT` l
 - **Keep the pure modules pure.** `csvfmt.py`, `natsort.py`, `pipeline.py`, `rules_core.py`, `store.py`, `words.py`
   and the node specs in `specs/` import no `bpy` when they load: the `*_test.py` suites run them under plain CPython.
   Import `bpy` inside the functions that need it, as the specs do.
-- **Nothing runs during evaluation.** Geometry Nodes can't call Python while it evaluates. OpenAct reads words and
-  asks the model outside evaluation, and writes the answers into the node's hidden group. Keep it that way: handlers
-  only schedule a pass, and the model is never asked during evaluation, playback or rendering.
+- **Nothing runs during evaluation.** Geometry Nodes can't call Python while it evaluates. OpenAct reads what each
+  evaluation reported afterwards, asks the model outside evaluation, and writes the answers into the node's table.
+  Keep it that way: handlers read an evaluation's results after it, and the model is never asked during an evaluation
+  or a render.
 - **Match the surrounding code:** lines of up to 120 characters, docstrings that say what a function returns or
   why it exists, and comments that explain reasons rather than restate the code.
 - **Tests come with the change.** Add or extend the suite that covers the behaviour: pure logic in a `*_test.py`,

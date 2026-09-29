@@ -46,7 +46,7 @@
 - **Runs on your GPU.** Qwen3.5-4B runs on your own NVIDIA card. After the one-time install, OpenAct talks only to
   `127.0.0.1`: nothing leaves your computer.
 - **Asks when you say so.** A node asks only while its Trigger input is on, and only for the words it has no answer
-  for yet. Never during evaluation, playback or rendering. Answers arrive in the background.
+  for yet, also while the timeline plays. Never during rendering. Answers arrive in the background.
 - **Saved in the .blend.** Answers live in the file, so it opens, plays and renders without the model, and even
   without the add-on. Render farms need nothing extra.
 - **Written in CSV.** Keep rules, labels and settings in CSV files next to the .blend. Numbers beside labels and

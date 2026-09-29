@@ -30,6 +30,11 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
 - A node with missing answers that nothing asks says why: *Link a Trigger to ask*, *Trigger off* or *Not
   evaluated*, with how many answers are missing. The sidebar shows the active node's Trigger at the last evaluation
   and how many sets of words the evaluation reported.
+- Nodes ask during playback: while the timeline plays, a node whose Trigger is on asks for the words each frame
+  brings that it has no answer for, and each answer shows a frame or so after it arrives, with no graph rebuilt and a
+  few milliseconds of Blender's time per frame at most. Meanwhile the node keeps showing what it showed last. The
+  answers are stored once playback stops, or when the file is saved; simulations continue without resetting. Renders
+  still never ask: bake simulations before final renders.
 
 ## 1.0.0
 

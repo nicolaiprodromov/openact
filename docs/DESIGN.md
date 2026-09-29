@@ -49,8 +49,13 @@ inner node group holds the model's decisions as a precomputed **table**. The add
 node's words outside evaluation, asks the model in the background and rewrites the table.
 Geometry Nodes then applies the table **per element** through an ID or state field. Words go in
 and Geometry Nodes data comes out. The model is asked only for what a node misses while its
-**Trigger** is on (§6.0), or once after *Ask Again*. It never runs during evaluation, playback or
-rendering, and the answers are saved in the .blend.
+**Trigger** is on (§6.0), or once after *Ask Again*: also while the timeline plays, when the
+answers are written into the table as they land, values only (§5.5). It never runs during an
+evaluation or a render, and the answers are saved in the .blend.
+
+**Determinism is not a goal.** An answer asked during playback lands when it lands, so a live run
+doesn't replay identically. A deterministic result comes from not triggering a node during
+playback, and from baking simulations before final renders (§5.5, NG1).
 
 v1 rests on four foundations:
 - the static input evaluator;
@@ -135,7 +140,8 @@ All figures were measured on an RTX 3090 with bf16 weights and order debiasing o
 | Table fill: yes/no cells | ~24 cells/s (216 cells in 8.9 s) |
 | Table fill: 7-option cells | ~14 cells/s (125 cells in 8.9 s) |
 | Game of Life table (18 cells) | 0.5–2.7 s, exact when framed as "outcome + when" |
-| Model calls during evaluation, playback and rendering | none, by construction |
+| Model calls during evaluation and rendering | none, by construction |
+| Model calls during playback | only for what triggered nodes miss; answered words cost nothing |
 
 The rest of the document specifies:
 - the sockets of each node (§6);
@@ -277,7 +283,9 @@ reading of evaluated geometry through `GeometrySet`.
 | First partial result on a large table | ≤ 2.5 s (tables fill in chunks of 32 questions) | §10 |
 | Re-ask after editing one CSV text cell | only the affected cells are sent | per-cell cache, §5 |
 | Re-ask after editing only numeric CSV columns | 0 requests | text/numeric split, §7 |
-| Model calls during evaluation, playback, render | 0 | principle 4.b |
+| Model calls during evaluation and render | 0 | principle 4.b |
+| Main-thread cost of the playback path (§5.5) | ≤ 3 ms after each frame's evaluation (`FRAME_BUDGET`) and ≤ 5 ms per tick (`TICK_BUDGET`), what doesn't fit deferred; measured on 4.5.2 and 5.1.1: 0.12–0.15 ms per frame with nothing new (0.34 ms at most), 0.72–0.79 ms at a frame that plans and asks one new word set, about 0.25 ms per new word set (12 of 40 planned within one frame's budget) | `tests/playback_blender.py` TIMING |
+| Playback cost of a table write | one more evaluation of the objects that use the node, at that frame (measured: a 29 ms frame took 59 ms); writing `entries` re-evaluates nothing, but `store.save()` costs 16–17 ms per 1024 Ask entries and 30 ms per 1024 18-cell Rules entries, so playback stores after it stops | §5.5 |
 | Reopen with no model | 0 requests, identical evaluated output | e2e `reopen` phase |
 | Game of Life tables (Conway, HighLife, Seeds, Day & Night) | 18/18 exact, 0 unsure, each | measured |
 | Biome Classify/Rules (27 cells, 7 described plants) | mean confidence ≥ 0.55, all 7 outcomes used | measured 0.61 |
@@ -290,9 +298,12 @@ reading of evaluated geometry through `GeometrySet`.
 
 ### 3.3 Non-Goals (v1)
 
-- **NG1. Agents** (think slow, act fast), decisions arriving asynchronously during playback and a
-  record mode for deterministic renders. These belong to a separate design document. v1 keeps
-  passes paused during playback and rendering exactly as today.
+- **NG1. Agents** (think slow, act fast) and a record mode for deterministic renders, e.g. rows
+  that remember the frame their answer arrived at. These belong to a separate design document.
+  Decisions do arrive asynchronously during playback (§5.5), and **determinism is not a goal**: a
+  live run doesn't replay identically, so bake before final renders. Python still never runs
+  *during* an evaluation: it reads what each evaluation reported afterwards (§5.7), and renders
+  never ask.
 - **NG2. The "Show" route.** No describing actual elements from geometry (per-element attribute
   values, images) and no vision encoder. The Qwen3.5-4B checkpoint has one, but SemIf loads only
   the text model. v1 has only the "Name" route (Pick/Match/Classify judge named entries) and the
@@ -404,9 +415,11 @@ field (Pick, Match, Classify) or through **factor** fields (Rules). This is an O
 element, so evaluation cost does not depend on the model.
 
 The model is asked only for the word sets an evaluation reported with the node's Trigger on, or
-once after *Ask Again* (§6.0), by a debounced pass run from `tick()`. It
-never runs during evaluation, during playback or while a render job runs (`_playing()`). Answers
-persist in three places, all saved in the .blend:
+once after *Ask Again* (§6.0): by a debounced pass run from `tick()`, or while the timeline plays
+by the playback path, which reads each frame's reports after its evaluation and writes the answers
+values only as they land (§5.5). It never runs during an evaluation, and nothing asks while a
+render job runs or in a background session that renders the saved answers (`_rendering()`,
+`_saved_only()`, §7.8). Answers persist in three places, all saved in the .blend:
 - the node's `entries` JSON;
 - the inner group;
 - the table object, which holds every per-element column, whatever the table's size.
@@ -682,6 +695,7 @@ sequenceDiagram
   A->>T: edits a socket or saves a CSV
   T->>T: schedule(), debounce 0.25 s (file watcher polls stat at 2 Hz)
   T->>P: run_pass() unless playing or rendering
+  Note over T,P: while the timeline plays, the playback path does the same, values only (§5.5)
   P->>P: evaluate, channel.read(), ensure_owned(), spec.plan(node, ctx) per word set
   P->>P: resolve rows: lock, code, MEMORY[cell.key], stored entry
   P->>Q: submit(job, missing cells, priority, generation) of word sets reported with the Trigger on
@@ -749,12 +763,18 @@ sequenceDiagram
      rows, and the status says why nothing asks them (§17.1).
 6. **Entries** are updated in `store`: at most 1024 **warm or cold** stored entries per node
    (`MAX_ENTRIES`), within the 2 MB soft cap, least recently used evicted. Live entries are exempt from that limit and never
-   evicted (§8.1). Every stored entry is in the node's table object, but an entry whose key an
+   evicted (§8.1). The entries the playback path answered since the node's last pass join them
+   first, in place of a stored entry with the same words (`engine._stored()`, §5.5), so the pass
+   after playback stores them. Every stored entry is in the node's table object, but an entry whose key an
    earlier one has (§8.2). Then one of two things happens:
-   - the **layout** changed (§8.8): `inner.build()`, at most once per pass;
+   - the **layout** changed (§8.8): `inner.build()`, at most once per pass, also for what playback
+     couldn't write (a Pick's new item names, other Rules factors);
    - otherwise `inner.update_values()`, values only: it rewrites the table object when its rows
      changed, their answers or single values, a new or evicted entry (`foreach_set`), and else at
      most the default a miss shows. A pass that changes nothing writes nothing.
+
+   What the pass wrote is kept for the playback path (`engine.TABLES`: the entries in table order,
+   the live word sets, the default, and whether a miss shows the last-shown entry).
 7. The node's status is computed (§17): hint, idle (missing answers nothing asks), waiting,
    filling *n/N*, complete (with unsure and locked counts), or error.
 
@@ -887,7 +907,7 @@ debias).
 
 | Thread | Owns | Never does |
 |---|---|---|
-| **Main** (timer `tick` every 0.1 s, handlers, operators, draw) | All `bpy` access: passes, evaluator, CSV reads (at most 1 MB, synchronous), `store`, `inner`, `tables`, status, redraw | Network I/O, waiting on the server |
+| **Main** (timer `tick` every 0.1 s, handlers, operators, draw) | All `bpy` access: passes and the playback path, evaluator, CSV reads (at most 1 MB, synchronous), `store`, `inner`, `tables`, status, redraw | Network I/O, waiting on the server |
 | **Decision worker** `openact-decide` (one `threading.Thread`, daemon) | Pops chunks from the priority queue, sends one HTTP request at a time, and posts results with `server.post()`. Reads two `threading.Event`s that `tick()` publishes on the main thread: `render_running` and `playing` | Touching `bpy`, including `bpy.app.is_job_running`; more than one request in flight |
 | **Executor** (`ThreadPoolExecutor(max_workers=2)`, was 4) | `/health` probes, start-up polling, installer steps and uv/pip subprocesses | Decision requests (moved to the worker) |
 | Server: HTTP threads, `load` thread, watchdog, `Engine.gpu` lock | Scoring, one call at a time | — |
@@ -904,7 +924,7 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
 
 | Class | Work | Target |
 |---|---|---|
-| P0 | Ask, Pick, Dials, and any job with at most 8 missing cells | ≤ 0.6 s on an idle queue (§3.2) |
+| P0 | Ask, Pick, Dials, any job with at most 8 missing cells, and whatever the playback path asks, whatever its size (below) | ≤ 0.6 s on an idle queue (§3.2) |
 | P1 | Tables of the active node in the focused node editor | first partial result ≤ 2.5 s |
 | P2 | Every other table | throughput |
 
@@ -927,24 +947,84 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
   when another file is opened or the add-on unregisters (`cancel_all()`).
 - The in-flight chunk always completes. Its answers land in `MEMORY`, where they remain useful:
   undo, or switching back to the previous words.
+- During playback, a node's newer word sets replace its older questions (below).
 
-**Playback, rendering and undo.**
-- **Playback.** Passes stay paused (`_playing()`, unchanged), and so does the CSV file watcher's
-  pass. The worker may finish queued chunks, but tables are written only after playback stops
-  (NG1).
-  - **Rule:** words that change *during* playback (a keyframed or driven modifier input, such as a
-    rule-set Menu Switch, or a CSV edited while playing) show their stored answers, as the node's
-    table object holds every stored entry (§8.1). Words with no answer yet show the fallback
-    below until the first pass after playback asks for them.
-  - **On a node used by exactly one live context**, a miss falls back to that context's
-    last-shown entry (the default a miss shows, §8.2), not to the neutral fallbacks. A
-    single-object sim, such as the hero demo, keeps its own last rules instead of reading
-    `alive = −1`. On shared trees a miss gives neutral values, so no object ever runs on another's
-    rules.
-- **Rendering.** While `render_running` is set, the worker starts no new chunk, so the model does
-  not compete with Cycles or EEVEE for the GPU. `tick()` sets the event from
-  `bpy.app.is_job_running('RENDER')` on the main thread, and the worker never calls `bpy`. The
-  in-flight chunk completes.
+**The playback path** (`engine._play_frame()`, `engine._play_tick()`). While the timeline plays
+(`_playback()`: `_animation_playing()`, and neither `_rendering()` nor `_saved_only()`), no pass runs,
+nor the CSV file watcher's: a CSV edited while playing is read once it stops. The playback path does
+a pass's work instead, values only, for the nodes whose Trigger is on:
+- **After each frame's evaluation** (`frame_change_post`, which sees that frame's result and
+  messages), it reads the reports (`channel.read()` with the handler's depsgraph, §5.7). A node
+  reported with no Trigger on, and no *Ask Again* pending (`ASK_ONCE`), costs nothing more: nothing
+  is asked or written for it. For a triggered node, each reported word set whose key its table's
+  header rows lack (`tables.header_rows()`, `words.key()`), or give a table so far, becomes a
+  **question** (`engine.QUESTIONS`, oldest first). Words already answered cost nothing: the table
+  holds every stored entry (§8.1), so they show at once.
+- **A question** is planned (`plan_words()`, §5.7), answered by the validity rule from the node's
+  entries and this session's `MEMORY` (§5.4), and written at once, values only, when any row is
+  known, as a table so far (stale-while-refilling). Its missing cells are submitted at **P0**, as
+  the timeline shows them now, at the node's generation (`engine._ask()`, the one place that
+  chooses which of a job's missing cells playback submits).
+- **Answers landing** (`_play_tick()`, after `server.pump()` in `tick()`): each question whose cells
+  landed is answered again and written, values only: a new entry is appended (`inner.append_entry()`),
+  and one that grew, a table so far filling in, rewrites the rows (`inner.update_values()`, with the
+  entries, live word sets and default of the node's last pass, `engine.TABLES`). A question whose
+  cells another node's new generation dropped, or that a starting model never took, is asked again.
+- **Never `inner.build()`.** An entry that takes a new layout (`append_entry()` or `update_values()`
+  refuses: a Pick's new item names, other Rules factors, a changed interface) is kept, and the pass
+  after playback lays it out; meanwhile a Pick's new item shows `""`. A word set that plans a Hint,
+  waits for another node's answer or has an error, or whose table stays partial with nothing left to
+  ask, is held for the next pass (`HELD`), which shows why.
+- **The default a miss shows** (§8.2, KD24) follows what the frames show: a context with one word set
+  updates `LAST_SHOWN` to the entry it shows, or the one the playback path writes for it; on a node whose pass
+  found one word set, in neither a hint nor an error state, the default follows it
+  (`inner.set_default()`, at a miss or a write). So while its answer is on the way, a single object
+  keeps its own last answers, such as a single-object sim its last rules, instead of reading
+  `alive = −1`; on shared trees a miss gives neutral values, so no object runs on another's rules.
+- **Budget.** The frame handler starts no more work once `FRAME_BUDGET` (3 ms) of main thread has
+  gone since it began, the reads included; a tick stops after `TICK_BUDGET` (5 ms), landed answers
+  first. The frame's new questions come first, then those left, in the order they came. A question
+  started within the budget may end past it: planning and asking an Ask's word set costs about
+  0.25 ms, planning a 4096-cell Rules context about 120 ms (§5.3). Measured on 4.5.2 and 5.1.1 (`playback_blender.py`,
+  §3.2): 0.12–0.15 ms per frame with nothing new, 0.72–0.79 ms at a frame that plans and asks one
+  word set, and 12 of 40 new word sets planned within one frame's budget, the others at the next
+  ticks.
+- **What a write costs.** A table write re-evaluates the objects that use the node, at that frame:
+  inside `frame_change_post` Blender evaluates the frame once more (measured: a 29 ms frame took
+  59 ms), and a tick's write re-evaluates the frame shown. A simulation zone continues without
+  resetting: a value written at frame N is seen at N + 1, or at N already when Blender evaluates that
+  frame again after the write, re-simulating it from the cached N − 1; scrubbing back shows the
+  cached frames, and the start frame re-simulates with the new answers. Blender's bake freezes a run
+  for final renders: **determinism is not a goal** (NG1).
+- **Stale questions.** A node that brings new word sets while it reports none of its questions any
+  more has moved on: they go, and a new generation (`_bump()`) drops their chunks still queued, the
+  pass's too. The chunk in flight completes, and its answers stay in `MEMORY` for when those words
+  come back. A node that still reports any of its questions keeps them all, so the other elements of
+  a For Each Element zone, and the other objects that share its tree, never lose theirs: bumping for
+  every new word set would cancel them. Once playback stops, a question never planned goes (the next
+  playback asks again for what it reports), those asked keep being written as they land, and the pass
+  after playback applies its own rules (`_moved()` bumps a node whose word sets changed since its
+  last visit, which drops what playback left queued for it).
+- **Storing.** Writing a node's `entries` re-evaluates nothing (measured on 4.5.2 and 5.1.1), but
+  `store.save()` serialises all of them: 16–17 ms for 1024 Ask entries, 30 ms for 1024 Rules entries
+  of 18 cells, and `store.load()` as much. So the playback path keeps what it answers
+  (`Table.answered`, the newest 2 × `MAX_ENTRIES`, more than a save keeps), and the node's next
+  pass, the one after playback, stores them in place of a stored entry with the same words, stamps the
+  last use of what the frames showed, and evicts as any save does (§14.7). A save before that pass
+  stores them first (`save_pre`, `engine._flush()`). Opening another file drops them: their answers
+  stay in this session's `MEMORY` only.
+- **The status** (§17.1) stays the last pass's while the timeline plays; the pass after playback
+  updates it.
+- **The GPU** is shared with the viewport while the timeline plays: the worker keeps sending. That
+  sharing is not managed.
+
+**Rendering and undo.**
+- **Rendering.** Renders never ask: they use the stored answers (§7.8). While `render_running` is
+  set, the worker starts no new chunk, so the model does not compete with Cycles or EEVEE for the
+  GPU. `tick()` sets the event from `bpy.app.is_job_running('RENDER')` on the main thread, and the
+  worker never calls `bpy`. The in-flight chunk completes. While a render job runs, neither a pass
+  nor the playback path runs, whatever the timeline does, nor in a background session that renders
+  the saved answers (`_saved_only()`), whose frame changes ask nothing.
 - **Undo and redo.** Entries JSON, inner groups and table objects are ordinary data inside undo
   steps. `on_undo_redo` schedules an immediate pass, and `MEMORY` makes re-applying answers free.
 - **No `temp_override`.** Under one, Blender 4.5 and 5.0 (Python 3.11) read the override without
@@ -958,7 +1038,9 @@ in submission order, so one 4096-cell table cannot starve a 50-cell one.
 OpenAct renders the saved answers and does not re-plan or re-bake from files (§7.8, R23). Headless
 **authoring** opts back in, through `OPENACT_BACKGROUND_PASSES=1` or in process through
 `openact.engine.allow_background_passes(True)`; a script that builds scenes uses the latter. The test
-suites then drive `engine.tick()` in a loop, as `tests/e2e_blender.py::drive()` does today.
+suites then drive `engine.tick()` in a loop, as `tests/e2e_blender.py::drive()` does today, and stand
+in for playback with `engine._animation_playing()` returning True, stepping frames with
+`scene.frame_set()` (`tests/playback_blender.py`).
 
 ### 5.6 Hooks kept open for the agents design (NG1)
 
@@ -967,8 +1049,8 @@ on them:
 - **`pipeline.submit(job, priority, on_rows=callback)`** accepts jobs from producers other than
   nodes. A future background agent loop can queue decisions and receive rows asynchronously.
 - **Table objects** (`tables.write_rows()`) can be rewritten without rebuilding any node graph. A
-  write is a `foreach_set` on attributes followed by a depsgraph tag. Decisions can therefore land
-  while Geometry Nodes plays; v1 simply doesn't do that yet.
+  write is a `foreach_set` on attributes followed by a depsgraph tag. Decisions therefore land
+  while Geometry Nodes plays: the playback path writes them values only (§5.5).
 - **`geometry.read_attributes(obj, names)`** wraps `GeometrySet.from_evaluated_object` safely: it
   keeps the GeometrySet referenced and never chains `.mesh` on a temporary. v1 itself does not use
   it: the Attributes source reads original data (§6.0). The agents loop will use it to read
@@ -1021,7 +1103,8 @@ each evaluation (`inner._Builder.warning()`).
   changed since the last evaluation, so a timer or a headless script reads the current lists. The
   pass calls it before it clears its dirty flag, so that evaluation's depsgraph update schedules no
   further pass. A frame change sends no depsgraph update, so `frame_change_post` schedules a pass,
-  which runs once the timeline stops.
+  which runs once the timeline stops; while it plays, the playback path reads the frame's lists
+  there, with the handler's depsgraph (§5.5).
 - `channel.read(nodes, contexts, depsgraph)` reads `mod.node_warnings` of each Geometry Nodes
   modifier whose tree holds an OpenAct node, and keeps what `words.parse()` accepts: node uid →
   (object pointer, modifier name) → {word tuple: triggered}. The same words reported with the
@@ -1047,9 +1130,10 @@ each evaluation (`inner._Builder.warning()`).
 - **Generations.** A context that loses a word set it planned at the node's last visit bumps the
   node's generation before anything is submitted (`engine._moved()`, §5.5), as a changed
   fingerprint does.
-- **For the playback path**, `engine.plan_words(node, ctx, words)` plans one reported word set
-  outside a pass, through the same plan cache and generations; `engine._sets()` gives the word sets
-  of a node's contexts from a report.
+- **For the playback path** (§5.5), `engine.plan_words(node, ctx, words)` plans one reported word
+  set outside a pass, through the same plan cache and generations; `engine._sets()` gives the word
+  sets of a node's contexts from a report. A new word set never bumps a generation by itself, so a
+  zone's elements, all new at one frame, are asked side by side.
 - **Files** (§16.1): Geometry Nodes' own Import Text reads any file. In a file that isn't trusted,
   a reported word set fed by an Import Text whose Path lies outside the file's folder, or can't be
   read statically, is refused with the usual "Blocked reading" error, so its text is never stored.
@@ -2542,6 +2626,7 @@ reference factor layout (§9), Dials' outputs, Pick's item names. Everything els
 |---|---|
 | Answers arrive, locks or numeric payload edited, confidence changes, a new word set answered, an entry evicted | **Values only.** `update_values()` rewrites the table object when its digest changed (§8.5) |
 | An answer lands during playback for words the table doesn't hold | **Values only.** `inner.append_entry()` appends its block, which the next evaluation finds; nothing else moves. It refuses (and the next pass writes) an entry whose key the table holds, one of another layout, or any change of the interface or columns |
+| An entry grows during playback (a table so far filling in) | **Values only.** `inner.update_values()` rewrites the rows from the entries the node's last pass wrote, the grown one in its place (§5.5); another layout waits for the pass after playback |
 | The default a miss shows changes (§8.2): a new last-shown entry, a change in the number of live contexts, or entering or leaving a hint or error state | **Values only.** Point 0 alone (`update_values()`; during playback `inner.set_default()`) |
 | A copy gets its own uid (`engine.ensure_owned()`) | **Values only.** `update_values()` rewrites the `OpenAct uid` String node the Warning reports (§5.7) |
 | Row count of an entry changes (items added or removed) | **Values only.** The table object's vertex count changes; the graph does not |
@@ -3102,10 +3187,12 @@ The pipeline adapts to each backend through `/v1/capabilities`: `slots`, `batch_
 
 The engine's rhythm:
 - the 0.1 s `tick()` timer and the 0.25 s debounce;
-- the depsgraph / frame change / `load_post` / undo / redo handlers;
+- the depsgraph / frame change / `load_post` / `save_pre` / undo / redo handlers (`save_pre` stores
+  what the playback path answered since the last pass, §5.5);
 - `SAFETY_PASS` (2 s), which now only **recomputes fingerprints** and re-plans nothing unless a
   fingerprint changed (§5.3 step 4);
-- pausing during playback and render jobs;
+- no pass during playback and render jobs: while the timeline plays, the playback path runs from
+  `frame_change_post` and `tick()` instead, within its budgets (§5.5);
 - skipping passes in files with no OpenAct nodes (`_has_nodes`, `_group_count`).
 
 And its work:
@@ -3273,6 +3360,8 @@ def read(nodes, contexts, depsgraph) -> dict: ...  # uid -> {(object pointer, mo
 
 # engine.py
 def plan_words(node, ctx, words) -> Job: ...    # one reported word set, through PLANS and GENERATIONS (§5.7)
+def _ask(node, question, job, missing) -> bool: ...  # the playback path's one place that submits missing cells (§5.5)
+TABLES: dict   # node uid -> Table: what its last pass wrote into its table, extended during playback (§5.5)
 
 # pipeline.py
 def submit(job: Job, missing: list[Cell], priority: int, on_rows=None) -> None: ...
@@ -3512,6 +3601,7 @@ Reading is pure Python. `tests/store_test.py` covers these rules under CPython a
 | `PLANS[(uid, ctx key)]`, or `PLANS[(uid, ctx key, words)]` for a reported word set, `→ (fingerprint, job)`: the plan cache (§5.3) | `engine.py` | a changed fingerprint; a context that disappears, unless the pass planned it (an evaluator read also reaches contexts `find_uses()` doesn't list, through a group node in a tree no modifier uses); a reported word set its node's pass no longer plans; `load_post` |
 | `LAST_SHOWN[(uid, ctx key)] → words_key` of the entry that context showed last (stale-while-refilling, carry-over, and the default a miss shows on single-context nodes, §5.3–§5.4, §8.2); a context with several word sets keeps none (§5.7). **Seeded on the first pass after load** from the stored entry whose `gn` equals that context's words, so rows re-asked after a CSV edit made while Blender was closed show stale values, not fallbacks | `engine.py` | `load_post` (then re-seeded); a context that disappears |
 | `REPORTS` (what the last evaluation reported, §5.7) and `SETS` (the word sets each node's last visit planned) | `engine.py` | every pass (`REPORTS`); `load_post` |
+| The playback path's (§5.5): `TABLES` (per node, what its last pass wrote into its table, extended during playback, with the entries answered since, which its next pass or a save stores), `QUESTIONS` (the word sets it plans or waits for) and `HELD` (the ones it leaves to the next pass) | `engine.py` | each pass (`TABLES` rewritten, `HELD` cleared); a node deleted; a question answered, or dropped by a newer word set; `load_post` |
 | `TRUST`: which file was opened; `PASS`: whether the open file is trusted, worked out once per pass (§16.1) | `trust.py` | `load_post` and enabling OpenAct (`TRUST`); every pass (`PASS`) |
 | `WATCH` (file stamps and `CsvDoc` cache), the evaluator memo and the file identities (`csvfmt.IDENTITIES`) | `engine.py`, `evaluator.py`, `csvfmt.py` | `load_post` (watch); every pass (memos) |
 | Worker queue, server `STATE` | `server.py` | add-on unregister (`shutdown_owned`) |
@@ -3982,7 +4072,7 @@ A later run can diff these lines to spot performance regressions.
 | `tests/lookup_blender.py` | Blender | none | Synthetic tables written through `store` and `inner`, with no server. Checks: the hash lookup on all six nodes (each context finds its entry by the key of its words; invalid IDs and a miss give fallbacks, or the default a miss shows); 3 contexts through the table object's header rows; payload columns; the Rules cell index for **every** combination against Python, including non-contiguous category maps; interpolation against the `rules_math` reference (max error 1e−5); dither fraction within ±2 %. **A rebuild leaves outputs unchanged**: evaluate, run `inner.build()` on the same entries, evaluate again and compare every attribute, **once with the CSV files deleted**. A values-only update keeps the node count. **No cap:** 20 objects with different words on one node each show their own answer; a new word set is new rows with the same nodes and layout, `append_entry()` and `set_default()` show at the next evaluation with no graph edit, and a second pass writes nothing. **Collisions:** words whose keys collide ('aZ' and 'b5') leave the later entry out and show the error naming both; a live entry wins its key over a warm one. **Shape agreement:** two contexts with different Outcomes CSVs that share a payload set work; conflicting Factors CSVs give the error and keep the last good table; per-entry Dials `min`/`max` and Pick materials. **Game of Life in a Simulation Zone**: 32 frames against a Python B3/S23 reference, both on a toroidal grid (§6.5), plus a Repeat Zone variant. **Key text (§8.2):** each word at its position, an absent one read as `""` (a Collection-source Pick finds its stored entry); word tuples that join to the same text have different keys. **Single values (§8.6):** Pick's Index feeds a single-value socket (Grid *Vertices X*). **A miss (§8.2):** with one live context, words with no entry show that context's own last answers; with two contexts, A's show neutral values, never B's answers; a cleared Question (a hint) shows neutral values; each change of the default is values only. **Layout (§8.8):** a group of another `LAYOUT`, or 1.0's, is rebuilt; the table keeps its digest through save and reload, so the reopened file's first update writes nothing. **No add-on (G6, §6.0):** Match, Classify and Pick with an unlinked ID, saved and opened in a second Blender without the add-on (the suite starts it), read what they read with it, each element its own row; a group saved before `UNLINKED` reads entry 0 there until its next pass rebuilds it; an ID linked from a float beyond the Int range reads the fallbacks in both. A Rules factor named `ID` keeps its typed value through `inner.build()`, whatever its kind. `--bench` enforces the §3.2 and §8.4 budgets: `inner.build()`, `update_values()` (unchanged, and one entry changed) and `append_entry()` on the demo and worst shapes, under the timing rule below |
 | `tests/pipeline_blender.py` | Blender + fake server | fake | Token required (403 without); `Origin`/`Host` rejection; chunks of at most 32 questions / 64 rows; a P0 job overtakes a P2 fill; cancellation drops queued chunks; per-question cache (`cached_questions`); 422 isolation; stale-while-refilling; locks send 0 requests; a numeric-only CSV edit sends 0 requests and updates the payload; a text edit re-asks only the affected cells; a missing file keeps the table; playback and render pauses. **Entry validity (§5.4):** a template bump sends 0 requests; toggling a node's *Balance Option Order* sends 0 requests until the words change, and later requests carry that node's `options.debias`; after a text edit, only rows whose `wkey` changed are asked. **Plan cache:** a TIMING line shows ≤ 5 ms per unchanged node and ≤ 50 ms per idle pass with a maximum-size Rules node used by 16 contexts. **Attributes:** a Pick (Attributes source) whose Item feeds a Store Named Attribute settles in one pass with one request. **Trust (§16.1):** an untrusted file with an absolute Import Text or CSV path outside its folder reads and stores nothing, while a CSV next to it is read |
 | `tests/reports_blender.py` | Blender + fake server | fake | **The Warning channel's reader (§5.3, §5.7):** words the static evaluator can't read (Scene Time's frame through Value to String, a Repeat zone's count, a simulation's step) are planned from the report and answered; a For Each Element zone's word sets each become an entry; a Collection list source reads its collection statically while its Prompt comes from the report; group paths sharing a modifier split its report; words built from an unanswered node's fallback wait for it; a tree no modifier uses and an unused node are planned statically, an unreadable word there is a hint; a modifier that doesn't evaluate reports nothing (disabled in viewports or in the viewport), an object hidden with the eye still does; a copy's shared uid is ignored; `plan_words()` shares the plan cache; no pass loop; in an untrusted file an Import Text outside the folder is refused. **The Trigger (§6.0):** unlinked, a node asks nothing and says so; linked to True it asks; turned off, new words ask nothing and the stored answer keeps showing, while a cell asked before still fills; a Float −1 is off and 0.3 on, and an Int, a Vector and a Color convert as Blender does; a triggered node whose outputs are unused asks nothing; Ask Again asks once without a Trigger, a statically planned word set too; a file saved by 1.0 keeps its answers and asks nothing; the sidebar's live activity. Every suite that expects asking links a Trigger (`_harness.trigger()`) |
-| `tests/playback_blender.py` | Blender + fake server | fake | **Playback (§5.5):** a keyframed Menu Switch cycles through three rule sets, two of them answered while the scene was stopped; playing sends 0 requests and writes no table, each answered rule set shows its table and the one never answered the object's last rules (the default a miss shows, §8.2), never a fallback, and the pass after playback asks for it. **Words at other frames (§7.8):** the F-curves are found through the action slot's channelbag on 4.5 and 5.1, give the words the scene has at every frame with no scene evaluation, and clamp to the hard range; a background render (`on_render_pre`) compares the words of its frame through them, and a driven input, an NLA strip and Time Stretching as the file holds them. OpenAct's code calls no `temp_override` (§5.5) |
+| `tests/playback_blender.py` | Blender + fake server | fake | **Playback (§5.5)**, with `engine._animation_playing()` returning True, `scene.frame_set()` for the frames and `engine.tick()` between them: a keyframed Menu Switch cycles through three rule sets, two of them answered while the scene was stopped: they show and ask and write nothing; the third is asked at its first frame, in one request, while the node shows the rules it showed last (its table so far, stale), and its answer is written values only as it lands and shows from then on; no `inner.build()` and no pass during playback; the pass after playback stores it; played again, nothing is asked or written. An untriggered Ask asks nothing and its table is never written; a triggered one whose Question holds the frame asks at each new frame, showing its last answer (the default a miss shows) until the frame's own lands. A simulation zone sees an answer written at frame N at N + 1 and continues without resetting. Stale questions: with the model busy, a node whose words change every frame keeps only its newest one queued, a For Each Element zone keeps all of its elements'. Storing: nothing during playback, then evicted as any save evicts (`MAX_ENTRIES` at 3); a save right after playback, before any pass, holds its answers, and so does the file reopened. The budget: TIMING lines for the frame handler with nothing new and with a new question, and 40 new word sets at one frame planned partly there and the rest at the ticks. Renders never ask (§2.6): played while a render job runs, or in a background session that renders the saved answers, new words ask and write nothing. **Words at other frames (§7.8):** the F-curves are found through the action slot's channelbag on 4.5 and 5.1, give the words the scene has at every frame with no scene evaluation, and clamp to the hard range; a background render (`on_render_pre`) compares the words of its frame through them, and a driven input, an NLA strip and Time Stretching as the file holds them. OpenAct's code calls no `temp_override` (§5.5) |
 | `tests/support_blender.py` | Blender + fake server | fake | `blender --command extension validate` with the `clipboard` permission; the templates parse with their sockets' schemas, and *New CSV from Template* never overwrites (`name 2.csv`) and fills only an empty, unlinked input; the diagnostics text has versions, counters and the runtime's folder (the home folder as `~`, also when it is the home folder) and its Python's folder name, never a server's or an account's but no prompt or CSV text; the JSONL request log only while `log_requests` is on; `unsure_below` moves the unsure counts, icons and exported column; **two Blender processes share one server through the token file** (the suite starts the second Blender, whose Stop Model only detaches), a second server can't take the port, a lost start race attaches at once and is no crash, and a wrong token file gives the §10.5 message; Detach lasts until *Start Model*, also while the other server loads and in a lost start race; a health probe that times out changes nothing, a chunk taken before a Detach is never sent without a token, the other server dying during its load leaves this Blender stopped, and *Stop Model* during its own load ends stopped, not in an error; diagnostics give each problem as its node type and severity, never its text; time-scaled: 3 fake-server exits within 10 minutes pause auto-start, a stalling `--fake-script` raises the stalled-fill alert, and a faked `ms_per_row` the slow-server note, only while cells are asked |
 | `tests/startup_blender.py` | Blender | none | On 4.5 and newer: `runtime_root()` follows the Runtime Folder preference, else the default folder; a server of another program on the port gives the port error and launches nothing until it has gone and *Start Model* runs. On older Blender, enabling the add-on fails before anything is registered (§11) |
 | `tests/e2e_blender.py` (extended) | Blender + real model | real | The existing `build` / `noaddon` / `reopen` phases, now covering all six nodes. **Game of Life acceptance:** Conway, HighLife, Seeds and Day & Night, each 18/18 exact with 0 unsure. Biome: mean confidence ≥ 0.55 with all 7 outcomes used. Sanity checks for Match, Classify and Dials; Pick's Probability field; `noaddon` with table objects and entry-level Index Switches; `reopen` sends 0 requests. TIMING lines are compared with §3.2 |
@@ -4060,10 +4150,10 @@ Severity is the impact if the risk happens. Likelihood is judged for v1 as desig
 | R12 | **Supply chain drift.** The SemIf archive or the Hugging Face revision changes or disappears | Medium | Low | Recorded hashes and a hash-locked environment stop a bad install; existing installs are unaffected. SemIf comes from the pinned commit archive with a SHA-256 check (user decision); bundling may come later |
 | R13 | **Name conflict.** "OpenAct" is taken or trademarked | Medium | Unknown | User decision: keep "OpenAct" for now, with no trademark gate before release; the user may rebrand later. Before 1.0 a rename changes only constants (id, bl_idname prefix, inner prefix, runtime folder); after 1.0 it would need another migration like §12 |
 | R14 | **Threading bug.** `bpy` is touched off the main thread and Blender crashes | High | Low | Strict rule: all `bpy` access on the main thread through `post()`/`pump()`. The worker holds only plain data. The fake-backend pipeline suite runs under load. Review checklist item |
-| R15 | **GPU contention** with Cycles, EEVEE or other applications: slowdowns or out-of-memory | Medium | Medium | The worker pauses during render jobs (§5.5); *Stop Model* frees VRAM; a slow-server warning (§17.3); OOM surfaces as a server error with the log |
+| R15 | **GPU contention** with Cycles, EEVEE, the viewport during playback or other applications: slowdowns or out-of-memory | Medium | Medium | The worker pauses during render jobs (§5.5); sharing the GPU with the viewport while the timeline plays is not managed; *Stop Model* frees VRAM; a slow-server warning (§17.3); OOM surfaces as a server error with the log |
 | R16 | **Weaker tournaments** above 16 options: conservative confidence and occasional misses | Low | Medium | Unsure flags; README recommends 16 labels or fewer per question, or a two-level split; locks |
 | R17 | **Undo and file-size growth** from large `entries` JSON | Low | Low | The 2 MB soft cap bounds warm and cold entries. **Deliberate exception:** live entries are kept above 2 MB with a size note, each bounded by the 4 MB per-entry hard cap (a 4096-cell table costs about 250 KB per live context). During fills the JSON is written at most every 2 s and once at completion (§14.7) |
-| R18 | **Scope creep towards agents** delays v1 | Medium | Medium | NG1. v1 ships only the hooks (§5.6), and the PR Plan contains no playback-time updates |
+| R18 | **Scope creep towards agents** delays v1 | Medium | Medium | NG1. v1 ships only the hooks (§5.6); during playback it asks only for what triggered nodes miss and writes values only, within a main-thread budget (§5.5) |
 | R19 | **Main-thread planning and graph-edit cost at the documented limits** (measured: RNA writes slow down as trees grow; planning 4096 cells takes about 120 ms, and a 64-setting Dials graph took 1.9 s to build, so Dials is limited to 32 settings, §8.4) | Medium | Medium | Answers in the table object, so the graph doesn't grow with the entries (§8.4); a table written only when its rows change (§8.5); plan cache and fingerprints (§5.3); the PR-08 contract spike; `--bench` and TIMING budgets as merge gates (§3.2, §8.7) |
 | R20 | **Mass re-asks** after an add-on upgrade (new templates), toggling a node's *Balance Option Order*, or a backend switch, silently changing saved scenes | High | Low (by design) | Words keys decide validity and ask keys only label rows (§5.4). A template bump and a toggle change each send 0 requests, asserted in `store_test` and `pipeline_blender` |
 | R21 | **Self-referential inputs**: a word source that reads the node's own output (evaluated geometry) re-asks or oscillates | Medium | Low (by design) | Attributes reads original data only and skips names the tree writes (§6.0). A test checks that the tree settles in one pass with one request |
@@ -4301,7 +4391,7 @@ decided (§4.e).
 |---|---|---|---|
 | KD1 | The product is **OpenAct**: package and extension id `openact`, bl_idnames `GeometryNodeOpenAct*`, inner prefix `.OpenAct `. "Jev" appears only in credits and API-compatibility notes | "Jev" is TypeSafe's trademark, and SemIf renamed itself from "OpenJev" for the same reason. **User decision:** keep "OpenAct" for now, with no trademark gate before release; the user may rebrand later. Before 1.0 a rename changes only constants (id, bl_idname prefix, inner prefix, runtime folder) | R13 |
 | KD2 | **Six nodes, one per verb**: Ask, Pick, Match, Classify, Rules, Dials. They share list sources, one answer-set format, the answer types and one confidence definition | Discoverable, and each node shows only its own sockets. Consistency comes from shared code (`specs/base.py`, `lists.py`, `csvfmt.py`), not from one mode-laden node | §6, §15.1 |
-| KD3 | **Decide per meaning, apply per element.** Decisions are table rows in the node's hidden inner group, looked up per element through an ID or factor fields. The model never runs during evaluation, playback or rendering: Python reads what each evaluation reported afterwards (§5.7), and asks only for word sets reported with the node's Trigger on, or once after *Ask Again* (§6.0) | Geometry Nodes cannot run Python while it evaluates. Tables are bounded by meaning (at most 4096 cells), saved, deterministic and safe on a render farm | §4.b, §8, §15.2 |
+| KD3 | **Decide per meaning, apply per element.** Decisions are table rows in the node's hidden inner group, looked up per element through an ID or factor fields. The model never runs during an evaluation or a render: Python reads what each evaluation reported afterwards (§5.7), and asks only for word sets reported with the node's Trigger on, or once after *Ask Again* (§6.0). During playback it asks for what triggered nodes miss, and writes the answers values only as they land (§5.5) | Geometry Nodes cannot run Python while it evaluates. Tables are bounded by meaning (at most 4096 cells), saved and safe on a render farm. Determinism is not a goal: a live run doesn't replay identically, so bake before final renders (NG1) | §4.b, §5.5, §8, §15.2 |
 | KD4 | Every answer set is **"answer + when it applies"**. Exact facts are handled by code: `if` restrictions, and single-option cells decided without the model | Measured: descriptions raised confidence from 0.32 to 0.61, and "outcome + when" made four Game of Life rule sets exact. Offering only the applicable clauses fixed 3 wrong cells | §4.c, §4.d, §9.4 |
 | KD5 | **CSV authoring with a text/numeric split.** Python parses every column, whether the file comes from a typed path or from a plugged-in Import CSV node (KD25). Text columns go to the model and into cell keys. Numeric payload columns are **baked** into the table and exposed as output sockets. The inner group never uses Import CSV's output | Import CSV drops text columns and caches by path (verified). Baking keeps the .blend self-contained, and numeric edits never re-ask the model | §7.1, §15.3 |
 | KD6 | Rules factors are declared in a **separate Factors CSV**. Artist overrides live in an **Overrides CSV** with a `lock` column. The sidebar is inspection only | "Everything happens in Geometry Nodes and files" (4.h). Files are diffable and can vary per object through Group Input | §7.4, §7.6, §15.5, §15.7 |
@@ -4322,7 +4412,7 @@ decided (§4.e).
 | KD21 | **Trust model for opened files.** Untrusted files may read only inside their own folder tree. Trust comes from a per-file *Allow this file* (`trusted_files`) or an explicit *Trust this folder* (`trusted_folders`), and a file created in this session is trusted. Blender's *Auto Run Python Scripts* does not count: a file that reads outside its folder needs one *Allow this file* click. Appended groups inherit the host file's trust, which is a documented residual risk | OpenAct stores the words it reads in the saved file, so a crafted file could otherwise exfiltrate local text. Blender can refuse Auto Run for one file (*Trusted Source* unchecked), and an add-on can't see that refusal. Demos with their CSVs still work, and allowing one download does not trust a whole Downloads folder | §16.1 |
 | KD22 | **v1 platform matrix.** Windows 10/11 with an NVIDIA GPU of ≥ 10 GB is supported and tested. Linux with NVIDIA is best effort. There is **no CPU path** in v1: the installer refuses without an NVIDIA GPU, and at run time `auto` means CUDA only. macOS is unsupported for authoring (future work) | Every gate runs on the one tested platform. A 13 GB install that cannot meet any target is refused up front, and a model that cannot use CUDA reports an error instead of crawling on the CPU | §3.3, §5.2, §10.5 |
 | KD23 | **Main-thread discipline.** A plan cache with fingerprints; rebuilds only on layout changes, never for a new entry; table-object writes only when the rows change, throttled; budgets as merge gates | Graph edits and planning are the expensive side (measured); an unchanged scene must cost almost nothing per pass | §5.3, §8.4, §8.8 |
-| KD24 | **Playback safety.** On a node used by exactly one live context, and not in a hint or error state, a miss falls back to that context's last-shown entry. Shared trees fall back to neutral values | Passes stay paused during playback (NG1), yet a single-object sim must not break. On shared trees, one object must never silently show another's answers while OpenAct runs. Without the add-on, the default stays as saved (R6) | §5.5, §8.1, §8.2 |
+| KD24 | **Playback safety.** On a node used by exactly one live context, and not in a hint or error state, a miss falls back to that context's last-shown entry, which the playback path keeps current during playback. Shared trees fall back to neutral values | Answers are asynchronous: during playback, new words miss until their answer lands, and a single-object sim must not break meanwhile, so it keeps its own last answers while the new ones are on the way. On shared trees, one object must never silently show another's answers while OpenAct runs. Without the add-on, the default stays as saved (R6) | §5.5, §8.1, §8.2 |
 | KD25 | **Import CSV hand-off** (user decision). A node gets its CSV from a typed path (String input) **or** from Blender's own Import CSV node plugged into the companion `<Input> CSV` Geometry socket. OpenAct traces the link (Reroutes, nested groups, Geometry selectors with static selectors) to the Import CSV node, reads its Path and Delimiter statically, and parses the file itself. A link wins over a typed path. Any other node, or a modifying node in between, is an error ("connect the Import CSV node directly") | Artists can wire CSVs the Blender way, while OpenAct keeps the text columns and always sees edits. The Import CSV geometry and path cache are never used. Limitation: the lookup's key can't see a traced path, so per-object files use route (a) or `Key` | §6.0, §7.7, §10.1 |
 | KD26 | **Per-node order balancing** (user decision). *Balance Option Order* (`balance_order`) is a node checkbox, default on, seeded from the global `debias` preference. It belongs to the ask key: toggling it discards nothing and sends 0 requests; new asks, and *Ask Again*, use the node's current setting | Some work doesn't need the double check, which costs 2× scored rows. Keeping it in the ask key preserves answers (KD13). Measuring accuracy with and without it is follow-up F2 | §6.0, §10.3, §14.2 |
 | KD27 | **Build orchestration** (user decision). The PR Plan is built locally by parallel worker subagents, one per PR, each in its own git worktree and branch, under an orchestrator that dispatches waves, reviews against *Tests to merge*, merges in dependency order, re-runs `tests/run_all.ps1`, and pushes `main`. Shared-resource rules: two GPU leases (one real-model run per RTX 3090, own port), a read-only runtime (`OPENACT_STATE_DIR` per worker), at most 4 headless Blenders, and tests tolerant of shared GPUs | Parallel waves shorten the build to about the critical path, while `origin/main` stays green and shared resources are never corrupted | §20.6 |

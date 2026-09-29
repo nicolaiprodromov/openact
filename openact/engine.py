@@ -14,6 +14,12 @@ node is answered outside evaluation:
    by the hash of the words. Geometry Nodes finds the matching answer by itself, so one node group
    can be used on several objects with different prompts, answers switch instantly back and
    forth, and they are saved with the file (Blender 4.5+ even evaluates them without the add-on).
+
+A pass runs from the timer, never while the timeline plays or a render job runs. During playback the
+playback path does the same work values only, within a budget per frame and per tick: after each
+frame's evaluation it reads what triggered nodes reported, writes what their stored entries and this
+session's answers give, asks for the rest, and writes the answers as they land; the pass after
+playback stores them and lays out what needs a new layout (§5.5).
 """
 
 from __future__ import annotations
@@ -40,9 +46,10 @@ from .evaluator import Ctx, Hint, Pending, Unreadable, Unresolvable, find_uses, 
 from .inner import INNER_PREFIX
 from .specs import SPECS
 from .specs.ask import AskSpec
-from .specs.base import orphaned
+from .specs.base import complete, orphaned
 from .specs.pick import PickSpec
 from .watch import WATCH
+from .words import key as key_of
 
 ASK_ID, PICK_ID = AskSpec.idname, PickSpec.idname
 OPENACT_TYPES = tuple(SPECS)
@@ -64,6 +71,8 @@ P0_CELLS = 8
 DIFFERS = "CSV {} differs from the saved table ({})"  # a file edited since a table read from it was stored (R23)
 RENDERING = "; rendering the saved answers"  # ... printed where passes leave the saved tables as they are (§7.8)
 READ_LATER = "Its {} is read when the node evaluates"  # a word only Geometry Nodes computes, of an unreported context
+FRAME_BUDGET = 0.003  # s of main thread the playback path takes after a frame's evaluation; the rest waits (§5.5)
+TICK_BUDGET = 0.005  # s it takes per tick: the answers that landed, then the planning the frames left
 
 STATUS = {}  # node uid -> NodeStatus
 PLANS = {}  # _key() of a word set -> (fingerprint, Job, or the (Hint or Unresolvable, message) planning gave)
@@ -79,6 +88,9 @@ NOTES = {}  # node uid -> what its last save evicted or kept above the soft cap 
 DRIFT = {}  # node uid -> {path: note} of the CSVs that differed from its saved tables when the file loaded (R23)
 REPORTED = set()  # CSV paths whose "differs" line was printed since the file loaded (§7.8)
 RENDERED = set()  # (node uid, words) a background render compared since the file loaded
+TABLES = {}  # node uid -> Table: its table object as its last pass wrote it, which the playback path extends (§5.5)
+QUESTIONS = {}  # (uid, words) -> Question: the word sets the playback path plans or waits for, oldest first (§5.5)
+HELD = set()  # (uid, words) the playback path leaves to the next pass: nothing to ask, or a new layout to lay out
 
 _dirty = True  # a pass is due
 _dirty_all = True  # ... and it visits every node
@@ -410,6 +422,7 @@ def run_pass(everything=True):
     # The evaluation the reports describe (§5.7): it evaluates any change since, whose depsgraph update then schedules
     # nothing more, as this pass covers it
     depsgraph = channel.evaluated()
+    HELD.clear()  # this pass plans the words shown now; the next playback tries the others again (§5.5)
     visit_all = everything or _dirty_all
     dirty = set(DIRTY)
     DIRTY.clear()
@@ -438,6 +451,8 @@ def run_pass(everything=True):
         ASK_ONCE.clear()
         NOTES.clear()
         DRIFT.clear()
+        TABLES.clear()
+        QUESTIONS.clear()
         WATCH.retain(())
         tables.collect_garbage(nodes)
         return
@@ -490,9 +505,11 @@ def run_pass(everything=True):
     for uid in [uid for uid in LIVE if uid not in contexts]:  # deleted nodes: their queued chunks go (undo asks again)
         pipeline.cancel(uid, below=math.inf)
     # nodes that disappeared: undo and deleting a node group call no node's free()
-    for cache in (LIVE, STATUS, SETS, NOTES, DRIFT):
+    for cache in (LIVE, STATUS, SETS, NOTES, DRIFT, TABLES):
         for uid in [uid for uid in cache if uid not in contexts]:
             del cache[uid]
+    for key in [key for key in QUESTIONS if key[0] not in contexts]:
+        del QUESTIONS[key]
     ASK_ONCE.intersection_update(contexts)
     WATCH.retain(contexts)  # stop watching the files of deleted nodes
     redraw()
@@ -507,6 +524,7 @@ def _process(tree, node, contexts):
     node_store = store.load(node)
     if node_store.schema > store.SCHEMA:  # save() would refuse any answer, and the group holds the newer ones
         STATUS[node.uid] = _error(store.newer_message(node_store))
+        TABLES.pop(node.uid, None)
         return False
     spec = SPECS[node.bl_idname]
     wanted = spec.interface(node)
@@ -522,7 +540,8 @@ def _process(tree, node, contexts):
     uses, resolved, asked = [], {}, set()  # (label, Job) per planned word set; words -> entry shown; cells asked
     sent = set()  # the missing cells the model is asked: sent now, or once the model that is starting is ready
     idle = set()  # missing cells nothing asks: of word sets not reported with the Trigger on (§6.0)
-    upstream = waiting = changed = unasked = False  # unasked: an idle word set was reported, with the Trigger off
+    upstream = waiting = unasked = False  # unasked: an idle word set was reported, with the Trigger off
+    changed = _stored(node.uid, entries)  # what playback answered since the last pass: this pass stores it (§5.5)
     reports = REPORTS.get(node.uid) or {}
     on = {words for reported in reports.values() for words, triggered in reported.items() if triggered}
     once = node.uid in ASK_ONCE
@@ -662,11 +681,13 @@ def _process(tree, node, contexts):
     problems += [COLLIDE.format(_named(kept), _named(other)) for kept, other in inner.collisions(graph.entries, live)]
     keys = [(node.uid, ctx.key()) for ctx, _words, _job in planned]  # one per word set: a zone's several show none
     last = [instead.get(key, LAST_SHOWN.get(key)) for key in keys]  # a miss shows what the table showed last
-    default = inner.k_default_key(last, blocked=bool(problems or hints or failed))
+    blocked = bool(problems or hints or failed)
+    default = inner.k_default_key(last, blocked)
     # The table object is written only when its rows change: a write re-evaluates every modifier that reads it, whose
     # depsgraph update schedules a pass, which then finds them unchanged and writes nothing
     if not inner.update_values(node, graph, live, default):  # values only (§8.8)
         inner.build(node, graph, live, default)
+    TABLES[node.uid] = Table(list(graph.entries), list(live), default, len(last) == 1 and not blocked)  # for playback
     warnings += spec.node_warnings(node)  # known once built, e.g. a renamed output that lost its link
     faults, warnings = list(dict.fromkeys(problems + failed)), list(dict.fromkeys(warnings))  # contexts share words
     trigger = _trigger(node, reports)
@@ -851,7 +872,8 @@ def _submit(job, missing):
 
 
 def _answered(_job):
-    """A chunk came back, answered or failed: the stall clock starts again, and a pass shows the answers."""
+    """A chunk came back, answered or failed: the stall clock starts again, and a pass shows the answers; during
+    playback, the playback path writes them in the same tick (_play_tick())."""
     global _quiet_since
     _quiet_since = time.monotonic()
     schedule(immediate=True)
@@ -988,6 +1010,7 @@ def reask(node):
         return
     jobs = [job for _ctx, job in _jobs(node)]
     node_store = store.load(node)
+    _stored(node.uid, node_store.entries)  # what playback answered since the last pass is stored with the rest (§5.5)
     words = {job.gn for job in jobs}
     node_store.entries = [entry for entry in node_store.entries if entry.gn not in words]
     store.save(node, node_store)  # no live set: nothing is evicted (§13.3)
@@ -999,6 +1022,7 @@ def reask(node):
     live = list(dict.fromkeys(job.gn for job in jobs))
     if not inner.update_values(node, node_store, live, None):
         inner.build(node, node_store, live, None)
+    TABLES[node.uid] = Table(list(node_store.entries), live, None, False)  # what it wrote, for the playback path
     schedule(immediate=True)
 
 
@@ -1010,6 +1034,298 @@ def redraw():
         for area in window.screen.areas:
             if area.type in ('NODE_EDITOR', 'PREFERENCES'):
                 area.tag_redraw()
+
+
+# ------------------------------------------------------------------------- the playback path (§5.5)
+
+
+@dataclass
+class Table:
+    """A node's table object as its last pass wrote it, for the playback path, which writes it values only (§5.5):
+    the entries of its blocks in table order, with the live word sets and the default a miss shows that the pass wrote
+    them with, as update_values() takes them to write the rows again; and the entries playback answered since, which
+    the next pass stores (_stored())."""
+
+    entries: list  # store.Entry of each block, in table order: the pass's, then the ones playback appended
+    live: list  # the gns of the node's live contexts at its pass, whose entries claim a shared key first (§8.2)
+    default: str | None  # the words key of the entry a miss shows (§8.2)
+    single: bool  # the pass planned one word set and found neither a hint nor an error: a miss shows its last entry
+    answered: dict = field(default_factory=dict)  # gn -> an entry answered during playback, newest last
+    found: dict = field(init=False, repr=False)  # gn -> the entry of `entries` with those words
+
+    def __post_init__(self):
+        self.found = {entry.gn: entry for entry in self.entries}
+
+    def keep(self, entry):
+        """Keep an answered entry for the next pass to store, newest last. A long playback keeps twice MAX_ENTRIES: a
+        save keeps the MAX_ENTRIES newest warm entries, and a live one besides, so the older ones would go (§14.7)."""
+        self.answered.pop(entry.gn, None)
+        self.answered[entry.gn] = entry
+        while len(self.answered) > 2 * store.MAX_ENTRIES:
+            del self.answered[next(iter(self.answered))]
+
+
+@dataclass
+class Question:
+    """A word set a triggered node reported during playback whose table holds no whole entry for it (§5.5): planned
+    once a frame or a tick has time for it, then waiting for its answers."""
+
+    ctx: Ctx
+    shown: tuple | None  # (uid, ctx key) when its context reported one word set: the context shows its entry
+    job: pipeline.Job | None = None  # once asked: its Job, at the generation it was asked at
+    asked: frozenset = frozenset()  # the keys of its cells asked and not answered yet
+
+
+def _playback():
+    """True while the timeline plays, outside render jobs and sessions that render the saved answers (§7.8): the
+    playback path asks and writes then, while no pass runs."""
+    return _animation_playing() and not _rendering() and not _saved_only()
+
+
+def _play_frame(depsgraph):
+    """After a frame's evaluation (frame_change_post), within FRAME_BUDGET (§5.5): each word set a triggered node
+    reported that its table holds no whole entry for becomes a question, which is planned, answered from the node's
+    stored entries and this session's answers, written values only, and asked at P0 for what it misses. This frame's
+    questions come first; what the budget leaves waits, oldest first, for the next frame or tick."""
+    started = time.perf_counter()
+    nodes = list(iter_nodes())
+    uses = find_uses()
+    trees = dict.fromkeys(tree.as_pointer() for tree, _node in nodes)
+    reports = channel.read(nodes, [ctx for key in trees for ctx in uses.get(key, ())], depsgraph)
+    asked = {}  # uid -> the words of its questions
+    for uid, words in QUESTIONS:
+        asked.setdefault(uid, set()).add(words)
+    fresh = []
+    for tree, node in nodes:
+        found, record = reports.get(node.uid), TABLES.get(node.uid)
+        if found and record is not None and tree.library is None:  # a linked node keeps its library's answers
+            contexts = uses.get(tree.as_pointer()) or [Ctx(None, None, (), tree)]
+            fresh += _new_questions(node, record, found, contexts, asked.get(node.uid, set()))
+    _plan_questions(fresh + [key for key, question in QUESTIONS.items() if question.job is None],
+                    started + FRAME_BUDGET)
+
+
+def _new_questions(node, record, found, contexts, asked):
+    """The keys of the node's new questions after a frame (§5.5): the word sets reported with its Trigger on (all of
+    them while Ask Again asks, ASK_ONCE) whose key its table's header rows lack, or give a table so far, and that no
+    question or HELD holds yet. found: the node's report; asked: the words of its questions. A node that brings new
+    ones and reports none of its questions any more has moved on: they go (_forget()). As a pass does, it follows what
+    each context with one word set shows (LAST_SHOWN) and, on a node its pass found with one word set, the default a
+    miss shows (_default()), and adds what the node shows to LIVE, whose last use the pass after it stamps (§8.1)."""
+    once = node.uid in ASK_ONCE
+    if not once and not any(on for reported in found.values() for on in reported.values()):
+        return []  # untriggered: it asks nothing, and nothing is written for it
+    sets = [(ctx, words) for ctx, words in _sets(SPECS[node.bl_idname], node, contexts, found) if words is not None]
+    counts = Counter(ctx.key() for ctx, _words in sets)
+    held, new, showing = tables.header_rows(node), [], set()
+    for ctx, words in sets:
+        shown = (node.uid, ctx.key()) if counts[ctx.key()] == 1 else None  # a zone's word sets show none (§5.7)
+        entry, key = record.found.get(words), (node.uid, words)
+        if key_of(words) in held:
+            if entry is not None:
+                showing.add(entry.words_key)
+                if shown is not None:
+                    LAST_SHOWN[shown] = entry.words_key  # what its context shows (§5.4)
+            if entry is None or complete(entry):  # answered, or another entry's key: a pass shows that collision
+                continue
+        if (once or found[ctx.key()[:2]].get(words)) and key not in QUESTIONS and key not in HELD:
+            new.append((key, Question(ctx, shown)))
+    LIVE[node.uid] = LIVE.get(node.uid, set()) | showing
+    if not new:
+        return []
+    if asked and asked.isdisjoint(words for _ctx, words in sets):
+        _forget(node.uid)
+    QUESTIONS.update(new)
+    if record.single and len(sets) == 1:
+        _default(node, record, LAST_SHOWN.get(new[0][1].shown))
+    return [key for key, _question in new]
+
+
+def _default(node, record, shown):
+    """On a node its pass found with one word set, the default a miss shows: the entry its context showed last (words
+    key `shown`, k_default_key(), §8.2), written values only when it changed, so that a single object keeps its own
+    last answers while new ones are on the way (KD24)."""
+    default = inner.k_default_key([shown])
+    if default != record.default:
+        inner.set_default(node, default, store.NodeStore(record.entries))
+        record.default = default
+
+
+def _plan_questions(keys, deadline):
+    """Plan the questions of these keys that aren't yet (_plan_one()), in this order, until the deadline."""
+    nodes = None
+    for key in keys:
+        question = QUESTIONS.get(key)
+        if question is None or question.job is not None:
+            continue
+        if time.perf_counter() >= deadline:
+            return
+        if nodes is None:
+            nodes = {node.uid: node for _tree, node in iter_nodes()}
+        _plan_one(key, question, nodes.get(key[0]))
+
+
+def _plan_one(key, question, node):
+    """Plan a question (plan_words()), write what the node's entries and this session's answers give (_answer()), and
+    ask for the rest (_ask()). Words with nothing to ask are held for the next pass, which shows why: they plan a
+    Hint, wait for another node's answer or have an error, their entry takes a new layout, or their table stays
+    partial."""
+    record = TABLES.get(key[0])
+    if node is None or record is None:  # deleted, or its table was never written by a pass
+        del QUESTIONS[key]
+        return
+    try:
+        job = plan_words(node, question.ctx, key[1])
+    except (Hint, Pending, Unresolvable):
+        _done(key, record)
+        return
+    missing = _answer(node, record, question, job)
+    if not (missing and _ask(node, question, job, missing)):
+        _done(key, record)
+
+
+def _answer(node, record, question, job):
+    """Answer a question's job by the validity rule (§5.4), from the node's entries and this session's answers, as a
+    table so far while cells are missing, and write it (_write()). Returns the missing cells, or None when the entry
+    takes a new layout."""
+    last = LAST_SHOWN.get(question.shown, "") if question.shown is not None else ""
+    entry, missing, _failed = SPECS[node.bl_idname].resolve(job, record.entries, last, partial=True)
+    if entry is not None and not _write(node, record, entry, question.shown):
+        return None
+    return missing
+
+
+def _ask(node, question, job, missing):
+    """Ask the model for a question's missing cells (§5.5): at P0, as the timeline shows them now, and at the node's
+    generation, so that _forget() drops them. The one place where the playback path chooses which of a job's missing
+    cells to submit. True when asked: sent, or sent once the model that is starting is ready (_play_tick())."""
+    job = dataclasses.replace(job, priority=0, generation=GENERATIONS.get(node.uid, 0))
+    if not _submit(job, missing):
+        return False
+    question.job, question.asked = job, frozenset(cell.key for cell in missing)
+    ASK_ONCE.discard(node.uid)  # Ask Again asks once (§6.0): the questions its frame made are all asked in turn
+    return True
+
+
+def _done(key, record):
+    """A question with nothing more to ask goes. Unless the node's table now holds its whole entry, its words are held
+    for the next pass (HELD), so that no frame plans them again."""
+    del QUESTIONS[key]
+    entry = record.found.get(key[1])
+    if entry is None or not complete(entry):
+        HELD.add(key)
+
+
+def _write(node, record, entry, shown=None):
+    """Write an entry the playback path answered into the node's table object, values only (§8.8): new words as a new
+    block (inner.append_entry()), an entry that grew, a table so far filling in, by writing the rows again
+    (inner.update_values()); never inner.build(). It is in use (LIVE), what its context shows (shown: the (uid, ctx
+    key) of a context with one word set) and, on a node its pass found with one word set, the default a miss shows.
+    Either way it is kept for the next pass to store. False, writing nothing, when it takes a new layout (other Rules
+    factors, a changed interface, a Pick's new item names), which the pass after playback lays out."""
+    old = record.found.get(entry.gn)
+    if old is not None and dataclasses.replace(entry, t=old.t) == old:
+        return True
+    record.keep(entry)
+    schedule(immediate=True, node=node)  # the pass after playback stores it
+    if old is None:
+        entries = [*record.entries, entry]
+        written = inner.append_entry(node, entry)
+    else:
+        entries = [entry if other is old else other for other in record.entries]
+        written = inner.update_values(node, store.NodeStore(entries), record.live, record.default)
+    if not written:
+        return False
+    record.entries, record.found[entry.gn] = entries, entry
+    LIVE.setdefault(node.uid, set()).add(entry.words_key)  # in use: the pass after playback stamps its last use
+    if shown is not None:
+        LAST_SHOWN[shown] = entry.words_key
+        if record.single:
+            _default(node, record, entry.words_key)
+    return True
+
+
+def _forget(uid):
+    """Drop the node's questions: it brings new word sets, and reports none of these any more (§5.5). A new
+    generation drops their chunks still queued (_bump()), and the pass's; a chunk in flight completes, its answers kept
+    in MEMORY for when those words come back. A question the node still reports is never dropped, so the other
+    elements of a For Each Element zone, and the other objects that share its tree, keep theirs."""
+    _bump(uid)
+    for key in [key for key in QUESTIONS if key[0] == uid]:
+        del QUESTIONS[key]
+
+
+def _play_tick(playing):
+    """Between frames, within TICK_BUDGET (§5.5): answer and write, values only, the questions whose answers landed,
+    and ask again those whose chunks another node's new generation dropped, or that a starting model never took; while
+    the timeline plays, then plan the questions the frames left, oldest first. Once it stops, a question never planned
+    goes: the pass plans the frame shown, and the next playback asks again for what it reports."""
+    if not QUESTIONS:
+        return
+    deadline, nodes = time.perf_counter() + TICK_BUDGET, None
+    for key, question in list(QUESTIONS.items()):
+        if question.job is None:
+            if not playing:
+                del QUESTIONS[key]
+            continue
+        if time.perf_counter() >= deadline:
+            break
+        asked = question.asked
+        landed = any(cell in pipeline.MEMORY or cell in pipeline.FAILED for cell in asked)
+        if not landed:
+            if any(cell in pipeline.PENDING for cell in asked) or not server.is_ready():
+                continue  # on the way, or asked once the model that is starting is ready
+            if GENERATIONS.get(key[0], 0) != question.job.generation:  # dropped by its node's new generation
+                del QUESTIONS[key]
+                continue
+        if nodes is None:
+            nodes = {node.uid: node for _tree, node in iter_nodes()}
+        node, record = nodes.get(key[0]), TABLES.get(key[0])
+        if node is None or record is None:
+            del QUESTIONS[key]
+        elif landed:
+            missing = _answer(node, record, question, question.job)
+            question.asked = frozenset(cell.key for cell in missing or ()) & asked
+            if not question.asked:
+                _done(key, record)
+        elif not _ask(node, question, question.job,
+                      [row.cell for row in question.job.rows if row.cell is not None and row.cell.key in asked]):
+            _done(key, record)
+    if playing:
+        _plan_questions([key for key, question in QUESTIONS.items() if question.job is None], deadline)
+
+
+def _stored(uid, entries):
+    """Put the entries playback answered for the node since its last pass (Table.answered, §5.5) among its stored
+    `entries`, in place of the one with the same words, for a save, which evicts as it always does (§14.7). True when
+    there were any."""
+    record = TABLES.get(uid)
+    if record is None or not record.answered:
+        return False
+    at = {entry.gn: i for i, entry in enumerate(entries)}
+    for gn, entry in record.answered.items():
+        if gn in at:
+            entries[at[gn]] = entry
+        else:
+            entries.append(entry)
+    record.answered.clear()
+    return True
+
+
+def _flush():
+    """Store what playback answered since each node's last pass (_stored()) before the file is written, as a save may
+    come during playback or before the pass after it; evicting as that pass would, by its live word sets."""
+    for tree, node in iter_nodes():
+        record = TABLES.get(node.uid)
+        if record is None or not record.answered or tree.library is not None:
+            continue
+        node_store = store.load(node)
+        if node_store.schema <= store.SCHEMA and _stored(node.uid, node_store.entries):
+            try:
+                store.save(node, node_store, frozenset(record.live))
+                NOTES[node.uid] = node_store.note
+            except ValueError:  # a damaged or too large entry: the table keeps showing it, and the next pass says why
+                pass
 
 
 # ----------------------------------------------------------- words at other frames (§7.8)
@@ -1183,7 +1499,12 @@ def tick():
         if now - _last_refresh > 5.0 and (_has_nodes or server.STATE.status in ("unknown", "ready", "starting")):
             _last_refresh = now
             server.refresh()
-        if not (rendering or playing):  # node trees are left alone during playback and render jobs
+        if not (rendering or _saved_only()):  # the playback path: answers that landed, what the frames left (§5.5)
+            try:
+                _play_tick(playing)
+            except Exception:  # never in the way of the passes
+                traceback.print_exc()
+        if not (rendering or playing):  # passes wait for playback and render jobs to end
             if WATCH.poll(now):  # a watched CSV changed: the pass visits the nodes that read it (take_dirty())
                 _dirty = True
             if _dirty and now - _last_change >= DEBOUNCE:
@@ -1205,11 +1526,17 @@ def on_depsgraph_update(scene, depsgraph):
 
 
 @persistent
-def on_frame_change(*_args):
-    # A new frame may give nodes new words (§5.7), and sends no depsgraph update: a pass reads them, once the timeline
-    # stops (tick())
-    if _has_nodes:
-        schedule()
+def on_frame_change(_scene, depsgraph=None):
+    # A new frame may give nodes new words (§5.7), and sends no depsgraph update: a pass reads them once the timeline
+    # stops (tick()). While it plays, the playback path reads this frame's reports, and asks and writes (§5.5)
+    if not _has_nodes:
+        return
+    schedule()
+    if depsgraph is not None and _playback():
+        try:
+            _play_frame(depsgraph)
+        except Exception:
+            traceback.print_exc()
 
 
 @persistent
@@ -1229,8 +1556,19 @@ def on_load_post(*_args):
     DRIFT.clear()
     REPORTED.clear()
     RENDERED.clear()
+    TABLES.clear()  # what playback answered for the file just closed is in this session's MEMORY only
+    QUESTIONS.clear()
+    HELD.clear()
     _opened = True
     schedule(immediate=True)
+
+
+@persistent
+def on_save_pre(*_args):
+    try:
+        _flush()  # the file holds what playback answered, whether or not a pass has stored it yet (§5.5)
+    except Exception:
+        traceback.print_exc()
 
 
 @persistent
@@ -1254,8 +1592,8 @@ def on_server_status():
 def _handlers():
     h = bpy.app.handlers
     return ((h.depsgraph_update_post, on_depsgraph_update), (h.frame_change_post, on_frame_change),
-            (h.load_post, on_load_post), (h.undo_post, on_undo_redo), (h.redo_post, on_undo_redo),
-            (h.render_pre, on_render_pre))
+            (h.load_post, on_load_post), (h.save_pre, on_save_pre), (h.undo_post, on_undo_redo),
+            (h.redo_post, on_undo_redo), (h.render_pre, on_render_pre))
 
 
 def register():
