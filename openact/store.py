@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field, fields
 
 SCHEMA = 2
-MAX_ENTRIES = 16  # warm or cold entries per node; live entries come on top
+MAX_ENTRIES = 1024  # warm or cold entries per node, within SOFT_CAP; live entries come on top
 MB = 1024 * 1024
 SOFT_CAP = 2 * MB  # per node; only warm and cold entries are evicted to meet it
 HARD_CAP = 4 * MB  # per entry

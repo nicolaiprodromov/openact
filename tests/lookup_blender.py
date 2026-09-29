@@ -38,7 +38,7 @@ P._Defaults.auto_start = False  # nothing here may start a model server
 nodes.register()
 ops.register()
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-MANY = 1024  # blocks in the bench's largest tables: every stored entry is a block, with no cap (§8.1)
+MANY = S.MAX_ENTRIES  # the warm entries a node keeps (§14.7): as many blocks in the bench's largest tables
 DIALS_MAX_SETTINGS = 32  # §7.5
 BUDGET_MS = {"build demo": 100, "build demo interpolated": 250, "build worst": 1000,  # §8.7
              "update_values": 10, "update_values worst": 100, "append": 5, "append worst": 20}

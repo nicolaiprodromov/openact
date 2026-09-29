@@ -91,8 +91,9 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
   Join Strings, Menu Switch, Import Text, or another OpenAct node's single-value output. OpenAct reads them outside
   evaluation, so they must be single values: a field linked into a word is an error on the node.
 - **One table per set of words.** A tree used by any number of objects, with words from each modifier, keeps one set
-  of answers per object, and every set of words it answered stays in the node, so switching back is instant. The
-  model is asked only when words change, and only for the rows whose words changed.
+  of answers per object. The node also keeps the answers of up to 1024 sets of words no object uses now, within
+  2 MB, so switching back to them is instant. The model is asked only when words change, and only for the rows whose
+  words changed.
 - **Lists** (Pick, Match, Classify) come from the node's dropdown: **Text or CSV** (inline items or a `.csv` path),
   **Collection** (its children, in the order Collection Info gives them with *Separate Children*), **Materials** (an
   object's material slots, so ID = material index) or **Attributes** (the attribute names of an object's own mesh,

@@ -17,6 +17,7 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
   its own answer, and every stored answer switches back instantly, as nodes find answers by a hash of their words in
   their table. The error "... the limit is 16: split the tree" is gone; two sets of words whose hashes collide, which
   is rare, get an error asking for another Key. Files saved by 1.0 are rebuilt on their first pass.
+- A node keeps up to 1024 stored sets of answers besides the ones in use (was 16), still within 2 MB per node.
 
 ## 1.0.0
 

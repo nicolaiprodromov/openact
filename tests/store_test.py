@@ -143,23 +143,24 @@ def phase_round_trip():
 
 
 def phase_max_entries():
-    live = [rules(f"live {i}", 100 + i, 64) for i in range(18)]  # more live entries than MAX_ENTRIES
-    pinned = rules("pinned", 0, 64, pinned=True)  # the least recently used of all
-    old = [rules(f"old {i}", 10 + (7 * i) % 20, 64) for i in range(20)]
-    entries = live[:9] + old[:10] + [pinned] + live[9:] + old[10:]
+    limit = store.MAX_ENTRIES
+    live = [rules(f"live {i}", 10_000 + i, 1) for i in range(18)]  # live entries come on top of MAX_ENTRIES
+    pinned = rules("pinned", 0, 1, pinned=True)  # the least recently used of all
+    old = [rules(f"old {i}", 10 + (7 * i) % (limit + 8), 1) for i in range(limit + 8)]  # small: under 2 MB
+    entries = live[:9] + old[:limit // 2] + [pinned] + live[9:] + old[limit // 2:]
     live_gns = frozenset(gn(f"live {i}") for i in range(18))
-    recent = set(words(sorted(old, key=lambda e: e.t)[-store.MAX_ENTRIES:]))
+    recent = set(words(sorted(old, key=lambda e: e.t)[-limit:]))
     expected = [first for first in words(entries) if first.startswith("live") or first in recent]
     kept, node = NodeStore(list(entries)), Node()
     store.save(node, kept, live_gns)
-    check("16 entries: keeps every live entry and the 16 most recent others, in order; an entry OpenAct 1.0 pinned "
-          "is evicted like the others", words(kept.entries) == expected and "pinned" not in words(kept.entries),
-          words(kept.entries))
-    check("16 entries: the node holds exactly what save() kept", store.load(node).entries == kept.entries)
-    check("16 entries: no note", kept.note == "", kept.note)
+    check(f"{limit} entries: keeps every live entry and the {limit} most recent others, in order; an entry OpenAct 1.0 "
+          "pinned is evicted like the others", words(kept.entries) == expected and "pinned" not in words(kept.entries),
+          len(kept.entries))
+    check(f"{limit} entries: the node holds exactly what save() kept", store.load(node).entries == kept.entries)
+    check(f"{limit} entries: no note", kept.note == "", kept.note)
     kept = NodeStore(list(entries))
     store.save(node, kept)
-    check("16 entries with live_gns=None: nothing is evicted",
+    check(f"{limit} entries with live_gns=None: nothing is evicted",
           kept.entries == entries and store.load(node).entries == entries, len(kept.entries))
 
 
@@ -192,24 +193,25 @@ def phase_soft_cap():
 
 
 def phase_both_caps():
+    limit = store.MAX_ENTRIES
     live = rules("live", 1, 2000)
-    old = [rules(f"old {i}", 10 + (7 * i) % 20, 2000) for i in range(20)]
+    old = [rules(f"old {i}", 10 + (7 * i) % (limit + 8), 40) for i in range(limit + 8)]  # each above 2 MB / limit
     by_age = sorted(old, key=lambda e: e.t)
     recent = Node()
-    store.save(recent, NodeStore([live, *by_age[-store.MAX_ENTRIES:]]))
-    check("both caps: live and the 16 most recent others still exceed 2 MB", size_of(recent) > SOFT_CAP,
+    store.save(recent, NodeStore([live, *by_age[-limit:]]))
+    check(f"both caps: live and the {limit} most recent others still exceed 2 MB", size_of(recent) > SOFT_CAP,
           size_of(recent))
-    kept, node = NodeStore(old[:10] + [live] + old[10:]), Node()
+    kept, node = NodeStore(old[:limit // 2] + [live] + old[limit // 2:]), Node()
     store.save(node, kept, frozenset({gn("live")}))
     others = [e for e in kept.entries if e.gn[0] != "live"]
     check("both caps: keeps live and the most recent others that fit",
-          "live" in words(kept.entries) and 0 < len(others) < store.MAX_ENTRIES
-          and set(words(others)) == set(words(by_age[-len(others):])), words(kept.entries))
+          "live" in words(kept.entries) and 0 < len(others) < limit
+          and set(words(others)) == set(words(by_age[-len(others):])), len(others))
     check("both caps: the node fits 2 MB", size_of(node) <= SOFT_CAP, size_of(node))
     probe = Node()
     store.save(probe, NodeStore(kept.entries + [by_age[-len(others) - 1]]))
     check("both caps: evicts no more than needed", size_of(probe) > SOFT_CAP, size_of(probe))
-    drops = store.MAX_ENTRIES - len(others)
+    drops = limit - len(others)
     check("both caps: the note counts only the drops for 2 MB",
           kept.note == f"{drops} old context{'s' if drops > 1 else ''} dropped to keep the file small", kept.note)
 
