@@ -15,7 +15,7 @@
 2. [Background & Motivation](#2-background--motivation)
 3. [Goals & Non-Goals](#3-goals--non-goals)
 4. [Principles](#4-principles)
-5. [Architecture](#5-architecture): runtime split, request pipeline, per-context caching, threading
+5. [Architecture](#5-architecture): runtime split, request pipeline, per-context caching, threading, the Warning channel
 6. [The Six Nodes](#6-the-six-nodes): Ask, Pick, Match, Classify, Rules, Dials (sockets, behaviour, examples)
 7. [CSV Formats](#7-csv-formats): schemas, text/numeric split, overrides and locks, validation, change detection
 8. [Table Lookup in Geometry Nodes](#8-table-lookup-in-geometry-nodes): Index Switch vs hidden table geometry, thresholds, node graphs
@@ -947,6 +947,46 @@ on them:
 - The server answers many questions per request and **caches per question**, which is the
   traffic pattern an agent loop produces.
 
+### 5.7 The Warning channel
+
+Python can't see inside a Geometry Nodes evaluation, and the static evaluator reads only the nodes
+it knows (§10.1). So every inner group reports what it evaluated through one **Warning** node
+(`GeometryNodeWarning`, *Info*, Show on), which the modifier lists in `mod.node_warnings` after
+each evaluation (`inner._Builder.warning()`).
+- **The message** is `words.message(uid, trigger, words)`: `"OpenAct <uid> <0|1> <key text>"`.
+  - `uid`: the node's, held by a String node named `OpenAct uid`. A copy that
+    `engine.ensure_owned()` gives its own uid and group still holds the original's there, so
+    `update_values()` rewrites it, values only: the uid is no part of the layout (`_built()`).
+  - `0|1`: a String Switch on the Trigger (§6.0), so Blender's implicit conversion into its Bool
+    socket decides what is on.
+  - `key text`: the node's words in `spec.words(node)` order, each as its length in code points
+    (String Length, then Value to String INT), `:` and the word (`words.key_text()`,
+    `_Builder.key_text()`). A word the node has no socket for is `""`, as in the match chain
+    (§8.2). The lengths make the text unambiguous, so no word needs escaping, and `words.parse()`
+    reads it back. The builder keeps it (`_Builder.key`) for the lookup to hash.
+  - The group path is not in it, as a group can't know it: a report identifies the object, the
+    modifier, the node's uid, its words and its Trigger.
+- **Every output is read through the Warning.** Each Group Output socket is fed through a Switch on
+  the Warning's Show output, which is always on (`_Builder.gate()`). Geometry Nodes evaluates an
+  unread Warning inside a group only with values the group computes anyway: typed words and
+  modifier inputs reach it, but a word or Trigger linked from another node of the outer tree never
+  does (4.5.2, 5.1.1). Gated, any output an evaluation asks for evaluates the Warning first, with
+  its whole message.
+- **What is reported** (`tests/channel_blender.py`, 4.5 and 5.1):
+  - one message per context that evaluates the node; identical messages merge into one;
+  - nothing from a node whose outputs are unused, as it is not evaluated, nor from a muted one;
+  - each use of a user group that holds the node, with its own words;
+  - one message per iteration of a For Each Element or Repeat zone;
+  - words the static evaluator can't read (Scene Time, simulation state), as evaluated at the
+    current frame.
+- Each modifier has its own list, and `frame_change_post` and `depsgraph_update_post` handlers see
+  the current evaluation's messages. Reading the list takes 3–6 µs. Unicode survives, and so do
+  long messages (a 100 KB word).
+- **Only the viewport depsgraph logs warnings**, so renders never report: they use the stored
+  answers (§7.8).
+- The messages show as info markers on the node and the modifier, which is accepted. Nothing reads
+  them yet: the engine's reader, which plans the reported words, comes with the change to asking.
+
 ## 6. The Six Nodes
 
 ### 6.0 Conventions shared by all nodes
@@ -996,7 +1036,7 @@ default, seeded from the `debias` preference when the node is created.
 |---|---|---|
 | **word** | the static evaluator (§10). May be typed, or linked from Group Input (modifier panel), String, Join Strings, Menu Switch, Import Text, another OpenAct node's single-value output… | Question, Prompt, Context, Items, Collection, Object, Answers, Labels, Outcomes, Factors, Settings, Overrides, and `Key` (hidden by default; compared, never sent to the model, §6.0) |
 | **field** | Geometry Nodes only, per element; never statically evaluated | ID, Rules factor sockets |
-| **single** | Geometry Nodes only, one value per evaluation (`SINGLE` on every version) | Trigger |
+| **single** | Geometry Nodes, one value per evaluation (`SINGLE` on every version); the Warning channel reports it (§5.7) | Trigger |
 | **GN value** | Geometry Nodes only; single value or field; Python ignores it | Threshold (Match), Dither and Seed (Rules) |
 
 **Geometry and Trigger (every node).** Every node's interface starts with the same three sockets,
@@ -1019,8 +1059,9 @@ whatever its spec, dropdowns and dynamic sockets (`specs/base.py`: `SHARED`, `sh
 - **Reserved names.** No Rules factor may be called `Geometry` or `Trigger`
   (`csvfmt.RULES_INPUTS`, which also keeps the Trigger, a Bool input, from being taken for a flag
   factor), and no payload column or Dials setting `Geometry` (§7.3–§7.5).
-- A muted node passes its Geometry input to its Geometry output. Its Trigger reaches its Bool, Int
-  and Float outputs that have no input of a closer type, as the ID does below.
+- A muted node passes its Geometry input to its Geometry output, and reports nothing (§5.7). Its
+  Trigger reaches its Bool, Int and Float outputs that have no input of a closer type, as the ID
+  does below.
 
 **ID input.**
 - An `Int` input with `default_input = 'INDEX'` and `hide_value = True`. Unlinked, it means
@@ -2024,6 +2065,11 @@ The sidebar lists every problem (at most 50 per file), each with *Open File*.
 
 ## 8. Table Lookup in Geometry Nodes
 
+Besides the lookup this chapter describes, every inner group passes its Geometry input to its
+Geometry output (§6.0) and holds the Warning channel (§5.7): the key text of its live words, built
+with String Length, Value to String and Join Strings, and one Warning node, whose Show output
+gates every Group Output socket through a Switch. `inner.LAYOUT` 3 marks groups laid out with it.
+
 ### 8.1 Table model
 
 **Stored and materialised entries.**
@@ -2389,7 +2435,8 @@ single-value sockets such as a Grid's *Vertices X* or Mesh Line's *Count*.
   above the budget and fails only above twice the budget, so other work on the machine cannot fail
   the gate. If a measurement fails, the PR that introduced the cost must fix it before merge.
 - **No model at evaluation.** Evaluation touches only Index Switch, Compare, Switch, Integer
-  Math, Map Range, Random Value, Object Info, Named Attribute and Sample Index. No Python runs
+  Math, Map Range, Random Value, Object Info, Named Attribute and Sample Index, and for the
+  Warning channel String Length, Value to String, Join Strings and Warning (§5.7). No Python runs
   (4.b).
 
 ### 8.8 Rebuild or values-only update
@@ -2398,6 +2445,7 @@ single-value sockets such as a Grid's *Vertices X* or Mesh Line's *Count*.
 |---|---|
 | Answers arrive, locks or numeric payload edited, confidence changes | **Values only.** `tables.write_rows()` writes the table object: per-element columns, and Dials' one-row-per-entry values, `min` and `max` (§8.4), at most once per 0.5 s during a fill. `inner.update_values()` sets changed entry-level Index Switch defaults (Ask, Pick) |
 | `k_default` changes (§8.2): a new last-shown entry, a change in the number of live contexts, or entering or leaving a hint or error state | **Values only.** `update_values()` sets the final Switch value of the match chain |
+| A copy gets its own uid (`engine.ensure_owned()`) | **Values only.** `update_values()` rewrites the `OpenAct uid` String node the Warning reports (§5.7) |
 | Row count of an entry changes (items added or removed) | **Values only.** The table object's vertex count changes, and base/count items are updated; the graph does not change |
 | The materialised set changes (a live context's words changed, or a warm entry is dropped, §8.1) | **Rebuild** of the match chain and entry-level switches: at most one per edit |
 | Answer type, list source, factor layout, or the payload column set changes | **Rebuild**, after `inner.sync_interface()` |

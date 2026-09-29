@@ -107,6 +107,9 @@ Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV t
 - **Key.** Objects whose words are identical but whose Collection or Object differ can't be told apart: the node
   says only one answer can show. Show **Key** (Ctrl H), expose it on the modifier and give each object its own
   value. The model never sees it.
+- **Info markers.** A node that an evaluation uses shows an info marker, on the node and on the modifier, whose
+  message starts with *OpenAct*: it carries the words the node evaluated and whether its Trigger was on, for OpenAct
+  to read. Renders report none.
 - **Sidebar** (N > OpenAct): the Model box; for the active node, its status, a summary per object, the table of
   answers with confidence and source (*Show Question* shows exactly what a row asks the model), **Ask Again** and
   **Write Overrides CSV**; and the *Files* panel: each CSV the node reads, with its columns and problems, *Open File*

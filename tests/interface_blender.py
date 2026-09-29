@@ -249,10 +249,10 @@ def first(node):
 
 
 def passes(node):
-    """True when the node's inner group links its Geometry input to its Geometry output."""
-    return any(link.from_node.bl_idname == "NodeGroupInput" and link.from_socket.name == "Geometry"
-               and link.to_node.bl_idname == "NodeGroupOutput" and link.to_socket.name == "Geometry"
-               for link in node.node_tree.links)
+    """True when the node's inner group feeds its Geometry output from its Geometry input, through the Warning's
+    gate (§5.7)."""
+    return any(name == "Geometry" and source.node.bl_idname == "NodeGroupInput" and source.name == "Geometry"
+               for name, source in inner._feeds(node.node_tree))
 
 
 def passing_tree(name):

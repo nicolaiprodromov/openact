@@ -29,7 +29,7 @@ from openact import engine, evaluator, inner, nodes, ops, pipeline, tables  # no
 from openact import prefs as P  # noqa: E402
 from openact import store as S  # noqa: E402  (store() is the harness's attribute writer)
 from openact.inner import SocketDef  # noqa: E402
-from openact.specs.base import Spec  # noqa: E402
+from openact.specs.base import Spec, shared_sockets  # noqa: E402
 from openact.specs.classify import ClassifySpec  # noqa: E402
 from openact.specs.match import MatchSpec  # noqa: E402
 from openact.specs.rules import RulesSpec  # noqa: E402
@@ -787,16 +787,27 @@ def table_geometry(b, table=TABLE):
 
 
 def words_iface(words):
-    return tuple(SocketDef('INPUT', w, 'NodeSocketString', kind="word") for w in words)
+    """Every node's shared sockets (§6.0), then these words."""
+    return (*shared_sockets(), *(SocketDef('INPUT', w, 'NodeSocketString', kind="word") for w in words))
 
 
-class RulesStandIn:
+class StandIn:
+    """What inner.build() reads of a spec besides its build(): its label and its words (Spec.words())."""
+
+    label, WORDS = "", ()
+
+    def words(self, node=None):
+        return self.WORDS
+
+
+class RulesStandIn(StandIn):
     """Rules in Amount mode (§9.2, §9.6): three Amount factors of `bands` bands, interpolated over 8
     corners with 3 lookups each (value, c, ok), weights and the renormalised blend. Custom edges cost a
     Compare and an Add per edge; equal-width bands a fixed graph."""
 
-    label, words = "Rules", ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
-    iface = words_iface(words) + tuple(SocketDef('INPUT', f"f{j}", 'NodeSocketFloat', kind="field") for j in range(3)) + (
+    label, WORDS = "Rules", ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
+    iface = words_iface(WORDS) + tuple(SocketDef('INPUT', f"f{j}", 'NodeSocketFloat', kind="field")
+                                       for j in range(3)) + (
         SocketDef('OUTPUT', "Amount", 'NodeSocketFloat'), SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'))
 
     def __init__(self, bands, custom_edges):
@@ -804,7 +815,7 @@ class RulesStandIn:
 
     def build(self, b, gi, go, entries):
         n = self.bands
-        k = chain(b, gi, self.words, entries)
+        k = chain(b, gi, self.WORDS, entries)
         table = table_geometry(b)
         lower, weight = [], []  # per factor: (b0, b0 + 1) and (1 - t, t)
         for j in range(3):
@@ -873,13 +884,14 @@ class RulesStandIn:
             b.link(guarded(b, valid.outputs[0], value, 'FLOAT', 0.0, 2700, 0), go.inputs[output])
 
 
-class RulesOneOfStandIn:
+class RulesOneOfStandIn(StandIn):
     """Rules in One-of mode (§9.2, §9.3, §9.7): three equal-width Amount factors of `bands` bands, each
     dithered with its own Random Value, the row-major cell index, and lookups of outcome, c and the
     payload columns."""
 
-    label, words = "Rules", ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
-    iface = words_iface(words) + tuple(SocketDef('INPUT', f"f{j}", 'NodeSocketFloat', kind="field") for j in range(3)) + (
+    label, WORDS = "Rules", ("Question", "Context", "Factors", "Outcomes", "Overrides", "Key")
+    iface = words_iface(WORDS) + tuple(SocketDef('INPUT', f"f{j}", 'NodeSocketFloat', kind="field")
+                                       for j in range(3)) + (
         SocketDef('INPUT', "Dither", 'NodeSocketFloat'), SocketDef('INPUT', "Seed", 'NodeSocketInt'),
         SocketDef('OUTPUT', "Outcome", 'NodeSocketInt'), SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'),
         SocketDef('OUTPUT', "instance", 'NodeSocketInt'), SocketDef('OUTPUT', "scale", 'NodeSocketFloat'))
@@ -889,7 +901,7 @@ class RulesOneOfStandIn:
 
     def build(self, b, gi, go, entries):
         n = self.bands
-        k = chain(b, gi, self.words, entries)
+        k = chain(b, gi, self.WORDS, entries)
         levels = []
         for j in range(3):  # x' = clamp(x + (r - 0.5) Dither / n), b = min(floor(x' n), n - 1)
             y = -600 * j
@@ -915,20 +927,20 @@ class RulesOneOfStandIn:
             b.link(sample(b, table, column, data_type, flat.outputs[0], 900, -150 * i), go.inputs[output])
 
 
-class DialsStandIn:
+class DialsStandIn(StandIn):
     """Dials with `settings` Amount settings (§8.4, §8.6): each one's value, min and max sampled from the
     one-row-per-entry table at k - 1 behind a Switch on k > 0, then Map Range; and the Confidence."""
 
-    label, words = "Dials", ("Prompt", "Settings", "Overrides", "Key")
+    label, WORDS = "Dials", ("Prompt", "Settings", "Overrides", "Key")
 
     def __init__(self, settings):
         self.settings = settings
-        self.iface = words_iface(self.words) + tuple(
+        self.iface = words_iface(self.WORDS) + tuple(
             SocketDef('OUTPUT', f"s{s}", 'NodeSocketFloat') for s in range(settings)) + (
             SocketDef('OUTPUT', "Confidence", 'NodeSocketFloat'),)
 
     def build(self, b, gi, go, entries):
-        k = chain(b, gi, self.words, entries)
+        k = chain(b, gi, self.WORDS, entries)
         table = table_geometry(b)
         row = math(b, INTEGER, 'SUBTRACT', -300, 0, k, 1)
         live = node(b, "FunctionNodeCompare", -300, -100, data_type='INT', operation='GREATER_THAN')
@@ -946,21 +958,21 @@ class DialsStandIn:
         b.link(guarded(b, live.outputs[0], confidence, 'FLOAT', 0.0, 600, 300), go.inputs["Confidence"])
 
 
-class PickPayloadStandIn:
+class PickPayloadStandIn(StandIn):
     """Pick at its limits (§8.4): Index, Item and Confidence, 16 payload columns and Material on k, each
     an Index Switch of 17 items, plus the per-element prob lookup (Probability, Selection) on ID."""
 
-    label, words = "Pick", ("Prompt", "Context", "Items", "Overrides", "Key")
+    label, WORDS = "Pick", ("Prompt", "Context", "Items", "Overrides", "Key")
     singles = [("Index", 'INT', -1), ("Item", 'STRING', ""), ("Confidence", 'FLOAT', 0.0)] + [
         (f"p{c}", 'FLOAT', 0.0) for c in range(16)] + [("Material", 'MATERIAL', None)]
-    iface = words_iface(words) + (
+    iface = words_iface(WORDS) + (
         SocketDef('INPUT', "ID", 'NodeSocketInt', kind="field", default_input='INDEX', hide_value=True),) + tuple(
         SocketDef('OUTPUT', name, {'INT': 'NodeSocketInt', 'STRING': 'NodeSocketString', 'FLOAT': 'NodeSocketFloat',
                                    'MATERIAL': 'NodeSocketMaterial'}[data_type]) for name, data_type, _ in singles) + (
         SocketDef('OUTPUT', "Selection", 'NodeSocketBool'), SocketDef('OUTPUT', "Probability", 'NodeSocketFloat'))
 
     def build(self, b, gi, go, entries):
-        k = chain(b, gi, self.words, entries)
+        k = chain(b, gi, self.WORDS, entries)
         picked = [b.lookup(k, data_type, fallback, [e.single[name] for e in entries], go.inputs[name], 300 - 150 * i)
                   for i, (name, data_type, fallback) in enumerate(self.singles)][0]
         flat, valid = flat_index(b, k, entries, 255, gi.outputs["ID"], -300, -3000)
@@ -975,22 +987,22 @@ class PickPayloadStandIn:
                go.inputs["Selection"])
 
 
-class ClassifyStandIn:
+class ClassifyStandIn(StandIn):
     """Classify with `payload` payload columns (§8.3, §8.4): label, c and each payload column, a
     per-element lookup on ID behind the valid switch. Match has the same graph with only p and c."""
 
-    label, words = "Classify", ("Question", "Context", "Items", "Labels", "Overrides", "Key")
+    label, WORDS = "Classify", ("Question", "Context", "Items", "Labels", "Overrides", "Key")
 
     def __init__(self, payload):
         self.columns = [("oa_label", 'INT', -1), ("oa_c", 'FLOAT', 0.0)] + [
             (f"oa_pl_{c}", 'FLOAT', 0.0) for c in range(payload)]
-        self.iface = words_iface(self.words) + (
+        self.iface = words_iface(self.WORDS) + (
             SocketDef('INPUT', "ID", 'NodeSocketInt', kind="field", default_input='INDEX', hide_value=True),) + tuple(
             SocketDef('OUTPUT', column, 'NodeSocketInt' if data_type == 'INT' else 'NodeSocketFloat')
             for column, data_type, _ in self.columns)
 
     def build(self, b, gi, go, entries):
-        k = chain(b, gi, self.words, entries)
+        k = chain(b, gi, self.WORDS, entries)
         flat, valid = flat_index(b, k, entries, 255, gi.outputs["ID"], -300, 0)
         table = table_geometry(b)
         for i, (column, data_type, fallback) in enumerate(self.columns):
@@ -998,17 +1010,17 @@ class ClassifyStandIn:
             b.link(guarded(b, valid, value, data_type, fallback, 700, -150 * i), go.inputs[column])
 
 
-class SampledCount:
+class SampledCount(StandIn):
     """One Dials-like output: an INT sampled from a table object at k - 1, a single-value index."""
 
-    label, words = "Dials", ("Prompt",)
-    iface = words_iface(words) + (SocketDef('OUTPUT', "Count", 'NodeSocketInt'),)
+    label, WORDS = "Dials", ("Prompt",)
+    iface = words_iface(WORDS) + (SocketDef('OUTPUT', "Count", 'NodeSocketInt'),)
 
     def __init__(self, table):
         self.table = table
 
     def build(self, b, gi, go, entries):
-        row = math(b, INTEGER, 'SUBTRACT', -300, 0, chain(b, gi, self.words, entries), 1)
+        row = math(b, INTEGER, 'SUBTRACT', -300, 0, chain(b, gi, self.WORDS, entries), 1)
         b.link(sample(b, table_geometry(b, self.table), "oa_count", 'INT', row, 0, 0), go.inputs["Count"])
 
 
@@ -1105,7 +1117,7 @@ class PickV1(Spec):
     specs/pick.py. Context, Overrides and Key are absent from this interface, so the chain joins them as ""."""
 
     name, label = "pick", "Pick"
-    WORDS = words = ("Prompt", "Context", "Items", "Overrides", "Key")
+    WORDS = ("Prompt", "Context", "Items", "Overrides", "Key")
     per_element = (inner.Column("Probability", "prob", 'FLOAT', 0.0, linked_only=True),)
     iface = (SocketDef('INPUT', "Prompt", 'NodeSocketString', kind="word"),
              SocketDef('INPUT', "Items", 'NodeSocketString', kind="word"),
@@ -1119,7 +1131,7 @@ class PickV1(Spec):
 
     @staticmethod
     def build(b, gi, go, entries):
-        k = b.match_chain(b.words(gi, PickV1.words), [e.gn for e in entries])
+        k = b.match_chain(b.words(gi, PickV1.WORDS), [e.gn for e in entries])
         picked = b.lookup(k, 'INT', -1, [e.single["Index"] for e in entries], go.inputs["Index"], 300)
         b.lookup(k, 'STRING', "", [e.single["Item"] for e in entries], go.inputs["Item"], 100)
         b.lookup(k, 'FLOAT', 0.0, [e.single["Confidence"] for e in entries], go.inputs["Confidence"], -100)
@@ -1238,9 +1250,9 @@ def phase_table(tree_, picker, users, idents):
     check("per-element: invalid IDs (-1 on TA's first point; past the row count on TB, where TC's rows follow) "
           "give the fallbacks", got["TA"]["prob"][0] == 0.0 and got["TA"]["sel"][0] is False
           and got["TB"]["prob"][4:] == [0.0, 0.0] and got["TC"]["prob"][2:] == [0.0] * 4, got)
-    joins = [n for n in picker.node_tree.nodes if n.bl_idname == "GeometryNodeStringJoin"]
-    empties = [n for n in picker.node_tree.nodes if n.bl_idname == "FunctionNodeInputString"]
-    check("joined key: one Join Strings over the 5-word tuple, linked in reverse order; the absent Context, "
+    joins, empties = chain_joins(picker), [n for n in picker.node_tree.nodes
+                                           if n.bl_idname == "FunctionNodeInputString" and n.string == ""]
+    check("joined key: one Join Strings with SEP over the 5-word tuple, linked in reverse order; the absent Context, "
           "Overrides and Key are constant \"\" nodes, and every stored entry matches",
           len(joins) == 1 and len(joins[0].inputs["Strings"].links) == 5 and len(empties) == 3
           and [got[key]["idx"][0] for key in users] == [1, 3, 0], (len(joins), len(empties)))
@@ -1288,6 +1300,13 @@ def phase_no_match(picker, users, idents, node_store, live):
     inner.update_values(picker, node_store, live)
 
 
+def chain_joins(node_):
+    """The match chain's Join Strings in the node's group: the one joining with SEP (the Warning's key text has its
+    own, §5.7)."""
+    return [n for n in node_.node_tree.nodes
+            if n.bl_idname == "GeometryNodeStringJoin" and n.inputs["Delimiter"].default_value == inner.SEP]
+
+
 def phase_per_word(picker, users, idents, node_store, live):
     """A word containing SEP could make two different tuples join to the same key, so the node compares each word."""
     tricky = table_entry("TX", 0, [0.375], prompt="p\x1f", items="i")
@@ -1297,8 +1316,7 @@ def phase_per_word(picker, users, idents, node_store, live):
     inner.build(picker, S.NodeStore([tricky, node_store.entries[2]]), gns)
     got = {key: table_read(obj) for key, obj in users.items()}
     check("joined key: a word containing \\x1f switches the node to per-word Compares, which still match",
-          "\x1f".join(gns[0]) == "\x1f".join(gns[1])
-          and not any(n.bl_idname == "GeometryNodeStringJoin" for n in picker.node_tree.nodes)
+          "\x1f".join(gns[0]) == "\x1f".join(gns[1]) and not chain_joins(picker)
           and got == {"TA": table_expected(tricky, -1), "TB": table_expected(None, 0),
                       "TC": table_expected(node_store.entries[2], 0)}, got)
     for key in ("TA", "TB"):
@@ -1609,8 +1627,8 @@ def bench_shape(label, node_, store_a, store_b, shape, budget=None):
     bench_line(f"build/{label}/{shape}", len(node_.node_tree.nodes), ms, BUDGET_MS[budget or "build " + shape])
     if store_b is None:
         return
-    switches = [n for n in node_.node_tree.nodes if n.bl_idname == "GeometryNodeIndexSwitch"
-                and any(link.to_node.bl_idname == "NodeGroupOutput" for link in n.outputs[0].links)]
+    switches = [source for _name, source in inner._feeds(node_.node_tree)  # the outputs' own, behind their gates
+                if source.node.bl_idname == "GeometryNodeIndexSwitch"]
     one = S.NodeStore(list(store_a.entries))
     one.entries[-1] = store_b.entries[-1]
     for variant, other, writes, limit in (
@@ -1651,7 +1669,7 @@ def pick_payload_store(count, offset=0):
 
 def words_store(spec, count):
     """Entries whose words fill every word of the spec; stand-ins need no values."""
-    return S.NodeStore([S.Entry(words_key=str(e), gn=tuple(f"{word} of context {e}" for word in spec.words))
+    return S.NodeStore([S.Entry(words_key=str(e), gn=tuple(f"{word} of context {e}" for word in spec.WORDS))
                         for e in range(count)])
 
 

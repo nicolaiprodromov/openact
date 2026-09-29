@@ -11,6 +11,8 @@ All notable changes to OpenAct. Versions follow the extension manifest (`openact
 - Every node starts with a **Geometry** input and output, which pass the geometry through unchanged, and a
   **Trigger** input. Files saved by 1.0 gain them on their first pass, keeping their links. Rules factors can't be
   called Geometry or Trigger, and payload columns and Dials settings can't be called Geometry.
+- Nodes show an info marker that carries their words: each one reports its words and whether its Trigger is on
+  through a Warning node, on every evaluation that uses it.
 
 ## 1.0.0
 

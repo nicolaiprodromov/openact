@@ -5,8 +5,9 @@ stored entries (store.py) at any time. Only the materialised entries (§8.1) are
 Nodes selects the entry whose words equal the node's live inputs (the joined-key match chain, §8.2),
 reads that entry's single values from Index Switches, and its per-element rows from the table object
 at base + ID (§8.3), so one tree answers every context that uses it, with no Python at evaluation.
-Every group passes its Geometry input to its Geometry output unchanged (§6.0). The interface is never
-cleared: sync_interface() diffs it, so the links from the outer tree survive every rebuild.
+Every group passes its Geometry input to its Geometry output unchanged (§6.0), and reports its uid,
+Trigger and live words through one Warning node (§5.7). The interface is never cleared:
+sync_interface() diffs it, so the links from the outer tree survive every rebuild.
 """
 
 from __future__ import annotations
@@ -20,13 +21,13 @@ from dataclasses import dataclass
 
 import bpy
 
-from . import compat, tables
+from . import compat, tables, words
 from . import store as _store  # build() and update_values() take `store`, the name §13.3 fixes
 from .specs import SPECS
 
 INNER_PREFIX = ".OpenAct "
 BUILT = "openact_built"  # ID property of the group: what build() laid out, for update_values()
-LAYOUT = 2  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
+LAYOUT = 3  # bump when build() lays out another graph for the same entries: groups saved before then are rebuilt
 SEP = "\x1f"  # joins a word tuple into one key (§8.2)
 UNLINKED = -2**31 + 1  # an unlinked ID's hidden value, read as the index (_Builder.ident()); no float converts to it
 MATERIALISED_MAX = 16  # entries in the graph and table object, pinned included (§8.1)
@@ -35,6 +36,10 @@ ROW_BUDGET = 16 * 4096  # flat rows warm entries may bring the table object to
 K_DEFAULT = "OpenAct k_default"  # the chain's innermost Switch: its False value is what a no-match shows
 BASE, COUNT = "OpenAct base", "OpenAct count"  # Index Switches: each entry's first flat row, its row count
 GEOMETRY = "Geometry"  # the input and output every node passes its geometry through (§6.0)
+TRIGGER = "Trigger"  # the input whose state the Warning reports (§5.7)
+UID = "OpenAct uid"  # the String node holding the uid the Warning reports: update_values() rewrites it for a copy
+GATES = {'VALUE': 'FLOAT', 'INT': 'INT', 'BOOLEAN': 'BOOLEAN', 'STRING': 'STRING', 'GEOMETRY': 'GEOMETRY',
+         'MATERIAL': 'MATERIAL'}  # output socket type -> the input_type of the Switch it is read through (gate())
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,7 @@ class _Builder:
         self.locations = {}  # node pointer -> (x, y)
         self.default = default  # k_default: what the match chain yields when no entry matches (§8.2)
         self.per_word = per_word  # a word contains SEP: compare word by word
+        self.key = None  # the key text of the live words (key_text()), which the Warning reports
         self.k = None  # the match chain's output, which the per-element lookup reads
         self.after_elements = []  # a spec's callables (valid, {output: value}), run once per_element() built them
         self.node = None  # the OpenAct node, for a spec that samples its own table object (entry_table, below)
@@ -118,6 +124,72 @@ class _Builder:
         """The Group Input sockets of the node's word tuple, in order, None where the interface has no such
         String socket (e.g. Items under a Collection source): match_chain() joins those as "" (§8.2)."""
         return [next((s for s in gi.outputs if s.name == name and s.type == 'STRING'), None) for name in names]
+
+    def key_text(self, sockets):
+        """The key text of the live words, words.key_text() in Geometry Nodes (§5.7): per word, its length in code
+        points (String Length, then Value to String INT), ":" and the word, all joined in one Join Strings. A word
+        the node has no socket for (None) is "", the constant "0:", as the match chain treats it (§8.2); a word
+        socket a dropdown removes before the next rebuild leaves its length 0 and ":", so it reads "" too. Kept as
+        self.key."""
+        key = self.new("GeometryNodeStringJoin", -250, 700)
+        key.hide = True
+        parts = []
+        for j, socket in enumerate(sockets):
+            y = 700 + 60 * len(sockets) - 60 * j
+            if socket is None:
+                empty = self.new("FunctionNodeInputString", -400, y)
+                empty.string, empty.hide = words.key_text([""]), True
+                parts.append(empty.outputs[0])
+                continue
+            length = self.new("FunctionNodeStringLength", -700, y)
+            number = self.new("FunctionNodeValueToString", -550, y)
+            colon = self.new("FunctionNodeInputString", -400, y)
+            number.data_type, colon.string = 'INT', ":"
+            length.hide = number.hide = colon.hide = True
+            self.link(socket, length.inputs["String"])
+            self.link(length.outputs["Length"], _enabled(number.inputs, "Value"))
+            parts += [number.outputs["String"], colon.outputs[0], socket]
+        for part in reversed(parts):  # Join Strings puts the most recently linked item first
+            self.link(part, key.inputs["Strings"])
+        self.key = key.outputs[0]
+        return self.key
+
+    def warning(self, gi, uid):
+        """The Warning channel (§5.7): one INFO Warning whose message is words.message(uid, trigger, words),
+        "OpenAct <uid> <0|1> <key text>", which the modifier lists after each evaluation that evaluates the node
+        (gate()). The uid is the String node UID; "1" comes from a String Switch on the Trigger, so Blender's
+        implicit conversion into its Bool socket decides what is on."""
+        mark, ident = self.new("FunctionNodeInputString", -250, 1000), self.new("FunctionNodeInputString", -250, 950)
+        mark.string, ident.name, ident.string = words.MARK, UID, uid
+        switch = self.new("GeometryNodeSwitch", -250, 900)
+        switch.input_type = 'STRING'
+        sock(switch.inputs, "False").default_value, sock(switch.inputs, "True").default_value = "0", "1"
+        trigger = next((s for s in gi.outputs if s.name == TRIGGER and s.type == 'BOOLEAN'), None)
+        if trigger is not None:  # else it reads "0", as an unlinked Trigger does
+            self.link(trigger, sock(switch.inputs, "Switch"))
+        message = self.new("GeometryNodeStringJoin", 0, 900)
+        message.inputs["Delimiter"].default_value = " "
+        for item in reversed((mark.outputs[0], ident.outputs[0], switch.outputs[0], self.key)):
+            self.link(item, message.inputs["Strings"])
+        warning = self.new("GeometryNodeWarning", 200, 900)
+        warning.warning_type = 'INFO'
+        warning.inputs["Show"].default_value = True
+        self.link(message.outputs[0], warning.inputs["Message"])
+        return warning
+
+    def gate(self, go, warning):
+        """Every output read through a Switch on the Warning's Show output, which is always on (§5.7). Geometry Nodes
+        evaluates a Warning inside a group only with values the group computes for a requested output: a word or
+        Trigger linked from another node outside would never reach an unread Warning. So any output an evaluation
+        asks for evaluates the Warning first, with everything its message needs; an unused node reports nothing."""
+        show = warning.outputs["Show"]
+        for j, socket in enumerate(s for s in go.inputs if s.type in GATES):
+            switch = self.new("GeometryNodeSwitch", 650, 400 - 40 * j)
+            switch.input_type, switch.hide = GATES[socket.type], True
+            self.link(show, sock(switch.inputs, "Switch"))
+            if socket.is_linked:  # an unlinked output gives the Switch's default, the type's zero, as before
+                self.link(socket.links[0].from_socket, sock(switch.inputs, "True"))
+            self.link(switch.outputs[0], socket)
 
     def match_chain(self, sockets, keys):
         """Integer socket k: 1 + index of the entry whose words equal the live words, else k_default; None
@@ -329,7 +401,8 @@ def create_inner(node, store=None):
 
 def build(node, store, live=None, default=None):
     """Rebuild the inner group's nodes, and rewrite its table object, from the store; the interface is kept, the
-    geometry passed through (§6.0) and the ID's hidden value set (_Builder.ident()).
+    geometry passed through (§6.0), the Warning channel laid out (§5.7) and the ID's hidden value set
+    (_Builder.ident()).
 
     live: the gn tuples of the node's live contexts, in context order (§8.1). None means unknown: every
     stored entry is laid out, in store order; only the pass knows the live set. default: the words_key of
@@ -350,11 +423,15 @@ def build(node, store, live=None, default=None):
     group_in = builder.new("NodeGroupInput", -900, 0)
     group_out = builder.new("NodeGroupOutput", 800, 0)
     builder.pass_through(group_in, group_out)
+    spec = SPECS[node.bl_idname]
+    builder.key_text(builder.words(group_in, spec.words(node)))  # before the spec's build(), which may read it
+    warning = builder.warning(group_in, node.uid)
     if table is not None:  # the table's only user, and how find() sees it, even while nothing samples it yet
         builder.table_geometry()
-    SPECS[node.bl_idname].build(builder, group_in, group_out, entries)
+    spec.build(builder, group_in, group_out, entries)
     if columns:
         builder.per_element(group_in, group_out, entries, columns)
+    builder.gate(group_out, warning)  # last: every output, whatever built it
     builder.finish()
     if columns:
         tables.write_rows(node, _table_rows(node, entries, columns), {c.name: c.data_type for c in columns})
@@ -365,9 +442,10 @@ def build(node, store, live=None, default=None):
 
 def update_values(node, store, live=None, default=None, rows=True):
     """Values only (§8.8): write the changed entry-level Index Switch values (each output's single values,
-    each entry's base and row count) and k_default, and with `rows` the table object's per-element rows.
-    Returns False, writing nothing, when build() laid out another materialised set or shape, so build() is
-    needed. live and default as for build(); the pass passes the same ones to both."""
+    each entry's base and row count), k_default and the uid the Warning reports (§5.7), and with `rows` the
+    table object's per-element rows. Returns False, writing nothing, when build() laid out another
+    materialised set or shape, so build() is needed. live and default as for build(); the pass passes the
+    same ones to both."""
     tree = node.node_tree
     if tree is None:
         return False
@@ -380,10 +458,13 @@ def update_values(node, store, live=None, default=None, rows=True):
     own_rows = own(node, entries) if own else None
     if own and own_rows is None:  # the spec wants other outputs
         return False
-    feeds = [(link.to_socket.name, link.from_node.data_type, _items(link.from_node)) for link in tree.links
-             if link.to_node.bl_idname == "NodeGroupOutput" and link.from_node.bl_idname == "GeometryNodeIndexSwitch"]
+    feeds = [(name, source.node.data_type, _items(source.node)) for name, source in _feeds(tree)
+             if source.node.bl_idname == "GeometryNodeIndexSwitch"]
     if any(len(slots) != len(entries) + 1 for _name, _type, slots in feeds):
         return False
+    ident = tree.nodes.get(UID)
+    if ident is not None and ident.string != node.uid:  # a copy's group, which engine.ensure_owned() copied
+        ident.string = node.uid
     for name, data_type, slots in feeds:  # an entry without the value (e.g. no Material) holds the fallback
         _write(slots[1:], _values(data_type, [entry.single.get(name, slots[0].default_value) for entry in entries]))
     counts = [row_count(entry) for entry in entries]
@@ -399,6 +480,18 @@ def update_values(node, store, live=None, default=None, rows=True):
     elif rows and own_rows:
         tables.write_rows(node, *own_rows)
     return True
+
+
+def _feeds(tree):
+    """(output name, the socket that computes it) of each output the group computes, found behind its gate, the
+    Switch on the Warning's Show (_Builder.gate())."""
+    found = []
+    for link in tree.links:
+        if link.to_node.bl_idname == "NodeGroupOutput" and link.from_node.bl_idname == "GeometryNodeSwitch":
+            fed = sock(link.from_node.inputs, "True").links
+            if fed:
+                found.append((link.to_socket.name, fed[0].from_socket))
+    return found
 
 
 def _values(data_type, values):
