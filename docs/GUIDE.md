@@ -2,6 +2,10 @@
 
 Everything about using OpenAct, in depth. For the overview, see the [README](../README.md).
 
+This guide describes OpenAct as it is in this repository. The changes since the 1.0.0 release, such as the Trigger
+and asking during playback, are listed under *Unreleased* in the [changelog](../CHANGELOG.md), and
+[Files from OpenAct 1.0](#files-from-openact-10) says what they mean for files saved by 1.0.
+
 **Contents**
 
 - [Requirements](#requirements)
@@ -18,13 +22,14 @@ Everything about using OpenAct, in depth. For the overview, see the [README](../
   - [Templates](#templates)
   - [Tips](#tips)
 - [Render farms and headless scripts](#render-farms-and-headless-scripts)
+- [Files from OpenAct 1.0](#files-from-openact-10)
 - [Privacy](#privacy)
 - [Limitations and known issues](#limitations-and-known-issues)
 - [Future work](#future-work)
 
 ## Requirements
 
-- Blender 4.5 or newer. OpenAct 1.0 is tested on 4.5, 5.0 and 5.1.
+- Blender 4.5 or newer. OpenAct is tested on 4.5, 5.0 and 5.1.
 - Windows 10 or 11 with an NVIDIA GPU (CUDA) with 10 GB of VRAM or more; the model uses about 9 GB. Linux with an
   NVIDIA GPU is best effort and untested.
 - 15 GB of free disk space for the one-time install of the model runtime, which takes about 13 GB.
@@ -34,7 +39,7 @@ on Blender 4.5 or newer.
 
 ## Install
 
-1. Download `openact-1.0.0.zip` from the GitHub release, or build it from this repository:
+1. Download `openact-1.0.0.zip` from the GitHub release, or build the current version from this repository:
    `blender --command extension build --source-dir openact --output-dir dist`.
 2. In Blender: *Edit > Preferences > Get Extensions > Install from Disk...* and pick the zip.
 3. Open a Geometry Node editor, press **N** and go to the **OpenAct** tab.
@@ -86,7 +91,7 @@ sit on the geometry's path; a Rules node that your geometry passes through asks 
 model: when it is on ([below](#when-a-node-asks-the-trigger)). Unlinked, it is off, and the node never asks; it still
 outputs the answers it has. Any value converts: a number above 0, a vector that isn't zero or a colour lighter than
 black is on. Files saved by OpenAct 1.0 get these sockets when they open, with their links, and keep their answers;
-they ask nothing until you link a Trigger.
+they ask nothing until you link a Trigger ([Files from OpenAct 1.0](#files-from-openact-10)).
 
 Every node also has hidden inputs: **Overrides** (with *Overrides CSV*), a CSV that locks answers
 ([below](#overrides)), and **Key**. Ctrl H shows them.
@@ -107,17 +112,21 @@ A node asks the model only for what it is missing, and only while its **Trigger*
 - **Ask Again** (sidebar) forgets the node's answers for its current words and asks them once, whatever its Trigger.
 - Answers arrive in the background: until one lands, the node shows its stored answer, or its neutral values.
 
-The node's status says why nothing is asked, and the sidebar shows its Trigger at the last evaluation and how many
-sets of words the evaluation reported:
+The node's status line says what it is doing, and why nothing is asked; the sidebar also shows its Trigger at the
+last evaluation and how many sets of words the evaluation reported:
 
 | Status | Meaning |
 |---|---|
+| *18 cells · 0 unsure · 2 locked* | Every answer is in: how many are unsure (below *Unsure Below*) and how many an Overrides CSV locks. |
+| *4 of 8 cells answered · 0 unsure* | A Rules node your geometry passes through has the answers of every cell your elements are in; it asks another cell when an element first lands in it. |
+| *Filling 12/50 · ~2 s* | Asking; the answers so far show, older ones meanwhile for rows being asked again. |
 | *Link a Trigger to ask: 3 answers missing* | The Trigger is unlinked. |
 | *Trigger off: 3 answers missing* | The Trigger is linked, but was off at the last evaluation. |
 | *Not evaluated: 3 answers missing* | No evaluation used the node: its outputs lead nowhere, its object is disabled in the viewport, or no modifier uses its tree. |
-| *Filling 12/50 · ~2 s* | Asking; the answers so far show, older ones meanwhile for rows being asked again. |
-| *4 of 8 cells answered · 0 unsure* | A Rules node your geometry passes through has the answers of every cell your elements are in; it asks another cell when an element first lands in it. |
 | *Its Question is read when the node evaluates* | The words come from nodes only Geometry Nodes can compute, and nothing evaluates the node yet. |
+| *Waiting for another OpenAct node...* | Its words use another node's answer, which isn't there yet. |
+| *Starting the model...*, *Model server is stopped (OpenAct tab)* | The model is loading, or stopped while *Start Automatically* is off. |
+| An error, e.g. *life_outcomes.csv:4 ...* | Nothing that depends on the problem is asked, and the node keeps its last good answers. |
 
 ### Working with the nodes
 
@@ -158,11 +167,10 @@ sets of words the evaluation reported:
   message starts with *OpenAct*: it carries the words the node evaluated and whether its Trigger was on, for OpenAct
   to read. Renders report none.
 - **Sidebar** (N > OpenAct): the Model box; for the active node, its Trigger at the last evaluation, its status, a
-  summary per object (per element in a For Each Element zone), the table of
-  answers with confidence and source (*Show Question* shows exactly what a row asks the model), **Ask Again** and
-  **Write Overrides CSV**; and the *Files* panel: each CSV the node reads, with its columns and problems, *Open File*
-  and *New CSV from Template*. The sidebar never edits answers: to change one, change its words, or lock it in the
-  Overrides CSV.
+  summary per object (per element in a For Each Element zone), the table of answers with confidence and source
+  (*Show Question* shows exactly what a row asks the model), **Ask Again** and **Write Overrides CSV**; and the
+  *Files* panel: each CSV the node reads, with its columns and problems, *Open File* and *New CSV from Template*.
+  The sidebar never edits answers: to change one, change its words, or lock it in the Overrides CSV.
 
 ### Playback and simulations
 
@@ -174,9 +182,11 @@ While the timeline plays, a node whose Trigger is on keeps asking for what it mi
   showed last: its previous answer when one object uses it, or a table's old rows, marked stale; on a tree several
   objects share, neutral values.
 - **An untriggered node** asks nothing and costs nothing during playback, and its stored answers show as they would.
+- **A Rules node your geometry passes through** asks each cell when its elements first reach it, during playback too.
 - **Words that change faster than the model answers**, such as a new question at every frame: a node keeps only its
   newest questions waiting, and drops its older ones not sent yet. The elements of a For Each Element zone keep all
-  of theirs.
+  of theirs. Build words from coarse values, e.g. "a hot, dry afternoon" rather than "23.47 °C": the model reads
+  words better than numbers, and words it has answered cost nothing when they come back.
 - **Answers are stored** in the node once playback stops, or when you save, so they survive saving and reopening the
   file. The node's status, and the sidebar, catch up then too.
 - **Nothing rebuilds a node while the timeline plays.** A Pick whose answer names an item its lists never had shows
@@ -242,8 +252,7 @@ Classify).
 
 A payload column holds only integers (an Int output) or only numbers (a Float output), and its header becomes the
 output's name. An empty cell, a decimal comma, `inf` or `nan` makes it text, with a warning. Other text columns are
-ignored. In 1.0.0 an Items CSV's numeric columns give no outputs, though the *Files* panel lists them as payload
-columns.
+ignored. An Items CSV's numeric columns give no outputs yet, though the *Files* panel lists them as payload columns.
 
 Row *r* is option *r*: Pick's Index, Classify's Label and Rules' Outcome give the row, which is also Import CSV's
 point *r*. A Yes/No set has exactly the rows `yes` and `no`; an Amount set has 2-16 levels, lowest first (by default
@@ -363,6 +372,32 @@ hundredths of a second until its nodes are answered, and saves, as `drive()` in
 read the words each evaluation reports, so a script that sets a modifier input calls `update_tag()` on the object
 (Blender re-evaluates nothing else by itself), and a node it wants answered needs a Trigger that is on and an output
 the modifier's result uses, as in the interface.
+
+## Files from OpenAct 1.0
+
+Open them as usual. On their first pass, the first time OpenAct looks at them:
+
+- **Every node gains the new sockets**, the **Geometry** input and output and the **Trigger** input, in their places;
+  its other sockets and their links stay. Its hidden node group is rebuilt for the new lookup.
+- **Every answer stays**, and **nothing is asked until you link a Trigger**: an unlinked Trigger is off. The nodes
+  keep showing their saved answers, and their status says *Link a Trigger to ask* where answers are missing. *Ask
+  Again* still asks once.
+- **A Rules node asks every missing cell**, as 1.0 did, until you pass your geometry through it
+  ([Working with the nodes](#working-with-the-nodes)).
+- **The limit of 16 sets of words is gone**, with its error: a node now answers any number of objects and words.
+
+Opened without OpenAct, or rendered on a farm (which runs no pass), a 1.0 file renders its saved answers as 1.0
+saved them.
+
+**Removed since 1.0:**
+
+- ***Prepare for Playback***, with its pins, *Unpin* and *Unpin All*. It asked for animated words before playback,
+  because 1.0 couldn't ask while the timeline played. Now a node whose Trigger is on asks for them at the frame they
+  first appear ([Playback and simulations](#playback-and-simulations)), and words answered before show at once. The
+  answers 1.0 pinned stay in the file, but may be dropped like any other stored answer when a node keeps more than
+  1024 sets of words or 2 MB.
+- **The demo scenes.** Their Game of Life, household objects, material families and weather dials live on as the
+  [starter templates](#templates).
 
 ## Privacy
 
