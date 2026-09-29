@@ -101,8 +101,8 @@ Each suite prints a `PASS` or `FAIL` line per check and ends with one `RESULT` l
 - **The design is the specification.** [`docs/DESIGN.md`](docs/DESIGN.md) specifies what the add-on does, and the
   code cites its sections, e.g. `(§5.4)`. When a change alters specified behaviour, update that section in the same
   pull request.
-- **Keep the pure modules pure.** `csvfmt.py`, `natsort.py`, `pipeline.py`, `rules_core.py`, `store.py` and the
-  node specs in `specs/` import no `bpy` when they load: the `*_test.py` suites run them under plain CPython.
+- **Keep the pure modules pure.** `csvfmt.py`, `natsort.py`, `pipeline.py`, `rules_core.py`, `store.py`, `words.py`
+  and the node specs in `specs/` import no `bpy` when they load: the `*_test.py` suites run them under plain CPython.
   Import `bpy` inside the functions that need it, as the specs do.
 - **Nothing runs during evaluation.** Geometry Nodes can't call Python while it evaluates. OpenAct reads words and
   asks the model outside evaluation, and writes the answers into the node's hidden group. Keep it that way: handlers
