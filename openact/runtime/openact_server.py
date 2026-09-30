@@ -15,6 +15,8 @@ Additions on top of SemIf:
 * More than 16 options: SemIf has 16 answer letters (A-P), so larger Choice questions run as a
   tournament (groups of <= 16, then a final between the group winners). The returned
   probabilities are hierarchical: P(item) = P(item | its group) * P(group winner wins the final).
+* A prompt limit of its own: --max-tokens, 8192 by default (SemIf's default is 4096). The add-on
+  passes its Max Prompt Tokens preference. A longer row is refused, never cut short.
 * A per-question LRU answer cache and a watchdog that exits when the parent process (Blender) is gone.
 * Backends: SemIf on PyTorch, or a deterministic fake that needs neither torch nor a GPU (tests).
 * Only local clients: a request with an Origin header, or a Host other than 127.0.0.1:<port> or
@@ -51,7 +53,7 @@ SLOTS = 16  # SemIf answer letters A..P
 MAX_CHOICE_OPTIONS = 255
 MAX_SCORE_LEVELS = 16
 MAX_QUESTIONS = 256
-MAX_TOKENS = 4096  # SemIf's prompt limit per row
+DEFAULT_MAX_TOKENS = 8192  # the longest prompt a row may have (--max-tokens); SemIf's own default is 4096
 BATCH_ROWS = 32
 CACHE_SIZE = 65536  # questions
 MAX_BODY = 4 * 1024 * 1024
@@ -156,20 +158,20 @@ class SemIfTorchBackend(Backend):
         from semif_phase1.direct import encode_prompt, score
         from semif_phase1.shared import score_shared
 
-        results = []
+        results, limit = [], self.args.max_tokens
         for start in range(0, len(rows), BATCH_ROWS):
             chunk = rows[start:start + BATCH_ROWS]
             try:
                 if len(chunk) == 1:
-                    results.append(score(self.model, self.tokenizer, chunk[0], self.metadata, MAX_TOKENS))
+                    results.append(score(self.model, self.tokenizer, chunk[0], self.metadata, limit))
                 else:
-                    scored, _timing = score_shared(self.model, self.tokenizer, chunk, self.metadata, MAX_TOKENS)
+                    scored, _timing = score_shared(self.model, self.tokenizer, chunk, self.metadata, limit)
                     results.extend(scored)
             except ValueError as error:
                 # Only tokenising again tells which row SemIf refused, e.g. one over the token limit.
                 for row in chunk:
                     try:
-                        encode_prompt(self.tokenizer, row, MAX_TOKENS)
+                        encode_prompt(self.tokenizer, row, limit)
                     except ValueError:
                         error.row = row["id"]
                         break
@@ -182,7 +184,7 @@ class FakeBackend(Backend):
 
     An option's weight depends only on (state, question, option id), so answers are the same in
     every run, and a row's answer does not depend on the order of its options (a tournament still
-    groups options by position). Rows over SemIf's token limit are refused as SemIf refuses them.
+    groups options by position). Rows over the token limit (--max-tokens) are refused as SemIf refuses them.
     --fake-script is a JSON list of rules: the first rule whose "state" and "question" texts (both
     optional) occur in a row's state and question decides that row, with its "answer": an option
     id, or a map of option ids to weights. A row with no matching rule, or none of whose options
@@ -212,8 +214,8 @@ class FakeBackend(Backend):
         results = []
         for row in rows:
             tokens = len(json.dumps(row, ensure_ascii=False)) // 4
-            if tokens > MAX_TOKENS:
-                error = ValueError(f"Row {row['id']}: about {tokens} input tokens exceed limit {MAX_TOKENS}")
+            if tokens > self.args.max_tokens:
+                error = ValueError(f"Row {row['id']}: about {tokens} input tokens exceed limit {self.args.max_tokens}")
                 error.row = row["id"]
                 raise error
             ids = [option["id"] for option in row["options"]]
@@ -279,6 +281,7 @@ class Engine:
             "revision": self.args.revision,
             "device": self.backend.device,
             "debias": not self.args.no_debias,
+            "max_tokens": self.args.max_tokens,  # the preferences compare it with Max Prompt Tokens
             "load_seconds": self.load_seconds,
             "requests": self.requests,
             "questions": self.questions,
@@ -299,6 +302,7 @@ class Engine:
             "max_options": MAX_CHOICE_OPTIONS,
             "max_levels": MAX_SCORE_LEVELS,
             "max_questions": MAX_QUESTIONS,
+            "max_tokens": self.args.max_tokens,
             "batch_rows": BATCH_ROWS,
             "debias": True,
             "question_cache": True,
@@ -714,6 +718,8 @@ def main(argv=None):
     parser.add_argument("--token-file", default=None, metavar="PATH",
                         help="once listening, write OPENACT_TOKEN to this file for other Blenders (mode 0600)")
     parser.add_argument("--no-debias", action="store_true", help="score each question once")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, metavar="N",
+                        help="the longest prompt a row may have, in tokens: a question over it gets 422")
     parser.add_argument("--record", default=None, metavar="PATH.jsonl",
                         help="append every /v1/systemone request, with its answers, to this file")
     parser.add_argument("--fake-script", default=None, metavar="JSON", help="fake backend: answer rules")
@@ -721,6 +727,8 @@ def main(argv=None):
     parser.add_argument("--fake-load-fail", action="store_true", help="fake backend: the load fails")
     parser.add_argument("--fake-no-cuda", action="store_true", help="fake backend: load as if PyTorch had no CUDA")
     args = parser.parse_args(argv)
+    if args.max_tokens < 1:
+        parser.error(f"--max-tokens must be at least 1, not {args.max_tokens}")
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # SemIf wants exactly one visible GPU

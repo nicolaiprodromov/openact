@@ -62,6 +62,12 @@ and the model is fetched at a fixed revision. The Model box shows the progress, 
 For a runtime in another folder, use *Locate Existing Runtime...* or the *Runtime Folder* preference. *Open Runtime
 Folder* shows the folder; deleting it uninstalls the model. Uninstalling OpenAct leaves it in place.
 
+The *Max Prompt Tokens* preference (8192 by default) is the longest prompt the model reads, in tokens; a token is
+about 4 characters of English. A question with a longer prompt fails with an error, and the node's other questions
+are still answered. CSV cells may hold half as many characters (4096 by default). A higher value lets longer text
+through, but long prompts take more GPU memory and time. The model server uses a new value once it restarts: *Stop
+Model*, then *Start Model*. Until then, a note under the preference says so.
+
 ## The six nodes
 
 OpenAct adds six Geometry Nodes that make judgements. A question, a prompt, a list of items or a table of rules goes
@@ -237,8 +243,8 @@ this session is trusted.
 
 Every CSV file is UTF-8 (a BOM is fine) with a header row. The delimiter is `,`, or `;` or a tab when the header has
 no comma, as Excel writes in some locales; with a plugged-in Import CSV node, it is that node's *Delimiter*. Cells
-may be quoted with `"`. Limits: 1 MB, 4096 data rows, 64 columns and 2000 characters per cell. The column names below
-are matched ignoring case.
+may be quoted with `"`. Limits: 1 MB, 4096 data rows, 64 columns, and 4096 characters per cell (half the *Max Prompt
+Tokens* preference, [above](#the-model-runtime)). The column names below are matched ignoring case.
 
 **Answer sets and item lists**: Answers (Ask, Match), Labels (Classify), Outcomes (Rules) and Items (Pick, Match,
 Classify).

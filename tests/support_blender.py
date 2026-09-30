@@ -31,7 +31,10 @@ headless Blender, against the fake model server the add-on starts itself (OPENAC
 - the slow-server note once a faked ms_per_row stays above 3 x 21 ms for a minute while cells are asked (never while
   idle), time-scaled;
 - a profile saved with the Device preference's old CPU choice, which Blender reads as "", starts the server with
-  --device auto.
+  --device auto;
+- the Max Prompt Tokens preference: its declaration; the server starts with --max-tokens from it and /health reports
+  that; the preferences say when the running server has another limit; CSV cells hold half as many characters as it
+  has tokens, checked again at the next pass; and changing it sets the cell limit at once and asks for a pass.
 
 Run:  blender -b --factory-startup --python tests/support_blender.py
 (The second Blender runs this file with -- attach <port>.)
@@ -1205,6 +1208,89 @@ def phase_old_device():
           (server.status(), argv[at:at + 1], shown and shown[0]))
 
 
+def phase_max_tokens():
+    try:
+        for cls in P.classes:
+            bpy.utils.register_class(cls)
+        rna = P.OpenActPreferences.bl_rna.properties["max_tokens"]
+        declared = (rna.default, rna.hard_min, rna.hard_max)
+    except Exception as error:  # noqa: BLE001 - reported by the check
+        declared = repr(error)
+    finally:
+        for cls in reversed(P.classes):
+            if getattr(cls, "is_registered", False):
+                bpy.utils.unregister_class(cls)
+    check("max tokens: the preference defaults to 8192, from 1024 up to the model's 262144, as without the add-on "
+          "enabled", declared == (8192, 1024, 262144) and P._Defaults.max_tokens == P.DEFAULT_MAX_TOKENS == 8192,
+          declared)
+
+    def preferences():
+        return text_of(drawn(lambda layout: ui.draw_preferences(P.get_prefs(), bpy.context, layout)))
+
+    server.stop()
+    P._Defaults.max_tokens = 6000
+    try:
+        started = server.start()
+        argv = list(server.STATE.process.args) if server.STATE.process else []
+        ready = drive(engine, lambda: server.status()[0] in ("ready", "error"), 30) and server.is_ready()
+        reported, same = server.STATE.health.get("max_tokens"), preferences()
+        P._Defaults.max_tokens = 8192  # changed while that server runs
+        other = preferences()
+    finally:
+        P._Defaults.max_tokens = P.DEFAULT_MAX_TOKENS
+    at = argv.index("--max-tokens") + 1 if "--max-tokens" in argv else len(argv)
+    check("max tokens: the server starts with --max-tokens from the preference, and /health reports it",
+          started and ready and argv[at:at + 1] == ["6000"] and reported == 6000,
+          (server.status(), argv[at:at + 1], reported))
+    later = ui.MAX_TOKENS_LATER.format(6000, 8192)
+    check("max tokens: the preferences say when the running server has another limit, and how to apply it",
+          later in other and "The running model server allows" not in same, (other, same))
+
+    folder = os.path.dirname(bpy.data.filepath)
+    with open(os.path.join(folder, "long_whens.csv"), "w", encoding="utf-8") as handle:
+        handle.write("answer,when\nbrief,a short one\nlengthy," + "w" * 5000 + "\n")
+    node = used("Long whens", MATCH, Question="Is it lengthy?", Items="//long_whens.csv")
+
+    def too_long():
+        found = status(node)
+        return any("5 000 characters (limit" in problem.message for problem in (found.problems if found else ()))
+
+    engine.run_pass()
+    strict = (line(node)[0], too_long(), csvfmt.MAX_CELL)
+    P._Defaults.max_tokens = 12000  # no update runs: the pass reads the preference
+    try:
+        engine.run_pass()
+        limit = csvfmt.MAX_CELL
+        done = settle(lambda: complete(node))
+        relaxed = (line(node)[0], too_long())
+    finally:
+        P._Defaults.max_tokens = P.DEFAULT_MAX_TOKENS
+    engine.run_pass()
+    back = (line(node)[0], too_long(), csvfmt.MAX_CELL)
+    check("max tokens: CSV cells hold half as many characters as it has tokens, checked again at the next pass: a cell "
+          "of 5 000 characters is an error at 8192 (limit 4 096), is asked at 12000 (limit 6 000), and is an error "
+          "again at 8192", strict == ("error", True, 4096) and limit == 6000 and done and relaxed == ("complete", False)
+          and back == ("error", True, 4096), (strict, limit, relaxed, back))
+
+    # The preference as the add-on declares it, on a stand-in property group: its update applies it at once
+    annotation = P.OpenActPreferences.__annotations__["max_tokens"]  # prefs postpones annotations: a string
+    declared = eval(annotation, vars(P)) if isinstance(annotation, str) else annotation  # the add-on's own source
+    group = type("OpenActTokensProbe", (bpy.types.PropertyGroup,), {"__annotations__": {"max_tokens": declared}})
+    bpy.utils.register_class(group)
+    bpy.types.WindowManager.openact_tokens_probe = bpy.props.PointerProperty(type=group)
+    try:
+        probe, seen = bpy.context.window_manager.openact_tokens_probe, []
+        for value in (10000, P.DEFAULT_MAX_TOKENS):
+            engine._dirty = False
+            probe.max_tokens = value
+            seen.append((csvfmt.MAX_CELL, engine._dirty))
+    finally:
+        del bpy.types.WindowManager.openact_tokens_probe
+        bpy.utils.unregister_class(group)
+    check("max tokens: changing it sets the cell limit at once and asks for a pass",
+          seen == [(5000, True), (4096, True)], seen)
+
+
 # -------------------------------------------------------------------------------------------- run
 
 def main():
@@ -1230,6 +1316,7 @@ def main():
         phase_stall()
         phase_slow()
         phase_old_device()
+        phase_max_tokens()
     except Exception:
         check("no unexpected error", False, traceback.format_exc())
     finally:

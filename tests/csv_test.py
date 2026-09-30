@@ -351,7 +351,7 @@ def test_classes():
 
     digits = "7" * 5000
     doc = read("digits.csv", f"answer,v\na,{digits}\n")
-    message = "Line 2: column 'v' has 5 000 characters (limit 2 000)"
+    message = "Line 2: column 'v' has 5 000 characters (limit 4 096)"
     check(
         "classes: a cell of 5 000 digits is a problem, not an exception",
         only(doc.problems, "error", 2, message),
@@ -379,13 +379,15 @@ def test_limits():
         only(doc.problems, "error", 1, "columns_65.csv has 65 columns (limit 64)") and not doc.header,
         summary(doc.problems),
     )
-    doc = read("cell_2000.csv", "answer,when\na," + "w" * 2000 + "\n")
-    check("limits: 2 000 characters in a cell are fine", not doc.problems, summary(doc.problems))
-    doc = read("cell_2001.csv", "answer,when\na," + "w" * 2001 + "\n")
-    message = "Line 2: column 'when' has 2 001 characters (limit 2 000)"
-    check("limits: 2 001 characters in a cell", only(doc.problems, "error", 2, message), summary(doc.problems))
+    check("limits: a cell holds up to 4 096 characters, half the default Max Prompt Tokens (8 192)",
+          csvfmt.MAX_CELL == 4096, csvfmt.MAX_CELL)
+    doc = read("cell_4096.csv", "answer,when\na," + "w" * 4096 + "\n")
+    check("limits: 4 096 characters in a cell are fine", not doc.problems, summary(doc.problems))
+    doc = read("cell_4097.csv", "answer,when\na," + "w" * 4097 + "\n")
+    message = "Line 2: column 'when' has 4 097 characters (limit 4 096)"
+    check("limits: 4 097 characters in a cell", only(doc.problems, "error", 2, message), summary(doc.problems))
     doc = read("cell_huge.csv", "answer,when\na," + "w" * 140000 + "\nb,c\n")
-    message = "Line 2: a cell has over 131 072 characters (limit 2 000), or a quote is not closed"
+    message = "Line 2: a cell has over 131 072 characters (limit 4 096), or a quote is not closed"
     check(
         "limits: a cell over the csv module's own cap", only(doc.problems, "error", 2, message), summary(doc.problems)
     )
@@ -403,10 +405,32 @@ def test_limits():
     listed = summary(doc.problems)
     good = listed == [("error", n, f"Line {n} has 2 cells; the header has 1") for n in range(2, 62)]
     check("limits: every long row is listed", good, (len(listed), listed[-1:]))
-    doc = read("long_cells.csv", "answer,when\n" + lines(55, lambda i: f"r{i}," + "w" * 2001))
+    doc = read("long_cells.csv", "answer,when\n" + lines(55, lambda i: f"r{i}," + "w" * 4097))
     listed = summary(doc.problems)
-    good = listed == [("error", n, f"Line {n}: column 'when' has 2 001 characters (limit 2 000)") for n in range(2, 57)]
+    good = listed == [("error", n, f"Line {n}: column 'when' has 4 097 characters (limit 4 096)") for n in range(2, 57)]
     check("limits: every long cell is listed", good, (len(listed), listed[-1:]))
+
+    # The engine sets the cell limit from the Max Prompt Tokens preference at each pass
+    path = write("cell_3000.csv", "answer,when\na," + "w" * 3000 + "\n")
+    fine = csvfmt.load(path)
+    csvfmt.set_max_tokens(csvfmt.MAX_CELL * 2)
+    kept = csvfmt.load(path)
+    csvfmt.set_max_tokens(4096)
+    try:
+        limit, strict, again = csvfmt.MAX_CELL, csvfmt.load(path), csvfmt.load(path)
+        edge = read("cell_2048.csv", "answer,when\na," + "w" * 2048 + "\n")
+        inline = raised(csvfmt.parse_inline_set, "a: " + "w" * 2049 + "; b", "one_of")
+    finally:
+        csvfmt.set_max_tokens(8192)
+    relaxed = csvfmt.load(path)
+    check("limits: 4 096 Max Prompt Tokens make the cell limit 2 048 characters, for CSV cells and inline descriptions",
+          limit == 2048 and not edge.problems and only(
+              strict.problems, "error", 2, "Line 2: column 'when' has 3 000 characters (limit 2 048)") and only(
+              inline, "error", 0, "Entry 1: the description has 2 049 characters (limit 2 048)"),
+          (limit, summary(edge.problems), summary(strict.problems), summary(inline)))
+    check("limits: a new cell limit forgets the cached reads, and the same one keeps them",
+          not fine.problems and kept is fine and strict is not fine and again is strict and relaxed is not strict
+          and not relaxed.problems and csvfmt.MAX_CELL == 4096, (summary(relaxed.problems), csvfmt.MAX_CELL))
 
 
 def test_messages():
@@ -1094,10 +1118,13 @@ def test_inline_sets():
         (",".join(f"o{i}" for i in range(256)), "one_of", "A One-of answer set needs 1 to 255 answers; this one has 256"),
         ("a; b; A", "one_of", "Entry 3: 'A' appears twice"),
         (": only a description", "one_of", "Entry 1: the name is empty"),
+        ("a: " + "w" * 4097 + "; b", "one_of", "Entry 1: the description has 4 097 characters (limit 4 096)"),
     ):
         problems = raised(parse, text, kind)
         check(f"inline set: {message}", only(problems, "error", 0, message), summary(problems))
     check("inline set: one option is fine for One-of", len(parse("only", "one_of").options) == 1)
+    check("inline set: a description of 4 096 characters is fine",
+          len(parse("a: " + "w" * 4096 + "; b", "one_of").options[0].when) == 4096)
     items = [o.name for o in parse("chair, table,lamp", "items").options]
     check("inline set: items", items == ["chair", "table", "lamp"], items)
 

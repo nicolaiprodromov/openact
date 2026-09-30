@@ -71,7 +71,7 @@ ASK, MATCH = SPECS["GeometryNodeOpenActAsk"], SPECS["GeometryNodeOpenActMatch"]
 CLASSIFY, DIALS, PICK, RULES = (SPECS[f"GeometryNodeOpenAct{name}"] for name in ("Classify", "Dials", "Pick", "Rules"))
 POINTS = 5
 REFUSED = 2  # the 403s this suite causes on purpose in the log: 2 requests sent straight to the server
-LONG = "x " * 20000  # far above the fake model's 4096-token limit, like a prompt too long for SemIf
+LONG = "x " * 20000  # far above the fake model's default limit of 8192 tokens, like a prompt too long for SemIf
 
 
 def free_port():
@@ -456,8 +456,8 @@ def phase_isolation():
     settle()
     bad = cells(job)[3]
     codes = [code for _body, code, _reply in TAP.since(start)]
-    check("422: the question the server names fails alone ('... exceed limit 4096'), and the other 9 are answered by "
-          "one more request", codes == [422, 200] and "exceed limit 4096" in pipeline.FAILED.get(bad.key, "")
+    check("422: the question the server names fails alone ('... exceed limit 8192'), and the other 9 are answered by "
+          "one more request", codes == [422, 200] and "exceed limit 8192" in pipeline.FAILED.get(bad.key, "")
           and all(pipeline.cached(cell.key) for cell in cells(job) if cell is not bad),
           (codes, pipeline.FAILED.get(bad.key)))
 

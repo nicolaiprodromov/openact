@@ -46,6 +46,9 @@ SERVER_BANNERS = ("install", "runtime", "port")  # shown in the Model box, above
 IMPORT_CSV_NOTE = ("Import CSV '{}' reads the same file; Blender won't re-read it after edits in this session. Use "
                    "this node's payload outputs, or restart Blender")
 EMPTY_SLOT = "(empty slot)"  # a row without a name: an empty material slot, never offered
+# Under Max Prompt Tokens while the running server has another limit: it keeps the one it started with
+MAX_TOKENS_LATER = ("The running model server allows {} tokens a prompt: {} applies once it restarts (Stop Model, "
+                    "then Start Model)")
 TRIGGER_ROWS = {  # NodeStatus.trigger -> its activity line (§17.2)
     "unlinked": ('UNLINKED', "Trigger unlinked: never asks"),
     "off": ('RADIOBUT_OFF', "Trigger off at the last evaluation"),
@@ -272,6 +275,10 @@ def draw_preferences(prefs, context, layout):
     col.prop(prefs, "auto_start")
     col.prop(prefs, "device")
     col.prop(prefs, "gpu")
+    col.prop(prefs, "max_tokens")
+    running = server.STATE.health.get("max_tokens")  # the server in use; {} while none answers
+    if running and running != prefs.max_tokens:
+        wrap(col, MAX_TOKENS_LATER.format(running, prefs.max_tokens), icon='INFO')
     col.prop(prefs, "debias")
     col.prop(prefs, "unsure_below")
     col.prop(prefs, "port")

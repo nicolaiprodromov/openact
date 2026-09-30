@@ -14,6 +14,8 @@ MODEL_SOURCE = "Qwen/Qwen3.5-4B"
 MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 MODEL_LABEL = "Qwen3.5-4B via SemIf"
 UNSURE_BELOW = 0.30  # 4.e: the Unsure Below preference's default
+DEFAULT_MAX_TOKENS = 8192  # the Max Prompt Tokens preference's default; SemIf's own default is 4096
+MODEL_MAX_TOKENS = 262144  # Qwen3.5-4B's context length (max_position_embeddings): no prompt can be longer
 
 
 def default_runtime_root() -> str:
@@ -36,6 +38,7 @@ class _Defaults:
     auto_start = True
     debias = True
     unsure_below = UNSURE_BELOW
+    max_tokens = DEFAULT_MAX_TOKENS
     log_requests = False
     trusted_folders = []  # plain path strings here; PropertyGroups with a path in the preferences
     trusted_files = []
@@ -129,6 +132,15 @@ def publish_log_requests(self, _context):
     server.STATE.log_requests = self.log_requests
 
 
+def publish_max_tokens(self, _context):
+    """The CSV cell limit follows the preference at once, and a pass checks every node's files against it (the limit is
+    in each plan's fingerprint). The running model server keeps its own limit until it restarts."""
+    from . import csvfmt, engine  # engine imports this module
+
+    csvfmt.set_max_tokens(self.max_tokens)
+    engine.schedule()
+
+
 class OpenActPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
@@ -155,6 +167,13 @@ class OpenActPreferences(bpy.types.AddonPreferences):
     gpu: bpy.props.IntProperty(
         name="GPU", default=0, min=0, max=15,
         description="Which NVIDIA GPU runs the model (0 = first). The model needs about 9 GB of VRAM",
+    )
+    max_tokens: bpy.props.IntProperty(
+        name="Max Prompt Tokens", default=DEFAULT_MAX_TOKENS, min=1024, max=MODEL_MAX_TOKENS, soft_max=32768,
+        update=publish_max_tokens,
+        description="The longest prompt the model reads, in tokens (about 4 characters of English each). A longer "
+                    "question fails with an error, and CSV cells may hold half as many characters. Longer prompts "
+                    "take more GPU memory and time. The model server uses a new value once it restarts",
     )
     auto_start: bpy.props.BoolProperty(
         name="Start Automatically", default=True,

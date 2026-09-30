@@ -638,7 +638,7 @@ def start(prefs=None):
     })
     args = [python, "-u", SERVER_SCRIPT, "--port", str(STATE.port), "--backend", backend, "--device", P.device(prefs),
             "--parent-pid", str(os.getpid()), "--token-file", os.path.abspath(_token_file(STATE.port)),
-            "--gpu", str(prefs.gpu)]
+            "--gpu", str(prefs.gpu), "--max-tokens", str(prefs.max_tokens)]
     if backend == "fake":
         args += FAKE_ARGS
     try:

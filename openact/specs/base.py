@@ -233,12 +233,13 @@ class Spec:
 
     def fingerprint(self, node, ctx) -> str:
         """Everything plan() reads, hashed: while it is unchanged, the Job planned from it still holds (§5.3). The
-        trust state is part of it, as it decides which files plan() may read (§16.1)."""
+        trust state is part of it, as it decides which files plan() may read (§16.1), and so is the cell limit, which
+        decides which of their cells are too long (Max Prompt Tokens, §7.9)."""
         from .. import trust  # imports bpy
 
         return pipeline.digest(self.name, self.PROMPT_VERSION, self.gn(node, ctx), getattr(node, "answer_type", ""),
                                node.balance_order, self.listed(node, ctx), self.overrides_stamp(node, ctx),
-                               trust.is_trusted())
+                               trust.is_trusted(), csvfmt.MAX_CELL)
 
     def plan(self, node, ctx) -> pipeline.Job:
         """The node's Job in ctx, without its Overrides CSV: engine._plan() applies that (locked()). Raises Hint,

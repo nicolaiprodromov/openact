@@ -468,6 +468,7 @@ def run_pass(everything=True):
     plans_made, stored = _plans_made, False
     evaluator.MEMO = {}  # nodes that read the same upstream words in a context share one read
     csvfmt.IDENTITIES = {}  # every fingerprint resolves its files and asks for the trust state: once per pass (§3.2)
+    csvfmt.set_max_tokens(P.get_prefs().max_tokens)  # also when no update ran, e.g. Revert to Saved Preferences
     planned = _pass_plans = set()
     visited = set()
     _pass_depsgraph = depsgraph  # the nodes' stamps are read from the evaluation their reports come from (§5.8)

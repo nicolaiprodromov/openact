@@ -623,7 +623,7 @@ Package `openact/`, in a flat style: one module per concern.
 | Module | Responsibility | Main entry points |
 |---|---|---|
 | `__init__.py` | Registers prefs → ops → nodes → ui → `engine.register()`, then `server.refresh()` | `register()`, `unregister()` |
-| `prefs.py` | `OpenActPreferences`. Runtime root resolution: the explicit `runtime_dir`, else `…/OpenAct`. Backend enum, `unsure_below` | `get_prefs()`, `runtime_root()`, `runtime_installed()` |
+| `prefs.py` | `OpenActPreferences`. Runtime root resolution: the explicit `runtime_dir`, else `…/OpenAct`. Backend enum, `unsure_below`, `max_tokens` | `get_prefs()`, `runtime_root()`, `runtime_installed()` |
 | `nodes.py` | The six node classes on an `_OpenActNode` mixin; Add menu | `GeometryNodeOpenAct*` |
 | `engine.py` | Passes, the playback path (§5.5), handlers, timer, per-node status, ownership fix-up | `run_pass()`, `tick()`, `schedule()`, `ensure_owned()`, `plan_words()`, `in_use()`, `reask()` |
 | `evaluator.py` | Static evaluator and contexts, including tracing a plugged-in Import CSV node to its Path and Delimiter (§6.0) | `eval_input()`, `find_uses()`, `trace_csv_source()`, `Ctx`, `Unresolvable`, `Unreadable`, `Pending`, `Hint`, `WORDS` |
@@ -677,9 +677,13 @@ flowchart TB
 **Process model:**
 - `server.start()` launches `venv/python -u runtime/openact_server.py`, with the script taken
   from the add-on folder;
-- arguments: `--port <port> --backend semif --device <auto|cuda> [--gpu N] --parent-pid
-  <blender pid> --token-file <state>/server-<port>.token`. There is no CPU device option at all:
-  only NVIDIA/CUDA is built (NG9).
+- arguments: `--port <port> --backend semif --device <auto|cuda> [--gpu N] --max-tokens <N>
+  --parent-pid <blender pid> --token-file <state>/server-<port>.token`. There is no CPU device
+  option at all: only NVIDIA/CUDA is built (NG9).
+  - **`--max-tokens`** is the *Max Prompt Tokens* preference (default 8192; SemIf's own default is
+    4096). It is SemIf's refusal limit, not the model's: Qwen3.5-4B reads up to 262 144 tokens. A
+    running server keeps the value it started with, so a changed preference applies once it
+    restarts; until then the preferences show a note (§13.4).
   - **`auto` means CUDA only.** When `torch.cuda.is_available()` is False,
     `openact_server.py` reports `status: "error"` with "CUDA is not available to PyTorch (is the
     NVIDIA driver too old for cu128?)" instead of falling back to the CPU in fp32. The add-on
@@ -707,9 +711,9 @@ be plugged in later (NG3).
 | Endpoint | Change |
 |---|---|
 | `POST /v1/systemone` | Unchanged request and response shape: `state`, `questions` map of `{type: noul/choice/score, instructions, criteria}`, `options.debias` |
-| `GET /health` | `server: "openact-semif"`. Adds counters: questions, scored rows, cache hits, mean ms per row |
+| `GET /health` | `server: "openact-semif"`. Adds counters: questions, scored rows, cache hits, mean ms per row; and `max_tokens` |
 | `GET /v1/models` | Unchanged |
-| `GET /v1/capabilities` | **New**: `{backend, slots: 16, max_options: 255, max_levels: 16, batch_rows: 32, debias: true, question_cache: true}`. The pipeline sizes its chunks from this |
+| `GET /v1/capabilities` | **New**: `{backend, slots: 16, max_options: 255, max_levels: 16, max_tokens, batch_rows: 32, debias: true, question_cache: true}`. The pipeline sizes its chunks from this |
 | `POST /shutdown` | Now requires the token |
 
 `POST /v1/systemone` and `POST /shutdown` require the header `X-OpenAct-Token`. The server also
@@ -834,7 +838,9 @@ sequenceDiagram
    - a list-source fingerprint: collection child names, material slot names, or attribute names;
    - the node's `balance_order` toggle (§10.3);
    - the file trust state (§16.1), which decides the files `plan()` may read. A pass works it out
-     once at its start, and resolves each file's `realpath` once, not per fingerprint.
+     once at its start, and resolves each file's `realpath` once, not per fingerprint;
+   - the CSV cell limit, half the *Max Prompt Tokens* preference (§7.9), which decides which cells
+     are too long. A pass sets it from the preference at its start.
 
    `engine.PLANS[(uid, ctx key)]`, or `PLANS[(uid, ctx key, words)]` for a reported word set, holds
    `(fingerprint, job)`. An unchanged fingerprint reuses the cached Job, so the cost is the evaluator
@@ -2082,8 +2088,13 @@ therefore also run under any plain CPython ≥ 3.11 (§18).
      physical line numbers and Import CSV parity is unverified.
    - A row longer than the header is an error. A shorter row is padded with empty cells.
    - Cells are trimmed.
-5. **Limits.** At most 4096 data rows and 64 columns. Text cells may hold up to 2000 characters,
-   which keeps prompts inside SemIf's context; the server answers 422 on over-long prompts.
+5. **Limits.** At most 4096 data rows and 64 columns. A cell may hold half as many characters as
+   the *Max Prompt Tokens* preference allows tokens (§13.4): 4096 at the default 8192. At about 4
+   characters a token, one cell then fills at most an eighth of a prompt. The limit bounds single
+   cells only: the server answers 422 on a whole prompt over its `--max-tokens`, which fails that
+   question alone (§10.4). The engine sets the limit from the preference at each pass
+   (`csvfmt.set_max_tokens()`, which forgets the cached reads when it changes), and the limit is part
+   of every plan's fingerprint, so a new value checks every node's files again (§5.3).
 6. **Numeric classification** applies to non-reserved columns and is intended to mirror Import
    CSV's typing. The rules below are **provisional**: the parity probe that would pin them
    against Import CSV on 4.5, 5.0 and 5.1 was never built (§21 F4), so `tests/csv_test.py` checks
@@ -2410,7 +2421,7 @@ The sidebar lists every problem (at most 50 per file), each with *Open File*.
 | Problem | Severity | Message (example) |
 |---|---|---|
 | Missing file | error | "Can't find //life_outcomes.csv" |
-| Over a limit (1 MB, 4096 rows, 64 columns, 2000 characters per cell) | error | "life.csv has 5 000 rows (limit 4 096)" |
+| Over a limit (1 MB, 4096 rows, 64 columns, or a cell's characters: half *Max Prompt Tokens*, 4096 by default) | error | "life.csv has 5 000 rows (limit 4 096)" |
 | Not UTF-8, or a NUL byte | error | "life.csv is not UTF-8 text (byte 1 203)" |
 | Duplicate or empty header | error | "Two columns are named 'when'" |
 | No name column | error | "No 'answer' column (or name, item, label, outcome)" |
@@ -3288,16 +3299,16 @@ or Rules question has more than 16 options, every item or cell pays the tourname
 | Cache | LRU of 65 536 **questions**, key `sha256([state, question, debias])`. `decide()` serves cached questions first and scores only the rest. A cache of whole requests would be invalidated by any single edit (§2.3) |
 | Auth | `OPENACT_TOKEN` → `X-OpenAct-Token` required on every POST (`hmac.compare_digest`). The server **refuses to start** without `OPENACT_TOKEN`, except with `--backend fake` (tests only). Reject any `Origin` header and any `Host` outside the allow-list (403, §16) |
 | Endpoints | `/v1/systemone`, `/health`, `/v1/models`, `/shutdown`, and `GET /v1/capabilities` (§5.2) |
-| `/health` | status, model, device, requests, `backend`, `model_id`, `questions`, `rows_scored`, `cache_hits`, `ms_per_row` (EMA over the last 64 scoring calls) |
-| Limits | `MAX_BODY` 4 MB, and at most 256 questions per request (422 above) |
+| `/health` | status, model, device, requests, `backend`, `model_id`, `questions`, `rows_scored`, `cache_hits`, `ms_per_row` (EMA over the last 64 scoring calls), `max_tokens` |
+| Limits | `MAX_BODY` 4 MB, at most 256 questions per request, and `--max-tokens` per scored row (8192 by default; the fake backend counts a quarter of the row's JSON length): 422 above each |
 | While loading | **Returns 503 immediately** with `{"status": "loading"}` while `status == "loading"`, and `{"status": "error", "error": …}` after a failed load. The worker never blocks behind a cold load |
 | 422 body | `{"error", "question": qid}`, so the client can isolate the bad question |
 
 **Also:**
 - binding to 127.0.0.1, `ThreadingHTTPServer`, and background load with a warm-up row;
 - the `--parent-pid` watchdog (`OpenProcess`/`WaitForSingleObject` on Windows);
-- `CUDA_VISIBLE_DEVICES` from `--gpu`, SemIf `score`/`score_shared` in chunks of 32 rows, and the
-  debias and tournament code.
+- `CUDA_VISIBLE_DEVICES` from `--gpu`, SemIf `score`/`score_shared` in chunks of 32 rows with
+  `max_tokens` from `--max-tokens`, and the debias and tournament code.
 
 **The per-question cache wraps the scoring**, in `_decide_uncached()`:
 
@@ -3543,7 +3554,7 @@ still work):
 ```json
 {"server": "openact-semif", "version": "1.0.0", "backend": "semif-torch",
  "model_id": "Qwen/Qwen3.5-4B@851bf6e8", "slots": 16, "max_options": 255, "max_levels": 16,
- "max_questions": 256, "batch_rows": 32, "debias": true, "question_cache": true}
+ "max_questions": 256, "max_tokens": 8192, "batch_rows": 32, "debias": true, "question_cache": true}
 ```
 
 | Code | When | Client reaction (`server.Worker`) |
@@ -3668,6 +3679,7 @@ def int_values(obj, name, depsgraph): ...  # an INT point attribute of the evalu
 | `device` | `auto`/`cuda` only, and `auto` **means CUDA only**: no run-time CPU fallback. Without CUDA the server reports an error with a driver hint (§5.2). There is no `cpu` option (NG9) |
 | `backend` | `SEMIF_CUDA` (the default); `FAKE` via the environment only. `LLAMACPP_CPU` is future work, not in this plan |
 | `unsure_below` | Float, default **0.30**, adjustable here, and tuned later from beta feedback (user decision; 4.e, §21 F3) |
+| `max_tokens` | **"Max Prompt Tokens"**, Int, default **8192** (1024 to 262 144, Qwen3.5-4B's context length). Passed as `--max-tokens` when this Blender starts the server (§5.2), and sets the CSV cell limit to half as many characters (§7.9) at once and at each pass. The running server keeps its own value until it restarts: while `/health`'s `max_tokens` differs, a note under the preference says so. Longer prompts take more VRAM and time; the limit only refuses prompts, it reserves nothing |
 | `log_requests` | Bool, default off. Writes JSONL of requests and responses to `<runtime>/logs/` (§17) |
 | `trusted_folders` | Folders (and their subfolders) whose .blend files OpenAct trusts for file reads outside their own folder tree (§16.1). Edited in the preferences; *Trust this folder* adds to it |
 | `trusted_files` | Individual .blend paths trusted the same way. *Allow this file* adds to it, which is the safer default for a Downloads folder |
@@ -4447,11 +4459,11 @@ A later run can diff these lines to spot performance regressions.
 
 | Suite | Runs in | Model | What it checks |
 |---|---|---|---|
-| `tests/csv_test.py` | CPython + Blender | none | `csvfmt` dialect (BOM, CRLF and CR, `;` and tab delimiters, quoting); INT/FLOAT/text classification; limits; every §7.9 message by fixture; the `parse_answer_set` / `parse_factors` / `parse_settings` / `parse_overrides` parsers; the `if` grammar; `lists.parse_inline` (newline, then `;`, then `,`); `text_hash` unchanged by numeric edits and `num_hash` unchanged by text edits |
+| `tests/csv_test.py` | CPython + Blender | none | `csvfmt` dialect (BOM, CRLF and CR, `;` and tab delimiters, quoting); INT/FLOAT/text classification; limits, the cell limit set from *Max Prompt Tokens* included; every §7.9 message by fixture; the `parse_answer_set` / `parse_factors` / `parse_settings` / `parse_overrides` parsers; the `if` grammar; `lists.parse_inline` (newline, then `;`, then `,`); `text_hash` unchanged by numeric edits and `num_hash` unchanged by text edits |
 | **`tests/store_test.py`** | CPython + Blender | none | The reading rules of §14.4 (damaged entries skipped, anything but schema 2 read as empty, a newer schema left unread); a changed `PROMPT_VERSION` or `debias` changes the ask key but no words key; save/load round trip with the documented field order; 2 MB soft-cap eviction removes only warm and cold entries, a pinned one of OpenAct 1.0 among them, and **keeps live entries**, even when they alone exceed 2 MB (with the size note) |
 | `tests/rules_math_test.py` | CPython + Blender | none | The 4.e confidence formulas: uniform answers give exactly 0 for L = 2…16, point masses give 1, near-uniform answers stay below 0.30, and the documented examples (0.65; the bimodal split gives 0). `itertools.product` order equals `ravel`; allowed sets and code-decided cells; the reference interpolation (corners, weights, renormalisation); dithering probabilities, analytic versus 100 000 samples within ±1 %; **the stamps (§5.8)**: a One-of stamp names its cell, and a Yes/No stamp exactly the corners of weight above 0 of 500 random elements (outer half-bands, band centres, clamped values, a 4th Amount factor, an unknown category), while numbers no stamp can be name none; a stored table so far resolves to itself, as a full resolve builds it, until an answer lands or a cell fails (§5.4) |
 | **`tests/words_test.py`** | CPython + Blender | none | `words.py` (§5.7, §8.2): the key text and `split()`; `blender_hash()` against the hashes Blender's Hash Value computed on 4.5 and 5.1, Unicode, a 2,000-character text and the 'aZ'/'b5' collision included; `message()` and `parse()`, which reads any other warning as none; `shared_keys()` |
-| `tests/server_test.py` | CPython + Blender | fake | The model server with its fake backend (§10.4, §16.1): the token, `Origin` and `Host` checks; the per-question cache and the `/health` counters; `/v1/capabilities`; 422 naming the question; tournaments; malformed and slow requests; `--fake-script` and `--record`; the 503 of a cold or failed load |
+| `tests/server_test.py` | CPython + Blender | fake | The model server with its fake backend (§10.4, §16.1): the token, `Origin` and `Host` checks; the per-question cache and the `/health` counters; `/v1/capabilities`; 422 naming the question; `--max-tokens` and its default; tournaments; malformed and slow requests; `--fake-script` and `--record`; the 503 of a cold or failed load |
 | `tests/rules_blender.py` | Blender | none | The Rules node with synthetic answers: the cell index of every combination, interpolation and dithering against `rules_core`; the Game of Life in a Simulation Zone against a Python B3/S23 reference; layout and Outcomes edits, shape agreement, the status's problems, writes only from the pass; background mode and farm renders (§7.8). **The cells in use (§5.8):** with its geometry passing through, a triggered node's first pass asks nothing and lays out its factors, the next asks the cell its points read, a cell a point moves into is asked at the next pass, Ask Again asks the cells in use again, and without the pass-through every missing cell is asked; One-of with Dither asks the cells its outcomes read, and Yes/No the corners its points blend, its stamp as `rules_core.blend_stamp()`; the stamp is a hidden point attribute named after the node, on the evaluated geometry only; the status says how many cells are answered. BENCH lines: reading the stamp and the cells in use at 10k and 100k points (1 and 3 ms budgets), and an evaluation stamped against bypassed. **With `-- --model PORT GPU`**, the real model answers Conway, HighLife, Seeds and Day & Night: each 18/18 exact with 0 unsure, the acceptance of §9.5 |
 | **`tests/evaluator_blender.py`** (extended) | Blender | none | Every existing case, plus **Menu Switch**: a value typed on the socket and a value coming from a modifier's Group Input menu, for String, Int and Float, covering both storage forms (§10.1). Also Special Characters, String Length, OpenAct single-value outputs used as words, field outputs rejected with the breadcrumb message, a muted Pick that passes a linked ID on (and its unlinked ID, the index, rejected as a field, §6.0), and the per-pass memo returning identical values. All are checked against Geometry Nodes ground truth with Compare nodes, the existing technique. **`trace_csv_source()`** (added by PR-13): a direct link; a Path exposed on the modifier; Reroute, nested-group and Geometry Menu Switch pass-through; the Import CSV Path/Delimiter socket identifiers pinned on 4.5, 5.0 and 5.1; both error messages |
 | `tests/interface_blender.py` | Blender | none | Guards the verified facts: interface edits reach custom group nodes and links survive; `default_input='INDEX'` with `hide_value` gives `[0, 1, 2, 3]`; Index Switch `MATERIAL` works; `structure_type` as measured per version: `SINGLE` on String words everywhere, `FIELD` on ID and factors only on 5.0+, `AUTO` on 4.5; `FIELD` on a String socket is rejected on 5.x, and setting it is never attempted. A string field linked into a word stays `is_valid = True`, pinning the fact that the evaluator's `Unresolvable` is the guard; `copy()` plus `ensure_owned()` gives every copy its own inner group and table object, including when the whole tree is duplicated; an unlinked table object survives save/reload, *Purge Unused Data*, F12 and `blender -b -f` (§8.5). **Every node's first sockets (§6.0):** Geometry and Trigger inputs and a Geometry output, through dropdowns and dynamic sockets; the Trigger a `SINGLE` Bool with no checkbox; the geometry passing through all six nodes (through Rules' stamp); a node saved by 1.0 gains them on its next pass, its other sockets and links kept |
@@ -4593,7 +4605,7 @@ There are no remote flags, because OpenAct makes no network calls after install.
 | `OPENACT_BACKEND=fake`, `OPENACT_SERVER_PYTHON=<python>` | environment | Tests and CI without a GPU or the runtime (§18.1) |
 | `OPENACT_BACKGROUND_PASSES=1`, or in process `openact.engine.allow_background_passes(True)` | environment / Python API | Lets headless authoring (test suites, scene-building scripts, user scripts) run passes. Without either, background mode renders only the saved answers (§7.8) |
 | `OPENACT_BENCH_SHAPE=demo\|worst` | environment | Selects the shape that `tests/lookup_blender.py --bench` builds for the main-thread budgets (§8.4) |
-| `debias` (the default for new nodes), `auto_start`, `unsure_below` (0.30), `log_requests` | preferences | Behaviour and diagnostics (§13.4) |
+| `debias` (the default for new nodes), `auto_start`, `unsure_below` (0.30), `max_tokens` (8192), `log_requests` | preferences | Behaviour and diagnostics (§13.4) |
 | `balance_order` | node property | Per-node order balancing (§10.3) |
 | `OPENACT_STATE_DIR` | environment | Writable state folder (logs, probe cache, token files). Build workers set it so the shared runtime stays read-only (§5.2, §20.6) |
 | `backend` enum | preference | A new backend appears only when its runtime profile is installed **and** its PR's acceptance suite passed. Until then it is hidden |

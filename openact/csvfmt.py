@@ -21,7 +21,7 @@ ERROR, WARNING, INFO = "error", "warning", "info"
 MAX_BYTES = 1024 * 1024
 MAX_ROWS = 4096
 MAX_COLUMNS = 64
-MAX_CELL = 2000  # characters: keeps prompts inside SemIf's context
+MAX_CELL = 4096  # characters: half the Max Prompt Tokens preference, 8192 by default (set_max_tokens())
 MAX_ANSWER = 200
 MAX_PAYLOAD = 16
 MAX_NAME = 63  # bytes of UTF-8: Blender cuts longer socket names
@@ -373,6 +373,18 @@ def clear_cache(path: str | None = None) -> None:
     ident = identity(path)
     for key in [key for key in _DOCS if key[0] == ident]:
         del _DOCS[key]
+
+
+def set_max_tokens(tokens: int) -> None:
+    """Size MAX_CELL from the Max Prompt Tokens preference, the model server's limit on one prompt: a cell may hold
+    half as many characters as a prompt may hold tokens. At about 4 characters a token, one cell then fills at most an
+    eighth of a prompt; the server still refuses a whole prompt over the limit, which fails that question alone. A new
+    limit forgets the cached reads, whose problems were found with the old one."""
+    global MAX_CELL
+    limit = max(int(tokens), 2) // 2
+    if limit != MAX_CELL:
+        MAX_CELL = limit
+        _DOCS.clear()
 
 
 def parse_inline(text: str) -> list[tuple[str, str]]:

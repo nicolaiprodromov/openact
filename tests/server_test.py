@@ -10,6 +10,8 @@ Each server is openact/runtime/openact_server.py --backend fake, run by this Pyt
 - /v1/capabilities; 422 for 257 questions and for an invalid question or one over the token limit,
   naming it; a 40-option tournament whose 40 probabilities sum to 1, also next to question ids
   that look like the tournament's own keys.
+- --max-tokens: 8192 by default, reported by /health and /v1/capabilities; a lower one refuses a
+  question the default answers; one below 1 stops the start.
 - Bad requests: a negative or non-numeric Content-Length, a real body over 4 MB, deeply nested JSON
   and lone surrogates all get a reply. Refused requests with bodies that are slow to parse, sent
   nonstop, leave /health within the add-on's 1 s probe timeout.
@@ -216,8 +218,8 @@ def phase_auth(port):
 
 def phase_capabilities(port):
     expected = {"server": "openact-semif", "version": "1.0.0", "backend": "fake", "model_id": "fake", "slots": 16,
-                "max_options": 255, "max_levels": 16, "max_questions": 256, "batch_rows": 32, "debias": True,
-                "question_cache": True}
+                "max_options": 255, "max_levels": 16, "max_questions": 256, "max_tokens": 8192, "batch_rows": 32,
+                "debias": True, "question_cache": True}
     code, caps = call(port, "GET", "/v1/capabilities")
     check("capabilities fields", code == 200 and {key: caps.get(key) for key in expected} == expected, caps)
 
@@ -310,8 +312,8 @@ def phase_limits(port):
     code, reply = ask(port, {"state": "s", "questions": {
         "fine": noul("Is it fine?"), "wide": choice("Which one?", {str(i): f"option {i}" for i in range(256)})}})
     check("422 for 256 options names the question", code == 422 and reply.get("question") == "wide", (code, reply))
-    code, reply = ask(port, {"state": "s", "questions": {
-        "fine": noul("Is it fine?"), "long": noul("Is it " + "very " * 5000 + "long?")}})
+    code, reply = ask(port, {"state": "s", "questions": {  # about 12 500 tokens as the fake counts them (JSON / 4)
+        "fine": noul("Is it fine?"), "long": noul("Is it " + "very " * 10000 + "long?")}})
     error = reply.get("error", "")
     check("422 for a question over the token limit names it, in the message too",
           code == 422 and reply.get("question") == "long" and error.startswith("long: ") and "limit" in error
@@ -322,6 +324,34 @@ def phase_limits(port):
     check("422 for a tournament group over the token limit names its question",
           code == 422 and reply.get("question") == "wide" and reply.get("error", "").startswith("wide: "),
           (code, reply.get("question"), reply.get("error", "")[:80]))
+
+
+def phase_max_tokens(port):
+    """port: the token server, started with the default limit."""
+    code, caps = call(port, "GET", "/v1/capabilities")
+    check("max tokens: 8192 by default, which /health and /v1/capabilities report",
+          code == 200 and caps.get("max_tokens") == 8192 and health(port).get("max_tokens") == 8192,
+          (caps.get("max_tokens"), health(port).get("max_tokens")))
+    request = {"state": "s", "questions": {  # about 1 300 tokens as the fake counts them: over 1024, under 8192
+        "fine": noul("Is it fine?"), "long": noul("Is it " + "very " * 1000 + "long?")}}
+    code, reply = ask(port, request)
+    check("max tokens: the default answers a question of about 1 300 tokens", code == 200, (code, reply.get("error")))
+    small, _process = launch("small", "--max-tokens", "1024")
+    check("max tokens: a server with --max-tokens 1024 is ready", wait_status(small, "ready", 15),
+          health(small).get("status"))
+    code, caps = call(small, "GET", "/v1/capabilities")
+    reported = (caps.get("max_tokens"), health(small).get("max_tokens"))
+    code, reply = call(small, "POST", "/v1/systemone", request)  # the fake backend without a token needs none
+    error = reply.get("error", "")
+    check("max tokens: --max-tokens 1024 is reported, and refuses that question with 422 naming it and the limit",
+          reported == (1024, 1024) and code == 422 and reply.get("question") == "long"
+          and error.startswith("long: ") and error.endswith("exceed limit 1024"), (reported, code, error[:80]))
+    result = subprocess.run(
+        [sys.executable, "-u", SERVER, "--backend", "fake", "--port", str(free_port()), "--max-tokens", "0"],
+        capture_output=True, text=True, timeout=60)
+    output = result.stdout + result.stderr
+    check("max tokens: --max-tokens 0 stops the start, with a message",
+          result.returncode != 0 and "--max-tokens must be at least 1" in output, (result.returncode, output[-300:]))
 
 
 def phase_tournament(port):
@@ -476,6 +506,7 @@ def main():
         phase_capabilities(port)
         phase_cache(port)
         phase_limits(port)
+        phase_max_tokens(port)
         phase_tournament(port)
         phase_script(port)
         phase_bad_requests(port)

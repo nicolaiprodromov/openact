@@ -34,6 +34,9 @@ answers during playback.
   words. The error "... the limit is 16: split the tree" is gone. Two sets of words whose hashes collide, which is
   rare, get an error asking for another Key.
 - A node keeps up to 1024 stored sets of answers besides the ones in use (was 16), still within 2 MB per node.
+- New preference, **Max Prompt Tokens**: the longest prompt the model reads, now 8192 tokens by default (was a fixed
+  4096). CSV cells may hold half as many characters, so 4096 by default (was a fixed 2000). A new value applies to
+  the model server once it restarts.
 - A node with missing answers that nothing asks says why: *Link a Trigger to ask*, *Trigger off* or *Not
   evaluated*, with how many answers are missing. The sidebar shows the active node's Trigger at the last evaluation
   and how many sets of words the evaluation reported.
