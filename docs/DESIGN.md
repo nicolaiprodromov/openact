@@ -4565,7 +4565,7 @@ Severity is the impact if the risk happens. Likelihood is judged for OpenAct as 
     design document as `docs/DESIGN.md`, and pushed.
   - The gh CLI on this machine is logged in as `nicolaiprodromov` with the `repo` and `workflow`
     scopes.
-  - **Local clone:** `X:\interzis\CHUMP_KIT\openact\`. It holds:
+  - **Local clone:** `openact\`. It holds:
   ```
   openact/
     openact/     (the add-on package)
@@ -4857,7 +4857,7 @@ runs it now.
 - `GeometrySet` access, and the evaluation of hidden objects in excluded collections;
 - `default_input`, Index Switch types, interface propagation, and the `copy()` pointer issue;
 - the cost of `node.location` (about 6 ms per node in 5.1), measured in the sibling RB Solver v4
-  project (`X:\interzis\CHUMP_KIT\RIGID BODY\v4_src\`).
+  project.
 
 **External:**
 - SemIf (formerly OpenJev), MIT, pinned commit `23cf1f39fc9534fe81437200959b6dfc7106e45a`:
@@ -4898,7 +4898,7 @@ runs it now.
 | KD14 | **Dynamic sockets** come from diffing the inner group's interface. The ID input uses `default_input = 'INDEX'`, not `ID_OR_INDEX` | Both behaviours are verified in 4.5.2 and 5.1.1. An ID means "entry number", and Distribute Points gives points large random ids that are not entry numbers | §6.0 |
 | KD15 | **One runtime location.** The runtime lives in the *Runtime Folder* preference, else in `%LOCALAPPDATA%\OpenAct` (on Linux `$XDG_DATA_HOME/OpenAct`). *Locate Existing Runtime…* points OpenAct at a runtime installed elsewhere, after a probe | No hidden search paths: the folder the preferences show is the one in use | §10.5, §14.6 |
 | KD16 | **Supply chain:** pinned versions, SHA-256 checks for uv and SemIf, a hash-locked environment, a ≥ 15 GB free-space check, and `online_access` respected | A 13 GB install must be reproducible, and it must fail loudly rather than end up half-working | §16.2, R3 |
-| KD17 | Development happens in the user's GitHub repository **https://github.com/nicolaiprodromov/openact** (private), cloned to `X:\interzis\CHUMP_KIT\openact\`. PR-01 clones it, creates `main`, scaffolds, commits this design as `docs/DESIGN.md`, and pushes. 1.0 is released as a GitHub release there; making the repository public is the user's call at release time, and an Extensions submission is considered after 1.0 | User decisions | §20.1, §20.2, §20.5 |
+| KD17 | Development happens in the user's GitHub repository **https://github.com/nicolaiprodromov/openact** (private), cloned locally. PR-01 clones it, creates `main`, scaffolds, commits this design as `docs/DESIGN.md`, and pushes. 1.0 is released as a GitHub release there; making the repository public is the user's call at release time, and an Extensions submission is considered after 1.0 | User decisions | §20.1, §20.2, §20.5 |
 | KD18 | **Only NVIDIA/CUDA is built** (user decision). A CPU backend (llama.cpp) is future work, outside this plan, and so is Apple Silicon. A high-accuracy 27B model is mentioned in the README only | Built and measured on RTX 3090s. Any future backend must pass the same acceptance suites before being offered | §3.3, NG9, §20.5 |
 | KD19 | **Agents are deferred; one part of them is delivered.** OpenAct ships hooks: `pipeline.submit(..., on_rows=…)`, table objects writable without rebuilds, the Warning channel, and `geometry.read_attributes`. The redesign delivered decisions that land during playback (KD31); the agents themselves (think slow, act fast) stay a separate design | Keeps the product focused (NG1) without precluding "think slow, act fast" | §5.5, §5.6 |
 | KD20 | **Shape agreement across contexts.** All live contexts of a node must agree on the interface shape (list source, answer type, factors, settings, payload headers), **and on every value baked into the graph** (band edges and centres, category offsets and value maps, flag assignments). Anything else (texts, payload values, Dials ranges, Pick's picked material) is per-entry data, found with its entry by the hash of the words | The interface exists once per node. A clear error is safer than a silent "first context wins", and per-entry values keep per-object variation possible | §6.0, §8.6 |
@@ -4925,7 +4925,7 @@ runs it now.
 > redesign that followed is listed after it, in [The redesign's commits](#the-redesigns-commits).
 
 **Conventions.**
-- All work happens in the local clone `X:\interzis\CHUMP_KIT\openact\` of
+- All work happens in a local clone of
   **https://github.com/nicolaiprodromov/openact** (private; §20.1), whose layout is:
   ```
   openact/
@@ -5041,7 +5041,7 @@ flowchart LR
 ### PR-01: Repository and scaffold
 - **Files/components:**
   - **Clone** `https://github.com/nicolaiprodromov/openact` (private, empty, no default branch)
-    into `X:\interzis\CHUMP_KIT\openact\` with `gh repo clone nicolaiprodromov/openact`. Then
+    with `gh repo clone nicolaiprodromov/openact`. Then
     **create `main`**: the first commit is on `main`, which becomes the default branch.
   - `.gitignore` (`__pycache__/`, `*.pyc`, `dist/`, `*.blend1`) and a `README.md` skeleton.
   - **`docs/DESIGN.md`**: this design document, committed verbatim.
